@@ -16,10 +16,11 @@ const artifacts = [
   ["Codey-1.2.3-windows-x64-setup.exe", "windows-setup"],
 ];
 
-test("generates a public update manifest with checksummed platform assets", async () => {
+for (const selectedArtifacts of [artifacts, [artifacts[2]]]) {
+test(`generates a public update manifest with ${selectedArtifacts.length} checksummed platform assets`, async () => {
   const directory = await mkdtemp(join(tmpdir(), "codey-update-manifest-"));
   const paths = [];
-  for (const [fileName, contents] of artifacts) {
+  for (const [fileName, contents] of selectedArtifacts) {
     const filePath = join(directory, fileName);
     await writeFile(filePath, contents);
     paths.push(filePath);
@@ -44,7 +45,7 @@ test("generates a public update manifest with checksummed platform assets", asyn
   assert.equal(manifest.schema_version, 1);
   assert.equal(manifest.version, "1.2.3");
   assert.equal(manifest.tag, "v1.2.3");
-  assert.equal(manifest.assets.length, 3);
+  assert.equal(manifest.assets.length, selectedArtifacts.length);
 
   const windowsInstaller = manifest.assets.find((asset) => asset.package_type === "nsis");
   assert.deepEqual(
@@ -60,6 +61,7 @@ test("generates a public update manifest with checksummed platform assets", asyn
     },
   );
 });
+}
 
 test("rejects a release whose tag does not match its version", async () => {
   const directory = await mkdtemp(join(tmpdir(), "codey-update-manifest-"));

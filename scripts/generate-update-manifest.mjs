@@ -87,14 +87,13 @@ async function buildManifest({ version, tag, downloadBaseUrl, assetPaths }) {
     providedPaths.set(fileName, resolve(assetPath));
   }
 
-  const missing = [...expectedByName.keys()].filter((fileName) => !providedPaths.has(fileName));
-  if (missing.length > 0) fail(`Missing release assets: ${missing.join(", ")}`);
-
   const unexpected = [...providedPaths.keys()].filter((fileName) => !expectedByName.has(fileName));
   if (unexpected.length > 0) fail(`Unexpected release assets: ${unexpected.join(", ")}`);
 
   const assets = await Promise.all(
-    artifactDefinitions.map(async (definition) => {
+    artifactDefinitions.filter((definition) =>
+      providedPaths.has(`Codey-${version}-${definition.suffix}`),
+    ).map(async (definition) => {
       const fileName = `Codey-${version}-${definition.suffix}`;
       const filePath = providedPaths.get(fileName);
       const metadata = await stat(filePath);

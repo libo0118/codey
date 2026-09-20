@@ -1,4 +1,4 @@
-name: Build desktop packages
+name: Build Windows package
 
 on:
   workflow_dispatch:
@@ -15,108 +15,6 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  macos:
-    name: macOS ${{ matrix.arch }} unsigned
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-          - arch: x64
-            runner: macos-15-intel
-
-    steps:
-      - name: Checkout Codey
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: "11.5.2"
-          run_install: false
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: TypeScript check
-        run: pnpm run check
-
-      - name: JavaScript tests
-        run: pnpm run test:js
-
-      - name: Rust tests
-        run: cargo test --workspace --locked
-
-      - name: Rust format
-        run: cargo fmt --all -- --check
-
-      - name: Rust clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Build unsigned macOS app
-        env:
-          CODEY_SKIP_CODESIGN: "1"
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-        run: pnpm run build
-
-      - name: Verify and archive macOS app
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          APP="target/release/bundle/macos/Codey.app"
-          test -x "$APP/Contents/MacOS/codey"
-          test -x "$APP/Contents/MacOS/codey-fastctx"
-          test -f "$APP/Contents/Resources/Codey.icns"
-          test -f "$APP/Contents/Resources/README.md"
-          test -f "$APP/Contents/Resources/LICENSE"
-          test -f "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
-          test -f "$APP/Contents/Resources/licenses/FastCtx/LICENSE-APACHE"
-          test -f "$APP/Contents/Resources/licenses/FastCtx/NOTICE"
-          plutil -lint "$APP/Contents/Info.plist"
-          if codesign --verify "$APP" >/dev/null 2>&1; then
-            echo "Expected an unsigned macOS bundle, but codesign verification succeeded." >&2
-            exit 1
-          fi
-
-          VERSION="$(node -p "require('./package.json').version")"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-            VERSION="${VERSION#V}"
-          else
-            VERSION="${VERSION}-${GITHUB_RUN_NUMBER}"
-          fi
-          VERSION="${VERSION//\//-}"
-
-          mkdir -p dist/macos
-          ARCHIVE="dist/macos/Codey-${VERSION}-macos-${{ matrix.arch }}-unsigned.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
-
-      - name: Upload macOS package
-        uses: actions/upload-artifact@v4
-        with:
-          name: codey-macos-${{ matrix.arch }}-unsigned
-          path: ${{ steps.package.outputs.archive }}
-          if-no-files-found: error
-
   windows:
     name: Windows x64
     runs-on: windows-latest
@@ -152,41 +50,19 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: |
-          $maxAttempts = 3
-          $installExitCode = 1
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
             choco install nsis --yes --no-progress
-            $installExitCode = $LASTEXITCODE
-            if ($installExitCode -eq 0) {
-              break
-            }
-
-            if ($attempt -lt $maxAttempts) {
-              $delaySeconds = 15 * $attempt
-              Write-Warning "Chocolatey failed to install NSIS (attempt $attempt/$maxAttempts, exit code $installExitCode). Retrying in $delaySeconds seconds."
-              Start-Sleep -Seconds $delaySeconds
-            }
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw "NSIS installation failed" }
+            Start-Sleep -Seconds (15 * $attempt)
           }
-          if ($installExitCode -ne 0) {
-            throw "Chocolatey failed to install NSIS after $maxAttempts attempts (exit code $installExitCode)."
-          }
-
           $makensis = @(
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
             "${env:ProgramFiles}\NSIS\makensis.exe",
             "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
             "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) {
-            $command = Get-Command makensis -ErrorAction SilentlyContinue
-            if ($command) {
-              $makensis = $command.Source
-            }
-          }
-          if (-not $makensis) {
-            throw "makensis.exe was not found after installing NSIS"
-          }
-          Split-Path $makensis | Out-File -FilePath $env:GITHUB_PATH -Append
+          if (-not $makensis) { throw "makensis.exe was not found" }
           "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install frontend dependencies
@@ -209,172 +85,36 @@ jobs:
 
       - name: Build Windows executable
         env:
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          CODEY_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
         run: pnpm run build
 
-      - name: Build Windows packages
-        id: package
+      - name: Build Windows installer and update manifest
         shell: pwsh
         run: |
           $version = node -p "require('./package.json').version"
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $version = $env:GITHUB_REF_NAME.TrimStart("v", "V")
-          } else {
-            $version = "$version-$env:GITHUB_RUN_NUMBER"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag must match package.json version"
           }
-          $version = $version -replace '[\\/]', '-'
+          New-Item -ItemType Directory -Force dist/windows | Out-Null
+          & $env:MAKENSIS /INPUTCHARSET UTF8 "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" scripts/installer/windows/Codey.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installer = "dist/windows/Codey-$version-windows-x64-setup.exe"
+          if (-not (Test-Path $installer)) { throw "Windows installer is missing" }
+          node scripts/generate-update-manifest.mjs --version $version --tag "v$version" --download-base-url "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version" --output dist/windows/latest.json $installer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          New-Item -ItemType Directory -Force "dist\windows" | Out-Null
-
-          $makensis = $env:MAKENSIS
-          if (-not $makensis -or -not (Test-Path $makensis)) {
-            $makensis = @(
-              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-              "${env:ProgramFiles}\NSIS\makensis.exe",
-              "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
-              "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
-            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          }
-          if (-not $makensis) {
-            $command = Get-Command makensis -ErrorAction SilentlyContinue
-            if ($command) {
-              $makensis = $command.Source
-            }
-          }
-          if (-not $makensis) {
-            throw "makensis.exe was not found. The NSIS install step must expose it before packaging."
-          }
-          $installerScript = (Resolve-Path "scripts\installer\windows\Codey.nsi").Path
-          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" $installerScript
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-          $installer = "dist\windows\Codey-$version-windows-x64-setup.exe"
-          if (-not (Test-Path $installer)) {
-            throw "NSIS installer was not created: $installer"
-          }
-          "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload Windows installer
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
           name: codey-windows-x64-installer
-          path: ${{ steps.package.outputs.installer }}
+          path: dist/windows/*
           if-no-files-found: error
 
-  publish:
-    name: Attach packages to GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - macos
-      - windows
-    runs-on: macos-14
-    env:
-      CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
-      CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
-    steps:
-      - name: Checkout release metadata
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: codey-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Verify the release version
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          TAG_VERSION="${TAG_VERSION#V}"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION" || {
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION." >&2
-            exit 1
-          }
-
-      - name: Publish release assets
+      - name: Publish Windows release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: release-assets/*
-
-      - name: Explain skipped Cloudflare R2 update sync
-        if: env.CLOUDFLARE_R2_BUCKET == '' || env.CLOUDFLARE_R2_PUBLIC_BASE_URL == '' || env.CLOUDFLARE_ACCOUNT_ID == '' || env.CLOUDFLARE_API_TOKEN == ''
-        run: echo "::notice::Cloudflare R2 update sync skipped. Configure the R2 bucket, public base URL, account ID, and API token to enable it."
-
-      - name: Generate Cloudflare R2 update manifest
-        if: env.CLOUDFLARE_R2_BUCKET != '' && env.CLOUDFLARE_R2_PUBLIC_BASE_URL != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          VERSION="${VERSION#V}"
-          BASE_URL="${CLOUDFLARE_R2_PUBLIC_BASE_URL%/}"
-          node scripts/generate-update-manifest.mjs \
-            --version "$VERSION" \
-            --tag "$TAG" \
-            --download-base-url "${BASE_URL}/releases/${TAG}" \
-            --output release-assets/latest.json \
-            release-assets/*
-
-      - name: Publish Cloudflare R2 update objects
-        if: env.CLOUDFLARE_R2_BUCKET != '' && env.CLOUDFLARE_R2_PUBLIC_BASE_URL != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$CLOUDFLARE_R2_BUCKET" in
-            *[!A-Za-z0-9.-]* | "")
-              echo "CLOUDFLARE_R2_BUCKET must be a bucket name." >&2
-              exit 1
-              ;;
-          esac
-          case "${CLOUDFLARE_R2_PUBLIC_BASE_URL%/}" in
-            https://*) ;;
-            *)
-              echo "CLOUDFLARE_R2_PUBLIC_BASE_URL must be an HTTPS URL." >&2
-              exit 1
-              ;;
-          esac
-
-          TAG="${GITHUB_REF_NAME}"
-          upload_object() {
-            local key="$1"
-            local file="$2"
-            local content_type="$3"
-            local cache_control="$4"
-            npm exec --yes --package=wrangler@4.112.0 -- wrangler r2 object put "${CLOUDFLARE_R2_BUCKET}/${key}" \
-              --file "$file" \
-              --remote \
-              --content-type "$content_type" \
-              --cache-control "$cache_control"
-          }
-
-          for ASSET in release-assets/*; do
-            test -f "$ASSET" || continue
-            FILE_NAME="$(basename "$ASSET")"
-            test "$FILE_NAME" = "latest.json" && continue
-            case "$FILE_NAME" in
-              *.zip) CONTENT_TYPE="application/zip" ;;
-              *.exe) CONTENT_TYPE="application/octet-stream" ;;
-              *)
-                echo "Unexpected release asset: ${FILE_NAME}" >&2
-                exit 1
-                ;;
-            esac
-            upload_object "releases/${TAG}/${FILE_NAME}" "$ASSET" "$CONTENT_TYPE" "public, max-age=31536000, immutable"
-          done
-          upload_object "releases/${TAG}/latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
-          upload_object "latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
+          make_latest: true
+          prerelease: false
+          files: dist/windows/*

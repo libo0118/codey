@@ -16,9 +16,9 @@
 
 ## 发布
 
-沿用仓库的 `Build desktop packages` 工作流，对 `custom` 手动运行可生成安装包；版本号使用 `上游版本-libo.序号` 区分，例如 `1.1.1-libo.1`。发布前运行 `pnpm run check`、`pnpm run test:js`、`cargo test --workspace --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --workspace --all-targets --locked -- -D warnings`。
+`Build Windows package` 工作流只构建 Windows x64，对 `custom` 手动运行可生成安装包。版本号使用 `上游版本-libo.序号` 区分，例如 `1.1.1-libo.2`；版本标签触发构建，检查通过后自动发布安装包和更新清单。发布前运行 `pnpm run check`、`pnpm run test:js`、`cargo test --workspace --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --workspace --all-targets --locked -- -D warnings`。
 
-GitHub 仓库变量 `CLOUDFLARE_R2_PUBLIC_BASE_URL` 指向 `https://github.com/libo0118/codey/releases/latest/download`，因此自定义安装包查询本 fork 的更新清单，不会自动替换为上游包。每次发布应使用 `scripts/generate-update-manifest.mjs` 生成并上传 `latest.json`，下载地址设为该版本的 GitHub Release URL，清单包含安装包大小及 SHA-256。未配置上游的 R2 密钥，无需上传到上游存储。
+构建时将更新地址设为本 fork 的 `https://github.com/libo0118/codey/releases/latest/download`，不会自动替换为上游包。工作流使用 `scripts/generate-update-manifest.mjs` 生成并上传 `latest.json`，清单包含 Windows 安装包地址、大小及 SHA-256；无需 R2 密钥或存储。
 
 供日常更新的自定义 Release 应标记为 Latest，不能标记为 GitHub Pre-release，否则 `releases/latest` 不会选中它。初次从官方版切换需手动安装自定义包；版本后缀仅用于区分分支，不代表已经安装。
 
