@@ -41,28 +41,19 @@ function workflowStep(from, to) {
 test("pull requests enforce the unified Rust quality gate", () => {
   assert.match(ciWorkflow, /^\s*RUSTFLAGS: -D warnings$/m);
   assertRustQualityGates(ciWorkflow);
-  const windowsJob = ciWorkflow.slice(ciWorkflow.indexOf("\n  windows-rust:"));
-  assert.match(windowsJob, /runs-on: windows-latest/);
-  assert.match(windowsJob, /components: clippy/);
-  assert.match(windowsJob, /cargo test --workspace --locked/);
-  assert.match(
-    windowsJob,
-    /cargo clippy --workspace --all-targets --locked -- -D warnings/,
-  );
+  assert.match(ciWorkflow, /runs-on: windows-latest/);
+  assert.doesNotMatch(ciWorkflow, /runs-on: (?:ubuntu|macos)/);
+  assert.match(ciWorkflow, /tests\/overlay-recovery-native\.ps1/);
 });
 
-test("tag-triggered desktop releases independently enforce Rust quality gates", () => {
+test("tag-triggered Windows releases independently enforce Rust quality gates", () => {
   assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
-  const macosJob = workflow.slice(
-    workflow.indexOf("\n  macos:"),
-    workflow.indexOf("\n  windows:"),
-  );
-  const windowsJob = workflow.slice(
-    workflow.indexOf("\n  windows:"),
-    workflow.indexOf("\n  publish:"),
-  );
-  assertRustQualityGates(macosJob);
+  const windowsJob = workflow.slice(workflow.indexOf("\n  windows:"));
   assertRustQualityGates(windowsJob);
+  assert.match(workflow, /runs-on: windows-latest/);
+  assert.doesNotMatch(workflow, /runs-on: (?:ubuntu|macos)/);
+  assert.match(workflow, /CODEY_UPDATE_BASE_URL: https:\/\/github\.com\/\$\{\{ github.repository \}\}\/releases\/latest\/download/);
+  assert.match(workflow, /files: dist\/windows\/\*/);
 });
 
 test("local releases run the same locked Rust checks", () => {
@@ -108,8 +99,6 @@ test("desktop packages include FastCtx license and notice files", () => {
     assert.match(macBuildScript, new RegExp(expected.replaceAll("/", "\\/")));
   }
 
-  assert.match(workflow, /Contents\/Resources\/licenses\/FastCtx\/LICENSE-APACHE/);
-  assert.match(workflow, /Contents\/Resources\/licenses\/FastCtx\/NOTICE/);
   assert.match(windowsInstallerScript, /licenses\\FastCtx\\LICENSE-APACHE/);
   assert.match(windowsInstallerScript, /licenses\\FastCtx\\NOTICE/);
 });
@@ -120,35 +109,28 @@ test("Windows release publishes the installer without a portable zip", () => {
     "- name: Install frontend dependencies",
   );
   const windowsPackageStep = workflowStep(
-    "- name: Build Windows packages",
-    "- name: Upload Windows installer",
+    "- name: Build Windows installer and update manifest",
+    "- name: Upload Windows package",
   );
 
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
   assert.match(nsisInstallStep, /choco install nsis --yes --no-progress/);
-  assert.match(nsisInstallStep, /\$maxAttempts = 3/);
-  assert.match(nsisInstallStep, /\$installExitCode = \$LASTEXITCODE/);
-  assert.match(nsisInstallStep, /Start-Sleep -Seconds \$delaySeconds/);
-  assert.match(
-    nsisInstallStep,
-    /Chocolatey failed to install NSIS after \$maxAttempts attempts/,
-  );
+  assert.match(nsisInstallStep, /\$attempt -le 3/);
+  assert.match(nsisInstallStep, /\$LASTEXITCODE -eq 0/);
+  assert.match(nsisInstallStep, /Start-Sleep -Seconds \(15 \* \$attempt\)/);
+  assert.match(nsisInstallStep, /throw "NSIS installation failed"/);
   assert.match(nsisInstallStep, /NSIS\\Bin\\makensis\.exe/);
-  assert.match(nsisInstallStep, /GITHUB_PATH/);
   assert.match(nsisInstallStep, /MAKENSIS=/);
   assert.match(
     windowsPackageStep,
-    /New-Item -ItemType Directory -Force "dist\\windows" \| Out-Null/,
+    /New-Item -ItemType Directory -Force dist\/windows \| Out-Null/,
   );
   assert.ok(
-    windowsPackageStep.indexOf('New-Item -ItemType Directory -Force "dist\\windows"') <
-      windowsPackageStep.indexOf("& $makensis"),
+    windowsPackageStep.indexOf('New-Item -ItemType Directory -Force dist/windows') <
+      windowsPackageStep.indexOf("& $env:MAKENSIS"),
   );
-  assert.match(windowsPackageStep, /\$makensis = \$env:MAKENSIS/);
-  assert.match(
-    windowsPackageStep,
-    /Get-Command makensis -ErrorAction SilentlyContinue/,
-  );
-  assert.doesNotMatch(windowsPackageStep, /\$makensis = "makensis"/);
+  assert.match(windowsPackageStep, /if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/);
+  assert.match(windowsPackageStep, /generate-update-manifest\.mjs/);
+  assert.doesNotMatch(windowsPackageStep, /Compress-Archive|portable\.zip/);
 });
