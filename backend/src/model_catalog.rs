@@ -103,6 +103,44 @@ pub struct ThirdPartyModelAvailability {
     pub default_reasoning_effort: String,
 }
 
+impl ModelSelectionState {
+    pub(crate) fn with_upstream_reasoning(
+        mut self,
+        upstream: Option<
+            &std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+        >,
+    ) -> Self {
+        if let Some(upstream) = upstream {
+            for metadata in &mut self.third_party_model_metadata {
+                if let Some((_, efforts)) = upstream
+                    .iter()
+                    .find(|(model, _)| model_id::equal(model, &metadata.slug))
+                {
+                    let values = efforts
+                        .iter()
+                        .map(|effort| effort.value.clone())
+                        .collect::<Vec<_>>();
+                    if values.is_empty() {
+                        continue;
+                    }
+                    metadata.auto_supported_reasoning_efforts = values.clone();
+                    if metadata.reasoning_efforts.is_empty() {
+                        metadata.supported_reasoning_efforts = values;
+                        if !metadata
+                            .supported_reasoning_efforts
+                            .contains(&metadata.default_reasoning_effort)
+                        {
+                            metadata.default_reasoning_effort =
+                                metadata.supported_reasoning_efforts[0].clone();
+                        }
+                    }
+                }
+            }
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSelectionState {
@@ -2130,6 +2168,77 @@ fn level_has_runtime_description(level: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_efforts_replace_fallback_but_not_manual_declarations() {
+        let efforts = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| crate::config::ModelReasoningEffort {
+                    level: (*item).into(),
+                    value: (*item).into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut config = crate::config::CodeyConfig::default();
+        config.upstream_model_reasoning_efforts_by_provider.insert(
+            "a".into(),
+            std::collections::BTreeMap::from([("flash".into(), efforts(&["low", "high", "max"]))]),
+        );
+        config.model_reasoning_efforts_by_provider.insert(
+            "a".into(),
+            std::collections::BTreeMap::from([("FLASH".into(), efforts(&["high"]))]),
+        );
+        assert_eq!(config.effective_model_reasoning_efforts("a").len(), 1);
+        assert_eq!(
+            config.effective_model_reasoning_efforts("a")["FLASH"][0].value,
+            "high"
+        );
+        let state = ModelSelectionState {
+            third_party_model_metadata: vec![ThirdPartyModelAvailability {
+                slug: "flash".into(),
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+                auto_supported_reasoning_efforts: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: "medium".into(),
+            }],
+            ..Default::default()
+        };
+        let mut synced = state
+            .with_upstream_reasoning(config.upstream_model_reasoning_efforts_by_provider.get("a"));
+        assert_eq!(
+            synced.third_party_model_metadata[0].supported_reasoning_efforts,
+            ["low", "high", "max"]
+        );
+        assert!(
+            synced.third_party_model_metadata[0]
+                .reasoning_efforts
+                .is_empty()
+        );
+        synced.third_party_model_metadata[0].reasoning_efforts = efforts(&["high"]);
+        synced.third_party_model_metadata[0].supported_reasoning_efforts = vec!["high".into()];
+        let preserved = synced
+            .with_upstream_reasoning(config.upstream_model_reasoning_efforts_by_provider.get("a"));
+        assert_eq!(
+            preserved.third_party_model_metadata[0].supported_reasoning_efforts,
+            ["high"]
+        );
+        assert_eq!(
+            preserved.third_party_model_metadata[0].auto_supported_reasoning_efforts,
+            ["low", "high", "max"]
+        );
+        let saved = serde_json::to_vec(&config).unwrap();
+        let restored: crate::config::CodeyConfig = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            restored.upstream_model_reasoning_efforts_by_provider,
+            config.upstream_model_reasoning_efforts_by_provider
+        );
+    }
 
     fn official_cache() -> Value {
         let mut cache = json!({

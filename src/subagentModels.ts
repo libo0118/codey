@@ -106,10 +106,15 @@ export function buildSubagentModelOptions(
 
     const officialModelMetadata = metadataForModel(officialMetadata, modelId);
     const thirdPartyModelMetadata = metadataForModel(thirdPartyMetadata, modelId);
+    const routeEfforts = [config.modelReasoningEffortsByProvider, config.upstreamModelReasoningEffortsByProvider]
+      .map((providers) => Object.entries(providers?.[providerId] || {})
+        .find(([id]) => modelKey(id) === modelKey(modelId))?.[1])
+      .find((efforts) => efforts && efforts.length > 0)
+      ?.map((effort) => effort.value);
     const efforts = official && officialModelMetadata
       ? officialModelMetadata.supportedReasoningEfforts
       : thirdPartyReasoningEfforts(
-        thirdPartyModelMetadata?.supportedReasoningEfforts ??
+        routeEfforts ?? thirdPartyModelMetadata?.supportedReasoningEfforts ??
           officialModelMetadata?.supportedReasoningEfforts,
       );
     const supportedReasoningEfforts = efforts.length > 0 ? efforts : ["low"];

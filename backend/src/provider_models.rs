@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use crate::config::ProviderProfile;
+use crate::config::{MODEL_REASONING_EFFORT_LEVELS, ModelReasoningEffort, ProviderProfile};
 use crate::local_router::{UpstreamProtocol, apply_upstream_headers, prepare_upstream_headers};
 use crate::model_id;
 use crate::model_list::{self, ModelEndpointError};
@@ -67,7 +67,21 @@ pub(crate) fn http_client() -> &'static Client {
     })
 }
 
+#[derive(Default)]
+pub(crate) struct ProviderModelCatalog {
+    pub models: Vec<String>,
+    pub reasoning_efforts: BTreeMap<String, Vec<ModelReasoningEffort>>,
+}
+
+#[cfg(test)]
 pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<String>> {
+    Ok(fetch_catalog(profile, client).await?.models)
+}
+
+pub(crate) async fn fetch_catalog(
+    profile: &ProviderProfile,
+    client: &Client,
+) -> Result<ProviderModelCatalog> {
     let base = profile.normalized_base_url();
     if base.is_empty() {
         anyhow::bail!("API 地址不能为空");
@@ -131,7 +145,40 @@ pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<Str
         .await
         .map_err(|error| anyhow::anyhow!("{error:#}：{endpoint}"))?;
         match model_ids(&body) {
-            Ok(models) => return Ok(models),
+            Ok(models) => {
+                let mut catalog = ProviderModelCatalog {
+                    reasoning_efforts: model_reasoning_efforts(&body, &models),
+                    models,
+                };
+                // Codex-compatible gateways can expose richer metadata through the
+                // same endpoint. This optional probe must never discard a valid ID list.
+                if catalog.reasoning_efforts.len() < catalog.models.len()
+                    && profile.upstream_protocol
+                        == crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+                {
+                    let mut url = reqwest::Url::parse(endpoint)?;
+                    url.query_pairs_mut().append_pair("client_version", "cpa");
+                    if let Ok(response) = client
+                        .get(url)
+                        .headers(headers.clone())
+                        .timeout(PROVIDER_MODEL_REQUEST_TIMEOUT)
+                        .send()
+                        .await
+                        && response.status().is_success()
+                        && let Ok(body) = crate::http_response::read_bounded_body(
+                            response,
+                            MAX_PROVIDER_MODEL_RESPONSE_BYTES,
+                            "上游模型能力响应",
+                        )
+                        .await
+                    {
+                        for (model, efforts) in model_reasoning_efforts(&body, &catalog.models) {
+                            catalog.reasoning_efforts.entry(model).or_insert(efforts);
+                        }
+                    }
+                }
+                return Ok(catalog);
+            }
             Err(error) if has_fallback && error.allows_endpoint_fallback() => continue,
             Err(error) => {
                 return Err(anyhow::Error::new(error))
@@ -140,6 +187,77 @@ pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<Str
         }
     }
     anyhow::bail!("上游没有返回可用的模型列表")
+}
+
+fn model_reasoning_efforts(
+    body: &[u8],
+    models: &[String],
+) -> BTreeMap<String, Vec<ModelReasoningEffort>> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return BTreeMap::new();
+    };
+    let known = models
+        .iter()
+        .map(|id| (model_id::key(id), id))
+        .collect::<BTreeMap<_, _>>();
+    let rows: Vec<&Value> = if let Some(items) = value.as_array() {
+        items.iter().collect()
+    } else {
+        let items = ["data", "models", "items"]
+            .into_iter()
+            .filter_map(|key| value.get(key).and_then(Value::as_array))
+            .flatten()
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            vec![&value]
+        } else {
+            items
+        }
+    };
+    let mut result = BTreeMap::new();
+    for row in rows {
+        let Some(id) = ["id", "name", "slug", "model"]
+            .into_iter()
+            .find_map(|key| row.get(key).and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let Some(canonical) = known.get(&model_id::key(id)) else {
+            continue;
+        };
+        let Some(levels) = row
+            .get("supported_reasoning_levels")
+            .or_else(|| row.get("supported_reasoning_efforts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let mut efforts = Vec::new();
+        for level in levels {
+            let Some(level) = level
+                .get("effort")
+                .and_then(Value::as_str)
+                .or_else(|| level.as_str())
+            else {
+                continue;
+            };
+            let level = level.trim().to_ascii_lowercase();
+            if MODEL_REASONING_EFFORT_LEVELS.contains(&level.as_str())
+                && !efforts
+                    .iter()
+                    .any(|item: &ModelReasoningEffort| item.value == level)
+            {
+                efforts.push(ModelReasoningEffort {
+                    level: level.clone(),
+                    value: level,
+                });
+            }
+        }
+        if !efforts.is_empty() {
+            result.insert((*canonical).clone(), efforts);
+        }
+    }
+    result
 }
 
 fn model_endpoints(base: &str) -> Result<Vec<String>> {
@@ -214,6 +332,69 @@ mod tests {
     use crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn reasoning_metadata_keeps_exact_levels_and_only_known_models() {
+        let metadata = model_reasoning_efforts(br#"{"models":[
+          {"slug":"qoder/DeepSeek-Flash","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"},{"effort":"max"},{"effort":"none"}]},
+          {"slug":"workbuddy/v4","supported_reasoning_efforts":["low","high","xhigh"]},
+          {"slug":"not-listed","supported_reasoning_efforts":["ultra"]}
+        ]}"#, &["qoder/DeepSeek-Flash".into(), "workbuddy/v4".into()]);
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata["qoder/DeepSeek-Flash"]
+                .iter()
+                .map(|e| e.value.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high", "max"]
+        );
+        assert_eq!(
+            metadata["workbuddy/v4"]
+                .iter()
+                .map(|e| e.value.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high", "xhigh"]
+        );
+    }
+
+    #[tokio::test]
+    async fn enriches_plain_model_ids_from_codex_catalog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, body) in [
+                ("/v1/models", r#"{"data":[{"id":"deepseek-flash"}]}"#),
+                (
+                    "/v1/models?client_version=cpa",
+                    r#"{"models":[{"slug":"deepseek-flash","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"}]}]}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size])
+                        .starts_with(&format!("GET {path} HTTP/1.1"))
+                );
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let mut profile = ProviderProfile::new("test");
+        profile.base_url = format!("http://{address}/v1");
+        profile.upstream_protocol = crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.into();
+        let catalog = fetch_catalog(&profile, &Client::builder().no_proxy().build().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(catalog.models, ["deepseek-flash"]);
+        assert_eq!(
+            catalog.reasoning_efforts["deepseek-flash"]
+                .last()
+                .unwrap()
+                .value,
+            "max"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn builds_compatible_model_endpoints() {

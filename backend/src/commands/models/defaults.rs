@@ -319,5 +319,12 @@ pub(crate) fn current_model_state_at(
         config.model_reasoning_efforts_by_provider.get(provider_id),
         requested_default_model.as_deref(),
     )
+    .map(|state| {
+        state.with_upstream_reasoning(
+            config
+                .upstream_model_reasoning_efforts_by_provider
+                .get(provider_id),
+        )
+    })
     .map_err(|error| error.to_string())
 }

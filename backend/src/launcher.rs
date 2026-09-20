@@ -91,6 +91,10 @@ struct SessionMaintenanceSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeModelConfig {
+    upstream_model_reasoning_efforts_by_provider: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+    >,
     routes: Vec<(String, String, bool, bool, bool)>,
     selected_models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
     model_reasoning_efforts_by_provider: std::collections::BTreeMap<
@@ -127,6 +131,8 @@ impl RuntimeModelConfig {
             && self.model_context_by_provider == config.model_context_by_provider
             && self.model_reasoning_efforts_by_provider
                 == config.model_reasoning_efforts_by_provider
+            && self.upstream_model_reasoning_efforts_by_provider
+                == config.upstream_model_reasoning_efforts_by_provider
             && self.manual_third_party_models_by_provider
                 == config.manual_third_party_models_by_provider
             && self.declared_official_models_by_provider
@@ -153,6 +159,9 @@ impl RuntimeModelConfig {
             selected_models_by_provider: config.selected_models_by_provider.clone(),
             model_context_by_provider: config.model_context_by_provider.clone(),
             model_reasoning_efforts_by_provider: config.model_reasoning_efforts_by_provider.clone(),
+            upstream_model_reasoning_efforts_by_provider: config
+                .upstream_model_reasoning_efforts_by_provider
+                .clone(),
             manual_third_party_models_by_provider: config
                 .manual_third_party_models_by_provider
                 .clone(),

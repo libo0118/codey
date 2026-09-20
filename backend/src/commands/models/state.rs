@@ -378,6 +378,13 @@ pub(crate) fn renderer_route_model_catalog(
                 reasoning_efforts,
                 default_model.as_deref(),
             )
+            .map(|state| {
+                state.with_upstream_reasoning(
+                    config
+                        .upstream_model_reasoning_efforts_by_provider
+                        .get(&provider_id),
+                )
+            })
             .unwrap_or_default()
         };
         let route_name = profile.name.trim();

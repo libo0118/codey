@@ -101,6 +101,7 @@ export type Config = {
     string,
     Record<string, ModelReasoningEffort[]>
   >;
+  upstreamModelReasoningEffortsByProvider?: Record<string, Record<string, ModelReasoningEffort[]>>;
   manualThirdPartyModelsByProvider: Record<string, string[]>;
   declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;

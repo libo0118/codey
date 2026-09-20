@@ -122,6 +122,9 @@ pub(crate) fn config_after_route_deletion(
         .remove(&removed_provider_id);
     config.profiles.retain(|profile| profile.id != route_id);
     config
+        .upstream_model_reasoning_efforts_by_provider
+        .remove(&removed_provider_id);
+    config
         .selected_models_by_provider
         .remove(&removed_provider_id);
     config
@@ -176,9 +179,10 @@ pub async fn fetch_route_models(
     }
     profile.validate()?;
     let provider_id = profile.provider_id().to_string();
-    let fetched_models = fetch_provider_models(profile)
+    let fetched_catalog = fetch_provider_models(profile)
         .await
         .map_err(|error| error.to_string())?;
+    let fetched_models = fetched_catalog.models;
     let visible_fetched_models = regular_route_models(fetched_models.clone());
     timings.mark("fetchModelsMs");
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -194,6 +198,11 @@ pub async fn fetch_route_models(
     if latest_profile.provider_id() != provider_id {
         return Err("同步模型期间线路接入配置已变化，请重试".to_string());
     }
+    latest
+        .upstream_model_reasoning_efforts_by_provider
+        .entry(provider_id.clone())
+        .or_default()
+        .extend(fetched_catalog.reasoning_efforts);
     latest = config_with_provider_model_sync(
         &latest,
         &provider_id,

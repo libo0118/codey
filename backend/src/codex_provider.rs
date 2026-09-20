@@ -295,6 +295,8 @@ fn sync_provider_profile(
             .remove(&placeholder_provider_id);
         next.model_reasoning_efforts_by_provider
             .remove(&placeholder_provider_id);
+        next.upstream_model_reasoning_efforts_by_provider
+            .remove(&placeholder_provider_id);
         next.model_context_by_provider
             .remove(&placeholder_provider_id);
         next.manual_third_party_models_by_provider

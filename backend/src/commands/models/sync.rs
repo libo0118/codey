@@ -147,15 +147,15 @@ pub(crate) async fn sync_native_current_provider_models(
     {
         return Err("只能同步当前 Codex 线路的模型".to_string());
     }
-    let visible_fetched_models = if let Some(fetch_profile) = context.fetch_profile.clone() {
+    let fetched_catalog = if let Some(fetch_profile) = context.fetch_profile.clone() {
         fetch_profile.validate()?;
-        let fetched_models = fetch_provider_models(fetch_profile)
+        fetch_provider_models(fetch_profile)
             .await
-            .map_err(|error| error.to_string())?;
-        regular_route_models(fetched_models)
+            .map_err(|error| error.to_string())?
     } else {
-        Vec::new()
+        provider_models::ProviderModelCatalog::default()
     };
+    let visible_fetched_models = regular_route_models(fetched_catalog.models);
 
     let current_provider = current_codex_provider().await?;
     if current_provider != context.provider {
@@ -175,6 +175,10 @@ pub(crate) async fn sync_native_current_provider_models(
 
     let mut next = latest.clone();
     if !context.provider.official {
+        next.upstream_model_reasoning_efforts_by_provider
+            .entry(context.provider.id.clone())
+            .or_default()
+            .extend(fetched_catalog.reasoning_efforts);
         let mut cached_models = visible_fetched_models.clone();
         if let Some(manual_models) = next
             .manual_third_party_models_by_provider
@@ -477,14 +481,16 @@ pub(crate) fn preserve_declared_official_models(
     }
 }
 
-pub(crate) async fn fetch_provider_models(profile: ProviderProfile) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn fetch_provider_models(
+    profile: ProviderProfile,
+) -> anyhow::Result<provider_models::ProviderModelCatalog> {
     let home = codex_home();
     let fetch_profile = tokio::task::spawn_blocking(move || {
         codex_provider::provider_model_fetch_profile(&profile, home)
     })
     .await
     .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
-    provider_models::fetch(&fetch_profile, provider_models::http_client()).await
+    provider_models::fetch_catalog(&fetch_profile, provider_models::http_client()).await
 }
 
 pub(crate) async fn sync_provider_models_for_launch(
@@ -526,16 +532,18 @@ pub(crate) async fn sync_provider_models_for_launch(
         return config;
     };
 
-    let (models, synced) = match tokio::time::timeout(
+    let (models, synced, reasoning_efforts) = match tokio::time::timeout(
         STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT,
         fetch_provider_models(profile.clone()),
     )
     .await
     {
-        Ok(Ok(models)) => {
-            let fetched_model_count = models.len();
-            let (provider_models, synced) =
-                startup_model_sync_models_or_fallback(models, config.upstream_models_snapshot());
+        Ok(Ok(catalog)) => {
+            let fetched_model_count = catalog.models.len();
+            let (provider_models, synced) = startup_model_sync_models_or_fallback(
+                catalog.models,
+                config.upstream_models_snapshot(),
+            );
             if synced {
                 eprintln!(
                     "启动时已从「{}」同步 {} 个上游模型",
@@ -552,7 +560,7 @@ pub(crate) async fn sync_provider_models_for_launch(
                     profile.name
                 );
             }
-            (provider_models, synced)
+            (provider_models, synced, catalog.reasoning_efforts)
         }
         Ok(Err(error)) => {
             let (models, synced) = startup_model_sync_models_or_fallback(
@@ -570,7 +578,7 @@ pub(crate) async fn sync_provider_models_for_launch(
                     profile.name
                 );
             }
-            (models, synced)
+            (models, synced, BTreeMap::new())
         }
         Err(_) => {
             let (models, synced) = startup_model_sync_models_or_fallback(
@@ -588,7 +596,7 @@ pub(crate) async fn sync_provider_models_for_launch(
                     profile.name
                 );
             }
-            (models, synced)
+            (models, synced, BTreeMap::new())
         }
     };
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -602,7 +610,15 @@ pub(crate) async fn sync_provider_models_for_launch(
         return latest;
     }
     let persistence_base = (!synced).then(|| latest.clone());
-    let next = config_with_current_provider_model_sync(&latest, models, synced, codex_home());
+    let mut sync_input = latest.clone();
+    if synced {
+        sync_input
+            .upstream_model_reasoning_efforts_by_provider
+            .entry(provider_id)
+            .or_default()
+            .extend(reasoning_efforts);
+    }
+    let next = config_with_current_provider_model_sync(&sync_input, models, synced, codex_home());
     let committed = commit_startup_model_sync(state, latest, next, synced).await;
     drop(_config_write_guard);
     reconcile_current_subagent_defaults(state, persistence_base.as_ref())

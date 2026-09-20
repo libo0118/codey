@@ -129,6 +129,13 @@ pub(crate) fn native_model_state_for_provider(
         reasoning_efforts,
         Some(&requested_default),
     )
+    .map(|state| {
+        state.with_upstream_reasoning(
+            config
+                .upstream_model_reasoning_efforts_by_provider
+                .get(&provider.id),
+        )
+    })
     .map_err(|error| error.to_string())
 }
 

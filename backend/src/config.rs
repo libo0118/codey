@@ -763,6 +763,10 @@ pub struct CodeyConfig {
     #[serde(default)]
     pub model_reasoning_efforts_by_provider:
         BTreeMap<String, BTreeMap<String, Vec<ModelReasoningEffort>>>,
+    /// Last successful upstream capability snapshot, separate from user overrides.
+    #[serde(default)]
+    pub upstream_model_reasoning_efforts_by_provider:
+        BTreeMap<String, BTreeMap<String, Vec<ModelReasoningEffort>>>,
     /// Third-party model IDs that were explicitly typed by the user. Synced
     /// provider models are intentionally excluded so only manual entries can be
     /// deleted from Codey's saved support list.
@@ -942,6 +946,7 @@ impl Default for CodeyConfig {
             selected_models_by_provider: BTreeMap::new(),
             model_context_by_provider: BTreeMap::new(),
             model_reasoning_efforts_by_provider: BTreeMap::new(),
+            upstream_model_reasoning_efforts_by_provider: BTreeMap::new(),
             manual_third_party_models_by_provider: BTreeMap::new(),
             declared_official_models_by_provider: BTreeMap::new(),
             upstream_models_by_provider: BTreeMap::new(),
@@ -1014,6 +1019,9 @@ impl CodeyConfig {
         normalize_model_lists(&mut self.selected_models_by_provider);
         self.prune_retired_official_selections();
         normalize_model_reasoning_effort_lists(&mut self.model_reasoning_efforts_by_provider);
+        normalize_model_reasoning_effort_lists(
+            &mut self.upstream_model_reasoning_efforts_by_provider,
+        );
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
         normalize_model_lists(&mut self.declared_official_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
@@ -1299,19 +1307,32 @@ impl CodeyConfig {
             .filter(|profile| profile.enabled)
             .filter(|profile| !profile.official_account || self.official_route_usable(profile))
             .flat_map(|profile| {
-                self.model_reasoning_efforts_by_provider
-                    .get(profile.provider_id())
+                self.effective_model_reasoning_efforts(profile.provider_id())
                     .into_iter()
-                    .flat_map(move |models| {
-                        models.iter().map(move |(model, efforts)| {
-                            (
-                                runtime_catalog_model_id(profile, model, qualify_official),
-                                efforts.clone(),
-                            )
-                        })
+                    .map(move |(model, efforts)| {
+                        (
+                            runtime_catalog_model_id(profile, &model, qualify_official),
+                            efforts,
+                        )
                     })
             })
             .collect()
+    }
+
+    pub(crate) fn effective_model_reasoning_efforts(
+        &self,
+        provider_id: &str,
+    ) -> BTreeMap<String, Vec<ModelReasoningEffort>> {
+        let mut merged = BTreeMap::new();
+        for sources in [
+            &self.upstream_model_reasoning_efforts_by_provider,
+            &self.model_reasoning_efforts_by_provider,
+        ] {
+            for (name, efforts) in sources.get(provider_id).into_iter().flatten() {
+                merged.insert(model_id::key(name), (name.clone(), efforts.clone()));
+            }
+        }
+        merged.into_values().collect()
     }
 
     pub(crate) fn provider_is_disabled(&self, provider_id: &str) -> bool {
@@ -1322,6 +1343,16 @@ impl CodeyConfig {
     }
 
     pub(crate) fn retain_model_contexts(&mut self, provider_id: &str, available: &[String]) {
+        if let Some(models) = self
+            .upstream_model_reasoning_efforts_by_provider
+            .get_mut(provider_id)
+        {
+            models.retain(|model, _| {
+                available
+                    .iter()
+                    .any(|candidate| model_id::equal(candidate, model))
+            });
+        }
         if let Some(models) = self.model_context_by_provider.get_mut(provider_id) {
             models.retain(|model, _| {
                 available

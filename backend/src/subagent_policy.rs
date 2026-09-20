@@ -39,6 +39,13 @@ pub(crate) fn reconcile_for_current_provider(
             .and_then(|provider_id| config.model_reasoning_efforts_by_provider.get(provider_id)),
         Some(&config.subagent_model),
     )
+    .map(|state| {
+        state.with_upstream_reasoning(
+            config
+                .current_provider_id()
+                .and_then(|id| config.upstream_model_reasoning_efforts_by_provider.get(id)),
+        )
+    })
     .ok();
     reconcile_with_model_state(config, state.as_ref());
 }

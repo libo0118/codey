@@ -686,6 +686,8 @@ fn local_route_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> boo
             != next.declared_official_models_by_provider
         || previous.upstream_models_by_provider != next.upstream_models_by_provider
         || previous.model_reasoning_efforts_by_provider != next.model_reasoning_efforts_by_provider
+        || previous.upstream_model_reasoning_efforts_by_provider
+            != next.upstream_model_reasoning_efforts_by_provider
         || previous.model_context_by_provider != next.model_context_by_provider
         || previous.default_model != next.default_model
         || previous.initial_route_import_completed != next.initial_route_import_completed
@@ -2095,6 +2097,9 @@ fn retain_route_scoped_config(config: &mut CodeyConfig) {
         .retain(|provider_id, _| provider_ids.contains(provider_id));
     config
         .model_reasoning_efforts_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .upstream_model_reasoning_efforts_by_provider
         .retain(|provider_id, _| provider_ids.contains(provider_id));
     config
         .selected_models_by_provider
