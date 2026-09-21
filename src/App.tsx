@@ -1286,7 +1286,7 @@ export function App({
         <div className="config-header-feedback justify-self-center">
           <Button
             aria-describedby="codey-feedback-qr-description"
-            aria-label="问题反馈群，悬浮或聚焦查看二维码"
+            aria-label="问题反馈群，鼠标悬停或键盘聚焦查看二维码"
             className="h-8! whitespace-nowrap px-3.5 text-xs max-[760px]:w-8! max-[760px]:px-0!"
             variant="brand-outline"
           >
@@ -1411,6 +1411,16 @@ export function App({
             <div className="sidebar-footer-left">
               <span className="sidebar-footer-version font-mono">
                 v{status.appVersion || "0.0.1"}
+                {(updateCheck?.updateAvailable === true || Boolean(downloadedUpdate)) && (
+                  <span
+                    className="ml-1.5 inline-flex shrink-0"
+                    role="img"
+                    aria-label={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                    title={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                  >
+                    <span className="size-1.5 rounded-full bg-[var(--codey-red)]" aria-hidden="true" />
+                  </span>
+                )}
               </span>
               <Tooltip content={updateTooltipText} position="top">
                 <Button

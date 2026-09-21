@@ -177,15 +177,20 @@ fn creation_does_not_overwrite_and_enabling_requires_confirmation() {
         .contains("确认")
     );
     assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
-    f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true,"confirmed":false})).unwrap();
+    assert!(f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true,"confirmed":false})).is_err());
+    assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
+    f.mutate(
+        json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true}),
+    )
+    .unwrap();
     assert_eq!(
         f.service.mcp_configuration(&Scope::User, "new").unwrap()["enabled"],
-        false
+        true
     );
 }
 
 #[test]
-fn json_stdio_import_preserves_strings_and_starts_disabled() {
+fn json_stdio_import_preserves_strings_and_starts_enabled() {
     let f = Fixture::new("# keep\nmodel='existing'\n");
     let config = json!({
         "type": "stdio",
@@ -193,16 +198,19 @@ fn json_stdio_import_preserves_strings_and_starts_disabled() {
         "args": ["quoted \"argument\"", "line\nnext", "中文", "[mcp_servers.injected]"],
         "env": {"TOKEN": "private-\"quoted\"\\token\nnext"},
         "cwd": "C:\\MCP tools",
-        "enabled": true,
+        "enabled": false,
         "required": true,
         "tool_timeout_sec": 45,
         "custom": {"nested": ["future", "value"]}
     });
-    let result = f.mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true,"confirmed":false})).unwrap();
+    let result = f
+        .mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true}))
+        .unwrap();
+    assert_eq!(result["applyStatus"], "reload-required");
     let stored = f.service.mcp_configuration(&Scope::User, "local").unwrap();
     let mut expected = config;
     expected.as_object_mut().unwrap().remove("type");
-    expected["enabled"] = json!(false);
+    expected["enabled"] = json!(true);
     assert_eq!(stored, expected);
     assert_eq!(f.list()["mcps"].as_array().unwrap().len(), 1);
     let displayed = f
@@ -235,7 +243,7 @@ fn json_http_import_normalizes_transport_and_headers() {
         );
         assert_eq!(stored["http_headers"]["X-Custom"], "quoted \"value\"");
         assert_eq!(stored["bearer_token_env_var"], "MCP_TOKEN");
-        assert_eq!(stored["enabled"], false);
+        assert_eq!(stored["enabled"], true);
         assert!(
             !f.service
                 .dispatch(json!({"action":"get_mcp","id":"remote"}))
@@ -752,7 +760,7 @@ fn unchanged_updates_have_no_history_and_concurrent_writes_require_fresh_revisio
             let revision = &revision;
             scope.spawn(move || {
                 barrier.wait();
-                service.dispatch(json!({"action":"save_mcp","id":id,"configJson":{"command":"node"},"createOnly":true,"revision":revision}))
+                service.dispatch(json!({"action":"save_mcp","id":id,"configJson":{"command":"node"},"createOnly":true,"revision":revision,"confirmed":true}))
             })
         }).collect();
         handles
@@ -806,22 +814,21 @@ fn managed_skill_install_toggle_edit_uninstall() {
 }
 
 #[test]
-fn external_and_modified_managed_skills_cannot_be_removed() {
+fn external_skills_can_be_removed_but_modified_managed_skills_are_preserved() {
     let f = Fixture::new("");
     let manual = f.home.join("skills/manual");
     fs::create_dir_all(&manual).unwrap();
     fs::copy(f.source.join("SKILL.md"), manual.join("SKILL.md")).unwrap();
     let id = f.list()["skills"][0]["id"].clone();
     assert!(
-        f.mutate(json!({"action":"uninstall_skill","id":id}))
-            .is_err()
-    );
-    assert!(
         f.mutate(json!({"action":"save_skill","id":id,"content":"anything"}))
             .is_err()
     );
     f.mutate(json!({"action":"set_skill_enabled","id":id,"enabled":false}))
         .unwrap();
+    f.mutate(json!({"action":"uninstall_skill","id":id}))
+        .unwrap();
+    assert!(!manual.exists());
     f.mutate(json!({"action":"install_skill","sourcePath":f.source}))
         .unwrap();
     let id = f.list()["skills"]
@@ -836,6 +843,132 @@ fn external_and_modified_managed_skills_cannot_be_removed() {
         f.mutate(json!({"action":"uninstall_skill","id":id}))
             .is_err()
     );
+}
+
+#[test]
+fn invalid_external_skills_can_be_removed_from_each_supported_root() {
+    for (project_scope, agents_root) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let f = Fixture::new("model='keep'\n");
+        let project = f.source.parent().unwrap().join("project");
+        fs::create_dir(&project).unwrap();
+        let scope = if project_scope {
+            json!({"kind":"project","projectPath":project})
+        } else {
+            json!({"kind":"user"})
+        };
+        let root = if project_scope {
+            project.join(if agents_root {
+                ".agents/skills"
+            } else {
+                ".codex/skills"
+            })
+        } else if agents_root {
+            f.service.user_home.join(".agents/skills")
+        } else {
+            f.home.join("skills")
+        };
+        let directory = root.join("broken");
+        fs::create_dir_all(directory.join("scripts")).unwrap();
+        fs::write(directory.join("SKILL.md"), "---\nname: [broken\n---\n").unwrap();
+        fs::write(directory.join("scripts/run.sh"), "echo example").unwrap();
+        let neighbor = root.join("neighbor");
+        fs::create_dir(&neighbor).unwrap();
+        fs::copy(f.source.join("SKILL.md"), neighbor.join("SKILL.md")).unwrap();
+        let inventory = f
+            .service
+            .dispatch(json!({"action":"list","scope":scope}))
+            .unwrap();
+        let id = skills::id(&directory.join("SKILL.md"));
+        let entry = inventory["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        assert_eq!(entry["configurationStatus"], "invalid");
+        assert_eq!(entry["canRemove"], true);
+        assert_eq!(entry["canEdit"], false);
+        let mut request = json!({"action":"uninstall_skill","scope":scope,"id":id,"revision":inventory["revision"]});
+        assert!(
+            f.service
+                .dispatch(request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("确认")
+        );
+        assert!(directory.join("SKILL.md").exists());
+        request["confirmed"] = json!(true);
+        let removed = f.service.dispatch(request).unwrap();
+        assert!(!directory.exists());
+        assert!(root.exists() && neighbor.join("SKILL.md").exists());
+        assert_eq!(removed["inventory"]["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(f.home.join("config.toml")).unwrap(),
+            "model='keep'\n"
+        );
+        assert!(!f.service.registry_path().exists());
+    }
+}
+
+#[test]
+fn external_skill_removal_rejects_changed_resources_and_protected_targets() {
+    let f = Fixture::new("");
+    let root = f.home.join("skills");
+    let directory = root.join("broken");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("SKILL.md"), "broken").unwrap();
+    fs::write(directory.join("asset.txt"), "original").unwrap();
+    let inventory = f.list();
+    let id = skills::id(&directory.join("SKILL.md"));
+    fs::write(directory.join("asset.txt"), "changed").unwrap();
+    assert!(f.service.dispatch(json!({"action":"uninstall_skill","id":id,"revision":inventory["revision"],"confirmed":true})).unwrap_err().to_string().contains("配置已变化"));
+    assert!(directory.join("SKILL.md").exists());
+
+    for target in [
+        root.clone(),
+        root.join(".system/protected"),
+        directory.join("nested"),
+    ] {
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "broken").unwrap();
+    }
+    for target in [&root, &root.join(".system/protected"), &directory] {
+        let id = skills::id(&target.join("SKILL.md"));
+        let inventory = f.list();
+        let entry = inventory["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        assert_eq!(entry["canRemove"], false);
+        assert!(
+            f.mutate(json!({"action":"uninstall_skill","id":id}))
+                .is_err()
+        );
+        assert!(target.join("SKILL.md").exists());
+    }
+    assert!(f.mutate(json!({"action":"uninstall_skill","id":skills::id(&f.source.join("SKILL.md")),"sourcePath":f.source})).is_err());
+    assert!(f.source.join("SKILL.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn external_skill_removal_rejects_linked_content() {
+    let f = Fixture::new("");
+    let directory = f.home.join("skills/broken");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("SKILL.md"), "broken").unwrap();
+    std::os::unix::fs::symlink(&f.source, directory.join("linked")).unwrap();
+    let inventory = f.list();
+    assert_eq!(inventory["skills"][0]["canRemove"], false);
+    assert!(
+        f.mutate(json!({"action":"uninstall_skill","id":inventory["skills"][0]["id"]}))
+            .is_err()
+    );
+    assert!(directory.join("SKILL.md").exists());
+    assert!(f.source.join("SKILL.md").exists());
 }
 
 #[test]
@@ -1068,7 +1201,7 @@ fn comments_opaque_fields_and_command_credentials_are_not_exposed() {
 }
 
 #[test]
-fn new_mcp_is_disabled_and_existing_legacy_credentials_allow_toggle() {
+fn new_mcp_is_enabled_and_existing_legacy_credentials_allow_toggle() {
     let f = Fixture::new(
         "[mcp_servers.legacy]\nurl='https://example.invalid'\nbearer_token='private-token'\nenabled=false\n",
     );
@@ -1084,7 +1217,7 @@ fn new_mcp_is_disabled_and_existing_legacy_credentials_allow_toggle() {
             .iter()
             .find(|m| m["id"] == "new")
             .unwrap()["enabled"],
-        false
+        true
     );
     f.mutate(json!({"action":"set_mcp_enabled","id":"legacy","enabled":true}))
         .unwrap();
@@ -1297,4 +1430,115 @@ fn dependency_declarations_are_explicit_and_invalid_declarations_remain_visible(
     assert_ne!(first["revision"], invalid["revision"]);
     let id = invalid["skills"][0]["id"].clone();
     assert!(f.mutate(json!({"action":"save_skill","id":id,"content":fs::read_to_string(f.source.join("SKILL.md")).unwrap()})).is_err());
+}
+
+#[test]
+fn skill_names_stay_unique_across_scope_roots_and_renames() {
+    let f = Fixture::new("");
+    // 目录名与目标目录不同、但 name 相同的既有 Skill 同样算冲突。
+    let external = f.home.parent().unwrap().join(".agents/skills/other-dir");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        external.join("SKILL.md"),
+        "---\nname: demo\ndescription: external copy\n---\n# External\n",
+    )
+    .unwrap();
+    for request in [
+        json!({"action":"install_skill","sourcePath":f.source}),
+        json!({"action":"create_skill","content":"---\nname: demo\ndescription: created copy\n---\n"}),
+    ] {
+        assert!(
+            f.mutate(request)
+                .unwrap_err()
+                .to_string()
+                .contains("已存在名为 demo")
+        );
+    }
+    f.mutate(json!({"action":"create_skill","content":"---\nname: alpha\ndescription: a\n---\n"}))
+        .unwrap();
+    f.mutate(json!({"action":"create_skill","content":"---\nname: beta\ndescription: b\n---\n"}))
+        .unwrap();
+    let id = f.list()["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "beta")
+        .unwrap()["id"]
+        .clone();
+    // 改名撞上同范围其他 Skill 要拒绝；名称不变时保存照常。
+    assert!(
+        f.mutate(
+            json!({"action":"save_skill","id":id,"content":"---\nname: alpha\ndescription: b\n---\n"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("已存在名为 alpha")
+    );
+    f.mutate(
+        json!({"action":"save_skill","id":id,"content":"---\nname: beta\ndescription: b2\n---\n"}),
+    )
+    .unwrap();
+    let listed = f.list();
+    let skills = listed["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 3);
+    assert_eq!(
+        skills
+            .iter()
+            .filter(|entry| entry["name"] == "beta")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn builtin_skills_do_not_block_installing_a_user_skill() {
+    let f = Fixture::new("");
+    let builtin = f.home.join("skills/.system/system");
+    fs::create_dir_all(&builtin).unwrap();
+    fs::write(
+        builtin.join("SKILL.md"),
+        "---\nname: demo\ndescription: builtin copy\n---\n# Builtin\n",
+    )
+    .unwrap();
+    // 系统内置资源用户无法改名或卸载，不能因此挡住自己的 Skill。
+    f.mutate(json!({"action":"install_skill","sourcePath":f.source}))
+        .unwrap();
+    let listed = f.list();
+    let ownership: Vec<_> = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_owned(),
+                entry["ownership"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(ownership.contains(&("demo".to_owned(), "builtin".to_owned())));
+    assert!(ownership.contains(&("demo".to_owned(), "managed".to_owned())));
+}
+
+#[test]
+fn external_skills_report_their_directory_instead_of_a_scope_token() {
+    let f = Fixture::new("");
+    let external = f.home.parent().unwrap().join(".agents/skills/demo");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        external.join("SKILL.md"),
+        "---\nname: demo\ndescription: external copy\n---\n# External\n",
+    )
+    .unwrap();
+    let listed = f.list();
+    let entry = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["ownership"] == "external")
+        .unwrap()
+        .clone();
+    let expected = external.to_string_lossy().into_owned();
+    // 外部安装没有托管记录：来源留空，由界面回退显示实际目录路径。
+    assert_eq!(entry["origin"].as_str(), Some(""));
+    assert_eq!(entry["sourcePath"].as_str(), Some(expected.as_str()));
 }

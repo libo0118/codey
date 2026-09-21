@@ -95,6 +95,16 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw "Release tag must match package.json version"
           }
+          # 更新助手按清单版本校验安装结果，安装包内嵌版本必须一致。
+          $cargoMatch = Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          if (-not $cargoMatch) {
+            throw "Unable to read the workspace version from Cargo.toml."
+          }
+          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+          if ($cargoVersion -ne $version) {
+            throw "Cargo.toml version $cargoVersion does not match packaged version $version. Bump the workspace version before releasing."
+          }
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           & $env:MAKENSIS /INPUTCHARSET UTF8 "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" scripts/installer/windows/Codey.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

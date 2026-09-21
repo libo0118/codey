@@ -150,7 +150,7 @@ export function createCodexExtensionsPreview(platform: string) {
           ],
           warnings: ["开发预览：操作仅修改模拟数据，不会读写你的 Codex 配置。"],
           applyNotice:
-            "配置变更需重新打开会话，必要时重启 Codex。运行时覆盖可能影响生效状态。",
+            "MCP 保存后自动刷新 Codex 配置；Skill 变更请在新会话中确认。运行时覆盖可能影响生效状态。",
         },
       });
       const inventory = states.get(key)!.inventory;
@@ -162,7 +162,10 @@ export function createCodexExtensionsPreview(platform: string) {
         entry.canEdit =
           !entry.readOnly &&
           (!("ownership" in entry) || entry.ownership === "managed");
-        entry.canRemove = entry.canEdit;
+        // 与后端一致：外部安装可以直接删除，系统内置与插件缓存只读。
+        entry.canRemove =
+          !entry.readOnly &&
+          (!("ownership" in entry) || entry.ownership !== "builtin");
       }
       inventory.mcps.forEach((entry) => {
         entry.scope = scope.kind;
@@ -377,8 +380,8 @@ export function createCodexExtensionsPreview(platform: string) {
           throw new Error("此 MCP 服务标识已存在，请打开原有服务进行编辑");
         if (existing && (existing.readOnly || existing.canEdit === false))
           throw new Error("此服务不可编辑");
-        if (!existing) config.enabled = false;
-        const enabled = Boolean(existing) && config.enabled !== false;
+        if (!existing) config.enabled = true;
+        const enabled = config.enabled !== false;
         if (enabled && !existing?.enabled && request.confirmed !== true)
           throw new Error("保存将启用 MCP，请先确认信任此服务");
         const entry = {
@@ -433,8 +436,8 @@ export function createCodexExtensionsPreview(platform: string) {
         state.bodies[id] = String(request.content);
         break;
       case "uninstall_skill":
-        if (skill().readOnly || skill().ownership !== "managed")
-          throw new Error("此 Skill 不可卸载");
+        if (skill().readOnly || skill().canRemove === false)
+          throw new Error("Skill 当前不允许删除，请检查目录或冲突规则");
         state.inventory.skills = state.inventory.skills.filter(
           (item) => item.id !== id,
         );
@@ -526,10 +529,11 @@ export function createCodexExtensionsPreview(platform: string) {
         throw new Error("不支持的预览操作");
     }
     state.inventory.revision = `preview-${++state.version}`;
+    const mcpMutation = ["save_mcp", "set_mcp_enabled", "set_mcps_enabled", "remove_mcp"].includes(action);
     return {
       inventory: structuredClone(state.inventory),
-      applyStatus: "restart-required",
-      message: "预览修改已保存。",
+      applyStatus: mcpMutation ? "applied" : "restart-required",
+      message: mcpMutation ? "预览 MCP 配置已保存并刷新。" : "预览修改已保存。",
     };
   };
 }

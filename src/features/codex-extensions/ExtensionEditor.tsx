@@ -45,8 +45,8 @@ export function ExtensionEditor({
         <p className="m-0 text-xs text-muted">
           {draft.kind === "mcp"
             ? draft.isNew
-              ? "粘贴 JSON 或导入 .json 文件，支持 mcpServers、mcp_servers 和单个服务配置。导入只填充草稿；新服务保存后默认禁用。"
-              : "编辑 JSON 或导入文件替换草稿，服务标识保持不变。保留脱敏占位符即可沿用原值，保存前会校验配置。"
+              ? "粘贴 JSON 或导入 .json 文件，支持 mcpServers、mcp_servers 和单个服务配置。新服务保存后自动启用并刷新 Codex，无需重启；请仅保存可信服务。"
+              : "编辑 JSON 或导入文件替换草稿，服务标识保持不变。保留脱敏占位符即可沿用原值；保存后自动刷新 Codex，无需重启。"
             : draft.kind === "install"
               ? "从本地目录或 ZIP 复制安装，保留来源，不执行脚本。新安装默认禁用。"
               : "仅 Codey 托管的 Skill 可编辑。保存后将更新本地文件。"}
@@ -138,7 +138,7 @@ export function ExtensionEditor({
               busy ||
               jsonReading ||
               !!error ||
-              (!draft.isNew && !draftChanged(draft))
+              (draft.kind !== "mcp" && !draft.isNew && !draftChanged(draft))
             }
             onClick={onSave}
           >

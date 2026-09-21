@@ -8,25 +8,27 @@ function preview(scenario = "") {
   globalThis.window = { location: { search: `?extensions=${scenario}` } };
   return createCodexExtensionsPreview("macos");
 }
-test("JSON creation and editing preserve disabled default and aliases", async () => {
+test("JSON creation enables MCP automatically and editing preserves aliases", async () => {
   const request = preview();
   const initial = await request({ action: "list" });
   const created = await request({
     action: "save_mcp",
     id: "json-demo",
     createOnly: true,
+    confirmed: true,
     configJson: {
       type: "http",
       url: "https://example.com/mcp",
       headers: { Test: "value" },
-      enabled: true,
+      enabled: false,
     },
     revision: initial.revision,
   });
   assert.equal(
     created.inventory.mcps.find((entry) => entry.id === "json-demo").enabled,
-    false,
+    true,
   );
+  assert.equal(created.applyStatus, "applied");
   const saved = await request({ action: "get_mcp", id: "json-demo" });
   assert.deepEqual(saved.configJson.http_headers, { Test: "value" });
   assert.equal("configToml" in saved, false);
@@ -191,5 +193,25 @@ test("preview scenarios cover empty, large, permission, offline and conflict", a
       revision: inventory.revision,
     }),
     /其他程序修改/,
+  );
+});
+test("external skills can be removed while builtin and cached ones stay read-only", async () => {
+  const request = preview(),
+    initial = await request({ action: "list" });
+  const external = initial.skills.find(
+    (entry) => entry.ownership === "external",
+  );
+  const builtin = initial.skills.find((entry) => entry.ownership === "builtin");
+  assert.equal(external.canRemove, true);
+  assert.equal(builtin.canRemove, false);
+  const removed = await request({
+    action: "uninstall_skill",
+    id: external.id,
+    revision: initial.revision,
+    confirmed: true,
+  });
+  assert.equal(
+    removed.inventory.skills.some((entry) => entry.id === external.id),
+    false,
   );
 });
