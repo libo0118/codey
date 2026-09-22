@@ -185,6 +185,104 @@ fn working_status_tool_cancels_unavailability_recovery() {
 }
 
 #[test]
+fn fresh_writer_after_interrupted_batch_does_not_inherit_recovery_deadlines() {
+    for role in ["codey_worker", "codey_visual_worker"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(STATE_DIRECTORY);
+        let session = "new-writer-after-interrupt";
+        let runtime = "runtime-a";
+        start_recovery_child(&root, session);
+        handle_hook_for_runtime_at(&root_command(session), &root, runtime, 1_000).unwrap();
+
+        let mut interrupt = input("PreToolUse", session);
+        interrupt.turn_id = Some("root-turn-a".into());
+        interrupt.tool_name = Some("agents.interrupt_agent".into());
+        interrupt.tool_input = Some(json!({"target":"/root/reader"}));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, &root, runtime, 2_000).unwrap(),
+            json!({})
+        );
+        interrupt.hook_event_name = "PostToolUse".into();
+        interrupt.tool_response = Some(json!({"previous_status":"running"}));
+        handle_hook_for_runtime_at(&interrupt, &root, runtime, 2_001).unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+            0
+        );
+
+        let now = 1_001 + STOP_ABSOLUTE_GRACE_MILLIS;
+        let mut spawn = input("PreToolUse", session);
+        spawn.turn_id = Some("new-root-turn".into());
+        spawn.cwd = Some(temp.path().to_string_lossy().into_owned());
+        spawn.tool_name = Some("agents.spawn_agent".into());
+        spawn.tool_input = Some(json!({
+            "task_name":"fresh_writer", "agent_type":role, "message":"Edit the assigned file"
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawn, &root, runtime, now).unwrap(),
+            json!({})
+        );
+        spawn.hook_event_name = "PostToolUse".into();
+        spawn.tool_response = Some(json!({"task_name":"/root/fresh_writer"}));
+        handle_hook_for_runtime_at(&spawn, &root, runtime, now + 1).unwrap();
+
+        let mut list = input("PreToolUse", session);
+        list.turn_id = Some("new-root-turn".into());
+        list.tool_name = Some("agents.list_agents".into());
+        handle_hook_for_runtime_at(&list, &root, runtime, now + 2).unwrap();
+
+        let agent_id = "00000000-0000-4000-8000-000000000001";
+        let transcript = temp
+            .path()
+            .join("sessions")
+            .join(format!("rollout-probe-{agent_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            serde_json::to_vec(&json!({
+                "type":"session_meta", "payload":{
+                    "id":agent_id, "parent_thread_id":session,
+                    "agent_path":"/root/fresh_writer", "agent_role":role
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut child = input("PreToolUse", session);
+        child.agent_id = Some(agent_id.into());
+        child.agent_type = Some(role.into());
+        child.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        child.tool_name = Some("mcp__codey_fastctx__grep".into());
+        attest_test_child(&child, &root, runtime);
+        assert_eq!(
+            handle_hook_for_runtime_at(&child, &root, runtime, now + 3).unwrap(),
+            json!({}),
+            "{role}"
+        );
+        child.tool_name = Some("functions.apply_patch".into());
+        assert_eq!(
+            handle_hook_for_runtime_at(&child, &root, runtime, now + 4).unwrap(),
+            json!({}),
+            "{role}"
+        );
+
+        child.agent_id = Some("/root/reader".into());
+        child.agent_type = Some("codey_quick_scan".into());
+        child.transcript_path = None;
+        child.tool_name = Some("mcp__codey_fastctx__grep".into());
+        attest_test_child(&child, &root, runtime);
+        let denied = handle_hook_for_runtime_at(&child, &root, runtime, now + 5).unwrap();
+        assert_eq!(denied["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("CODEY_SUBAGENT_UNBOUND_ATTEMPT")
+        );
+    }
+}
+
+#[test]
 fn single_agent_status_is_anonymous_reconciliation_and_settles_only_its_target() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

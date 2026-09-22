@@ -1437,6 +1437,15 @@ fn recover_root_active_state(
         return Ok(0);
     };
     if active == 0 {
+        for file_name in [
+            STOP_BLOCKED_SINCE_FILE,
+            STOP_ABSOLUTE_SINCE_FILE,
+            UNAVAILABLE_STATUS_SINCE_FILE,
+            PENDING_INIT_OBSERVED_FILE,
+            STATUS_PROGRESS_FINGERPRINT_FILE,
+        ] {
+            remove_session_auxiliary_file(state_root, runtime_id, &input.session_id, file_name)?;
+        }
         return Ok(0);
     }
     let ledger_pending_recovery =
