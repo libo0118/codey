@@ -2265,24 +2265,12 @@ fn root_read_tool_allowed(state_root: &Path, tool_name: &str, tool_input: Option
 }
 
 fn root_read_tool_class(tool_name: &str, tool_input: Option<&Value>) -> Option<ToolClass> {
-    let tool_class = crate::subagent::rules::classify_tool(tool_name);
+    let tool_class = crate::subagent::read_only_tool::classify(tool_name, tool_input);
     if matches!(tool_class, ToolClass::Read | ToolClass::Network) {
         return Some(tool_class);
     }
 
     let normalized = tool_name.trim().to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "read_mcp_resource"
-            | "functions.read_mcp_resource"
-            | "list_mcp_resources"
-            | "functions.list_mcp_resources"
-            | "list_mcp_resource_templates"
-            | "functions.list_mcp_resource_templates"
-    ) {
-        return Some(ToolClass::Read);
-    }
-
     database_mcp_is_read_only(&normalized, tool_input).then_some(ToolClass::Read)
 }
 

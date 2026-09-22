@@ -531,9 +531,50 @@ fn spawn_task_receipt_binds_child_while_codex_controls_read_paths() {
     attest_test_child(&first_read, &state_root, &current_runtime_id());
     assert_eq!(handle_hook(&first_read, &state_root).unwrap(), json!({}));
 
-    let mut sibling_read = first_read;
-    sibling_read.cwd = Some(sibling_worktree);
-    assert_eq!(handle_hook(&sibling_read, &state_root).unwrap(), json!({}));
+    first_read.cwd = Some(sibling_worktree);
+    assert_eq!(handle_hook(&first_read, &state_root).unwrap(), json!({}));
+
+    for (tool, arguments) in [
+        (
+            "exec_command",
+            json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"}),
+        ),
+        (
+            "exec_command",
+            json!({"cmd":"curl -q --head https://example.com"}),
+        ),
+        (
+            "functions.read_mcp_resource",
+            json!({"server":"example","uri":"readme"}),
+        ),
+        (
+            "functions.exec",
+            json!(r#"text(await tools.web__run({"search_query":[{"q":"rust"}]}));"#),
+        ),
+    ] {
+        first_read.tool_name = Some(tool.into());
+        first_read.tool_input = Some(arguments);
+        assert_eq!(
+            handle_hook(&first_read, &state_root).unwrap(),
+            json!({}),
+            "{tool}"
+        );
+        let denial = crate::subagent_orchestrator::authorize_child_tool_with_context(
+            &state_root,
+            &current_runtime_id(),
+            session_id,
+            crate::subagent_orchestrator::ChildToolContext {
+                agent_id: "unbound-reader",
+                agent_type: Some("codey_quick_scan"),
+                transcript_path: None,
+                tool_name: tool,
+                tool_input: first_read.tool_input.as_ref(),
+            },
+            current_timestamp_millis(),
+        )
+        .unwrap();
+        assert!(denial.is_some(), "unbound {tool}");
+    }
 }
 
 #[test]
@@ -2296,6 +2337,14 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap(),
         json!({})
     );
+    let mut git_read = root_tool(read_session, root_turn, "functions.exec");
+    git_read.tool_input = Some(json!(
+        r#"text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"}));"#
+    ));
+    assert_eq!(
+        handle_hook_for_runtime_at(&git_read, root, runtime_id, base + 30).unwrap(),
+        json!({})
+    );
     for tool_name in [
         "mcp__codey_fastctx__replace",
         "functions.apply_patch",
@@ -2460,6 +2509,9 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
     )
     .unwrap();
     assert_eq!(permission(&writer_active).as_deref(), Some("deny"));
+    git_read.session_id = write_session.into();
+    let denied = handle_hook_for_runtime_at(&git_read, root, runtime_id, base + 63).unwrap();
+    assert_eq!(permission(&denied).as_deref(), Some("deny"));
 }
 
 #[test]
@@ -3247,6 +3299,23 @@ fn ledger_backed_stale_attempt_is_fenced_before_stop_recovery() {
     )
     .unwrap();
     assert_eq!(recovered, json!({}));
+    let command =
+        json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"});
+    let denial = crate::subagent_orchestrator::authorize_child_tool_with_context(
+        root,
+        runtime_id,
+        session_id,
+        crate::subagent_orchestrator::ChildToolContext {
+            agent_id: "/root/stale_reader",
+            agent_type: Some("codey_deep_research"),
+            transcript_path: None,
+            tool_name: "exec_command",
+            tool_input: Some(&command),
+        },
+        2_001 + STOP_STALL_GRACE_MILLIS,
+    )
+    .unwrap();
+    assert!(denial.is_some(), "fenced read command");
     assert_eq!(
         active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
         0

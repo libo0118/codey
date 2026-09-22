@@ -8,5 +8,6 @@ pub(crate) mod api;
 pub(crate) mod hook_composer;
 pub(crate) mod lifecycle;
 pub(crate) mod protocol;
+pub(crate) mod read_only_tool;
 pub(crate) mod rules;
 pub(crate) mod telemetry;
