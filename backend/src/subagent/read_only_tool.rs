@@ -118,7 +118,7 @@ fn words(source: &str) -> Option<Vec<String>> {
         };
         let mut word = String::new();
         let mut closed = quote.is_none();
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             if Some(c) == quote {
                 closed = true;
                 break;
@@ -144,12 +144,13 @@ fn words(source: &str) -> Option<Vec<String>> {
 
 fn git(args: &[String]) -> bool {
     let mut i = 0;
-    let (mut pager, mut locks, mut monitor) = (false, false, false);
+    let (mut pager, mut locks, mut monitor, mut no_fetch) = (false, false, false, false);
     let mut signature = false;
     while let Some(arg) = args.get(i) {
         match arg.as_str() {
             "--no-pager" => pager = true,
             "--no-optional-locks" => locks = true,
+            "--no-lazy-fetch" => no_fetch = true,
             "-C" => {
                 i += 1;
                 if !args.get(i).is_some_and(|s| !s.starts_with('-')) {
@@ -169,7 +170,7 @@ fn git(args: &[String]) -> bool {
         }
         i += 1;
     }
-    if !(pager && locks && monitor) {
+    if !(pager && locks && monitor && no_fetch) {
         return false;
     }
     let Some(subcommand) = args.get(i).map(String::as_str) else {
@@ -309,10 +310,10 @@ mod tests {
     #[test]
     fn read_only_commands_and_literal_wrappers() {
         for cmd in [
-            "git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files",
-            "git --no-pager --no-optional-locks -c core.fsmonitor=false -C C:/repo log --oneline --no-show-signature -n 5",
-            "git.exe --no-pager --no-optional-locks -c core.fsmonitor=false -c safe.directory=C:/项目 ls-files",
-            "git --no-pager --no-optional-locks -c core.fsmonitor=false diff --cached --no-ext-diff --no-textconv --ignore-submodules=all --stat",
+            "git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files",
+            "git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false -C C:/repo log --oneline --no-show-signature -n 5",
+            "git.exe --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false -c safe.directory=C:/项目 ls-files",
+            "git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false diff --cached --no-ext-diff --no-textconv --ignore-submodules=all --stat",
             "curl.exe -q --head https://example.com",
             "curl -q https://example.com",
             "gh api --method GET repos/owner/repo",
@@ -333,7 +334,7 @@ mod tests {
             assert_eq!(classify(tool, Some(&json!({}))), ToolClass::Read);
         }
         for code in [
-            r#"text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"}));"#,
+            r#"text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"}));"#,
             r#"text(await tools.web__run({"search_query":[{"q":"rust"}]}));"#,
             r#"text(await tools.read_mcp_resource({"server":"a","uri":"b"}));"#,
         ] {
@@ -357,6 +358,15 @@ mod tests {
 
     #[test]
     fn unproved_commands_and_javascript_stay_commands() {
+        assert_eq!(
+            classify(
+                "exec_command",
+                Some(
+                    &json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"})
+                )
+            ),
+            ToolClass::Command
+        );
         for suffix in [
             "status --short",
             "diff --no-ext-diff --no-textconv --ignore-submodules=all",
@@ -368,8 +378,9 @@ mod tests {
             "ls-files --output=out",
             "ls-remote https://github.com/owner/repo",
         ] {
-            let cmd =
-                format!("git --no-pager --no-optional-locks -c core.fsmonitor=false {suffix}");
+            let cmd = format!(
+                "git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false {suffix}"
+            );
             assert_eq!(
                 classify("exec_command", Some(&json!({"cmd":cmd}))),
                 ToolClass::Command,
@@ -382,7 +393,7 @@ mod tests {
             json!({"login":true}),
             json!({"sandbox_permissions":"require_escalated"}),
         ] {
-            let mut input = json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"});
+            let mut input = json!({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"});
             input
                 .as_object_mut()
                 .unwrap()
@@ -405,8 +416,9 @@ mod tests {
             "status $(evil)",
             "ls-remote origin",
         ] {
-            let cmd =
-                format!("git --no-pager --no-optional-locks -c core.fsmonitor=false {suffix}");
+            let cmd = format!(
+                "git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false {suffix}"
+            );
             assert_eq!(
                 classify("exec_command", Some(&json!({"cmd":cmd}))),
                 ToolClass::Command,

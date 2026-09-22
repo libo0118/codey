@@ -537,7 +537,7 @@ fn spawn_task_receipt_binds_child_while_codex_controls_read_paths() {
     for (tool, arguments) in [
         (
             "exec_command",
-            json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"}),
+            json!({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"}),
         ),
         (
             "exec_command",
@@ -2339,7 +2339,7 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
     );
     let mut git_read = root_tool(read_session, root_turn, "functions.exec");
     git_read.tool_input = Some(json!(
-        r#"text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"}));"#
+        r#"text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"}));"#
     ));
     assert_eq!(
         handle_hook_for_runtime_at(&git_read, root, runtime_id, base + 30).unwrap(),
@@ -3299,8 +3299,7 @@ fn ledger_backed_stale_attempt_is_fenced_before_stop_recovery() {
     )
     .unwrap();
     assert_eq!(recovered, json!({}));
-    let command =
-        json!({"cmd":"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files"});
+    let command = json!({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"});
     let denial = crate::subagent_orchestrator::authorize_child_tool_with_context(
         root,
         runtime_id,

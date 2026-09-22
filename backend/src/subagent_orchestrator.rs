@@ -2247,7 +2247,7 @@ pub(crate) fn authorize_child_tool_with_context(
                 ))
             }
             Some(reservation) if !reservation_declares_command(reservation) => Some(format!(
-                "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止未经证明只读的工具 `{tool_name}`。可用规范包装 text(await tools.exec_command({{\"cmd\":\"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files\"}})); 或直接调用同样的 exec_command。仅单次 JSON literal 包装可用，任意 JS、脚本、链式命令及未知参数仍禁止；其他读取请用专用工具或交回根代理。",
+                "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止未经证明只读的工具 `{tool_name}`。可用规范包装 text(await tools.exec_command({{\"cmd\":\"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files\"}})); 或直接调用同样的 exec_command。仅单次 JSON literal 包装可用，任意 JS、脚本、链式命令及未知参数仍禁止；其他读取请用专用工具或交回根代理。",
                 reservation.attempt_id
             )),
             Some(_) => None,

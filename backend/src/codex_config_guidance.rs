@@ -237,11 +237,11 @@ pub(crate) const READ_ONLY_AGENT_WRITE_GUARD: &str = "\
 当前任务类型是只读子代理，只能检查、搜索、分析和回报。不要调用 `replace`、`apply_patch`、\
 文件写入命令或任何会创建、修改、删除、移动文件及改变外部状态的工具。即使任务正文要求写入，\
 也不要尝试或重试；请停止实施，把需要修改的内容和证据交回主代理，由主代理完成写入。\
-只读命令仅接受严格参数子集，例如 `git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files`、\
+只读命令仅接受严格参数子集，例如 `git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files`、\
 `curl.exe -q --head https://example.com`（POSIX 用 curl）、`gh api --method GET repos/owner/repo`。\
 Git diff/show 必须加 --no-ext-diff --no-textconv --ignore-submodules=all；diff 只允许 --cached/--staged 暂存区查询，log/show 必须加 --no-show-signature --oneline。\
 git status、工作区 diff 可能调用 clean filter，ls-remote 可能调用凭证程序或写入 Cookie，因此仍由主代理处理；远程信息可用 gh API GET 或网页读取。\
-functions.exec 只接受单次 JSON literal 包装，例如 `text(await tools.exec_command({\"cmd\":\"git --no-pager --no-optional-locks -c core.fsmonitor=false ls-files\"}));`；\
+functions.exec 只接受单次 JSON literal 包装，例如 `text(await tools.exec_command({\"cmd\":\"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files\"}));`；\
 同样可包装 tools.web__run 或 MCP 资源读取工具。未知参数、任意 JS/脚本、管道、重定向、环境和 shell 覆盖均不允许；不能证明只读时交回主代理。";
 
 pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
