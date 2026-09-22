@@ -4,6 +4,8 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
+pub mod lifecycle;
+
 pub use serde_json;
 use serde_json::Value;
 use std::{fs, io::Write, path::PathBuf};
@@ -27,6 +29,16 @@ impl PluginContext {
     pub fn log(&self, event: &str) -> Result<(), String> {
         append_log(&self.log_dir, "plugin.log", event)
     }
+}
+
+/// 带本地时区与毫秒的标准时间，供文件日志和插件事件复用。
+pub fn timestamp_rfc3339() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
+/// Local log timestamp in the compact format used by plugin.log and events.
+pub fn timestamp_log() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// 有界事件日志；目录必须由宿主预先创建，不创建或重建目录。
@@ -64,10 +76,7 @@ pub fn append_log(directory: &std::path::Path, name: &str, event: &str) -> Resul
         .map_err(|e| e.to_string())?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .map_err(|e| format!("日志写入被占用或无法锁定: {e}"))?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = timestamp_log();
     let line = format!("{timestamp} {}\n", event.replace(['\r', '\n'], " "));
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) + line.len() as u64 > 1024 * 1024 {
         if backup.exists() {
@@ -113,10 +122,7 @@ pub type EntryPoint = unsafe extern "C" fn() -> *const PluginApiV1;
 
 /// 单个实例的调用被串行化。插件必须在 Drop 中结束自己启动的任务。
 pub trait Plugin: Send + 'static + Sized {
-    fn create(config: Value) -> Result<Self, String>;
-    fn create_with_context(config: Value, _context: PluginContext) -> Result<Self, String> {
-        Self::create(config)
-    }
+    fn create(config: Value, context: PluginContext) -> Result<Self, String>;
     fn invoke(&mut self, method: &str, params: Value) -> Result<Value, String>;
 }
 
@@ -153,7 +159,7 @@ fn output(result: Result<Value, String>, out: *mut Buffer) -> i32 {
 }
 
 /// # Safety
-/// 指针必须指向宿主拥有且在调用期间有效的内存。
+/// 输入必须包含 config 与 context；指针须在调用期间有效。
 pub unsafe extern "C" fn create<P: Plugin>(
     data: *const u8,
     len: usize,
@@ -167,37 +173,14 @@ pub unsafe extern "C" fn create<P: Plugin>(
         *instance = std::ptr::null_mut();
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let config = unsafe { read_json(data, len)? };
-        let plugin = P::create(config)?;
-        unsafe {
-            *instance = Box::into_raw(Box::new(Mutex::new(plugin))).cast();
-        }
-        Ok(Value::Null)
-    }))
-    .unwrap_or_else(|_| Err("插件初始化发生 panic".into()));
-    output(result, out)
-}
-
-/// # Safety
-/// 与 create 相同；输入为包含 config 与 context 的 JSON 对象。
-pub unsafe extern "C" fn create_with_context<P: Plugin>(
-    data: *const u8,
-    len: usize,
-    instance: *mut *mut c_void,
-    out: *mut Buffer,
-) -> i32 {
-    if instance.is_null() {
-        return output(Err("实例输出指针为空".into()), out);
-    }
-    unsafe {
-        *instance = std::ptr::null_mut();
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| {
         let input = unsafe { read_json(data, len)? };
+        let fields = input.as_object().ok_or("初始化参数必须是对象")?;
+        if fields.keys().any(|key| key != "config" && key != "context") {
+            return Err("初始化参数只允许 config 和 context".into());
+        }
         let context = serde_json::from_value(input.get("context").cloned().ok_or("缺少 context")?)
             .map_err(|e| e.to_string())?;
-        let plugin =
-            P::create_with_context(input.get("config").cloned().ok_or("缺少 config")?, context)?;
+        let plugin = P::create(input.get("config").cloned().ok_or("缺少 config")?, context)?;
         unsafe {
             *instance = Box::into_raw(Box::new(Mutex::new(plugin))).cast();
         }
@@ -261,18 +244,6 @@ pub unsafe extern "C" fn free_buffer(buffer: Buffer) {
 macro_rules! export_plugin {
     ($plugin:ty) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn codey_plugin_entry_with_context_v1() -> *const $crate::PluginApiV1 {
-            static API: $crate::PluginApiV1 = $crate::PluginApiV1 {
-                abi_version: $crate::ABI_VERSION,
-                struct_size: std::mem::size_of::<$crate::PluginApiV1>() as u32,
-                create: $crate::create_with_context::<$plugin>,
-                invoke: $crate::invoke::<$plugin>,
-                destroy: $crate::destroy::<$plugin>,
-                free_buffer: $crate::free_buffer,
-            };
-            &API
-        }
-        #[unsafe(no_mangle)]
         pub extern "C" fn codey_plugin_entry_v1() -> *const $crate::PluginApiV1 {
             static API: $crate::PluginApiV1 = $crate::PluginApiV1 {
                 abi_version: $crate::ABI_VERSION,
@@ -320,7 +291,7 @@ mod tests {
 
     struct PanicPlugin;
     impl Plugin for PanicPlugin {
-        fn create(_: Value) -> Result<Self, String> {
+        fn create(_: Value, _: PluginContext) -> Result<Self, String> {
             Ok(Self)
         }
         fn invoke(&mut self, _: &str, _: Value) -> Result<Value, String> {
@@ -332,8 +303,11 @@ mod tests {
     fn panic_stays_inside_abi_and_buffers_are_released_by_plugin() {
         let mut instance = std::ptr::null_mut();
         let mut result = Buffer::default();
+        let input = br#"{"config":{},"context":{"pluginId":"test","pluginDir":"plugin","dataDir":"data","logDir":"logs"}}"#;
         assert_eq!(
-            unsafe { create::<PanicPlugin>(b"{}".as_ptr(), 2, &mut instance, &mut result) },
+            unsafe {
+                create::<PanicPlugin>(input.as_ptr(), input.len(), &mut instance, &mut result)
+            },
             0
         );
         unsafe {
@@ -370,6 +344,37 @@ mod tests {
     }
 
     #[test]
+    fn initialization_requires_the_complete_envelope_without_extra_fields() {
+        let context = serde_json::json!({
+            "pluginId": "test", "pluginDir": "plugin", "dataDir": "data", "logDir": "logs"
+        });
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"config": {}}),
+            serde_json::json!({"context": context}),
+            serde_json::json!({"config": {}, "context": null}),
+            serde_json::json!({"config": {}, "context": {"pluginId": "test"}}),
+            serde_json::json!({"config": {}, "context": context, "extra": true}),
+            serde_json::json!([]),
+        ] {
+            let bytes = serde_json::to_vec(&input).unwrap();
+            let mut instance = std::ptr::null_mut();
+            let mut result = Buffer::default();
+            assert_eq!(
+                unsafe {
+                    create::<PanicPlugin>(bytes.as_ptr(), bytes.len(), &mut instance, &mut result)
+                },
+                1,
+                "{input}"
+            );
+            assert!(instance.is_null());
+            unsafe {
+                free_buffer(result);
+            }
+        }
+    }
+
+    #[test]
     fn event_logs_are_bounded_and_do_not_recreate_directories() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("plugin.log"), vec![b'x'; 1024 * 1024]).unwrap();
@@ -389,6 +394,19 @@ mod tests {
         let missing = temp.path().join("missing");
         assert!(append_log(&missing, "plugin.log", "event").is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn event_log_timestamp_uses_compact_local_format() {
+        let temp = tempfile::tempdir().unwrap();
+        append_log(temp.path(), "plugin.log", "timestamp-check").unwrap();
+        let line = fs::read_to_string(temp.path().join("plugin.log")).unwrap();
+        let (date, rest) = line.split_once(' ').unwrap();
+        assert_eq!(date.len(), 10);
+        let time = rest.split_once(' ').unwrap().0;
+        assert_eq!(time.len(), 8);
+        assert_eq!(&time[2..3], ":");
+        assert_eq!(&time[5..6], ":");
     }
 
     #[cfg(unix)]

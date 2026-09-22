@@ -16,6 +16,19 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// 发现与选择阶段的失败只付一次 loopback 请求的代价，既不触碰 renderer，也不
+// 留下 CDP 副作用，因此可以用更密的节奏跟随 renderer 就绪。一旦失败进入桥接
+// 安装阶段，每次重试都会重建 WebSocket 并重复注册持久注入脚本，必须保持原有
+// 退避，避免在 Codex 冷启动的 CPU 高峰窗口里叠加负担。
+const DISCOVERY_RETRY_STEP: Duration = Duration::from_millis(50);
+const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
+// 发现阶段单次失败超过这个预算就不再算廉价探测：正常情况是一次被拒绝或返回空
+// 列表的 loopback 请求，远低于此值。
+const DISCOVERY_RETRY_COST_BUDGET: Duration = Duration::from_millis(100);
+const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
+const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
+const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
@@ -62,6 +75,40 @@ impl InjectionPhase {
             Self::InstallBridge => "安装 CDP bridge 与注入脚本",
             Self::VerifyOverlay => "验证 Codey 浮层",
             Self::ReadStatuses => "读取注入状态",
+        }
+    }
+
+    /// 诊断日志用的稳定标识，避免把面向用户的中文文案写进可检索字段。
+    fn key(self) -> &'static str {
+        match self {
+            Self::DiscoverTargets => "discoverTargets",
+            Self::SelectTarget => "selectTarget",
+            Self::InstallBridge => "installBridge",
+            Self::VerifyOverlay => "verifyOverlay",
+            Self::ReadStatuses => "readStatuses",
+        }
+    }
+
+    /// 该阶段的失败是否只花掉一次廉价探测：没有建立 CDP 会话，因而可以安全地
+    /// 用更短的间隔重试。
+    fn is_discovery(self) -> bool {
+        matches!(self, Self::DiscoverTargets | Self::SelectTarget)
+    }
+}
+
+/// 触发这一轮注入重试的入口：首次启动等待渲染进程就绪，与看门狗在运行期按
+/// 健康判定重建，失败画像的含义完全不同，日志里必须能分开。
+#[derive(Clone, Copy)]
+pub enum InjectionRetrySource {
+    Startup,
+    Watchdog,
+}
+
+impl InjectionRetrySource {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Watchdog => "watchdog",
         }
     }
 }
@@ -150,6 +197,12 @@ impl InjectedTarget {
 
     pub fn websocket_url_arc(&self) -> Arc<str> {
         self.websocket_url.clone()
+    }
+
+    /// 常驻桥接连接的消息泵是否已经结束。
+    /// 结束时页面内的桥接调用再也无法送达后端，重新注入是唯一出路。
+    pub fn pump_finished(&self) -> bool {
+        self.pump.is_finished()
     }
 
     pub async fn close(self) {
@@ -414,27 +467,38 @@ pub async fn retry_inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
+    source: InjectionRetrySource,
 ) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
     // Renderer asset preparation on newer Windows Codex builds can consume
     // more than ten seconds before the first injectable page appears. Keep
     // enough budget for the bridge commands after discovery while retaining a
     // hard startup deadline.
-    let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
-    let mut delay = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+    let deadline = started + CDP_INJECTION_TIMEOUT;
+    let mut delay = INITIAL_RETRY_INTERVAL;
     let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
     let mut previous_error = None;
+    let mut stats = InjectionRetryStats::default();
     let last_error = loop {
         phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
+        stats.attempts += 1;
+        let attempt_started = tokio::time::Instant::now();
         match tokio::time::timeout_at(
             deadline,
             inject_with_scripts(debug_port, handler.clone(), scripts, &phase),
         )
         .await
         {
-            Ok(Ok(target)) => return Ok(target),
+            Ok(Ok(target)) => {
+                stats.report(source, "injected", started.elapsed());
+                return Ok(target);
+            }
             Ok(Err(error)) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                let failure_cost = attempt_started.elapsed();
+                stats.record_failure(current_phase, failure_cost);
                 if tokio::time::Instant::now() + delay > deadline {
+                    stats.report(source, "noRetryBudget", started.elapsed());
                     break anyhow::anyhow!(
                         "Codex CDP bridge 注入失败（阶段：{}；{}）",
                         current_phase.label(),
@@ -443,12 +507,11 @@ pub async fn retry_inject_with_scripts(
                 }
                 previous_error = Some(safe_injection_error_summary(&error));
                 tokio::time::sleep(delay).await;
-                // A renderer that becomes injectable mid-sleep should not wait
-                // out a multi-second backoff; a loopback GET every 500 ms is cheap.
-                delay = (delay * 2).min(Duration::from_millis(500));
+                delay = next_injection_retry_delay(delay, current_phase, failure_cost);
             }
             Err(_) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                stats.report(source, "deadlineExceeded", started.elapsed());
                 let previous_error = previous_error
                     .as_deref()
                     .map(|error| format!("；最近一次失败：{error}"))
@@ -463,6 +526,62 @@ pub async fn retry_inject_with_scripts(
         }
     };
     Err(InjectionRetryFailure { error: last_error })
+}
+
+/// 下一次重试前的等待时长。发现与选择阶段的失败通常只付一次 loopback 请求的
+/// 代价，既不触碰 renderer 也不留 CDP 副作用，用小步长逼近 renderer 就绪即可。
+/// 但同一阶段的失败也可能突然变贵（例如调试端口被别的服务占用而让请求挂到
+/// 超时），因此还要看刚结束的那次失败的实付代价：一旦不再廉价就立刻退回保守
+/// 退避。桥接及之后的阶段每次失败都会重建 WebSocket 并重复注册持久脚本，无论
+/// 代价高低都沿用原来的指数退避。
+fn next_injection_retry_delay(
+    current: Duration,
+    phase: InjectionPhase,
+    last_failure_cost: Duration,
+) -> Duration {
+    if phase.is_discovery() && last_failure_cost <= DISCOVERY_RETRY_COST_BUDGET {
+        return (current + DISCOVERY_RETRY_STEP).min(DISCOVERY_RETRY_MAX_INTERVAL);
+    }
+    (current * 2).min(BRIDGE_RETRY_MAX_INTERVAL)
+}
+
+/// 单次注入重试的失败画像：把「注入慢」区分为等待 renderer 还是重复桥接，
+/// 不必只凭重试间隔反推。每次启动只写一条汇总，不随重试次数增长。
+#[derive(Default)]
+struct InjectionRetryStats {
+    attempts: u32,
+    discovery_failures: u32,
+    bridge_failures: u32,
+    failure_expense_ms: u64,
+    last_failure_phase: Option<InjectionPhase>,
+}
+
+impl InjectionRetryStats {
+    fn record_failure(&mut self, phase: InjectionPhase, cost: Duration) {
+        if phase.is_discovery() {
+            self.discovery_failures += 1;
+        } else {
+            self.bridge_failures += 1;
+        }
+        self.failure_expense_ms += cost.as_millis() as u64;
+        self.last_failure_phase = Some(phase);
+    }
+
+    fn report(&self, source: InjectionRetrySource, outcome: &str, elapsed: Duration) {
+        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+            "cdp.injection_retry_summary",
+            serde_json::json!({
+                "source": source.key(),
+                "outcome": outcome,
+                "attempts": self.attempts,
+                "discoveryFailures": self.discovery_failures,
+                "bridgeFailures": self.bridge_failures,
+                "failureExpenseMs": self.failure_expense_ms,
+                "lastFailurePhase": self.last_failure_phase.map(InjectionPhase::key),
+                "totalMs": elapsed.as_millis() as u64,
+            }),
+        );
+    }
 }
 
 fn summarize_cdp_targets(targets: &[CdpTarget]) -> String {
@@ -692,17 +811,45 @@ pub struct ModelWhitelistRefresh {
 }
 
 pub async fn reload_mcp_servers(websocket_url: &str) -> Result<()> {
-    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+    // 会话工具是按需注入的。若在已阻塞的 awaitPromise 里再走页面桥接去
+    // Runtime.evaluate 注入脚本，部分 Chromium/Electron 会把后续 evaluate 排
+    // 到当前 Promise 之后，形成死等。这里先用独立命令装好刷新入口。
+    ensure_mcp_reload_function_ready(websocket_url).await;
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
         websocket_url,
         r#"(async () => {
-  if (typeof window.__codeyReloadMcpServers !== "function") {
-    await window.__codeyLoadSessionTools?.();
+  const pickClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+  for (const delay of [0, 200, 500, 1000, 2000]) {
+    if (delay > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, delay));
+    }
+    try {
+      const client = pickClient();
+      if (client) {
+        await client.sendRequest("config/mcpServer/reload", {});
+        return true;
+      }
+      if (typeof window.__codeyReloadMcpServers === "function") {
+        const result = await window.__codeyReloadMcpServers();
+        if (result?.ok === true) return true;
+      }
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (/unknown method/i.test(message)) return false;
+    }
   }
-  if (typeof window.__codeyReloadMcpServers !== "function") return false;
-  const result = await window.__codeyReloadMcpServers();
-  return result?.ok === true;
+  return false;
 })()"#,
         true,
+        MCP_RELOAD_EVALUATE_TIMEOUT,
     )
     .await
     .context("请求 Codex 刷新 MCP 配置失败")?;
@@ -711,6 +858,37 @@ pub async fn reload_mcp_servers(websocket_url: &str) -> Result<()> {
         "Codex 未确认 MCP 配置刷新"
     );
     Ok(())
+}
+
+async fn mcp_reload_function_available(websocket_url: &str) -> bool {
+    codey_runtime_core::bridge::evaluate_script(
+        websocket_url,
+        r#"typeof window.__codeyReloadMcpServers === "function"
+          || typeof window.__codeyAppServerRequestClients?.get?.("local")?.sendRequest === "function""#,
+    )
+    .await
+    .ok()
+    .and_then(|response| runtime_value(&response).and_then(serde_json::Value::as_bool))
+    .unwrap_or(false)
+}
+
+async fn ensure_mcp_reload_function_ready(websocket_url: &str) {
+    if mcp_reload_function_available(websocket_url).await {
+        return;
+    }
+    let _ = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+        websocket_url,
+        &prepared_session_tools_load_script(),
+        false,
+        SESSION_TOOLS_INJECT_TIMEOUT,
+    )
+    .await;
+    for delay_ms in [80_u64, 200, 500, 1000] {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if mcp_reload_function_available(websocket_url).await {
+            return;
+        }
+    }
 }
 
 pub async fn refresh_model_whitelist(
@@ -1178,6 +1356,10 @@ pub enum TargetHealth {
     Healthy,
     Unhealthy,
     Busy,
+    /// 探测连接可用，但页面端点没有在 CDP 命令预算内产生任何回应。
+    /// 页面忙碌时命令仍会被 renderer 排队执行并回包，完全不回应只出现在
+    /// renderer 已被回收或页面重载导致 page target 被替换的情况。
+    Unresponsive,
 }
 
 fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetHealth {
@@ -1189,14 +1371,27 @@ fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetH
 }
 
 pub async fn is_target_healthy(websocket_url: &str) -> Result<TargetHealth> {
-    let result = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+    match codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
         bridge_health_check_script(),
         true,
     )
     .await
-    .context("检查 Codey bridge 健康状态失败")?;
-    Ok(target_health_from_evaluate_response(&result))
+    {
+        Ok(result) => Ok(target_health_from_evaluate_response(&result)),
+        Err(error) => {
+            // 探测每次都新建 CDP 连接。命令超时意味着端点收下了连接却不执行
+            // 命令，与"页面忙而桥接仍在"是两种状态：前者只能重新发现 target，
+            // 后者保守等待。这里把超时单独标出来，交给看门狗分级处理。
+            if error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+            {
+                return Ok(TargetHealth::Unresponsive);
+            }
+            Err(error).context("检查 Codey bridge 健康状态失败")
+        }
+    }
 }
 
 pub fn target_health_error_requires_rediscovery(error: &anyhow::Error) -> bool {
@@ -1238,36 +1433,62 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                while let Some(message) = socket.next().await {
-                    let message = message.unwrap();
-                    let Ok(text) = message.to_text() else {
-                        continue;
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
                     };
-                    let request: serde_json::Value = serde_json::from_str(text).unwrap();
-                    let evaluate = request["method"] == "Runtime.evaluate";
-                    let result = if evaluate {
-                        assert_eq!(request["params"]["awaitPromise"], true);
-                        assert!(
-                            request["params"]["expression"]
-                                .as_str()
-                                .unwrap()
-                                .contains("__codeyReloadMcpServers")
-                        );
-                        payload.clone()
-                    } else {
-                        json!({})
-                    };
-                    socket
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            json!({"id":request["id"],"result":result})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await
-                        .unwrap();
-                    if evaluate {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut finished = false;
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        let Ok(text) = message.to_text() else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(text).unwrap();
+                        let evaluate = request["method"] == "Runtime.evaluate";
+                        let result = if evaluate {
+                            let expression = request["params"]["expression"].as_str().unwrap();
+                            let await_promise = request["params"]["awaitPromise"] == true;
+                            if await_promise {
+                                assert!(expression.contains("__codeyReloadMcpServers"));
+                                assert!(
+                                    expression.contains("__codeyAppServerRequestClients"),
+                                    "MCP reload must use the patched AppServerRequestClient before fiber discovery"
+                                );
+                                assert!(
+                                    !expression.contains("__codeyLoadSessionTools"),
+                                    "MCP reload must not nest session-tools loading inside awaitPromise"
+                                );
+                                payload.clone()
+                            } else if expression
+                                .contains("typeof window.__codeyReloadMcpServers === \"function\"")
+                            {
+                                json!({"result":{"type":"boolean","value":true}})
+                            } else {
+                                json!({"result":{"type":"string","value":""}})
+                            }
+                        } else {
+                            json!({})
+                        };
+                        if socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                json!({"id":request["id"],"result":result})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if evaluate && request["params"]["awaitPromise"] == true {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    if finished {
                         break;
                     }
                 }
@@ -1325,6 +1546,148 @@ assert.equal(nextPage.window.attempts, 1);
     #[test]
     fn injection_deadline_leaves_time_for_slow_windows_renderer_startup() {
         assert_eq!(CDP_INJECTION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// 按给定阶段的退避节奏推导探测时刻（毫秒），首项为立即执行的第一次探测。
+    fn probe_times(phase: InjectionPhase, count: usize) -> Vec<u64> {
+        let mut delay = INITIAL_RETRY_INTERVAL;
+        let mut elapsed = 0u64;
+        let mut probes = vec![0];
+        for _ in 0..count {
+            elapsed += delay.as_millis() as u64;
+            probes.push(elapsed);
+            delay = next_injection_retry_delay(delay, phase, Duration::from_millis(1));
+        }
+        probes
+    }
+
+    #[test]
+    fn discovery_retry_stays_dense_while_probes_stay_cheap() {
+        assert_eq!(
+            probe_times(InjectionPhase::DiscoverTargets, 5),
+            vec![0, 100, 250, 450, 650, 850]
+        );
+        assert_eq!(
+            probe_times(InjectionPhase::SelectTarget, 5),
+            vec![0, 100, 250, 450, 650, 850]
+        );
+    }
+
+    #[test]
+    fn discovery_retry_never_exceeds_its_dense_ceiling() {
+        assert_eq!(
+            next_injection_retry_delay(
+                Duration::from_millis(500),
+                InjectionPhase::SelectTarget,
+                Duration::from_millis(1)
+            ),
+            DISCOVERY_RETRY_MAX_INTERVAL
+        );
+    }
+
+    #[test]
+    fn discovery_retry_falls_back_when_a_probe_stops_being_cheap() {
+        // 廉价失败：维持密集节奏。
+        assert_eq!(
+            next_injection_retry_delay(
+                INITIAL_RETRY_INTERVAL,
+                InjectionPhase::DiscoverTargets,
+                Duration::from_millis(8)
+            ),
+            Duration::from_millis(150)
+        );
+        // 同阶段但单次探测已花掉 900 ms，说明失败不再廉价（例如端口被别的
+        // 服务占用导致请求挂起），立刻退回指数退避而不是继续密集轮询。
+        assert_eq!(
+            next_injection_retry_delay(
+                Duration::from_millis(200),
+                InjectionPhase::DiscoverTargets,
+                Duration::from_millis(900)
+            ),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn bridge_retry_keeps_the_original_exponential_backoff() {
+        assert_eq!(
+            probe_times(InjectionPhase::InstallBridge, 6),
+            vec![0, 100, 300, 700, 1200, 1700, 2200]
+        );
+    }
+
+    #[test]
+    fn post_discovery_phases_ignore_the_dense_interval() {
+        for phase in [
+            InjectionPhase::InstallBridge,
+            InjectionPhase::VerifyOverlay,
+            InjectionPhase::ReadStatuses,
+        ] {
+            assert!(!phase.is_discovery());
+            assert_eq!(
+                next_injection_retry_delay(INITIAL_RETRY_INTERVAL, phase, Duration::from_millis(1)),
+                Duration::from_millis(200)
+            );
+        }
+    }
+
+    #[test]
+    fn dense_discovery_retry_probes_a_late_renderer_sooner() {
+        let legacy = probe_times(InjectionPhase::InstallBridge, 6);
+        let dense = probe_times(InjectionPhase::DiscoverTargets, 12);
+
+        // 旧节奏在 1200 ms 之后要等到 1700 ms 才再次探测。
+        assert_eq!(legacy[4], 1200);
+        assert_eq!(legacy[5], 1700);
+        // 新节奏在 1200~1700 ms 之间补出三个探测点，最多提前 450 ms 命中。
+        assert_eq!(
+            dense
+                .iter()
+                .copied()
+                .filter(|&t| t > 1200 && t < 1700)
+                .collect::<Vec<_>>(),
+            vec![1250, 1450, 1650]
+        );
+    }
+
+    #[test]
+    fn retry_stats_separate_cheap_discovery_failures_from_bridge_failures() {
+        let mut stats = InjectionRetryStats {
+            attempts: 5,
+            ..Default::default()
+        };
+        stats.record_failure(InjectionPhase::DiscoverTargets, Duration::from_millis(12));
+        stats.record_failure(InjectionPhase::SelectTarget, Duration::from_millis(18));
+        stats.record_failure(InjectionPhase::VerifyOverlay, Duration::from_millis(900));
+
+        assert_eq!(stats.attempts, 5);
+        assert_eq!(stats.discovery_failures, 2);
+        assert_eq!(stats.bridge_failures, 1);
+        assert_eq!(stats.failure_expense_ms, 930);
+        assert_eq!(
+            stats.last_failure_phase.map(InjectionPhase::key),
+            Some("verifyOverlay")
+        );
+    }
+
+    #[test]
+    fn retry_source_keys_separate_startup_from_watchdog_rebuilds() {
+        assert_eq!(InjectionRetrySource::Startup.key(), "startup");
+        assert_eq!(InjectionRetrySource::Watchdog.key(), "watchdog");
+    }
+
+    #[test]
+    fn injection_phase_keys_cover_every_variant() {
+        for (phase, key) in [
+            (InjectionPhase::DiscoverTargets, "discoverTargets"),
+            (InjectionPhase::SelectTarget, "selectTarget"),
+            (InjectionPhase::InstallBridge, "installBridge"),
+            (InjectionPhase::VerifyOverlay, "verifyOverlay"),
+            (InjectionPhase::ReadStatuses, "readStatuses"),
+        ] {
+            assert_eq!(phase.key(), key);
+            assert_eq!(InjectionPhase::from_raw(phase as u8) as u8, phase as u8);
+        }
     }
 
     #[test]
@@ -1427,6 +1790,29 @@ assert.equal(nextPage.window.attempts, 1);
 
         let renderer_timeout = anyhow::anyhow!("timed out waiting for CDP command");
         assert!(!target_health_error_requires_rediscovery(&renderer_timeout));
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_answers_no_cdp_command_is_unresponsive_not_busy() {
+        // An endpoint can accept the WebSocket upgrade and still never execute
+        // a command; that is what a replaced page target looks like. It must
+        // not be reported as a busy renderer, because "busy" tells the watchdog
+        // to wait instead of rediscovering the target.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+
+        assert_eq!(
+            is_target_healthy(&format!("ws://{address}")).await.unwrap(),
+            TargetHealth::Unresponsive,
+        );
+
+        server.abort();
     }
 
     #[test]

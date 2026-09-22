@@ -5,6 +5,7 @@ import {
   Checkbox as HeroCheckbox,
   Chip,
   ComboBox,
+  Drawer as HeroDrawer,
   Input as HeroInput,
   InputGroup,
   Label,
@@ -321,6 +322,7 @@ export interface SelectProps {
   filter?: boolean;
   id?: string;
   onChange?: (value: string | number | null) => void;
+  onOpenChange?: (open: boolean) => void;
   optionList?: SelectOption[];
   placeholder?: string;
   popoverClassName?: string;
@@ -333,7 +335,7 @@ function optionText(option: SelectOption) {
   return typeof option.label === "string" || typeof option.label === "number" ? String(option.label) : String(option.value);
 }
 export function Select({
-  optionList = [], onChange, filter = false, popoverClassName, renderOptionItem, prefix, value, disabled, className, placeholder, searchPlaceholder = "搜索…", id, ...labels
+  optionList = [], onChange, onOpenChange, filter = false, popoverClassName, renderOptionItem, prefix, value, disabled, className, placeholder, searchPlaceholder = "搜索…", id, ...labels
 }: SelectProps) {
   const { contains } = useFilter({ sensitivity: "base" });
   const selectedKey: Key | null = value != null && value !== "" ? String(value) : null;
@@ -372,6 +374,7 @@ export function Select({
         isDisabled={disabled}
         selectedKey={selectedKey}
         onSelectionChange={handleSelectionChange}
+        onOpenChange={onOpenChange}
         menuTrigger="focus"
       >
         <ComboBox.InputGroup>
@@ -400,6 +403,7 @@ export function Select({
       placeholder={placeholder}
       selectedKey={selectedKey}
       onSelectionChange={handleSelectionChange}
+      onOpenChange={onOpenChange}
     >
       <HeroSelect.Trigger id={id} className="min-h-8 md:min-h-8">
         {prefix}
@@ -427,7 +431,7 @@ export function Checkbox({ checked, onCheckedChange, label, disabled, children, 
   return (
     <HeroCheckbox
       {...props}
-      className={cn("items-center", className)}
+      className={cn("items-start", className)}
       isSelected={checked === undefined ? undefined : checked === true}
       isIndeterminate={checked === "indeterminate"}
       isDisabled={disabled}
@@ -545,5 +549,100 @@ export function DialogTitle({ id, className, ...props }: React.ComponentProps<ty
 }
 export function DialogDescription({ id, className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   const labels = React.useContext(DialogLabelContext);
+  return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted", className)} />;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Drawer（受控抽屉，基于 HeroUI Drawer）
+ * -----------------------------------------------------------------------------------------------*/
+type DrawerContextValue = { open: boolean; setOpen: (open: boolean) => void };
+const DrawerContext = React.createContext<DrawerContextValue | null>(null);
+const DrawerLabelContext = React.createContext<{ descriptionId: string; titleId: string } | null>(null);
+export interface DrawerProps { children?: React.ReactNode; onOpenChange?: (open: boolean) => void; open: boolean }
+export function Drawer({ children, onOpenChange, open }: DrawerProps) {
+  const setOpen = React.useCallback((nextOpen: boolean) => { onOpenChange?.(nextOpen); }, [onOpenChange]);
+  const value = React.useMemo(() => ({ open, setOpen }), [open, setOpen]);
+  return <DrawerContext.Provider value={value}>{children}</DrawerContext.Provider>;
+}
+export interface DrawerContentProps {
+  children?: React.ReactNode;
+  className?: string;
+  container?: HTMLElement | null;
+  placement?: "left" | "right" | "top" | "bottom";
+  onEscapeKeyDown?: (event: DialogDismissEvent) => void;
+  onPointerDownOutside?: (event: DialogDismissEvent) => void;
+}
+export function DrawerContent({
+  children,
+  className,
+  container,
+  placement = "right",
+  onEscapeKeyDown,
+  onPointerDownOutside,
+}: DrawerContentProps) {
+  const drawer = React.useContext(DrawerContext);
+  const [toastHostEl, setToastHostEl] = React.useState<HTMLDivElement | null>(null);
+  useToastContainer(toastHostEl, drawer?.open ?? false);
+  const id = React.useId();
+  const getContainer = React.useCallback(() => container ?? null, [container]);
+  if (!drawer) throw new Error("DrawerContent must be rendered inside Drawer");
+  const labels = { titleId: `codey-drawer-title-${id}`, descriptionId: `codey-drawer-description-${id}` };
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (nextOpen) return;
+    const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    onEscapeKeyDown?.(event);
+    onPointerDownOutside?.(event);
+    if (!event.defaultPrevented) drawer.setOpen(false);
+  };
+  const isInline = Boolean(container);
+  const drawerElement = (
+    <HeroDrawer.Backdrop
+      isOpen={drawer.open}
+      onOpenChange={handleOpenChange}
+      isDismissable
+      className={cn(isInline && "absolute inset-0 h-full w-full z-40 bg-black/30 backdrop-blur-xs")}
+    >
+      <HeroDrawer.Content
+        placement={placement}
+        className={cn(isInline && "absolute inset-0 h-full w-full justify-end z-40")}
+      >
+        <HeroDrawer.Dialog
+          className={cn(
+            placement === "right" && "h-full w-[75%] min-w-[380px] max-w-full border-l border-border/80 shadow-2xl",
+            placement === "bottom" && "sm:max-w-[760px] sm:mx-auto",
+            className
+          )}
+          aria-labelledby={labels.titleId}
+          aria-describedby={labels.descriptionId}
+        >
+          <div
+            ref={setToastHostEl}
+            className="toast-portal-host pointer-events-none absolute inset-x-0 top-0 z-[100] h-0"
+            aria-hidden="true"
+          />
+          {placement === "bottom" && <HeroDrawer.Handle />}
+          <HeroDrawer.CloseTrigger aria-label="关闭" />
+          <DrawerLabelContext.Provider value={labels}>{children}</DrawerLabelContext.Provider>
+        </HeroDrawer.Dialog>
+      </HeroDrawer.Content>
+    </HeroDrawer.Backdrop>
+  );
+  return container ? <UNSAFE_PortalProvider getContainer={getContainer}>{drawerElement}</UNSAFE_PortalProvider> : drawerElement;
+}
+export function DrawerHeader({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Header>) {
+  return <HeroDrawer.Header {...props} className={cn("pr-9", className)} />;
+}
+export function DrawerBody({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Body>) {
+  return <HeroDrawer.Body {...props} className={className} />;
+}
+export function DrawerFooter({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Footer>) {
+  return <HeroDrawer.Footer {...props} className={className} />;
+}
+export function DrawerTitle({ id, className, ...props }: React.ComponentProps<typeof HeroDrawer.Heading>) {
+  const labels = React.useContext(DrawerLabelContext);
+  return <HeroDrawer.Heading {...props} id={id ?? labels?.titleId} className={className} />;
+}
+export function DrawerDescription({ id, className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
+  const labels = React.useContext(DrawerLabelContext);
   return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted", className)} />;
 }

@@ -31,11 +31,9 @@ use crate::local_router::{self, RuntimeRouterEndpoint};
 
 mod fastctx;
 mod fs_io;
-mod locale_migration;
 mod repair;
 mod runtime_role_transaction;
 
-pub(crate) use locale_migration::migrate_legacy_default_locale;
 pub(crate) use repair::{ConfigRepairFailure, repair_codex_config};
 
 use fastctx::{
@@ -2637,20 +2635,27 @@ fn build_isolated_runtime_overrides(
             hook_trust_entries.len() == expected_hook_count,
             "Codey Hook 信任项不完整"
         );
-        for trust_entry in hook_trust_entries {
-            let state_segment = toml_string_literal(&trust_entry.state_key);
-            let key = format!("hooks.state.{state_segment}.trusted_hash");
-            push_runtime_override_value(
-                &mut overrides,
-                &key,
-                &Value::from(trust_entry.trusted_hash.as_str()),
-            );
-        }
+        push_runtime_hook_trust_override(&mut overrides, hook_trust_entries);
     }
     if let Some(provider_id) = provider_id {
         validate_runtime_router_overrides(&overrides, provider_id)?;
     }
     Ok(overrides)
+}
+
+fn push_runtime_hook_trust_override(
+    overrides: &mut Vec<String>,
+    hook_trust_entries: &[RuntimeHookTrustEntry],
+) {
+    // Codex 按点号拆分 -c 的键，不识别带引号的路径段。将路径放在
+    // TOML 值中；配置层按表递归合并，保留用户的其他状态及 enabled 字段。
+    let mut states = InlineTable::new();
+    for entry in hook_trust_entries {
+        let mut state = InlineTable::new();
+        state.insert("trusted_hash", Value::from(entry.trusted_hash.as_str()));
+        states.insert(&entry.state_key, Value::InlineTable(state));
+    }
+    push_runtime_override_value(overrides, "hooks.state", &Value::InlineTable(states));
 }
 
 fn document_item_at<'a>(document: &'a DocumentMut, path: &[&str]) -> Option<&'a Item> {

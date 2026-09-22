@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 #[cfg(all(test, windows))]
 use std::fs;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex as BlockingMutex,
@@ -136,6 +134,8 @@ pub struct AppState {
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
+    /// Official token refresh clients keyed by account proxy URL.
+    official_proxied_clients: BlockingMutex<HashMap<String, reqwest::Client>>,
     #[cfg(test)]
     pub webhook_http_client_override: Option<reqwest::Client>,
     /// Built on first use: the login/sync client is only needed for WeChat
@@ -237,6 +237,7 @@ impl Default for AppState {
                 .connect_timeout(Duration::from_secs(5))
                 .build()
                 .expect("shared Codey HTTP client should be constructible"),
+            official_proxied_clients: BlockingMutex::new(HashMap::new()),
             #[cfg(test)]
             webhook_http_client_override: None,
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
@@ -389,27 +390,27 @@ impl AppState {
                     .expect("CodeyConfig must be JSON-serializable")
             }
             "/codex-model-catalog" => {
-                let current_config = self.config.read().await.clone();
                 let runtime = self.runtime.lock().await.clone();
                 let applied_catalog_config = match runtime.as_ref() {
                     Some(runtime) => Some(runtime.applied_model_catalog_config().await),
                     None => None,
                 };
-                let current_config = runtime
-                    .as_ref()
-                    .filter(|runtime| {
-                        runtime
-                            .validate_subagent_route_hot_reload(&current_config)
-                            .is_err()
-                    })
-                    .and(applied_catalog_config.as_ref())
-                    .unwrap_or(&current_config);
-                let catalog_config = model_catalog_config_for_runtime(
-                    current_config,
-                    runtime.as_ref().map(|runtime| &runtime.applied_config),
-                    applied_catalog_config.as_ref(),
-                )
-                .clone();
+                let catalog_config = {
+                    let config = self.config.read().await;
+                    let current_config = runtime
+                        .as_ref()
+                        .filter(|runtime| {
+                            runtime.validate_subagent_route_hot_reload(&config).is_err()
+                        })
+                        .and(applied_catalog_config.as_ref())
+                        .unwrap_or(&config);
+                    model_catalog_config_for_runtime(
+                        current_config,
+                        runtime.as_ref().map(|runtime| &runtime.applied_config),
+                        applied_catalog_config.as_ref(),
+                    )
+                    .clone()
+                };
                 current_renderer_model_catalog_async(catalog_config)
                     .await
                     .unwrap_or_else(api_error_message)
@@ -615,7 +616,7 @@ pub(crate) async fn restore_default_context_budgets(state: &AppState) -> Result<
     let _guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
     config.model_context_by_provider.clear();
-    save_config_to_store(state, &config).await?;
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config;
     Ok(())
 }
@@ -658,10 +659,12 @@ where
     Ok(true)
 }
 
-async fn save_config_to_store(state: &AppState, config: &CodeyConfig) -> Result<(), String> {
+async fn save_config_to_store(
+    state: &AppState,
+    config: CodeyConfig,
+) -> Result<CodeyConfig, String> {
     let store = state.store.clone();
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || store.save(&config))
+    tokio::task::spawn_blocking(move || store.persist(config))
         .await
         .map_err(|error| format!("保存 Codey 配置任务异常退出：{error}"))?
         .map_err(|error| error.to_string())
@@ -783,7 +786,7 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
         if next.settings_revision == previous.settings_revision {
             next.settings_revision = previous.settings_revision.saturating_add(1);
         }
-        save_config_to_store(state, &next)
+        next = save_config_to_store(state, next)
             .await
             .map_err(|error| format!("保存启动线路准备结果失败：{error}"))?;
     }
@@ -1193,15 +1196,29 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Ok(_model_contexts),
                 Ok(upstream_proxy),
             ) => {
-                save_official_route_models(
-                    state,
-                    route_id,
-                    models,
-                    enabled,
-                    show_usage,
-                    upstream_proxy,
-                )
-                .await
+                match (
+                    optional_argument::<String>(&args, "accountId"),
+                    optional_argument::<String>(&args, "routeName"),
+                    optional_argument::<String>(&args, "routeShortName"),
+                ) {
+                    (Ok(account_id), Ok(route_name), Ok(route_short_name)) => {
+                        save_official_route_models(
+                            state,
+                            models::OfficialRouteModelSave {
+                                route_id,
+                                models,
+                                enabled,
+                                show_account_usage: show_usage,
+                                upstream_proxy,
+                                account_id,
+                                route_name,
+                                route_short_name,
+                            },
+                        )
+                        .await
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+                }
             }
             (Err(error), _, _, _, _, _, _)
             | (_, Err(error), _, _, _, _, _)
@@ -1351,6 +1368,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
         "save_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
         "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "open_codey_plugin_directory" => native_plugins::invoke(command, &args).await,
+        "open_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
+        "clear_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
         "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
@@ -1392,6 +1412,69 @@ pub(super) fn open_system_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法使用系统默认浏览器打开页面：{error}"))
+}
+
+pub(super) fn open_in_file_manager(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("无法访问目录：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("只能打开普通目录".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(windows)]
+    let mut command = Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(file_manager_path(path).as_os_str())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法使用系统文件管理器打开目录：{error}"))
+}
+
+fn file_manager_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod file_manager_tests {
+    use super::*;
+
+    #[test]
+    fn open_in_file_manager_rejects_files_and_missing_paths() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = open_in_file_manager(file.path()).unwrap_err();
+        assert!(error.contains("普通目录"), "{error}");
+        let missing = file.path().with_file_name("missing-codey-plugin-dir");
+        let error = open_in_file_manager(&missing).unwrap_err();
+        assert!(error.contains("无法访问目录"), "{error}");
+    }
+
+    #[test]
+    fn file_manager_path_strips_windows_extended_prefix() {
+        assert_eq!(
+            file_manager_path(Path::new(r"\\?\C:\Users\kim\plugin")),
+            PathBuf::from(r"C:\Users\kim\plugin")
+        );
+        assert_eq!(
+            file_manager_path(Path::new(r"\\?\UNC\server\share\plugin")),
+            PathBuf::from(r"\\server\share\plugin")
+        );
+        assert_eq!(
+            file_manager_path(Path::new("/tmp/plugins")),
+            PathBuf::from("/tmp/plugins")
+        );
+    }
 }
 
 pub async fn query_route_request_logs(
@@ -1565,7 +1648,7 @@ async fn mark_initial_route_import_completed(state: &Arc<AppState>) -> Result<bo
     let mut next = previous.clone();
     next.initial_route_import_completed = true;
     next.settings_revision = previous.settings_revision.saturating_add(1);
-    save_config_to_store(state, &next)
+    let next = save_config_to_store(state, next)
         .await
         .map_err(|error| format!("保存首次线路导入标记失败：{error}"))?;
     *state.config.write().await = next;
@@ -1634,7 +1717,7 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
     let mut config = state.config.read().await.clone();
     config.codex_app_path = app_dir.to_string_lossy().to_string();
     config.settings_revision = config.settings_revision.saturating_add(1);
-    save_config_to_store(state, &config)
+    let config = save_config_to_store(state, config)
         .await
         .map_err(|error| format!("保存 Codex 桌面应用目录失败：{error}"))?;
     *state.config.write().await = config;
@@ -2001,21 +2084,24 @@ async fn save_codey_config_locked(
     } else {
         None
     };
-    if let Err(error) = save_config_to_store(state, &config).await {
-        if trace_guard_changed {
-            let error = rollback_trace_log_guard(
-                codex_home().to_path_buf(),
-                previous.disable_trace_log_writes,
-                error,
-            )
-            .await;
-            state
-                .trace_log_write_protection_active
-                .store(false, Ordering::Release);
+    let config = match save_config_to_store(state, config).await {
+        Ok(config) => config,
+        Err(error) => {
+            if trace_guard_changed {
+                let error = rollback_trace_log_guard(
+                    codex_home().to_path_buf(),
+                    previous.disable_trace_log_writes,
+                    error,
+                )
+                .await;
+                state
+                    .trace_log_write_protection_active
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
             return Err(error);
         }
-        return Err(error);
-    }
+    };
     *state.config.write().await = config.clone();
     if let Some(report) = trace_guard_report {
         state.trace_log_write_protection_active.store(

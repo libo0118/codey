@@ -1,4 +1,6 @@
 //! Codey 原生插件平台。安装不执行代码，用户显式启用后加载可信动态库。
+pub mod lifecycle;
+mod logs;
 mod native;
 mod package;
 
@@ -11,10 +13,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,14 +33,30 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub header_names: Vec<String>,
-    // Older manifests are read once without retaining form metadata in new state.
-    #[serde(default, rename = "configSchema", skip_serializing)]
-    legacy_config_schema: Option<Value>,
-    #[serde(default, rename = "configUi", skip_serializing)]
-    _legacy_config_ui: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub response_header_names: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lifecycle_failure_policy: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lifecycle_max_wait_ms: Option<u64>,
 }
 
 const CONFIG_FILE: &str = "config.json";
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -55,11 +70,9 @@ pub struct ConfigFile {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Record {
     manifest: Manifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    config: Option<Value>,
     enabled: bool,
     directory: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,8 +84,6 @@ struct Record {
 struct State {
     #[serde(default)]
     plugins: BTreeMap<String, Record>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    retained_config: BTreeMap<String, Value>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +103,7 @@ pub struct PluginInfo {
     pub plugin_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub log_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -122,21 +134,10 @@ struct Active {
     instance: Arc<Mutex<Native>>,
     manifest: Manifest,
     config: Value,
-}
-
-struct RequestPlugin {
-    id: String,
-    instance: Arc<Mutex<Native>>,
-    header_names: Vec<String>,
+    lifecycle: Arc<lifecycle::LifecyclePlugin>,
 }
 
 static MANAGER: OnceLock<Mutex<Manager>> = OnceLock::new();
-static HAS_HEADERS: AtomicBool = AtomicBool::new(false);
-static REQUEST_PLUGINS: OnceLock<arc_swap::ArcSwap<Vec<RequestPlugin>>> = OnceLock::new();
-
-fn request_plugins() -> &'static arc_swap::ArcSwap<Vec<RequestPlugin>> {
-    REQUEST_PLUGINS.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
-}
 
 pub fn initialize(root: PathBuf) -> Result<(), String> {
     if let Some(manager) = MANAGER.get() {
@@ -169,10 +170,14 @@ pub fn list() -> Result<PluginList, String> {
 pub fn get_config_file(id: &str) -> Result<ConfigFile, String> {
     manager()?.get_config_file(id)
 }
-pub fn has_request_plugins() -> bool {
-    HAS_HEADERS.load(Ordering::Relaxed)
+pub fn plugin_directory(id: &str) -> Result<PathBuf, String> {
+    manager()?.plugin_directory(id)
 }
-
+pub fn clear_logs(id: &str) -> Result<PluginList, String> {
+    let manager = manager()?;
+    logs::clear(&manager.plugin_directory(id)?)?;
+    Ok(manager.list())
+}
 /// 停止接受新调用；已取得实例引用的请求完成后销毁实例。库映射保留至进程退出。
 pub fn shutdown() {
     let live = if let Ok(mut m) = manager() {
@@ -301,99 +306,6 @@ pub fn invoke(id: &str, method: &str, params: Value) -> Result<Value, String> {
     result
 }
 
-pub fn dispatch_request_headers(
-    metadata: &Value,
-    headers: &BTreeMap<String, String>,
-) -> Vec<HeaderPatch> {
-    if !HAS_HEADERS.load(Ordering::Relaxed) {
-        return vec![];
-    }
-    // Management may perform filesystem writes or native initialization. Request
-    // callbacks use an immutable snapshot and never wait on that work.
-    let entries = request_plugins().load_full();
-    // Only explicitly declared header values are sent to each plugin.
-    let mut visible: BTreeMap<String, String> = headers
-        .iter()
-        .filter(|(name, _)| allowed_header_name(name))
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-        .collect();
-    let mut result = vec![];
-    for entry in entries.iter() {
-        let id = &entry.id;
-        let instance = &entry.instance;
-        let allowed = &entry.header_names;
-        let selected: BTreeMap<_, _> = visible
-            .iter()
-            .filter(|(name, _)| allowed.iter().any(|n| n.eq_ignore_ascii_case(name)))
-            .collect();
-        let output = instance
-            .lock()
-            .map_err(|_| "插件实例锁已损坏".to_string())
-            .and_then(|mut p| {
-                p.invoke(
-                    "request.beforeSend",
-                    serde_json::json!({"metadata":metadata,"headers":selected}),
-                )
-            });
-        let patches = output.and_then(|v| validate_patches(v, allowed));
-        match patches {
-            Ok(patches) => {
-                for patch in patches {
-                    match &patch.value {
-                        Some(v) => {
-                            visible.insert(patch.name.clone(), v.clone());
-                        }
-                        None => {
-                            visible.remove(&patch.name);
-                        }
-                    }
-                    result.push(patch);
-                }
-            }
-            Err(e) => {
-                // Retire only this generation. An old in-flight callback must not
-                // disable a replacement that was enabled while the callback ran.
-                let retired = manager()
-                    .ok()
-                    .filter(|m| {
-                        m.live
-                            .get(id)
-                            .is_some_and(|active| Arc::ptr_eq(&active.instance, instance))
-                    })
-                    .and_then(|mut m| retire_untrusted_plugin(&mut m, id, e));
-                drop(retired);
-            }
-        }
-    }
-    result
-}
-
-/// 撤销一个不可信的插件：内存态立即生效，同时按启动加载失败的做法持久化停用。
-/// 只改内存态会让重启后重新加载已被判定不安全的插件，界面也不再显示原因。
-fn retire_untrusted_plugin(m: &mut Manager, id: &str, error: String) -> Option<Active> {
-    let message = format!("请求回调失败，插件已自动停用，请检查后重新启用：{error}");
-    let mut state = m.state.clone();
-    let saved = match state.plugins.get_mut(id) {
-        Some(record) => {
-            record.enabled = false;
-            record.load_error = Some(message.clone());
-            m.commit(state)
-        }
-        None => Ok(()),
-    };
-    m.errors.insert(
-        id.to_owned(),
-        match saved {
-            Ok(()) => message,
-            Err(save_error) => format!("{message}；保存自动停用状态失败：{save_error}"),
-        },
-    );
-    m.log_event(id, "request_callback_failed");
-    let retired = m.live.remove(id);
-    m.update_fast_path();
-    retired
-}
-
 fn validate_patches(value: Value, allowed: &[String]) -> Result<Vec<HeaderPatch>, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -493,6 +405,13 @@ impl Manager {
         } else {
             State::default()
         };
+        for (id, record) in &state.plugins {
+            if !package::valid_id(id) || record.manifest.id != *id {
+                return Err("插件状态 ID 无效或不一致".into());
+            }
+            // 这里只校验管理操作依赖的路径；兼容性错误由列表展示，加载前仍完整校验。
+            validate_artifact_directory(&record.directory)?;
+        }
         let errors = state
             .plugins
             .iter()
@@ -503,16 +422,14 @@ impl Manager {
                     .map(|error| (id.clone(), error.clone()))
             })
             .collect();
-        let mut manager = Self {
+        Ok(Self {
             root: canonical_root,
             state,
             live: BTreeMap::new(),
             errors,
             stopping: false,
             generations: BTreeMap::new(),
-        };
-        manager.migrate_config_files()?;
-        Ok(manager)
+        })
     }
 
     fn load_enabled(&mut self) -> Result<(), String> {
@@ -604,7 +521,7 @@ impl Manager {
                 if remove_data {
                     sources.push(plugin_dir);
                 } else {
-                    // Preserve persistent children, and remove both new and legacy artifact directories.
+                    // 保留配置、数据和日志，移除已卸载插件的其他文件。
                     for entry in fs::read_dir(&plugin_dir).map_err(|e| e.to_string())? {
                         let entry = entry.map_err(|e| e.to_string())?;
                         if entry.file_name() == "data"
@@ -630,7 +547,6 @@ impl Manager {
         }
         let mut state = self.state.clone();
         state.plugins.remove(id);
-        state.retained_config.remove(id);
         // Move before state commit; any move/commit failure restores the original installation.
         let mut moved = Vec::new();
         for source in sources {
@@ -676,9 +592,6 @@ impl Manager {
             return Err("仅允许安装更高版本；相同版本不可覆盖".into());
         }
         let enabled = old.is_some_and(|record| record.enabled);
-        let legacy_config = old
-            .and_then(|record| record.config.clone())
-            .or_else(|| self.state.retained_config.get(&id).cloned());
         // 升级成功后清理旧版本目录，先取成 owned 值，避免状态借用跨过后续提交。
         let previous_directory = old.map(|record| record.directory.clone());
         // Unique paths prevent dlopen from reusing a retained mapping after reinstall.
@@ -696,11 +609,7 @@ impl Manager {
         checked_child_directory(&plugin_directory, "data", true)?;
         checked_child_directory(&plugin_directory, "logs", true)?;
         let config_path = plugin_directory.join(CONFIG_FILE);
-        let initial_content = if let Some(config) = legacy_config {
-            serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?
-        } else {
-            package.default_config.clone()
-        };
+        let initial_content = package.default_config.clone();
         if fs::symlink_metadata(&config_path).is_ok() {
             checked_config_file(&config_path)?;
         }
@@ -732,13 +641,11 @@ impl Manager {
             id.clone(),
             Record {
                 manifest: inspection.manifest,
-                config: None,
                 enabled,
                 directory: directory.clone(),
                 load_error: None,
             },
         );
-        state.retained_config.remove(&id);
         if let Err(e) = self.commit(state) {
             let _ = fs::remove_dir_all(destination);
             if created_config {
@@ -763,42 +670,11 @@ impl Manager {
         Ok(())
     }
 
-    fn migrate_config_files(&mut self) -> Result<(), String> {
-        let mut state = self.state.clone();
-        let ids: HashSet<_> = state
-            .plugins
-            .keys()
-            .chain(state.retained_config.keys())
-            .cloned()
-            .collect();
-        let mut changed = false;
-        for id in ids {
-            if !package::valid_id(&id) {
-                return Err("插件状态 ID 无效".into());
-            }
-            let legacy = state
-                .plugins
-                .get(&id)
-                .and_then(|record| record.config.as_ref())
-                .or_else(|| state.retained_config.get(&id));
-            let content = serde_json::to_string_pretty(legacy.unwrap_or(&serde_json::json!({})))
-                .map_err(|e| e.to_string())?;
-            let installed = checked_child_directory(&self.root, "installed", false)?;
-            let directory = checked_child_directory(&installed, &id, true)?;
-            // Existing files always take precedence, including files needing syntax repair.
-            ensure_config_file(&directory.join(CONFIG_FILE), &content)?;
-            if let Some(record) = state.plugins.get_mut(&id) {
-                changed |= record.config.take().is_some();
-            }
-            changed |= state.retained_config.remove(&id).is_some();
-        }
-        if changed {
-            self.commit(state)?;
-        }
-        Ok(())
+    fn config_path(&self, id: &str) -> Result<PathBuf, String> {
+        Ok(self.plugin_directory(id)?.join(CONFIG_FILE))
     }
 
-    fn config_path(&self, id: &str) -> Result<PathBuf, String> {
+    fn plugin_directory(&self, id: &str) -> Result<PathBuf, String> {
         if !package::valid_id(id) {
             return Err("插件 ID 无效".into());
         }
@@ -808,7 +684,7 @@ impl Manager {
         }
         let root = checked_directory(&self.root)?;
         let installed = checked_child_directory(&root, "installed", false)?;
-        Ok(checked_child_directory(&installed, id, false)?.join(CONFIG_FILE))
+        checked_child_directory(&installed, id, false)
     }
 
     fn get_config_file(&self, id: &str) -> Result<ConfigFile, String> {
@@ -880,12 +756,15 @@ impl Manager {
         let generations = self.generations.entry(id.to_owned()).or_default();
         generations.retain(|generation| generation.strong_count() > 0);
         generations.push(native.lifetime());
+        let instance = Arc::new(Mutex::new(native));
+        let lifecycle = lifecycle::LifecyclePlugin::native(&record.manifest, instance.clone());
         self.live.insert(
             id.to_owned(),
             Active {
-                instance: Arc::new(Mutex::new(native)),
+                instance,
                 manifest: record.manifest.clone(),
                 config,
+                lifecycle,
             },
         );
         self.log_event(id, "loaded");
@@ -909,7 +788,9 @@ impl Manager {
                     let restart_required = live.is_some_and(|p| {
                         p.manifest.version != r.manifest.version || config.as_ref() != Ok(&p.config)
                     });
-                    let last_error = config_error.or_else(|| self.errors.get(id).cloned());
+                    let last_error = config_error
+                        .or_else(|| self.errors.get(id).cloned())
+                        .or_else(|| package::validate_manifest(&r.manifest).err());
                     let status = if last_error.is_some() {
                         "error"
                     } else if live.is_some() {
@@ -932,6 +813,10 @@ impl Manager {
                         plugin_dir: self.root.join("installed").join(id),
                         data_dir: self.root.join("installed").join(id).join("data"),
                         log_dir: self.root.join("installed").join(id).join("logs"),
+                        log_size_bytes: self
+                            .plugin_directory(id)
+                            .and_then(|dir| logs::size(&dir))
+                            .ok(),
                     }
                 })
                 .collect(),
@@ -939,28 +824,14 @@ impl Manager {
     }
 
     fn update_fast_path(&self) {
-        let entries = if self.stopping {
-            Vec::new()
-        } else {
+        lifecycle::publish(
             self.live
-                .iter()
-                .filter(|(_, active)| {
-                    active
-                        .manifest
-                        .capabilities
-                        .iter()
-                        .any(|name| name == "request.beforeSend")
-                })
-                .map(|(id, active)| RequestPlugin {
-                    id: id.clone(),
-                    instance: active.instance.clone(),
-                    header_names: active.manifest.header_names.clone(),
-                })
-                .collect()
-        };
-        let has_headers = !entries.is_empty();
-        request_plugins().store(Arc::new(entries));
-        HAS_HEADERS.store(has_headers, Ordering::Relaxed);
+                .values()
+                .filter(|_| !self.stopping)
+                .filter(|active| lifecycle::enabled(&active.manifest))
+                .map(|active| active.lifecycle.clone())
+                .collect(),
+        );
     }
 }
 
@@ -1112,15 +983,22 @@ fn validate_optional_child(parent: &Path, name: &str) -> Result<(), String> {
     }
 }
 
-fn checked_artifact_directory(plugin_dir: &Path, directory: &str) -> Result<PathBuf, String> {
-    if !package::safe_relative(directory) {
-        return Err("插件安装目录无效".into());
+fn validate_artifact_directory(directory: &str) -> Result<(), String> {
+    if !package::safe_relative(directory)
+        || !matches!(
+            directory.split('/').collect::<Vec<_>>().as_slice(),
+            ["versions", _]
+        )
+    {
+        return Err("插件安装目录必须使用 versions/<版本目录> 格式".into());
     }
+    Ok(())
+}
+
+fn checked_artifact_directory(plugin_dir: &Path, directory: &str) -> Result<PathBuf, String> {
+    validate_artifact_directory(directory)?;
     let parts: Vec<_> = directory.split('/').collect();
     match parts.as_slice() {
-        [name] if !["data", "logs", "versions"].contains(name) => {
-            checked_child_directory(plugin_dir, name, false)
-        }
         ["versions", name] => {
             let versions = checked_child_directory(plugin_dir, "versions", false)?;
             checked_child_directory(&versions, name, false)
@@ -1262,6 +1140,73 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_installed_plugin_does_not_block_manager_startup() {
+        for enabled in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut manager = Manager::open(root.path().into()).unwrap();
+            manager.install(fixture_package()).unwrap();
+            let config = manager.get_config_file("test.boundary").unwrap();
+            let mut other = fixture_package();
+            other.inspection.manifest.id = "test.compatible".into();
+            manager.install(other).unwrap();
+
+            // 模拟升级宿主前保存的旧协议插件，绕过新安装包的兼容性检查。
+            let mut state = manager.state.clone();
+            let record = state.plugins.get_mut("test.boundary").unwrap();
+            record.manifest.capabilities = vec!["request.beforeSend".into()];
+            record.enabled = enabled;
+            manager.commit(state).unwrap();
+
+            let mut reopened = Manager::open(root.path().into()).unwrap();
+            reopened.load_enabled().unwrap();
+            let plugins = reopened.list().plugins;
+            assert_eq!(plugins.len(), 2);
+            let obsolete = &plugins[0];
+            assert_eq!(obsolete.id, "test.boundary");
+            assert!(!obsolete.enabled);
+            assert_eq!(obsolete.status, "error");
+            assert!(
+                obsolete
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("尚未支持的扩展能力")
+            );
+            assert_eq!(plugins[1].id, "test.compatible");
+            assert_eq!(plugins[1].status, "disabled");
+            assert!(plugins[1].last_error.is_none());
+            assert!(reopened.live.is_empty());
+            assert!(
+                reopened
+                    .load("test.boundary")
+                    .unwrap_err()
+                    .contains("尚未支持的扩展能力")
+            );
+            assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
+
+            let persisted = fs::read(root.path().join("state.json")).unwrap();
+            let mut restarted = Manager::open(root.path().into()).unwrap();
+            restarted.load_enabled().unwrap();
+            assert_eq!(fs::read(root.path().join("state.json")).unwrap(), persisted);
+            assert_eq!(restarted.list().plugins[0].last_error, obsolete.last_error);
+            assert!(!restarted.list().plugins[0].enabled);
+
+            if enabled {
+                let mut upgrade = fixture_package();
+                upgrade.inspection.manifest.version = "1.0.1".into();
+                restarted.install(upgrade).unwrap();
+                let repaired = Manager::open(root.path().into()).unwrap().list();
+                assert_eq!(repaired.plugins[0].status, "disabled");
+                assert!(repaired.plugins[0].last_error.is_none());
+            } else {
+                restarted.uninstall("test.boundary", false).unwrap();
+                assert_eq!(restarted.list().plugins.len(), 1);
+            }
+            assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
+        }
+    }
+
+    #[test]
     fn config_file_preserves_text_and_rejects_external_edits() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
@@ -1305,6 +1250,36 @@ mod tests {
         for removed in ["config", "configSchema", "configUi", "activeConfig"] {
             assert!(info["plugins"][0].get(removed).is_none());
         }
+    }
+
+    #[test]
+    fn plugin_directory_resolves_installed_root_and_rejects_invalid_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let directory = manager.plugin_directory("test.boundary").unwrap();
+        assert_eq!(
+            directory,
+            manager.context("test.boundary", false).unwrap().plugin_dir
+        );
+        assert_eq!(directory, manager.list().plugins[0].plugin_dir);
+        assert_eq!(directory.file_name().unwrap(), "test.boundary");
+        assert_eq!(
+            directory.parent().unwrap().file_name().unwrap(),
+            "installed"
+        );
+        assert!(
+            manager
+                .plugin_directory("../test.boundary")
+                .unwrap_err()
+                .contains("无效")
+        );
+        assert!(
+            manager
+                .plugin_directory("missing")
+                .unwrap_err()
+                .contains("未安装")
+        );
     }
 
     #[test]
@@ -1363,66 +1338,38 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_migrates_once_and_existing_file_wins() {
+    fn obsolete_state_fields_are_rejected_without_rewriting_files() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
         manager.install(fixture_package()).unwrap();
-        let path = manager.get_config_file("test.boundary").unwrap().path;
-        fs::remove_file(&path).unwrap();
-        let mut old = serde_json::to_value(&manager.state).unwrap();
-        old["plugins"]["test.boundary"]["config"] = json!({"legacy":true});
-        old["plugins"]["test.boundary"]["configSchema"] = json!({"type":"object"});
-        old["plugins"]["test.boundary"]["manifest"]["configSchema"] = json!("schema.json");
-        old["plugins"]["test.boundary"]["manifest"]["configUi"] =
-            json!({"type":"html", "entry":"gone.html"});
-        old["retainedConfig"] = json!({"test.retained":{"retained":true}});
-        fs::write(
-            root.path().join("state.json"),
-            serde_json::to_vec(&old).unwrap(),
-        )
-        .unwrap();
-        let migrated = Manager::open(root.path().into()).unwrap();
-        assert_eq!(
-            parse_config(&fs::read_to_string(&path).unwrap()).unwrap(),
-            json!({"legacy":true})
-        );
-        assert_eq!(
-            parse_config(
-                &fs::read_to_string(root.path().join("installed/test.retained/config.json"))
-                    .unwrap()
-            )
-            .unwrap(),
-            json!({"retained":true})
-        );
-        assert!(migrated.state.plugins["test.boundary"].config.is_none());
-        let saved = fs::read_to_string(root.path().join("state.json")).unwrap();
-        for removed in ["configSchema", "configUi", "retainedConfig", "\"config\""] {
-            assert!(!saved.contains(removed), "{removed}");
+        let config = manager.get_config_file("test.boundary").unwrap();
+        let current = serde_json::to_value(&manager.state).unwrap();
+        for field in ["config", "retainedConfig", "configSchema", "configUi"] {
+            let mut obsolete = current.clone();
+            match field {
+                "config" => obsolete["plugins"]["test.boundary"][field] = json!({"old":true}),
+                "retainedConfig" => obsolete[field] = json!({"test.boundary":{}}),
+                _ => obsolete["plugins"]["test.boundary"]["manifest"][field] = json!({}),
+            }
+            let bytes = serde_json::to_vec(&obsolete).unwrap();
+            fs::write(root.path().join("state.json"), &bytes).unwrap();
+            assert!(Manager::open(root.path().into()).is_err(), "{field}");
+            assert_eq!(fs::read(root.path().join("state.json")).unwrap(), bytes);
+            assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
         }
-        fs::write(&path, "{invalid but preserved").unwrap();
-        fs::write(
-            root.path().join("state.json"),
-            serde_json::to_vec(&old).unwrap(),
-        )
-        .unwrap();
-        Manager::open(root.path().into()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{invalid but preserved");
     }
 
     #[test]
-    fn migration_failure_keeps_legacy_configuration_in_state() {
+    fn opening_does_not_synthesize_a_missing_configuration() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
         manager.install(fixture_package()).unwrap();
         let path = manager.get_config_file("test.boundary").unwrap().path;
         fs::remove_file(&path).unwrap();
-        fs::create_dir(&path).unwrap();
-        let mut old = serde_json::to_value(&manager.state).unwrap();
-        old["plugins"]["test.boundary"]["config"] = json!({"preserved":true});
-        let bytes = serde_json::to_vec(&old).unwrap();
-        fs::write(root.path().join("state.json"), &bytes).unwrap();
-        assert!(Manager::open(root.path().into()).is_err());
-        assert_eq!(fs::read(root.path().join("state.json")).unwrap(), bytes);
+        let mut reopened = Manager::open(root.path().into()).unwrap();
+        assert!(!path.exists());
+        assert!(reopened.get_config_file("test.boundary").is_err());
+        assert!(reopened.load("test.boundary").is_err());
     }
 
     #[cfg(unix)]
@@ -1576,7 +1523,7 @@ mod tests {
         let manifest: Manifest = serde_json::from_value(json!({
             "id":"test.rollback","name":"Rollback","version":"1.0.0","abiVersion":1,
             "platform":std::env::consts::OS,"arch":std::env::consts::ARCH,
-            "entry":"lib.so","librarySha256":"0".repeat(64),"configSchema":"config.json"
+            "entry":"lib.so","librarySha256":"0".repeat(64)
         }))
         .unwrap();
         let package = package::Package {
@@ -1667,20 +1614,30 @@ mod tests {
     }
 
     #[test]
-    fn legacy_artifact_directory_remains_compatible() {
+    fn artifact_directory_requires_the_versions_layout() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
         manager.install(fixture_package()).unwrap();
         let context = manager.context("test.boundary", false).unwrap();
         let old = manager.state.plugins["test.boundary"].directory.clone();
-        let name = old.strip_prefix("versions/").unwrap();
-        fs::rename(context.plugin_dir.join(&old), context.plugin_dir.join(name)).unwrap();
         assert_eq!(
-            checked_artifact_directory(&context.plugin_dir, name).unwrap(),
-            context.plugin_dir.join(name)
+            checked_artifact_directory(&context.plugin_dir, &old).unwrap(),
+            context.plugin_dir.join(&old)
         );
-        manager.uninstall("test.boundary", false).unwrap();
-        assert!(!context.plugin_dir.join(name).exists());
-        assert!(context.data_dir.exists());
+        for invalid in [
+            "1.0.0",
+            "data",
+            "logs",
+            "versions",
+            "versions/a/b",
+            "../outside",
+        ] {
+            assert!(checked_artifact_directory(&context.plugin_dir, invalid).is_err());
+            let mut state = manager.state.clone();
+            state.plugins.get_mut("test.boundary").unwrap().directory = invalid.into();
+            manager.commit(state).unwrap();
+            assert!(Manager::open(root.path().into()).is_err(), "{invalid}");
+            assert!(context.plugin_dir.join(&old).exists());
+        }
     }
 }
