@@ -713,6 +713,10 @@ fn response_has_textual_spawn_failure(value: &Value) -> bool {
         Value::Array(values) => values.iter().any(response_has_textual_spawn_failure),
         Value::String(value) => {
             let normalized = value.trim().to_ascii_lowercase();
+            if normalized.starts_with("unknown model ") && normalized.contains(" for spawn_agent.")
+            {
+                return true;
+            }
             [
                 "collab spawn failed",
                 "agent spawn failed",
@@ -1193,6 +1197,15 @@ mod tests {
         assert!(response_is_explicit_spawn_failure(
             &json!({"error": {"code": "capacity"}})
         ));
+        let unknown_model =
+            "Unknown model `gpt-6-luna` for spawn_agent. Available models: gpt-6-astra";
+        assert!(response_is_explicit_spawn_failure(&json!(unknown_model)));
+        assert!(!response_is_explicit_spawn_failure(
+            &json!({"agent_id": "agent-1", "output": unknown_model})
+        ));
+        assert!(!response_is_explicit_spawn_failure(&json!(
+            "Unknown model in the file being reviewed"
+        )));
     }
 
     #[test]

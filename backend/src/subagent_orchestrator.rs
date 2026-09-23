@@ -2978,6 +2978,52 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_spawn_failure_releases_the_workspace_reservation() {
+        let temp = tempdir().unwrap();
+        let input = spawn_input("failed_writer", "codey_worker");
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                Some("/repo"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        post_spawn(
+            temp.path(), "runtime-a", "session-a", Some(&input),
+            Some(&json!("Unknown model `gpt-6-luna` for spawn_agent. Available models: gpt-6-astra, gpt-5.6-luna")),
+            11,
+        ).unwrap();
+        let ledger = LedgerStore::open(temp.path(), "session-a")
+            .unwrap()
+            .load("runtime-a", "session-a", 12)
+            .unwrap()
+            .unwrap();
+        let reservation = &ledger.reservations["failed_writer"];
+        assert!(reservation.spawn_failed);
+        assert_eq!(reservation.state, ReservationState::Terminal);
+        assert_eq!(reservation.outcome, ExecutionOutcome::Failed);
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&spawn_input("next_writer", "codey_worker")),
+                Some("/repo"),
+                0,
+                12,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn coordination_paths_are_normalized() {
         assert_eq!(
             normalize_absolute_path("/repo/src/../tests").unwrap(),
