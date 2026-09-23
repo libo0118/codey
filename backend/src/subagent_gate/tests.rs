@@ -551,6 +551,11 @@ fn spawn_task_receipt_binds_child_while_codex_controls_read_paths() {
             "functions.exec",
             json!(r#"text(await tools.web__run({"search_query":[{"q":"rust"}]}));"#),
         ),
+        ("clockcurr_time", json!({})),
+        (
+            "functions.exec",
+            json!(r#"text(await tools.clock__curr_time({}));"#),
+        ),
     ] {
         first_read.tool_name = Some(tool.into());
         first_read.tool_input = Some(arguments);

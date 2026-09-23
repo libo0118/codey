@@ -529,7 +529,7 @@ pub(crate) fn classify_tool(tool_name: &str) -> ToolClass {
         ToolClass::Network
     } else if matches!(
         normalized.as_str(),
-        "read_file" | "inspect_local_file" | "grep" | "glob" | "tool_search"
+        "read_file" | "inspect_local_file" | "grep" | "glob" | "tool_search" | "clock_curr_time"
     ) {
         ToolClass::Read
     } else if matches!(
@@ -619,6 +619,13 @@ pub(crate) fn normalize_tool_name(tool_name: &str) -> String {
         "web_search" => Some("web_search"),
         "websearch" => Some("websearch"),
         "web.run" | "web/run" | "web::run" | "web__run" | "web_run" | "webrun" => Some("web_run"),
+        "clock.curr_time"
+        | "clock/curr_time"
+        | "clock::curr_time"
+        | "clock__curr_time"
+        | "clockcurr_time"
+        | "clock_curr_time"
+        | "mcp__clock__curr_time" => Some("clock_curr_time"),
         "open" => Some("open"),
         "find" => Some("find"),
         "screenshot" => Some("screenshot"),
@@ -727,6 +734,43 @@ mod tests {
                 RuleEffect::Deny,
                 "{class:?}"
             );
+        }
+    }
+
+    #[test]
+    fn clock_reads_use_only_known_namespace_aliases() {
+        for tool in [
+            "clock.curr_time",
+            "clock/curr_time",
+            "clock::curr_time",
+            "clock__curr_time",
+            "clockcurr_time",
+            "clock_curr_time",
+            "mcp__clock__curr_time",
+        ] {
+            assert_eq!(classify_tool(tool), ToolClass::Read, "{tool}");
+            for role in ["codey_quick_scan", "codey_worker"] {
+                assert_eq!(
+                    embedded()
+                        .evaluate(&RuleContext {
+                            actor: RuleActor::Child,
+                            role: Some(role),
+                            tool_name: tool,
+                            tool_class: classify_tool(tool),
+                        })
+                        .effect,
+                    RuleEffect::Allow,
+                    "{role}: {tool}"
+                );
+            }
+        }
+        for tool in [
+            "clock.sleep",
+            "clock__set_time",
+            "mcp__evil__curr_time",
+            "attacker.clockcurr_time",
+        ] {
+            assert_eq!(classify_tool(tool), ToolClass::Unknown, "{tool}");
         }
     }
 

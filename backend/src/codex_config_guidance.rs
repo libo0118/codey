@@ -51,6 +51,9 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] =
     &[SUBAGENT_GUIDANCE, CONSERVATIVE_SUBAGENT_GUIDANCE];
 
+const LEGACY_BATCH_CONTROL_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary tools; never call them through `functions.exec`. Dispatch every independent agent planned for the current batch before the first wait. While any attempt is active, use only the relevant `agents.send_message`, `agents.followup_task`, `agents.interrupt_agent`, `agents.list_agents`, or `agents.wait_agent`, then return to `agents.wait_agent` with `timeout_ms <= 120000`; `MESSAGE` and mailbox updates are not completion. Use `followup_task` only for a bound nonterminal attempt. If `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` is denied, do not retry or wait for that target; take over or use a fresh `task_name` for a materially changed task. Treat `FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` as terminal. A successful root interrupt permanently abandons and fences that attempt, settles it for the batch, and makes later active-looking provider state stale; do not wait for or follow up that target. If wait output lacks per-agent terminal details, call unfiltered `agents.list_agents` and reconcile until every attempt is terminal or fenced. Then call `mcp__codey_subagent_control__resolve_batch` with the batch number, unique decision ID, reason, and exactly one of `spawn_next_batch`, `continue_root`, `complete`, or `blocked`; spawn the next batch immediately after `spawn_next_batch`, and replace `continue_root` with a terminal decision before Stop. While a batch is active, Codey's gate blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an unregistered tool.";
+
 const PRE_INTERRUPT_FENCING_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
 tools; never call them through `functions.exec`. Dispatch up to the current concurrency limit from the \
@@ -125,6 +128,7 @@ mode remains active until a later multi-agent mode developer message changes it.
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
     PRE_INTERRUPT_FENCING_USAGE_HINT,
+    LEGACY_BATCH_CONTROL_USAGE_HINT,
 ];
 
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
@@ -242,7 +246,7 @@ pub(crate) const READ_ONLY_AGENT_WRITE_GUARD: &str = "\
 Git diff/show 必须加 --no-ext-diff --no-textconv --ignore-submodules=all；diff 只允许 --cached/--staged 暂存区查询，log/show 必须加 --no-show-signature --oneline。\
 git status、工作区 diff 可能调用 clean filter，ls-remote 可能调用凭证程序或写入 Cookie，因此仍由主代理处理；远程信息可用 gh API GET 或网页读取。\
 functions.exec 只接受单次 JSON literal 包装，例如 `text(await tools.exec_command({\"cmd\":\"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files\"}));`；\
-同样可包装 tools.web__run 或 MCP 资源读取工具。未知参数、任意 JS/脚本、管道、重定向、环境和 shell 覆盖均不允许；不能证明只读时交回主代理。";
+同样可包装 tools.web__run、tools.clock__curr_time({}) 或 MCP 资源读取工具。未知参数、任意 JS/脚本、管道、重定向、环境和 shell 覆盖均不允许；不能证明只读时交回主代理。";
 
 pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 执行前确认本次任务正文完整可读。正文为空、缺失或无法解密时，只向主代理报告阻塞，等待明确重述；\
@@ -564,12 +568,16 @@ mod tests {
             append_root_agent_collaboration_usage_hint(&combined),
             combined
         );
-        assert_eq!(
-            append_root_agent_collaboration_usage_hint(&format!(
-                "{custom}\n\n{PRE_INTERRUPT_FENCING_USAGE_HINT}"
-            )),
-            combined
-        );
+        for legacy in [
+            PRE_INTERRUPT_FENCING_USAGE_HINT,
+            LEGACY_BATCH_CONTROL_USAGE_HINT,
+        ] {
+            assert_eq!(
+                append_root_agent_collaboration_usage_hint(&format!("{custom}\n\n{legacy}")),
+                combined
+            );
+        }
+        assert!(!combined.contains("resolve_batch"));
         let current_before_user =
             format!("{ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nPreserve this position.");
         assert_eq!(

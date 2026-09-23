@@ -57,10 +57,14 @@ fn literal_call(input: Option<&Value>) -> Option<ToolClass> {
         name,
         "exec_command"
             | "web__run"
+            | "clock__curr_time"
             | "read_mcp_resource"
             | "list_mcp_resources"
             | "list_mcp_resource_templates"
     ) {
+        return None;
+    }
+    if name == "clock__curr_time" && !args.as_object().is_some_and(|object| object.is_empty()) {
         return None;
     }
     let class = classify(name, Some(&args));
@@ -353,6 +357,27 @@ mod tests {
                 classify("functions.exec", Some(&json!({"input":code}))),
                 ToolClass::Read | ToolClass::Network
             ));
+        }
+    }
+
+    #[test]
+    fn clock_wrapper_proves_only_an_empty_argument_read() {
+        let call = r#"text(await tools.clock__curr_time({}));"#;
+        assert_eq!(
+            classify("functions.exec", Some(&json!(call))),
+            ToolClass::Read
+        );
+        for call in [
+            r#"text(await tools.clock__curr_time({"command":"write"}));"#,
+            r#"text(await tools.clock__curr_time(null));"#,
+            r#"text(await tools.clock__curr_time({}));text(await tools.apply_patch("x"));"#,
+            r#"text(await tools.clock__set_time({}));"#,
+        ] {
+            assert_eq!(
+                classify("functions.exec", Some(&json!(call))),
+                ToolClass::Command,
+                "{call}"
+            );
         }
     }
 
