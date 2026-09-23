@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::config::ProviderProfile;
 
@@ -904,6 +906,22 @@ fn unavailable_official_auth_returns_the_placeholder_to_initial_import() {
     assert!(next.profiles[0].is_unconfigured_default());
     assert!(!next.initial_route_import_completed);
     assert!(next.needs_initial_route_import());
+}
+
+#[test]
+fn unavailable_official_auth_does_not_treat_empty_default_as_a_third_party_route() {
+    let next = apply_unavailable_official_probe(
+        CodeyConfig::default(),
+        "not logged in".into(),
+        Vec::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(next.profiles[0].is_unconfigured_default());
+    assert!(!next.has_third_party_route());
+    assert!(next.needs_initial_route_import());
+    assert!(!next.official_account_available_this_launch);
 }
 
 #[tokio::test]

@@ -545,6 +545,29 @@
         legacyAliases.set(modelKey(alias), source.trim());
       }
     }
+    const routePrefixByProviderKey = new Map();
+    const rememberRoutePrefix = (providerId, prefix) => {
+      const key = modelKey(providerId);
+      if (!key || !prefix || routePrefixByProviderKey.has(key)) return;
+      routePrefixByProviderKey.set(key, prefix);
+    };
+    const bracketPrefix = (displayName) => {
+      const match = /^\[([^\[\]]+)\](?=\s+\S)/.exec(displayName);
+      return match ? cleanText(match[1]) : "";
+    };
+    for (const [model, metadata] of Object.entries(modelMetadata)) {
+      const prefix = metadataText(metadata, "route_prefix")
+        || bracketPrefix(metadataText(metadata, "display_name"));
+      if (!prefix) continue;
+      rememberRoutePrefix(metadataText(metadata, "route_provider_id"), prefix);
+      const separator = model.indexOf("/");
+      if (separator > 0) rememberRoutePrefix(model.slice(0, separator), prefix);
+    }
+    const historicalRouteProviderKeys = new Set();
+    for (const alias of legacyAliases.keys()) {
+      const separator = alias.indexOf("/");
+      if (separator > 0) historicalRouteProviderKeys.add(alias.slice(0, separator));
+    }
     return {
       loaded: true,
       models,
@@ -558,6 +581,8 @@
       routeByRouteProviderSource,
       routeByAnyProviderSource,
       legacyAliases,
+      routePrefixByProviderKey,
+      historicalRouteProviderKeys,
       nativeProviderId: nativeSelectionOnly ? requestProviderId(value.native_model_provider) : "",
     };
   };
@@ -621,9 +646,45 @@
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 
+  const generatedRouteProviderId = (providerId) => {
+    const key = modelKey(providerId);
+    return key.startsWith("codey-official-account-") || key.startsWith("route-");
+  };
+  // A historical thread can keep a route alias after that model leaves the
+  // enabled catalog. Sibling models on the same route still carry its short
+  // name; a removed route at least drops the provider id.
+  const routeQualifiedDisplayName = (sourceCatalog, modelName) => {
+    const model = cleanText(modelName);
+    const separator = model.indexOf("/");
+    if (separator <= 0) return "";
+    const encodedProviderId = model.slice(0, separator).trim();
+    let providerId = encodedProviderId;
+    try {
+      providerId = decodeURIComponent(encodedProviderId);
+    } catch {
+      return "";
+    }
+    const upstream = cleanText(model.slice(separator + 1).replace(/#\d+$/, ""));
+    if (!providerId || !upstream) return "";
+    const prefix = sourceCatalog.routePrefixByProviderKey?.get(modelKey(providerId))
+      || sourceCatalog.routePrefixByProviderKey?.get(modelKey(encodedProviderId))
+      || "";
+    if (prefix) return `[${prefix}] ${upstream}`;
+    const providerKey = modelKey(providerId);
+    if (
+      generatedRouteProviderId(providerId)
+      || sourceCatalog.historicalRouteProviderKeys?.has(providerKey)
+      || sourceCatalog.historicalRouteProviderKeys?.has(modelKey(encodedProviderId))
+    ) {
+      return upstream;
+    }
+    return "";
+  };
+
   const modelPresentationFromCatalog = (sourceCatalog, modelName, current = null) => {
-    const metadata = sourceCatalog.modelMetadata[modelName];
-    const route = sourceCatalog.routeMetadata[modelName];
+    const canonicalModelName = sourceCatalog.modelNamesByKey?.get(modelKey(modelName)) || modelName;
+    const metadata = sourceCatalog.modelMetadata[canonicalModelName];
+    const route = sourceCatalog.routeMetadata[canonicalModelName];
     const metadataDisplayName = metadataText(metadata, "display_name");
     const displayParts = displayNameParts(metadataDisplayName);
     const routeName = metadataText(metadata, "route_name")
@@ -635,18 +696,22 @@
     const modelLabel = metadataText(metadata, "model_display_name")
       || sourceModel
       || displayParts.modelName
-      || modelFallbackName(modelName);
+      || modelFallbackName(canonicalModelName);
     const currentDisplayName = cleanText(current?.displayName);
+    const qualifiedDisplayName = metadata
+      ? ""
+      : routeQualifiedDisplayName(sourceCatalog, modelName);
     const displayName = metadataDisplayName
       || (routeName && modelLabel ? `${routeName} / ${modelLabel}` : "")
+      || qualifiedDisplayName
       || currentDisplayName
-      || modelName;
+      || canonicalModelName;
     return {
       routeName,
       modelName: modelLabel,
       displayName,
       providerId: cleanText(route?.providerId) || metadataText(metadata, "provider_id"),
-      sourceModel: sourceModel || modelName,
+      sourceModel: sourceModel || canonicalModelName,
     };
   };
 
@@ -2803,6 +2868,7 @@
     isBlockedOutgoingMessage: (detail) => Boolean(blockedProviderRequest(detail)),
     notifyBlockedOutgoingMessage: showBlockedProviderNotice,
     enhanceModelMenus: enhanceGroupedModelMenus,
+    presentModel: (modelName, current) => modelPresentation(modelName, current),
     delivery: () => ({ ...deliveryState }),
     snapshot: () => ({
       loaded: catalog.loaded,

@@ -17,6 +17,7 @@ import type {
   ModelContextConfig,
   ModelReasoningEffort,
   ModelState,
+  OfficialModelState,
 } from "./App.types";
 import { ModelSettingsFields } from "./components/ModelSettingsFields";
 import {
@@ -43,12 +44,14 @@ import {
 type ModelPickerDialogProps = {
   open: boolean;
   routeConfigReadOnly: boolean;
+  officialOnly: boolean;
   isBusy: boolean;
   busy: string | null;
   container: HTMLElement | null;
   customModelInput: string;
   modelInputError: string;
   modelSyncWarning: string;
+  loading?: boolean;
   autoReviewSupported: boolean;
   thirdPartyModelOptions: string[];
   modelState: ModelState;
@@ -75,12 +78,14 @@ type ModelPickerDialogProps = {
 function ModelPickerDialogComponent({
   open,
   routeConfigReadOnly,
+  officialOnly,
   isBusy,
   busy,
   container,
   customModelInput,
   modelInputError,
   modelSyncWarning,
+  loading = false,
   autoReviewSupported,
   thirdPartyModelOptions,
   modelState,
@@ -103,20 +108,51 @@ function ModelPickerDialogComponent({
   const [visibleThirdPartyCount, setVisibleThirdPartyCount] = useState(
     MODEL_PICKER_PAGE_SIZE,
   );
+  const [visibleOfficialCount, setVisibleOfficialCount] = useState(
+    MODEL_PICKER_PAGE_SIZE,
+  );
   useEffect(() => {
     if (!open) return;
     setVisibleThirdPartyCount(MODEL_PICKER_PAGE_SIZE);
+    setVisibleOfficialCount(MODEL_PICKER_PAGE_SIZE);
   }, [open, customModelInput]);
   const filteredThirdPartyModels = useMemo(() => {
     if (!open) return [];
     return filterModelOptions(thirdPartyModelOptions, customModelInput);
   }, [customModelInput, open, thirdPartyModelOptions]);
+  const officialModelCatalog = useMemo(() => {
+    const available = new Map(modelState.officialModels.map((model) => [modelKey(model.slug), model]));
+    const ids = modelState.officialModelIds.length > 0
+      ? modelState.officialModelIds
+      : modelState.officialModels.map((model) => model.slug);
+    const seen = new Set<string>();
+    const models: Array<{ model: OfficialModelState; haystack: string }> = [];
+    for (const id of ids) {
+      const key = modelKey(id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const model = available.get(key) ?? {
+        slug: id,
+        displayName: id,
+        supported: false,
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "low",
+      };
+      models.push({
+        model,
+        haystack: `${model.slug} ${model.displayName}`.toLowerCase(),
+      });
+    }
+    return models;
+  }, [modelState.officialModelIds, modelState.officialModels]);
   const filteredOfficialModels = useMemo(() => {
     if (!open) return [];
     const query = customModelInput.trim().toLowerCase();
-    return modelState.officialModels.filter((model) =>
-      `${model.slug} ${model.displayName}`.toLowerCase().includes(query));
-  }, [customModelInput, modelState.officialModels, open]);
+    if (!query) return officialModelCatalog.map((entry) => entry.model);
+    return officialModelCatalog.flatMap((entry) => (
+      entry.haystack.includes(query) ? [entry.model] : []
+    ));
+  }, [customModelInput, officialModelCatalog, open]);
   const matchingModels = useMemo(
     () => [
       ...filteredOfficialModels.map((model) => model.slug),
@@ -137,6 +173,10 @@ function ModelPickerDialogComponent({
     : someMatchingSelected
       ? "indeterminate"
       : false;
+  const visibleOfficialModels = visibleModelOptions(
+    filteredOfficialModels,
+    visibleOfficialCount,
+  );
   const visibleThirdPartyModels = visibleModelOptions(
     filteredThirdPartyModels,
     visibleThirdPartyCount,
@@ -164,8 +204,10 @@ function ModelPickerDialogComponent({
         <DialogHeader>
           <DialogTitle>配置当前线路支持的模型</DialogTitle>
           <DialogDescription>
-            {modelState.officialModels.length > 0
-              ? "请选择本次官方账号登录可用的模型。"
+            {officialOnly
+              ? "列出当前官方账号可用的全部模型。勾选后才会出现在线路模型列表中，不能添加模型或修改模型参数。"
+              : modelState.officialModels.length > 0
+                ? "请选择本次官方账号登录可用的模型。"
               : "请选择同步到的线路模型，或手动输入当前线路支持的模型 ID。"}
             {routeConfigReadOnly && " 保存只更新模型选择，线路连接配置保持只读。"}
           </DialogDescription>
@@ -176,7 +218,7 @@ function ModelPickerDialogComponent({
             <span className="min-w-0 break-words">{modelSyncWarning}</span>
           </div>
         )}
-        {!routeConfigReadOnly && <div className="mt-3 flex items-center justify-between gap-4 rounded-[9px] border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-sunken,#f7f7f8)] px-3.5 py-2.5">
+        {!routeConfigReadOnly && !officialOnly && <div className="mt-3 flex items-center justify-between gap-4 rounded-[9px] border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-sunken,#f7f7f8)] px-3.5 py-2.5">
           <div className="grid min-w-0 gap-0.5">
             <strong className="text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">Auto Review</strong>
             <small className="text-[10px] leading-[1.45] text-[var(--codey-muted,#6e6e73)]">
@@ -191,7 +233,7 @@ function ModelPickerDialogComponent({
             aria-label="当前线路支持 auto-review"
           />
         </div>}
-        <div className="mt-3 flex items-center gap-2">
+        {!officialOnly && <div className="mt-3 flex items-center gap-2">
           <Input
             className="min-w-0 flex-1"
             value={customModelInput}
@@ -216,27 +258,27 @@ function ModelPickerDialogComponent({
             ) : undefined}
             placeholder="搜索模型，或输入模型 ID 添加"
             spellCheck={false}
-            aria-label="搜索或添加模型"
+            aria-label={officialOnly ? "搜索模型" : "搜索或添加模型"}
             aria-invalid={Boolean(modelInputError)}
             error={Boolean(modelInputError)}
             disabled={isBusy}
           />
-          <Button
-            className="shrink-0"
-            disabled={isBusy || !customModelInput.trim()}
-            onClick={onAddCustomModel}
-          >
-            <Plus size={16} aria-hidden="true" />
-            添加
-          </Button>
-        </div>
+          {!officialOnly && <Button
+              className="shrink-0"
+              disabled={isBusy || !customModelInput.trim()}
+              onClick={onAddCustomModel}
+            >
+              <Plus size={16} aria-hidden="true" />
+              添加
+            </Button>}
+        </div>}
         {modelInputError && (
           <p className="mt-1.5 text-[11px] leading-[1.45] text-[var(--codey-red,#d70015)]" role="alert">{modelInputError}</p>
         )}
         <div className="mt-3 mb-1 flex items-center justify-between gap-3 px-1">
           <Checkbox
             checked={checkAllState}
-            disabled={isBusy || matchingModels.length === 0}
+            disabled={isBusy || loading || matchingModels.length === 0}
             onCheckedChange={(checked) =>
               onToggleDraftModel(matchingModels, checked === true)}
             aria-label={allMatchingSelected ? "取消全选模型" : "全选模型"}
@@ -246,20 +288,29 @@ function ModelPickerDialogComponent({
             </span>
           </Checkbox>
           <span className="text-[11.5px] text-[var(--codey-muted,#6e6e73)]">
-            已选 <strong className="font-semibold text-[var(--codey-text,#1d1d1f)]">{draftModelSet.size}</strong> 个模型
+            {loading
+              ? "正在获取模型"
+              : <>已选 <strong className="font-semibold text-[var(--codey-text,#1d1d1f)]">{draftModelSet.size}</strong> 个模型</>}
           </span>
         </div>
         <div className="my-2 max-h-[360px] overflow-y-auto rounded-[10px] border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fbfbfc)] py-1 pl-1 pr-0.5 [scrollbar-color:rgba(99,99,104,0.46)_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-button]:hidden [&::-webkit-scrollbar-thumb]:min-h-11 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-transparent [&::-webkit-scrollbar-thumb]:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/40 [&::-webkit-scrollbar-thumb]:bg-clip-padding">
-          {modelState.officialModels.length > 0 && (
+          {loading ? (
+            <div className="flex flex-col items-center justify-center px-4 py-10 text-center">
+              <LoaderCircle className="mb-2.5 animate-spin text-[var(--codey-subtle,#86868b)]" size={22} aria-hidden="true" />
+              <strong className="text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">正在获取当前账号可用的模型</strong>
+              <p className="mt-1 text-[11px] leading-relaxed text-[var(--codey-subtle,#86868b)]">获取完成后会列出全部模型，勾选的模型会显示在线路列表中。</p>
+            </div>
+          ) : null}
+          {!loading && filteredOfficialModels.length > 0 && (
             <>
               <div className="m-0.5 flex items-center justify-between gap-3 rounded-[7px] bg-[var(--codey-blue-soft,#f1f5fb)] px-2.5 py-2">
                 <div className="grid gap-0.5">
                   <strong className="text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">官方模型</strong>
                   <small className="text-[10px] leading-[1.35] text-[var(--codey-muted,#6e6e73)]">来自本次 Codex 官方账号登录</small>
                 </div>
-                <Badge variant="info">{modelState.officialModels.length} 个</Badge>
+                <Badge variant="info">{filteredOfficialModels.length} 个</Badge>
               </div>
-              {filteredOfficialModels.map((model) => (
+              {visibleOfficialModels.map((model) => (
                 <div className="flex flex-wrap items-center gap-2.5 rounded-md bg-blue-500/[0.025] px-3 py-2 hover:bg-blue-500/[0.07]" key={model.slug}>
                   <Checkbox
                     checked={draftModelSet.has(modelKey(model.slug))}
@@ -272,13 +323,40 @@ function ModelPickerDialogComponent({
                     <strong className="break-words text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">{model.displayName}</strong>
                     <small className="break-words text-[11px] text-[var(--codey-subtle,#86868b)]">{model.slug}</small>
                   </div>
-                  {!routeConfigReadOnly && <ModelSettingsFields model={model.slug} policy={draftModelContexts[model.slug]} disabled={isBusy}
+                  {!routeConfigReadOnly && !officialOnly && <ModelSettingsFields model={model.slug} policy={draftModelContexts[model.slug]} disabled={isBusy}
                     onChange={(policy) => onUpdateDraftModelContext(model.slug, policy)} />}
                 </div>
               ))}
+              {visibleOfficialModels.length < filteredOfficialModels.length && (
+                <div className="flex justify-center px-2 pb-1 pt-1.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={isBusy}
+                    onClick={() =>
+                      setVisibleOfficialCount((count) =>
+                        nextVisibleModelCount(count, filteredOfficialModels.length)
+                      )}
+                  >
+                    再显示{" "}
+                    {Math.min(
+                      MODEL_PICKER_PAGE_SIZE,
+                      filteredOfficialModels.length - visibleOfficialModels.length,
+                    )}{" "}
+                    个
+                  </Button>
+                </div>
+              )}
             </>
           )}
-          <div
+          {!loading && officialOnly && filteredOfficialModels.length === 0 && (
+            <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
+              <IconCpu size={20} className="mb-2.5 text-[var(--codey-subtle,#86868b)]" aria-hidden="true" />
+              <strong className="text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">暂未读取到当前账号可用模型</strong>
+              <p className="mt-1 text-[11px] leading-relaxed text-[var(--codey-subtle,#86868b)]">请关闭弹窗后重新同步官方线路。</p>
+            </div>
+          )}
+          {!loading && !officialOnly && <div
             className={`mx-0.5 mb-0.5 flex items-center justify-between gap-3 rounded-[7px] bg-[var(--codey-surface-sunken,#f5f5f7)] px-2.5 py-2 ${
               modelState.officialModels.length > 0
                 ? "mt-1.5 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6"
@@ -294,8 +372,8 @@ function ModelPickerDialogComponent({
                 ? `${thirdPartyModelOptions.length} 个`
                 : `${filteredThirdPartyModels.length} / ${thirdPartyModelOptions.length} 个`}
             </Badge>
-          </div>
-          {visibleThirdPartyModels.map((model) => {
+          </div>}
+          {!loading && !officialOnly && visibleThirdPartyModels.map((model) => {
             const key = modelKey(model);
             const selected = draftModelSet.has(key);
             const added =
@@ -340,7 +418,7 @@ function ModelPickerDialogComponent({
               </div>
             );
           })}
-          {visibleThirdPartyModels.length < filteredThirdPartyModels.length && (
+          {!loading && !officialOnly && visibleThirdPartyModels.length < filteredThirdPartyModels.length && (
             <div className="flex justify-center px-2 pb-1 pt-1.5">
               <Button
                 variant="ghost"
@@ -363,7 +441,7 @@ function ModelPickerDialogComponent({
               </Button>
             </div>
           )}
-          {filteredThirdPartyModels.length === 0 && (
+          {!loading && !officialOnly && filteredThirdPartyModels.length === 0 && (
             <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
               <div className="mb-2.5 flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.04] text-[var(--codey-subtle,#86868b)]">
                 {thirdPartyModelOptions.length === 0 ? (
@@ -390,13 +468,13 @@ function ModelPickerDialogComponent({
             取消
           </Button>
           <Button
-            disabled={isBusy}
+            disabled={isBusy || loading}
             onClick={onSave}
           >
             {busy === "save-models"
               ? <LoaderCircle className="animate-spin" aria-hidden="true" />
               : <Check aria-hidden="true" />}
-            保存模型声明
+            {officialOnly ? "保存选择" : "保存模型声明"}
           </Button>
         </DialogFooter>
       </DialogContent>}
