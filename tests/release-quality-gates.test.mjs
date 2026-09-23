@@ -50,10 +50,21 @@ test("tag-triggered Windows releases independently enforce Rust quality gates", 
   assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
   const windowsJob = workflow.slice(workflow.indexOf("\n  windows:"));
   assertRustQualityGates(windowsJob);
+  assert.match(windowsJob, /pnpm run check/);
+  assert.match(windowsJob, /pnpm run test:js/);
+  assert.match(windowsJob, /overlay-recovery-native\.ps1/);
   assert.match(workflow, /runs-on: windows-latest/);
   assert.doesNotMatch(workflow, /runs-on: (?:ubuntu|macos)/);
   assert.match(workflow, /CODEY_UPDATE_BASE_URL: https:\/\/github\.com\/\$\{\{ github.repository \}\}\/releases\/latest\/download/);
   assert.match(workflow, /files: dist\/windows\/\*/);
+});
+
+test("Windows release reuses the prebuilt frontend overlay", () => {
+  assert.match(workflow, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
+  assert.match(workflow, /cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  assert.match(workflow, /cargo clippy --workspace --all-targets --locked -- -D warnings\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  assert.match(workflow, /- name: Build Windows executable\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  assert.match(macBuildScript, /CODEY_SKIP_OVERLAY_BUILD/);
 });
 
 test("local releases run the same locked Rust checks", () => {
@@ -115,13 +126,17 @@ test("Windows release publishes the installer without a portable zip", () => {
 
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
-  assert.match(nsisInstallStep, /choco install nsis --yes --no-progress/);
-  assert.match(nsisInstallStep, /\$attempt -le 3/);
-  assert.match(nsisInstallStep, /\$LASTEXITCODE -eq 0/);
-  assert.match(nsisInstallStep, /Start-Sleep -Seconds \(15 \* \$attempt\)/);
-  assert.match(nsisInstallStep, /throw "NSIS installation failed"/);
-  assert.match(nsisInstallStep, /NSIS\\Bin\\makensis\.exe/);
+  assert.match(nsisInstallStep, /nsis-\$version\.zip/);
+  assert.match(nsisInstallStep, /nsis-\$version\/nsis-\$version\.zip/);
+  assert.match(
+    nsisInstallStep,
+    /c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1/,
+  );
+  assert.match(nsisInstallStep, /curl\.exe -fL --retry 3 --retry-all-errors/);
+  assert.match(nsisInstallStep, /NSIS archive hash mismatch/);
+  assert.match(nsisInstallStep, /Join-Path \$nsisHome "Bin" "makensis\.exe"/);
   assert.match(nsisInstallStep, /MAKENSIS=/);
+  assert.doesNotMatch(nsisInstallStep, /choco install nsis/);
   assert.match(
     windowsPackageStep,
     /New-Item -ItemType Directory -Force dist\/windows \| Out-Null/,

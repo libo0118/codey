@@ -12,7 +12,7 @@ import { errorText, withTimeout } from "./appUtils";
 import { ManualModelCombobox } from "./components/ManualModelCombobox";
 import { ModelCombobox } from "./components/ModelCombobox";
 import { Tabs, toast } from "@heroui/react";
-import { Button, Input, PasswordInput, Select, Switch } from "./components/ui";
+import { Button, Input, Label, PasswordInput, Select, Switch, TextArea } from "./components/ui";
 import type { SubagentModelOption } from "./subagentModels";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { validateOutboundApiUrl } from "./urlValidation";
@@ -20,7 +20,13 @@ import { validateOutboundApiUrl } from "./urlValidation";
 const TEST_TIMEOUT_MS = 65_000;
 const FETCH_MODELS_TIMEOUT_MS = 20_000;
 const DEFAULT_OPTIMIZER_INSTRUCTION =
-  "你是提示词优化专家。用户会提供一段提示词，请在不改变其意图的前提下，把它重写为更清晰、更具体、可执行的高质量提示词。只输出优化后的提示词本身，不要添加任何解释、前言、后记或代码围栏。";
+  "你是一名资深提示词架构师。接收用户的原始提示词后，在完全保留其原始目标和核心意图的前提下，将其优化为更精确、逻辑严密、指令明确的高效提示词。\n\n" +
+  "优化重点：\n\n" +
+  "- 明确模型角色与专业立场\n" +
+  "- 细化任务步骤与边界约束\n" +
+  "- 规范输出格式与风格要求\n" +
+  "- 消除歧义词汇与冗余表达\n\n" +
+  "严格输出要求：仅输出优化后的提示词正文本身。绝不包含任何前言、开场白、结尾说明、解释性文字或代码块符号（```）。";
 
 const MANUAL_PROTOCOL_OPTIONS = [
   { value: "openaiResponses", label: "OpenAI Responses" },
@@ -286,7 +292,7 @@ function PromptOptimizationCardComponent({
                 <Tabs.Panel id="codeyRoute" className="prompt-tabs-panel">
                   <div className="prompt-form-group">
                     <div className="prompt-field">
-                      <label htmlFor={modelInputId} className="prompt-field-label">模型</label>
+                      <Label htmlFor={modelInputId} className="prompt-field-label">模型</Label>
                       <div className="prompt-field-control">
                         <ModelCombobox
                           aria-label="提示词优化 Codey 路由模型"
@@ -324,21 +330,23 @@ function PromptOptimizationCardComponent({
 
                     <div className="prompt-field">
                       <div className="prompt-field-label-row">
-                        <label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</label>
+                        <Label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</Label>
                         {optimization.instruction && optimization.instruction !== DEFAULT_OPTIMIZER_INSTRUCTION ? (
-                          <button
-                            type="button"
-                            className="reset-instruction-btn"
+                          <Button
+                            variant="link"
+                            size="xs"
+                            className="reset-instruction-btn h-auto p-0 text-[11.5px] font-medium text-accent hover:underline"
+                            disabled={isBusy}
                             onClick={() => updateOptimization({ instruction: DEFAULT_OPTIMIZER_INSTRUCTION })}
                           >
                             恢复默认
-                          </button>
+                          </Button>
                         ) : null}
                       </div>
                       <div className="prompt-field-control">
-                        <textarea
+                        <TextArea
                           id={controlId + "-instruction"}
-                          className="prompt-optimization-instruction"
+                          className="h-[240px] min-h-[140px] resize-y text-xs leading-relaxed"
                           value={optimization.instruction || DEFAULT_OPTIMIZER_INSTRUCTION}
                           disabled={isBusy}
                           onChange={(event) =>
@@ -355,7 +363,7 @@ function PromptOptimizationCardComponent({
                 <Tabs.Panel id="manual" className="prompt-tabs-panel">
                   <div className="prompt-form-group">
                     <div className="prompt-field">
-                      <label htmlFor={controlId + "-protocol"} className="prompt-field-label">上游协议</label>
+                      <Label htmlFor={controlId + "-protocol"} className="prompt-field-label">上游协议</Label>
                       <div className="prompt-field-control">
                         <Select
                           id={controlId + "-protocol"}
@@ -376,7 +384,7 @@ function PromptOptimizationCardComponent({
                     </div>
 
                     <div className="prompt-field">
-                      <label htmlFor={baseUrlInputId} className="prompt-field-label">API 地址</label>
+                      <Label htmlFor={baseUrlInputId} className="prompt-field-label">API 地址</Label>
                       <div className="prompt-field-control">
                         <Input
                           id={baseUrlInputId}
@@ -400,7 +408,7 @@ function PromptOptimizationCardComponent({
                     </div>
 
                     <div className="prompt-field">
-                      <label htmlFor={apiKeyInputId} className="prompt-field-label">API Key</label>
+                      <Label htmlFor={apiKeyInputId} className="prompt-field-label">API Key</Label>
                       <div className="prompt-field-control">
                         <PasswordInput
                           id={apiKeyInputId}
@@ -439,7 +447,7 @@ function PromptOptimizationCardComponent({
                     </div>
 
                     <div className="prompt-field">
-                      <label htmlFor={modelInputId} className="prompt-field-label">模型</label>
+                      <Label htmlFor={modelInputId} className="prompt-field-label">模型</Label>
                       <div className="prompt-field-control">
                         <div className="flex min-w-0 items-center gap-2 max-[680px]:flex-col max-[680px]:items-stretch">
                           <div className="relative min-w-0 flex-1 max-[680px]:w-full">
@@ -480,21 +488,23 @@ function PromptOptimizationCardComponent({
 
                     <div className="prompt-field">
                       <div className="prompt-field-label-row">
-                        <label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</label>
+                        <Label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</Label>
                         {optimization.instruction && optimization.instruction !== DEFAULT_OPTIMIZER_INSTRUCTION ? (
-                          <button
-                            type="button"
-                            className="reset-instruction-btn"
+                          <Button
+                            variant="link"
+                            size="xs"
+                            className="reset-instruction-btn h-auto p-0 text-[11.5px] font-medium text-accent hover:underline"
+                            disabled={isBusy}
                             onClick={() => updateOptimization({ instruction: DEFAULT_OPTIMIZER_INSTRUCTION })}
                           >
                             恢复默认
-                          </button>
+                          </Button>
                         ) : null}
                       </div>
                       <div className="prompt-field-control">
-                        <textarea
+                        <TextArea
                           id={controlId + "-instruction"}
-                          className="prompt-optimization-instruction"
+                          className="h-[240px] min-h-[140px] resize-y text-xs leading-relaxed"
                           value={optimization.instruction || DEFAULT_OPTIMIZER_INSTRUCTION}
                           disabled={isBusy}
                           onChange={(event) =>

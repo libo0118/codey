@@ -50,19 +50,26 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: |
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            choco install nsis --yes --no-progress
-            if ($LASTEXITCODE -eq 0) { break }
-            if ($attempt -eq 3) { throw "NSIS installation failed" }
-            Start-Sleep -Seconds (15 * $attempt)
+          $ErrorActionPreference = "Stop"
+          $version = "3.11"
+          $expectedHash = "c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1"
+          $zip = Join-Path $env:RUNNER_TEMP "nsis-$version.zip"
+          $url = "https://github.com/tauri-apps/binary-releases/releases/download/nsis-$version/nsis-$version.zip"
+          curl.exe -fL --retry 3 --retry-all-errors -o $zip $url
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to download NSIS $version"
           }
-          $makensis = @(
-            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-            "${env:ProgramFiles}\NSIS\makensis.exe",
-            "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
-            "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) { throw "makensis.exe was not found" }
+          $actualHash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "NSIS archive hash mismatch. Expected $expectedHash, got $actualHash."
+          }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $nsisHome = Join-Path $env:RUNNER_TEMP "nsis-$version"
+          $makensis = Join-Path $nsisHome "Bin" "makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            throw "makensis.exe was not found at $makensis"
+          }
+          "NSISDIR=$nsisHome" | Out-File -FilePath $env:GITHUB_ENV -Append
           "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install frontend dependencies
@@ -74,17 +81,29 @@ jobs:
       - name: JavaScript tests
         run: pnpm run test:js
 
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
       - name: Rust format
         run: cargo fmt --all -- --check
 
       - name: Rust tests
         run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
+
+      - name: Compile native overlay helper and test identity guards
+        shell: powershell
+        run: ./tests/overlay-recovery-native.ps1
 
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build Windows executable
         env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
           CODEY_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
         run: pnpm run build
 

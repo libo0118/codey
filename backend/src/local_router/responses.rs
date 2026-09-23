@@ -1,15 +1,22 @@
 use super::*;
 
 impl RouterServer {
-    pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+    pub(crate) async fn handle_connection(
+        &self,
+        mut stream: TcpStream,
+        connection_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
-                return self.handle_responses_websocket(stream).await;
+                return self
+                    .handle_responses_websocket(stream, connection_permit)
+                    .await;
             }
             ResponsesWebSocketProbe::Http => {}
             ResponsesWebSocketProbe::Silent => {
                 // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
                 // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
+                let _connection_permit = connection_permit;
                 let _ = write_error_response(
                     &mut stream,
                     408,
@@ -21,6 +28,7 @@ impl RouterServer {
                 return Ok(());
             }
         }
+        let _connection_permit = connection_permit;
         let pending =
             match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_http_request_head(&mut stream))
                 .await
@@ -623,63 +631,64 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let request_builder =
-            upstream_client
-                .post(&upstream_url)
-                .headers(headers)
-                .body(if body_mutated {
-                    serde_json::to_vec(&body).context("序列化 Images 上游请求失败")?
-                } else {
-                    request.body
-                });
+        let request_body = if body_mutated {
+            Bytes::from(serde_json::to_vec(&body).context("序列化 Images 上游请求失败")?)
+        } else {
+            Bytes::from(request.body)
+        };
         let response_header_timeout = if stream_requested {
             UPSTREAM_RESPONSE_HEADER_TIMEOUT
         } else {
             UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
         };
-        let response =
-            match tokio::time::timeout(response_header_timeout, request_builder.send()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    let timeout = error.is_timeout();
-                    let (status, code, message) = if timeout {
-                        (
-                            504,
-                            "upstream_timeout",
-                            format!(
-                                "Codey 线路「{}」请求图片生成上游超时",
-                                route_display_name(&route)
-                            ),
-                        )
-                    } else {
-                        (
-                            424,
-                            "upstream_unreachable",
-                            format!(
-                                "Codey 线路「{}」无法连接图片生成上游",
-                                route_display_name(&route)
-                            ),
-                        )
-                    };
-                    mark_error(status, code);
-                    write_text_error_response(&mut stream, status, code, message).await?;
-                    return Ok(());
-                }
-                Err(_) => {
-                    mark_error(504, "upstream_header_timeout");
-                    write_text_error_response(
-                        &mut stream,
+        let response = match send_for_response_headers(
+            upstream_client.post(&upstream_url).headers(headers),
+            request_body,
+            response_header_timeout,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let timeout = error.is_timeout();
+                let (status, code, message) = if timeout {
+                    (
                         504,
-                        "upstream_header_timeout",
+                        "upstream_timeout",
                         format!(
-                            "Codey 线路「{}」等待图片生成上游返回响应头超时",
+                            "Codey 线路「{}」请求图片生成上游超时",
                             route_display_name(&route)
                         ),
                     )
-                    .await?;
-                    return Ok(());
-                }
-            };
+                } else {
+                    (
+                        424,
+                        "upstream_unreachable",
+                        format!(
+                            "Codey 线路「{}」无法连接图片生成上游",
+                            route_display_name(&route)
+                        ),
+                    )
+                };
+                mark_error(status, code);
+                write_text_error_response(&mut stream, status, code, message).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                mark_error(504, "upstream_header_timeout");
+                write_text_error_response(
+                    &mut stream,
+                    504,
+                    "upstream_header_timeout",
+                    format!(
+                        "Codey 线路「{}」等待图片生成上游返回响应头超时",
+                        route_display_name(&route)
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         if let Some(probe) = &probe {
             probe.mark_upstream_headers(
                 response.status().as_u16(),
@@ -833,7 +842,14 @@ impl RouterServer {
     // Tungstenite's handshake callback fixes the error type to an HTTP
     // response value; its size is imposed by the external Callback contract.
     #[allow(clippy::result_large_err)]
-    pub(crate) async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+    pub(crate) async fn handle_responses_websocket(
+        &self,
+        stream: TcpStream,
+        connection_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        // 握手完成前一直占着并发名额。空闲等待在循环里释放，避免预连接和
+        // 已结束的回合把名额占满；下一条需要转发的消息会重新获取。
+        let mut connection_permit = Some(connection_permit);
         let handshake_context = Arc::new(Mutex::new(None));
         let captured_context = Arc::clone(&handshake_context);
         let token = self.token.clone();
@@ -895,13 +911,27 @@ impl RouterServer {
             socket,
             Arc::clone(&self.websocket_backoffs),
             Arc::clone(&self.request_body_budget),
+            Arc::clone(&self.idle_downstreams),
         );
+        downstream.subagent_turn_states = Arc::clone(&self.subagent_turn_states);
         downstream.native_history = NativeResponsesHistory::with_cache(
             Arc::clone(&self.native_history_cache),
             &context.headers,
         );
 
-        while let Some(message) = downstream.next_message().await? {
+        loop {
+            drop(connection_permit.take());
+            let Some(message) = downstream.next_message().await? else {
+                break;
+            };
+            if matches!(message, WebSocketMessage::Text(_)) {
+                connection_permit = Some(
+                    Arc::clone(&self.connection_limit)
+                        .acquire_owned()
+                        .await
+                        .context("等待本地路由连接名额失败")?,
+                );
+            }
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
@@ -1738,6 +1768,11 @@ impl RouterServer {
                 &resolved.upstream_model,
             );
         }
+        // 子代理入站不带轮次票据，上游会把每次调用当成新轮次。只补这条父线程
+        // 最近一次成功响应的票据。主会话请求保持客户端原样。
+        if subagent_request && resolved.route.official_account {
+            reuse_subagent_turn_state(&self.subagent_turn_states, &mut headers);
+        }
         let mut lifecycle = request_lifecycle(
             &headers,
             &resolved,
@@ -1761,6 +1796,8 @@ impl RouterServer {
             && stream_requested
             && bridge == ProtocolBridge::NativeResponses
         {
+            // Lifecycle plugins need response headers, so they skip this
+            // attempt. Continuation history is staged on the HTTP fallback.
             if !compacting && !lifecycle.is_active() {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
@@ -1855,10 +1892,12 @@ impl RouterServer {
         };
         // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
         // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
-        // reasoning_text 缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
+        // reasoning 明文缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
         // 不参与该回退。
-        let reasoning_text_retry_allowed = bridge == ProtocolBridge::NativeResponses
-            && request_kind == ResponsesRequestKind::Create
+        let reasoning_text_retry_allowed = matches!(
+            bridge,
+            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
+        ) && request_kind == ResponsesRequestKind::Create
             && !compacting
             && !resolved.route.official_account;
         // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。
@@ -2038,6 +2077,16 @@ impl RouterServer {
         }
         if let Some(probe) = downstream.request_log_probe() {
             probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
+        }
+        if resolved.route.official_account
+            && let Some(response) = upstream_response.as_ref()
+        {
+            observe_upstream_turn_state(
+                &self.subagent_turn_states,
+                &headers,
+                upstream_status,
+                response.headers(),
+            );
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {

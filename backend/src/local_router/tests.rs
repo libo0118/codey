@@ -1,4 +1,5 @@
 use super::*;
+use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::ProviderProfile;
 
 #[test]
@@ -593,7 +594,8 @@ async fn upstream_websocket_connection_disables_nagle() {
         None,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .socket;
     let MaybeTlsStream::Plain(stream) = socket.get_ref() else {
         panic!("loopback WebSocket must use a plain TCP stream");
     };
@@ -1745,6 +1747,109 @@ async fn idle_connection_receives_a_request_timeout_without_a_router_failure() {
 }
 
 #[tokio::test]
+async fn idle_downstream_websockets_do_not_consume_connection_permits() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let mut sockets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        sockets.push(connect_router_websocket(&endpoint).await);
+    }
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut last = String::new();
+    let mut available = false;
+    for _ in 0..50 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        last.clear();
+        tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last))
+            .await
+            .expect("healthz should respond")
+            .unwrap();
+        if last.contains("200") && last.contains("ok") {
+            available = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        available,
+        "idle websockets should leave a connection slot for healthz, got {last}"
+    );
+    drop(sockets);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn connections_that_have_not_gone_idle_still_report_router_busy() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut silent = Vec::new();
+    let head = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n",
+        endpoint.token
+    );
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        silent.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut last = String::new();
+    let mut busy = false;
+    for _ in 0..20 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        if health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .is_err()
+        {
+            busy = true;
+            break;
+        }
+        last.clear();
+        match tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last)).await {
+            Ok(Ok(_)) if last.contains("router_busy") => {
+                busy = true;
+                break;
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                // 拒绝名额也用尽时，这条连接会被直接丢掉。
+                busy = true;
+                break;
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        busy,
+        "in-flight connections should still saturate the router, got {last}"
+    );
+    drop(silent);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -2134,6 +2239,180 @@ async fn native_route_retries_once_with_a_reasoning_text_placeholder() {
         json!([{"type":"reasoning_text","text":"(thinking unavailable)"}])
     );
     assert_eq!(attempts[0]["input"][1], attempts[1]["input"][1]);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn reasoning_content_missing_replays_a_placeholder_for_the_previous_turn() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body.clone());
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "{\"code\":11155,\"msg\":\"the reasoning content from the previous turn must be passed back in thinking mode\",\"extError\":{\"code\":\"reasoning_content_missing\",\"message\":\"the reasoning content from the previous turn must be passed back in thinking mode\",\"type\":\"invalid_request_error\",\"StatusCode\":400}}",
+                                "type": "invalid_request_error",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id":"resp-reasoning-content",
+                            "object":"response",
+                            "status":"completed",
+                            "model":body["model"],
+                            "output":[],
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看文件"}]},
+                {"role":"user","content":[{"type":"input_text","text":"继续"}]},
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "resp-reasoning-content"
+    );
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0]["input"][0]["type"], "reasoning");
+    assert_eq!(attempts[1]["input"][0]["type"], "reasoning");
+    assert_eq!(
+        attempts[1]["input"][0]["content"][0]["text"],
+        "(thinking unavailable)"
+    );
+    assert_eq!(attempts[1]["input"][1]["role"], "assistant");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_route_retries_reasoning_content_missing_with_a_placeholder() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body);
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "the reasoning content from the previous turn must be passed back in thinking mode",
+                                "type": "invalid_request_error",
+                                "code": "reasoning_content_missing",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id": "chatcmpl-reasoning",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看文件"}]},
+                {"role":"user","content":"继续"},
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(
+        attempts[1]["messages"][0]["reasoning_content"],
+        "(thinking unavailable)"
+    );
+    assert_eq!(attempts[1]["messages"][0]["content"], "先看文件");
     router.stop().await.unwrap();
 }
 
@@ -2681,6 +2960,43 @@ fn official_account_models_enter_the_router_only_when_login_is_available() {
         RouterSnapshot::from_config(&api_key_launch)
             .target_for_model(CODEX_AUTO_REVIEW_MODEL)
             .is_err()
+    );
+}
+
+#[test]
+fn official_account_route_uses_a_saved_gateway_instead_of_the_default() {
+    let mut official = ProviderProfile::new("官方账号1");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.base_url = "https://gateway.example/backend-api/codex/".into();
+    official.normalize();
+    let mut config = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    config
+        .selected_models_by_provider
+        .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+    let resolved = RouterSnapshot::from_config(&config)
+        .target_for_model(&model_alias("openai", "gpt-5.6-sol"))
+        .unwrap();
+
+    assert_eq!(
+        resolved.route.upstream_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses"
+    );
+    assert_eq!(
+        resolved.route.upstream_compact_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses/compact"
+    );
+    assert_eq!(
+        resolved.route.upstream_websocket_url.as_ref().unwrap(),
+        "wss://gateway.example/backend-api/codex/responses"
     );
 }
 
@@ -6746,6 +7062,242 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
         .unwrap();
     assert_ne!(retry.status().as_u16(), 409);
     upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (headers_read, headers_read_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (socket, _) = upstream.accept().await.unwrap();
+        let std_socket = socket.into_std().unwrap();
+        std_socket.set_nonblocking(false).unwrap();
+        let socket = socket2::Socket::from(std_socket);
+        // 不读正文时，收紧的接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传
+        // 记成 504。窗口要保持在回环 MSS 的数倍以上（回环 MTU 在部分系统上有
+        // 64 KiB），并且全程不再改动：窗口一旦小于一个报文段，发送端会退进零窗口
+        // 探测，之后再调大缓冲也补不回这段正文的传输速度。
+        socket.set_recv_buffer_size(256 * 1024).unwrap();
+        let std_socket: std::net::TcpStream = socket.into();
+        std_socket.set_nonblocking(true).unwrap();
+        let mut socket = TcpStream::from_std(std_socket).unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = String::from_utf8(header).unwrap();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        headers_read.send(length).unwrap();
+        release_rx.await.unwrap();
+        let mut body = vec![0_u8; length];
+        socket
+            .read_exact(&mut body)
+            .await
+            .expect("上传仍应在进行，不能被响应头期限提前掐断");
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp-after-upload\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    // 1 MiB 正文可能全部进入 Linux/Windows 的发送缓冲；仅缩小接收缓冲不足以
+    // 阻塞发送。使用更大的正文，让连接在上游恢复读取前仍有数据等待写出。
+    let padding = "x".repeat(16 * 1024 * 1024);
+    let mut pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": padding,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let length = headers_read_rx.await.unwrap();
+    assert!(
+        length > 512 * 1024,
+        "forwarded body was only {length} bytes"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .is_err(),
+        "upload must still be in progress before the virtual header timeout"
+    );
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;
+    tokio::time::resume();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut pending).await;
+    assert!(
+        early.is_err(),
+        "header timeout included the blocked history upload"
+    );
+    release.send(()).unwrap();
+    // 断言关心的是上传最终走完而不是被记成 504，等待要宽到不会把慢机器误报成
+    // 失败，同时短到能及时暴露真正卡死的上传。
+    tokio::time::timeout(Duration::from_secs(30), upstream_task)
+        .await
+        .expect("上游应当读完整段正文并回包")
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
+        .await
+        .expect("upstream response should arrive after the body upload")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_header_timeout_still_bounds_the_wait_after_upload() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (received, received_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        received.send(()).unwrap();
+        assert!(request.body.len() < 64 * 1024);
+        std::future::pending::<()>().await;
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": "short",
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    received_rx.await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let response = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("uploaded requests must still hit the header timeout")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 504);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("upstream_header_timeout"), "{body}");
+    upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn replayed_history_still_waiting_after_the_nominal_header_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (received, received_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        let length = request.body.len();
+        received.send(length).unwrap();
+        release_rx.await.unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp-after-replay\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    // 模拟切模型后重放的历史：正文已经进了上游读缓冲，但网关还没给出首字。
+    let padding = "x".repeat(4 * 1024 * 1024);
+    let mut pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": padding,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let length = received_rx.await.unwrap();
+    let budget =
+        super::lifecycle::response_header_timeout(length, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+    assert!(
+        budget > UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(30),
+        "replayed body of {length} bytes did not extend the header budget"
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;
+    tokio::time::resume();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut pending)
+            .await
+            .is_err(),
+        "nominal header timeout fired while the replayed upload was still buffered"
+    );
+    release.send(()).unwrap();
+    upstream_task.await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
+        .await
+        .expect("upstream response should arrive inside the extended header budget")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
     router.stop().await.unwrap();
 }
 

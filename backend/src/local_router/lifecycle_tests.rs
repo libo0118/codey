@@ -97,12 +97,14 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         bindings: Arc::default(),
         websocket_backoffs: Arc::default(),
         native_history_cache: Arc::default(),
+        idle_downstreams: Arc::default(),
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         proxied_clients: Mutex::default(),
         official_auth_path: PathBuf::from("/nonexistent/codey-lifecycle-test-auth"),
         account_usage_cache: Arc::default(),
         official_auth_cache: Arc::default(),
         request_log: Arc::new(RouteRequestLogController::new()),
+        subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
     }
 }
 

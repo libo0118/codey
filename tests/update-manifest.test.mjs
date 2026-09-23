@@ -12,11 +12,10 @@ const manifestScript = fileURLToPath(new URL("../scripts/generate-update-manifes
 
 const artifacts = [
   ["Codey-1.2.3-macos-arm64-unsigned.zip", "macos-arm64"],
-  ["Codey-1.2.3-macos-x64-unsigned.zip", "macos-x64"],
   ["Codey-1.2.3-windows-x64-setup.exe", "windows-setup"],
 ];
 
-for (const selectedArtifacts of [artifacts, [artifacts[2]]]) {
+for (const selectedArtifacts of [artifacts, [artifacts[1]]]) {
 test(`generates a public update manifest with ${selectedArtifacts.length} checksummed platform assets`, async () => {
   const directory = await mkdtemp(join(tmpdir(), "codey-update-manifest-"));
   const paths = [];
@@ -115,7 +114,6 @@ test("rejects duplicate release asset basenames", async () => {
       join(directory, "first", duplicateName),
       join(directory, "second", duplicateName),
       join(directory, artifacts[1][0]),
-      join(directory, artifacts[2][0]),
     ],
     { cwd: root, encoding: "utf8" },
   );

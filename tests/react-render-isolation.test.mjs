@@ -14,6 +14,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
     confirmation,
     sections,
     modelSelection,
+    draftConfig,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
@@ -27,6 +28,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
       ].map((file) => readFile(new URL(`src/${file}`, root), "utf8")),
     ).then((sources) => sources.join("\n")),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
+    readFile(new URL("src/useDraftConfig.ts", root), "utf8"),
   ]);
 
   assert.doesNotMatch(app, /useState<Notice>/);
@@ -100,12 +102,13 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /仅展示 Codex 当前线路，可同步模型/);
   assert.match(sections, /if \(routeConfigReadOnly\) return nativeProfile \? \[nativeProfile\] : \[\]/);
   assert.match(sections, /disabled=\{!canSyncCurrentProvider \|\| isBusy\}/);
-  assert.match(app, /const canSyncCurrentProvider = !dirty \|\| pendingNativeRouterToggle/);
+  assert.match(draftConfig, /canSyncCurrentProvider: !dirty \|\| pendingNativeRouterToggle/);
   assert.match(app, /canSyncCurrentProvider=\{canSyncCurrentProvider\}/);
   assert.match(app, /if \(shouldPersistNativeToggle\) \{\s*await persist\(config\)/);
-  assert.match(app, /if \(nativeMode\) \{\s*openModelPicker\(/);
+  assert.match(app, /if \(nativeMode\) \{\s*completeModelPickerLoad\(/);
   assert.match(app, /result\.providerStatus\.provider\.official \? null : result\.providerStatus\.provider\.id/);
-  assert.match(app, /if \(nativeMode \|\| route\.authMode === "officialAccount"\) \{\s*await syncCurrentProvider\(\);\s*return/);
+  assert.match(app, /if \(nativeMode\) \{\s*await syncCurrentProvider\(\);\s*return/);
+  assert.match(app, /savedRoute\.authMode === "officialAccount"\s*\?\s*result\.routeModelState/);
   assert.match(
     sections,
     /disabled=\{\s*routeConfigReadOnly \|\|\s*(?:isOfficial \|\|\s*)?isBusy \|\|\s*dirty \|\|\s*config\.profiles\.length <= 1\s*\}/,

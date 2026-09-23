@@ -14,7 +14,7 @@ import {
 } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { rememberOfficialAccounts } from "./officialAccountsRequests";
-import { reconcileConfigDraft } from "./configDraft";
+import { useDraftConfig } from "./useDraftConfig";
 import { ModelPickerDialog } from "./AppDialogs";
 import { SystemSettingsDialog } from "./SystemSettingsDialog";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
@@ -72,6 +72,8 @@ const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   userConfigured: false,
   detectionFailed: true,
 };
+const CONFIG_LOAD_TIMEOUT_MS = 30_000;
+const PLUGIN_MARKETPLACE_STATUS_TIMEOUT_MS = 15_000;
 
 function localDateCacheKey(date: Date) {
   return [
@@ -107,22 +109,6 @@ function thirdPartyRouteModelState(
   };
 }
 
-function onlyLocalRouterToggleChanged(current: Config, persisted: Config) {
-  if (current.localRouterEnabled === persisted.localRouterEnabled) return false;
-  const currentKeys = Object.keys(current) as Array<keyof Config>;
-  if (currentKeys.length === Object.keys(persisted).length
-    && currentKeys.every((key) => (
-      key === "localRouterEnabled" || key === "settingsRevision" || Object.is(current[key], persisted[key])
-    ))) {
-    return true;
-  }
-  return JSON.stringify({
-    ...current,
-    localRouterEnabled: persisted.localRouterEnabled,
-    settingsRevision: 0,
-  }) === JSON.stringify({ ...persisted, settingsRevision: 0 });
-}
-
 export function App({
   embedded = false,
   modalContainer,
@@ -132,8 +118,19 @@ export function App({
 }: AppProps) {
   const feedbackGroupQrUrl =
     `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
-  const [config, setConfig] = useState<Config | null>(null);
-  const persistedConfigRef = useRef<Config | null>(null);
+  const {
+    config,
+    setConfig,
+    dirty,
+    setDirty,
+    persistedConfigRef,
+    setPersistedConfig,
+    canSyncCurrentProvider,
+    editConfig,
+    isOnlyNativeRouterToggle,
+    adoptRouteConfig,
+    discardDraft,
+  } = useDraftConfig();
   const { status, setStatus, markRestartInProgress, refreshStatus, refreshStatusForLoad,
     restartStatusError, setRestartStatusError } =
     useRuntimeStatus({
@@ -147,8 +144,8 @@ export function App({
   );
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
-  const [dirty, setDirty] = useState(false);
   const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
+  const loadGenerationRef = useRef(0);
   const settingsScroll = useRef<HTMLDivElement>(null);
   const usageReturn = useRef<{ trigger: HTMLElement; scrollTop: number } | null>(null);
   const handleOpenUsageAnalysis = useCallback((trigger: HTMLElement) => {
@@ -195,19 +192,6 @@ export function App({
     });
   }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
   const configLoaded = config !== null;
-  const pendingNativeRouterToggle = useMemo(() => Boolean(
-    config &&
-      persistedConfigRef.current &&
-      !config.localRouterEnabled &&
-      onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
-  ), [config]);
-  const canSyncCurrentProvider = !dirty || pendingNativeRouterToggle;
-  const setPersistedConfig = useCallback((next: Config) => {
-    persistedConfigRef.current = next;
-    setConfig(next);
-  }, []);
-  const draftConfigRef = useRef(config);
-  draftConfigRef.current = config;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
       current ? { ...current, subagentOptimization: enabled } : current,
@@ -266,9 +250,13 @@ export function App({
     subagentModelOptions,
     modelState,
     modelEditorState,
+    officialOnly,
     setModelState,
     modelPickerVisible,
+    modelPickerLoading,
     setModelPickerVisible,
+    beginModelPickerLoad,
+    completeModelPickerLoad,
     customModelInput,
     modelInputError,
     modelSyncWarning,
@@ -283,7 +271,6 @@ export function App({
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,
     thirdPartyModelOptions,
-    openModelPicker,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
@@ -321,10 +308,20 @@ export function App({
 
   useEffect(() => {
     void load();
+    return () => {
+      loadGenerationRef.current += 1;
+    };
   }, []);
 
   async function load() {
+    const generation = ++loadGenerationRef.current;
+    const current = () => generation === loadGenerationRef.current;
     setLoadFailed(false);
+    const timer = window.setTimeout(() => {
+      if (!current()) return;
+      setLoadFailed(true);
+      setNotice({ tone: "error", text: "加载配置超时，请重新检查" });
+    }, CONFIG_LOAD_TIMEOUT_MS);
     try {
       const result = await invoke<{
         config: Config;
@@ -334,12 +331,15 @@ export function App({
         providerStatus?: ProviderStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
+      window.clearTimeout(timer);
+      if (!current()) return;
+      setLoadFailed(false);
       setPersistedConfig(result.config);
       setProviderStatus(result.providerStatus ?? null);
       if (!result.providerStatus) throw new Error("未能读取当前服务配置，请重新检查");
       if (typeof result.officialAccountAvailable === "boolean") {
-        setStatus((current) => ({
-          ...current,
+        setStatus((currentStatus) => ({
+          ...currentStatus,
           officialAccountAvailable: result.officialAccountAvailable,
         }));
       }
@@ -349,8 +349,9 @@ export function App({
       if (result.modelState) setModelState(result.modelState);
       const [next] = await Promise.all([
         refreshStatusForLoad(),
-        refreshPluginMarketplaceStatus(),
+        refreshPluginMarketplaceStatus(current),
       ]);
+      if (!current()) return;
       const startupError = next.startupError || result.startupError;
       if (startupError) {
         setNotice({ tone: "error", text: `自动启动失败：${startupError}` });
@@ -365,16 +366,21 @@ export function App({
         });
       }
     } catch (error) {
+      window.clearTimeout(timer);
+      if (!current()) return;
       setLoadFailed(true);
       setNotice({ tone: "error", text: errorText(error) });
     }
   }
 
-  async function refreshPluginMarketplaceStatus() {
+  async function refreshPluginMarketplaceStatus(isCurrent: () => boolean = () => true) {
     try {
-      const next = await invoke<PluginMarketplaceStatus>(
-        "plugin_marketplace_status",
+      const next = await withTimeout(
+        invoke<PluginMarketplaceStatus>("plugin_marketplace_status"),
+        PLUGIN_MARKETPLACE_STATUS_TIMEOUT_MS,
+        "插件市场状态查询超时",
       );
+      if (!isCurrent()) return next;
       setPluginMarketplaceStatus(next);
       return next;
     } catch (error) {
@@ -383,14 +389,10 @@ export function App({
         needsRepair: true,
         message: errorText(error),
       };
+      if (!isCurrent()) return next;
       setPluginMarketplaceStatus(next);
       return next;
     }
-  }
-
-  function editConfig(next: Config) {
-    setConfig(next);
-    setDirty(true);
   }
 
   function changeAutomaticUpdateChecks(enabled: boolean) {
@@ -528,46 +530,59 @@ export function App({
     if (!config || isBusy) return;
     const nativeMode = config?.localRouterEnabled === false;
     const shouldPersistNativeToggle = Boolean(
-      nativeMode &&
-        dirty &&
-        persistedConfigRef.current &&
-        onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
+      nativeMode && dirty && isOnlyNativeRouterToggle(config),
     );
     if (dirty && !shouldPersistNativeToggle) return;
     await runOperation("sync-provider", async () => {
       if (shouldPersistNativeToggle) {
         await persist(config);
       }
-      const result = await invoke<{
-        config: Config;
-        providerStatus: ProviderStatus;
-        modelState: ModelState;
-        restartRequired?: boolean;
-      }>("sync_current_provider");
-      setPersistedConfig(result.config);
-      setProviderStatus(result.providerStatus);
-      setModelState(result.modelState);
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired ?? current.restartRequired,
-      }));
-      if (nativeMode) {
-        openModelPicker(
-          result.providerStatus.provider.official
-            ? result.modelState
-            : { ...result.modelState, officialModels: [] },
-          "",
-          result.providerStatus.provider.official ? null : result.providerStatus.provider.id,
-        );
+      const session = nativeMode
+        ? beginModelPickerLoad(provider?.official ? null : provider?.id ?? null, false)
+        : 0;
+      try {
+        const result = await invoke<{
+          config: Config;
+          providerStatus: ProviderStatus;
+          modelState: ModelState;
+          restartRequired?: boolean;
+        }>("sync_current_provider");
+        setPersistedConfig(result.config);
+        setProviderStatus(result.providerStatus);
+        setModelState(result.modelState);
+        setStatus((current) => ({
+          ...current,
+          restartRequired: result.restartRequired ?? current.restartRequired,
+        }));
+        if (nativeMode) {
+          completeModelPickerLoad(
+            session,
+            result.providerStatus.provider.official
+              ? result.modelState
+              : { ...result.modelState, officialModels: [] },
+            "",
+            result.providerStatus.provider.official ? null : result.providerStatus.provider.id,
+          );
+        }
+        setNotice({
+          tone: result.restartRequired ? "info" : "success",
+          text: nativeMode
+            ? `已同步当前线路「${result.providerStatus.provider.name}」，请勾选要启用的模型`
+            : result.restartRequired
+              ? "已重新读取 Codex 配置，重启后应用当前线路"
+              : "已重新读取 Codex 配置",
+        });
+      } catch (error) {
+        if (nativeMode) {
+          completeModelPickerLoad(
+            session,
+            provider?.official ? modelState : { ...modelState, officialModels: [] },
+            `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`,
+            provider?.official ? null : provider?.id ?? null,
+          );
+        }
+        throw error;
       }
-      setNotice({
-        tone: result.restartRequired ? "info" : "success",
-        text: nativeMode
-          ? `已同步当前线路「${result.providerStatus.provider.name}」，请勾选要启用的模型`
-          : result.restartRequired
-            ? "已重新读取 Codex 配置，重启后应用当前线路"
-            : "已重新读取 Codex 配置",
-      });
     });
   }
 
@@ -577,11 +592,8 @@ export function App({
     modelState?: ModelState;
     restartRequired?: boolean;
   }) {
-    const merged = reconcileConfigDraft(persistedConfigRef.current, draftConfigRef.current, result.config);
+    const merged = adoptRouteConfig(result.config);
     if (!merged) return;
-    persistedConfigRef.current = result.config;
-    draftConfigRef.current = merged.config;
-    setConfig(merged.config);
     if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
@@ -733,7 +745,7 @@ export function App({
   async function fetchRouteModels(route: Profile) {
     if (!config) return;
     const nativeMode = !config.localRouterEnabled;
-    if (nativeMode || route.authMode === "officialAccount") {
+    if (nativeMode) {
       await syncCurrentProvider();
       return;
     }
@@ -741,6 +753,10 @@ export function App({
       const savedConfig = config;
       const savedRoute = savedConfig.profiles.find((profile) => profile.id === route.id);
       if (!savedRoute) throw new Error("找不到要同步模型的线路");
+      const session = beginModelPickerLoad(
+        savedRoute.id,
+        savedRoute.supportsAutoReview === true,
+      );
       try {
         const result = await invoke<{
           config: Config;
@@ -755,17 +771,25 @@ export function App({
           expectedRevision: savedConfig.settingsRevision,
         });
         applyRouteResult(result);
-        openModelPicker(
-          { ...result.routeModelState, officialModels: [] },
+        completeModelPickerLoad(
+          session,
+          savedRoute.authMode === "officialAccount"
+            ? result.routeModelState
+            : { ...result.routeModelState, officialModels: [] },
           "",
           savedRoute.id,
           result.config.profiles.find((profile) => profile.id === savedRoute.id)
             ?.supportsAutoReview === true,
         );
       } catch (error) {
-        const warning = `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
-        openModelPicker(
-          thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
+        const warning = savedRoute.authMode === "officialAccount"
+          ? `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`
+          : `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
+        completeModelPickerLoad(
+          session,
+          savedRoute.authMode === "officialAccount"
+            ? modelState
+            : thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
           warning,
           savedRoute.id,
           savedRoute.supportsAutoReview === true,
@@ -789,6 +813,7 @@ export function App({
       accountId: string;
       routeName: string;
       routeShortName: string;
+      baseUrl: string;
     },
   ) {
     if (!config) return false;
@@ -814,12 +839,13 @@ export function App({
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
-        // 线路名、短名称和代理写入同一账号记录，避免再打一次派生/热更新。
+        // 线路名、短名称、网关和代理写入同一账号记录，避免再打一次派生/热更新。
         ...(routeSettings
           ? {
               accountId: routeSettings.accountId,
               routeName: routeSettings.routeName,
               routeShortName: routeSettings.routeShortName,
+              baseUrl: routeSettings.baseUrl,
             }
           : {}),
       });
@@ -922,10 +948,7 @@ export function App({
 
   function closeSettings() {
     if (isBusy) return;
-    if (persistedConfigRef.current) {
-      setConfig(persistedConfigRef.current);
-    }
-    setDirty(false);
+    discardDraft();
     setModelPickerVisible(false);
     setUsageAnalysisOpen(false);
     usageReturn.current = null;
@@ -1571,12 +1594,14 @@ export function App({
       <ModelPickerDialog
         open={modelPickerVisible}
         routeConfigReadOnly={config?.localRouterEnabled === false}
+        officialOnly={officialOnly}
         isBusy={isBusy}
         busy={busy}
         container={popupContainer}
         customModelInput={customModelInput}
         modelInputError={modelInputError}
         modelSyncWarning={modelSyncWarning}
+        loading={modelPickerLoading}
         autoReviewSupported={draftAutoReviewSupported}
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelEditorState}

@@ -38,7 +38,6 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config};
 use uuid::Uuid;
 
-use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::{
     CodeyConfig, ProviderProfile, RouteRequestLogBackend, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
     UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS, UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
@@ -64,9 +63,9 @@ pub(crate) const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = crate::route_request_log::MAX_LOG_ERROR_BYTES;
-const MAX_UPSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-const RETAINED_RESPONSE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RETAINED_RESPONSE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CACHED_RESPONSE_IDS: usize = 1024;
 const DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPSTREAM_SSE_SNIFF_BYTES: usize = 1024;
@@ -87,7 +86,14 @@ const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// 流式网关常把响应头留到首个 token。60 秒只覆盖正文离开本机发送缓冲之后的
+// 首字等待。同对话切换模型会重放整段历史，HTTP/2 窗口和内核发送缓冲可以在
+// 网关收齐之前就把正文取走；若从取走起只等 60 秒，会在网关侧首字（高思考大约
+// 三十秒）之前用完。本地记成 504 后 Codex 收不到终态，界面就停在思考。
+// 仍在缓冲中的传输由 response_header_timeout 按正文大小加到这个期限上。
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+// 正文被协议栈取走后，按这个上行速率估算它还要多久才到达网关。
+const BUFFERED_UPLOAD_BYTES_PER_SEC: u64 = 64 * 1024;
 // A non-streaming upstream may not send response headers until generation is
 // complete, so its header wait is also the model's total generation budget.
 const UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -166,6 +172,7 @@ mod sse;
 mod sse_anthropic;
 mod sse_chat;
 mod sse_responses;
+mod subagent_turn_state;
 mod upstream;
 mod upstream_response;
 mod websocket;
@@ -191,6 +198,7 @@ pub(crate) use sse::*;
 pub(crate) use sse_anthropic::*;
 pub(crate) use sse_chat::*;
 pub(crate) use sse_responses::*;
+pub(crate) use subagent_turn_state::*;
 pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;

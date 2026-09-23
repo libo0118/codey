@@ -4,6 +4,15 @@ use crate::codey_plugins::lifecycle::{
     LifecycleDecision, LifecycleError, LifecycleOutcome, LifecycleRequest, LifecycleResponse,
     LifecycleStage, has_plugins,
 };
+use http_body::{Body as HttpBody, Frame};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// hyper 1.11 HTTP/1 的默认写缓冲上限（`DEFAULT_MAX_BUFFER_SIZE`）。
+/// 缓冲还放得下时，连接会先把正文取完并丢掉，再去刷套接字；响应头期限因此
+/// 会把仍堵在用户态缓冲里的历史上传算进去。最后一块必须至少这么大，连接
+/// 才会先写完它，再结束正文。
+const HYPER_H1_WRITE_BUFFER_BYTES: usize = 8192 + 4096 * 100;
 
 pub(super) fn apply_codey_plugin_header_patches(
     headers: &mut HeaderMap,
@@ -117,6 +126,125 @@ fn official_account_email(route: &RouteTarget) -> Option<&str> {
     route.official_auth.as_ref()?.email.as_deref()
 }
 
+struct SignaledRequestBody {
+    bytes: Bytes,
+    cursor: usize,
+    /// 结束帧交出之后才为真。最后一块数据交出时不能提前变成结束，否则连接
+    /// 不会先把写缓冲刷进套接字，响应头期限会把还在缓冲里的历史上传算进去。
+    ended: bool,
+    uploaded: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl SignaledRequestBody {
+    /// 下一块的结束位置。剩余部分比写缓冲更小时并入当前块，避免最后一块
+    /// 还能留在缓冲里，连接却已经认为正文结束。
+    fn next_chunk_end(&self) -> usize {
+        let remaining = self.bytes.len() - self.cursor;
+        if remaining <= HYPER_H1_WRITE_BUFFER_BYTES {
+            return self.bytes.len();
+        }
+        let end = self.cursor + HYPER_H1_WRITE_BUFFER_BYTES;
+        let tail = self.bytes.len() - end;
+        if tail < HYPER_H1_WRITE_BUFFER_BYTES {
+            self.bytes.len()
+        } else {
+            end
+        }
+    }
+}
+
+impl HttpBody for SignaledRequestBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        if body.cursor >= body.bytes.len() {
+            // 大请求的最后一块已经占满写缓冲。is_end_stream 在此之前仍为假，
+            // 连接会先把这块刷进套接字，再来取结束帧。这里才通知上传结束。
+            body.ended = true;
+            if let Some(uploaded) = body.uploaded.take() {
+                let _ = uploaded.send(());
+            }
+            return Poll::Ready(None);
+        }
+        let end = body.next_chunk_end();
+        let chunk = body.bytes.slice(body.cursor..end);
+        body.cursor = end;
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.bytes.len().saturating_sub(self.cursor) as u64)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended
+    }
+}
+
+/// 响应头等待。`after_upload` 只覆盖网关收齐正文之后的首字或生成时间；
+/// 切模型重放的历史可能还在 HTTP/2 或内核发送缓冲里，按正文大小补上这段传输。
+pub(crate) fn response_header_timeout(body_len: usize, after_upload: Duration) -> Duration {
+    let transit_secs = (body_len as u64) / BUFFERED_UPLOAD_BYTES_PER_SEC;
+    after_upload
+        .saturating_add(Duration::from_secs(transit_secs))
+        .min(UPSTREAM_RESPONSE_TIMEOUT)
+}
+
+fn signaled_request_body(bytes: Bytes) -> (reqwest::Body, tokio::sync::oneshot::Receiver<()>) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    if bytes.is_empty() {
+        let _ = sender.send(());
+        return (reqwest::Body::from(bytes), receiver);
+    }
+    (
+        reqwest::Body::wrap(SignaledRequestBody {
+            bytes,
+            cursor: 0,
+            ended: false,
+            uploaded: Some(sender),
+        }),
+        receiver,
+    )
+}
+
+/// 等待上游响应头。大请求体（切模型后的整段历史）先上传，上传完成后再应用
+/// 响应头期限；上传本身只受响应总期限约束，避免还在传正文时被记成 504。
+/// 协议栈取走正文不等于网关已经收齐，期限里包含这段缓冲传输。
+pub(super) async fn send_for_response_headers(
+    builder: reqwest::RequestBuilder,
+    body: Bytes,
+    header_timeout: Duration,
+) -> std::result::Result<
+    std::result::Result<reqwest::Response, reqwest::Error>,
+    tokio::time::error::Elapsed,
+> {
+    let header_timeout = response_header_timeout(body.len(), header_timeout);
+    let (body, mut uploaded) = signaled_request_body(body);
+    let send = builder.body(body).send();
+    tokio::pin!(send);
+    let upload_limit = tokio::time::sleep(UPSTREAM_RESPONSE_TIMEOUT);
+    tokio::pin!(upload_limit);
+    let uploaded_first = tokio::select! {
+        biased;
+        result = &mut send => return Ok(result),
+        _ = &mut uploaded => true,
+        _ = &mut upload_limit => false,
+    };
+    if !uploaded_first {
+        return Err(
+            tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .expect_err("zero timeout"),
+        );
+    }
+    tokio::time::timeout(header_timeout, send).await
+}
+
 /// 生命周期只允许在尚未向下游写出响应时重发。与 reasoning 回退共享两次发送预算。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
@@ -163,13 +291,10 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
         }
         let result = await_upstream(
             downstream,
-            tokio::time::timeout(
+            send_for_response_headers(
+                client.post(url).headers(headers.clone()),
+                body.clone(),
                 timeout,
-                client
-                    .post(url)
-                    .headers(headers.clone())
-                    .body(body.clone())
-                    .send(),
             ),
         )
         .await?;
@@ -369,5 +494,85 @@ mod tests {
         assert_eq!(json!(official_account_email(&route)), Value::Null);
         route.official_auth = None;
         assert_eq!(json!(official_account_email(&route)), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn upload_signal_arrives_only_after_the_body_is_consumed() {
+        let payload = vec![7_u8; 40_000];
+        let (mut body, mut uploaded) = signaled_request_body(Bytes::from(payload.clone()));
+        assert_eq!(
+            HttpBody::size_hint(&body).exact(),
+            Some(payload.len() as u64)
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut seen = 0_usize;
+        loop {
+            match Pin::new(&mut body).poll_frame(&mut context) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    seen += frame.into_data().unwrap().len();
+                    assert!(
+                        uploaded.try_recv().is_err(),
+                        "upload signal must wait until every chunk is taken"
+                    );
+                }
+                Poll::Ready(Some(Err(error))) => panic!("{error}"),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("in-memory body should be ready"),
+            }
+        }
+        assert_eq!(seen, payload.len());
+        uploaded.try_recv().unwrap();
+
+        let (_empty, mut empty_uploaded) = signaled_request_body(Bytes::new());
+        empty_uploaded.try_recv().unwrap();
+
+        // 大于写缓冲的正文要拆成至少一块满缓冲的帧，最后一块也不得小于缓冲，
+        // 否则连接会在尾部尚未写出时结束正文。
+        let large = vec![9_u8; HYPER_H1_WRITE_BUFFER_BYTES * 2 + 10];
+        let (mut body, mut uploaded) = signaled_request_body(Bytes::from(large));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut context) else {
+            panic!("expected the first full-buffer chunk");
+        };
+        assert_eq!(
+            frame.into_data().unwrap().len(),
+            HYPER_H1_WRITE_BUFFER_BYTES
+        );
+        assert!(uploaded.try_recv().is_err());
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut context) else {
+            panic!("expected the trailing chunk to stay above the write buffer");
+        };
+        assert_eq!(
+            frame.into_data().unwrap().len(),
+            HYPER_H1_WRITE_BUFFER_BYTES + 10
+        );
+        assert!(!HttpBody::is_end_stream(&body));
+        assert!(uploaded.try_recv().is_err());
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut context),
+            Poll::Ready(None)
+        ));
+        assert!(HttpBody::is_end_stream(&body));
+        uploaded.try_recv().unwrap();
+    }
+
+    #[test]
+    fn replayed_history_keeps_a_first_token_budget_after_the_buffered_upload() {
+        let small = response_header_timeout(32 * 1024, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+        assert_eq!(small, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+
+        let replayed = 8 * 1024 * 1024;
+        let extended = response_header_timeout(replayed, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+        assert_eq!(
+            extended,
+            UPSTREAM_RESPONSE_HEADER_TIMEOUT
+                + Duration::from_secs((replayed as u64) / BUFFERED_UPLOAD_BYTES_PER_SEC)
+        );
+        assert!(extended < UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT);
+
+        let huge = response_header_timeout(usize::MAX, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+        assert_eq!(huge, UPSTREAM_RESPONSE_TIMEOUT);
     }
 }
