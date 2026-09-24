@@ -17,7 +17,7 @@ const HYPER_H1_WRITE_BUFFER_BYTES: usize = 8192 + 4096 * 100;
 pub(super) fn apply_codey_plugin_header_patches(
     headers: &mut HeaderMap,
     patches: Vec<crate::codey_plugins::HeaderPatch>,
-) {
+) -> Result<(), LifecycleError> {
     let parsed = patches
         .into_iter()
         .map(|patch| {
@@ -32,7 +32,15 @@ pub(super) fn apply_codey_plugin_header_patches(
             Some((name, value))
         })
         .collect::<Option<Vec<_>>>();
-    let Some(parsed) = parsed else { return };
+    // 任一补丁无法成为合法 HTTP 头时保持原请求不变。静默跳过会把其他插件
+    // 已经校验过的修改一起丢掉，调用方应终止这次生命周期。
+    let Some(parsed) = parsed else {
+        return Err(LifecycleError {
+            status: 502,
+            code: "plugin_invalid_headers".into(),
+            message: "插件请求生命周期处理失败".into(),
+        });
+    };
     for (name, value) in parsed {
         if let Some(value) = value {
             headers.insert(name, value);
@@ -40,6 +48,7 @@ pub(super) fn apply_codey_plugin_header_patches(
             headers.remove(name);
         }
     }
+    Ok(())
 }
 
 pub(super) fn lifecycle_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -219,6 +228,7 @@ pub(super) async fn send_for_response_headers(
     builder: reqwest::RequestBuilder,
     body: Bytes,
     header_timeout: Duration,
+    mut on_uploaded: impl FnMut() + Send,
 ) -> std::result::Result<
     std::result::Result<reqwest::Response, reqwest::Error>,
     tokio::time::error::Elapsed,
@@ -231,10 +241,16 @@ pub(super) async fn send_for_response_headers(
     tokio::pin!(upload_limit);
     let uploaded_first = tokio::select! {
         biased;
-        result = &mut send => return Ok(result),
+        result = &mut send => {
+            on_uploaded();
+            return Ok(result);
+        }
         _ = &mut uploaded => true,
         _ = &mut upload_limit => false,
     };
+    // 正文已经交给连接，或这次发送不会再继续占用它。先交回准入名额，
+    // 再等待响应头，避免高思考的首字等待挡住后续请求。
+    on_uploaded();
     if !uploaded_first {
         return Err(
             tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
@@ -247,13 +263,14 @@ pub(super) async fn send_for_response_headers(
 
 /// 生命周期只允许在尚未向下游写出响应时重发。与 reasoning 回退共享两次发送预算。
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
+pub(super) async fn send_lifecycle_http<D, F>(
     downstream: &mut D,
     lifecycle: &mut LifecycleRequest,
     client: &reqwest::Client,
     url: &str,
     headers: &mut HeaderMap,
     body: Bytes,
+    on_uploaded: &mut F,
     attempt: &mut u32,
     timeout: Duration,
 ) -> Result<
@@ -261,7 +278,12 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
         std::result::Result<reqwest::Response, reqwest::Error>,
         tokio::time::error::Elapsed,
     >,
-> {
+>
+where
+    D: ResponsesDownstream + ?Sized,
+    F: FnMut() + Send,
+{
+    let mut retained_body = Some(body);
     loop {
         let decision = await_upstream(
             downstream,
@@ -275,7 +297,7 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
         .await??;
         match decision {
             LifecycleDecision::Continue(patches) => {
-                apply_codey_plugin_header_patches(headers, patches)
+                apply_codey_plugin_header_patches(headers, patches)?
             }
             LifecycleDecision::Retry(_) => {
                 return Err(LifecycleError {
@@ -289,12 +311,25 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
         if let Some(probe) = downstream.request_log_probe() {
             probe.set_upstream_request_headers(&format_upstream_headers(headers));
         }
+        let payload = retained_body
+            .as_ref()
+            .expect("plugin retry keeps the uploaded body")
+            .clone();
+        // 以这条请求启动时的插件快照为准。上传过程中全局插件被关掉时，
+        // 快照仍可能在响应头之后要求重发，正文必须还在。
+        let keep_uploaded_body = lifecycle.is_active();
         let result = await_upstream(
             downstream,
             send_for_response_headers(
                 client.post(url).headers(headers.clone()),
-                body.clone(),
+                payload,
                 timeout,
+                &mut || {
+                    if !keep_uploaded_body {
+                        retained_body.take();
+                    }
+                    on_uploaded();
+                },
             ),
         )
         .await?;
@@ -326,7 +361,7 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
                     .into());
                 }
                 drop(result);
-                apply_codey_plugin_header_patches(headers, patches);
+                apply_codey_plugin_header_patches(headers, patches)?;
                 *attempt += 1;
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.mark_fallback("plugin_request_retry");
@@ -574,5 +609,63 @@ mod tests {
 
         let huge = response_header_timeout(usize::MAX, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
         assert_eq!(huge, UPSTREAM_RESPONSE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn upload_releases_admission_before_response_headers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_read, body_read_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await.unwrap();
+            body_read.send(request.body.len()).unwrap();
+            release_rx.await.unwrap();
+            let body = b"ok";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        let budget = Arc::new(Semaphore::new(1));
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        let mut permit = Some(permit);
+        let client = reqwest::Client::new();
+        let send = send_for_response_headers(
+            client.post(format!("http://{address}/")),
+            Bytes::from_static(b"{\"input\":\"hello\"}"),
+            Duration::from_secs(5),
+            || retain_compact_request_budget(&mut permit, 0),
+        );
+        tokio::pin!(send);
+        let uploaded = tokio::time::timeout(Duration::from_secs(2), async {
+            body_read_rx.await.unwrap();
+            loop {
+                if budget.available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            result = &mut send => panic!("headers arrived before the body was released: {result:?}"),
+            result = uploaded => result.expect("admission should be free while headers are still pending"),
+        }
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("response headers")
+            .expect("transport")
+            .expect("upstream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
     }
 }

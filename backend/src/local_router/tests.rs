@@ -23,6 +23,66 @@ fn request_log_catalog_exposes_login_status_independently_of_profiles() {
 }
 
 #[test]
+fn image_request_uses_the_model_route_instead_of_a_conversation_binding() {
+    let mut chat = ProviderProfile::new("Chat");
+    chat.id = "chat".into();
+    chat.base_url = "https://chat.example/v1".into();
+    chat.api_key = "sk-chat".into();
+    chat.normalize();
+    let mut images = ProviderProfile::new("Images");
+    images.id = "images".into();
+    images.base_url = "https://images.example/v1".into();
+    images.api_key = "sk-images".into();
+    images.normalize();
+    let chat_id = chat.provider_id().to_string();
+    let images_id = images.provider_id().to_string();
+    let mut config = CodeyConfig {
+        profiles: vec![chat, images],
+        default_model: model_alias(&chat_id, "provider-model"),
+        ..CodeyConfig::default()
+    };
+    config
+        .selected_models_by_provider
+        .insert(chat_id.clone(), vec!["provider-model".into()]);
+    config
+        .selected_models_by_provider
+        .insert(images_id.clone(), vec!["gpt-image-2".into()]);
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .unwrap()
+            .provider_id,
+        images_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("unknown-image", None)
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", Some(&chat_id))
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    config
+        .selected_models_by_provider
+        .get_mut(&chat_id)
+        .unwrap()
+        .push("gpt-image-2".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .is_err()
+    );
+}
+
+#[test]
 fn disabled_route_has_no_request_target() {
     let mut route = ProviderProfile::new("Disabled");
     route.id = "disabled".into();
@@ -594,8 +654,7 @@ async fn upstream_websocket_connection_disables_nagle() {
         None,
     )
     .await
-    .unwrap()
-    .socket;
+    .unwrap();
     let MaybeTlsStream::Plain(stream) = socket.get_ref() else {
         panic!("loopback WebSocket must use a plain TCP stream");
     };
@@ -2413,6 +2472,168 @@ async fn chat_route_retries_reasoning_content_missing_with_a_placeholder() {
         "(thinking unavailable)"
     );
     assert_eq!(attempts[1]["messages"][0]["content"], "先看文件");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_route_retries_reasoning_content_missing_with_the_saved_summary() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body);
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "the reasoning content from the previous turn must be passed back in thinking mode",
+                                "type": "invalid_request_error",
+                                "code": "reasoning_content_missing",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id": "chatcmpl-summary",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第二轮"}]}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert!(
+        attempts[0]["messages"][2]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(attempts[1]["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(attempts[1]["messages"][0]["content"], "已完成");
+    assert_eq!(
+        attempts[1]["messages"][2]["reasoning_content"],
+        "(thinking unavailable)"
+    );
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn deepseek_chat_route_sends_the_reasoning_summary_on_the_first_attempt() {
+    let proxy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({
+                "id": "chatcmpl-deepseek",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        (request.path, body)
+    });
+    let (mut config, provider_id, model) = router_config("http://api.deepseek.com/v1".into());
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].upstream_proxy = format!("http://{proxy_address}");
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let (path, body) = proxy_task.await.unwrap();
+    assert_eq!(path, "http://api.deepseek.com/v1/chat/completions");
+    assert_eq!(body["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(body["messages"][0]["content"], "已完成");
+    assert!(body["messages"][1].get("reasoning_content").is_none());
     router.stop().await.unwrap();
 }
 
@@ -8687,16 +8908,16 @@ async fn model_switch_from_chat_to_native_expands_synthetic_history_in_order() {
     let sent = upstream_task.await.unwrap();
     assert!(sent.get("previous_response_id").is_none());
     assert_eq!(sent["input"][0], "original task");
-    assert_eq!(sent["input"][1]["role"], "assistant");
-    assert_eq!(sent["input"][1]["content"][0]["text"], "remembered answer");
-    assert_eq!(sent["input"][2], "continue");
-    assert!(
-        sent["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| { item.get("type").and_then(Value::as_str) != Some("reasoning") })
+    assert_eq!(sent["input"][1]["type"], "reasoning");
+    assert!(sent["input"][1].get("encrypted_content").is_none());
+    assert_eq!(sent["input"][1]["content"], json!([]));
+    assert_eq!(
+        sent["input"][1]["summary"][0]["text"],
+        "private bridge reasoning"
     );
+    assert_eq!(sent["input"][2]["role"], "assistant");
+    assert_eq!(sent["input"][2]["content"][0]["text"], "remembered answer");
+    assert_eq!(sent["input"][3], "continue");
     socket.close(None).await.unwrap();
     router.stop().await.unwrap();
 }

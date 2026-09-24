@@ -183,7 +183,6 @@ impl LocalRouter {
                 crate::account_usage::OfficialAuthCaches::default(),
             )),
             request_log: Arc::clone(&request_log),
-            subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
         };
         let server = Arc::new(server);
         let task = tokio::spawn(async move {
@@ -478,7 +477,6 @@ pub(crate) struct RouterServer {
         Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     pub(crate) official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCaches>>,
     pub(crate) request_log: Arc<RouteRequestLogController>,
-    pub(crate) subagent_turn_states: Arc<Mutex<SubagentTurnStateCache>>,
 }
 
 const MAX_PROXIED_CLIENTS: usize = 8;
@@ -751,6 +749,39 @@ impl RouterSnapshot {
             route_hint,
             bound_route,
         })
+    }
+
+    /// 图片请求不沿用对话线程绑定。显式线路提示优先；模型能唯一确定线路时用该线路；
+    /// 模型未登记时才退到默认模型所在线路。同名模型归属不明时仍然拒绝。
+    pub(crate) fn route_for_image_request(
+        &self,
+        model: &str,
+        route_hint: Option<&str>,
+    ) -> Result<Arc<RouteTarget>> {
+        if let Some(route_hint) = route_hint.map(str::trim).filter(|hint| !hint.is_empty())
+            && let Some(route) = self.routes.get(route_hint)
+        {
+            return Ok(Arc::clone(route));
+        }
+        let model = model.trim();
+        if !model.is_empty() {
+            if let Some(alias) = self.aliases.get(&model_id::key(model)) {
+                return self
+                    .target_for_route_model(&alias.provider_id, &alias.model, model)
+                    .map(|selection| selection.route);
+            }
+            if let Some(candidates) = self.raw_models.get(&model_id::key(model)) {
+                if candidates.len() > 1 {
+                    anyhow::bail!("模型 {model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
+                }
+                if let Some(candidate) = candidates.first() {
+                    return self
+                        .target_for_route_model(&candidate.provider_id, &candidate.model, model)
+                        .map(|selection| selection.route);
+                }
+            }
+        }
+        self.target_for_auxiliary_request(None, None)
     }
 
     pub(crate) fn target_for_auxiliary_request(

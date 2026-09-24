@@ -107,18 +107,15 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        let request = match tokio::time::timeout(
-            REQUEST_READ_TIMEOUT,
-            read_http_request_body_with_budget(
-                &mut stream,
-                pending,
-                Some(&self.request_body_budget),
-            ),
+        let admission = match acquire_request_body_budget_within(
+            &self.request_body_budget,
+            pending.content_length,
+            REQUEST_BODY_BUDGET_WAIT,
         )
         .await
         {
-            Ok(Ok(request)) => request,
-            Ok(Err(error))
+            Ok(permit) => permit,
+            Err(error)
                 if error
                     .downcast_ref::<RequestBodyBudgetUnavailable>()
                     .is_some() =>
@@ -132,6 +129,29 @@ impl RouterServer {
                 )
                 .await?;
                 return Ok(());
+            }
+            Err(error) if error.is::<RequestBodyTooLarge>() => {
+                write_error_response(
+                    &mut stream,
+                    413,
+                    "request_too_large",
+                    error.to_string(),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let request = match tokio::time::timeout(
+            REQUEST_READ_TIMEOUT,
+            read_http_request_body_with_budget(&mut stream, pending, None),
+        )
+        .await
+        {
+            Ok(Ok(mut request)) => {
+                request._body_budget_permit = admission;
+                request
             }
             Ok(Err(error)) => {
                 write_error_response(
@@ -495,15 +515,11 @@ impl RouterServer {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let binding_keys = request_binding_keys(&request);
-        let bound_route = self
-            .bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .route_for_keys(&binding_keys);
-        let route = match snapshot
-            .target_for_auxiliary_request(route_hint.as_deref(), bound_route.as_deref())
-        {
+        let image_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let route = match snapshot.route_for_image_request(image_model, route_hint.as_deref()) {
             Ok(route) => route,
             Err(error) => {
                 mark_error(404, "route_not_enabled");
@@ -645,6 +661,7 @@ impl RouterServer {
             upstream_client.post(&upstream_url).headers(headers),
             request_body,
             response_header_timeout,
+            || {},
         )
         .await
         {
@@ -913,7 +930,6 @@ impl RouterServer {
             Arc::clone(&self.request_body_budget),
             Arc::clone(&self.idle_downstreams),
         );
-        downstream.subagent_turn_states = Arc::clone(&self.subagent_turn_states);
         downstream.native_history = NativeResponsesHistory::with_cache(
             Arc::clone(&self.native_history_cache),
             &context.headers,
@@ -935,26 +951,31 @@ impl RouterServer {
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
-                    let body_budget_permit =
-                        match acquire_request_body_budget(&self.request_body_budget, text.len()) {
-                            Ok(permit) => permit,
-                            Err(error)
-                                if error
-                                    .downcast_ref::<RequestBodyBudgetUnavailable>()
-                                    .is_some() =>
-                            {
-                                downstream
-                                    .write_error(
-                                        503,
-                                        "router_memory_busy",
-                                        "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
-                                        None,
-                                    )
-                                    .await?;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
+                    let body_budget_permit = match acquire_request_body_budget_within(
+                        &self.request_body_budget,
+                        text.len(),
+                        REQUEST_BODY_BUDGET_WAIT,
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error)
+                            if error
+                                .downcast_ref::<RequestBodyBudgetUnavailable>()
+                                .is_some() =>
+                        {
+                            downstream
+                                .write_error(
+                                    503,
+                                    "router_memory_busy",
+                                    "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
+                                    None,
+                                )
+                                .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut body = match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(Value::Object(body)) => Value::Object(body),
                         Ok(_) => {
@@ -1650,6 +1671,22 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        let replay_reasoning_summary = should_replay_reasoning_text(
+            resolved.route.official_account,
+            bridge,
+            request_kind,
+            compacting,
+            upstream_url,
+        );
+        // Chat 转换只保留 reasoning_text，summary 会在转换时消失。DeepSeek
+        // 要在首次发送时带上摘要，所以先写回明文。这里不丢弃 encoded_body：
+        // 非原生线路只拿它判断是否把转换放到阻塞线程，正文以转换结果为准。
+        if bridge == ProtocolBridge::ResponsesToChatCompletions
+            && replay_reasoning_summary
+            && restore_reasoning_text_from_summary(&mut body)
+        {
+            body_mutated = true;
+        }
         let mut tool_bridge = ResponsesToolBridge::default();
         let offload_conversion = bridge != ProtocolBridge::NativeResponses
             && encoded_body
@@ -1685,11 +1722,13 @@ impl RouterServer {
             let converted = bridge.convert_responses_body(&body);
             (body, converted)
         };
+        let mut chat_reasoning_summaries = Vec::new();
         let mut upstream_body = match converted {
             Ok(converted) => {
                 if let Some(converted) = converted {
                     drop(body);
                     tool_bridge = converted.tool_bridge;
+                    chat_reasoning_summaries = converted.chat_reasoning_summaries;
                     converted.body
                 } else {
                     body
@@ -1717,6 +1756,21 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        // Codex Desktop 的工具 schema 会把 `$ref` 和 description/type 写在同一层。
+        // Moonshot、Kimi 的 Chat Completions 拒绝这种写法，收进 allOf 后语义不变。
+        if bridge == ProtocolBridge::ResponsesToChatCompletions
+            && upstream_rejects_ref_sibling_keywords(upstream_url)
+            && wrap_chat_tool_ref_siblings(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        let anthropic_context_1m = bridge == ProtocolBridge::ResponsesToAnthropicMessages
+            && strip_anthropic_context_1m_model_field(&mut upstream_body);
+        if anthropic_context_1m {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let mut headers = match self
             .prepare_upstream_request_headers(&request, &resolved.route)
             .await
@@ -1732,6 +1786,13 @@ impl RouterServer {
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
         align_routing_hint_model(&mut headers, &resolved.upstream_model);
+        if anthropic_context_1m {
+            if let Some(model) = upstream_body.get("model").and_then(Value::as_str) {
+                let model = model.to_string();
+                align_routing_hint_model(&mut headers, &model);
+            }
+            ensure_anthropic_context_1m_beta(&mut headers);
+        }
         // Commit the new binding only after the request's route compatibility,
         // payload conversion, and credentials have passed local checks. A
         // rejected switch must leave the prior route available for a retry.
@@ -1768,11 +1829,6 @@ impl RouterServer {
                 &resolved.upstream_model,
             );
         }
-        // 子代理入站不带轮次票据，上游会把每次调用当成新轮次。只补这条父线程
-        // 最近一次成功响应的票据。主会话请求保持客户端原样。
-        if subagent_request && resolved.route.official_account {
-            reuse_subagent_turn_state(&self.subagent_turn_states, &mut headers);
-        }
         let mut lifecycle = request_lifecycle(
             &headers,
             &resolved,
@@ -1786,6 +1842,15 @@ impl RouterServer {
             status: None,
             error: None,
         };
+        // 重试只留下还没写进首次请求的摘要。没有摘要时不保留这份列表。
+        let chat_reasoning_summaries = (matches!(
+            bridge,
+            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
+        ) && request_kind == ResponsesRequestKind::Create
+            && !compacting
+            && !resolved.route.official_account
+            && chat_reasoning_summaries.iter().any(Option::is_some))
+        .then_some(chat_reasoning_summaries);
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -1798,7 +1863,12 @@ impl RouterServer {
         {
             // Lifecycle plugins need response headers, so they skip this
             // attempt. Continuation history is staged on the HTTP fallback.
-            if !compacting && !lifecycle.is_active() {
+            // Grok 回包要改工具名和整数参数，不能走原样透传的上游 WebSocket。
+            // 历史仍由下面的 HTTP 回退展开。
+            if !compacting
+                && !lifecycle.is_active()
+                && !native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
+            {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
                 let websocket_attempt = downstream
@@ -1869,6 +1939,44 @@ impl RouterServer {
                 encoded_body = None;
             }
         }
+        // 原生请求可能刚被 WebSocket 回退展开，摘要要在这份最终正文上还原。
+        // Chat 已在转换前还原；转换后的 messages 里没有 summary，再扫一次没有结果。
+        if bridge == ProtocolBridge::NativeResponses
+            && replay_reasoning_summary
+            && restore_reasoning_text_from_summary(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+            && !resolved.route.official_account
+            && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
+        {
+            match prepare_xai_native_request(&mut upstream_body) {
+                Ok(prepared) => {
+                    if prepared.request_changed {
+                        body_mutated = true;
+                        encoded_body = None;
+                    }
+                    Some(prepared.response)
+                }
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            400,
+                            "unsupported_responses_payload",
+                            format!(
+                                "线路「{}」发往 Grok 前无法整理请求：{error:#}",
+                                route_display_name(&resolved.route)
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -1891,9 +1999,10 @@ impl RouterServer {
             }
         };
         // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
-        // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
-        // reasoning 明文缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
-        // 不参与该回退。
+        // 回放历史时只保留加密字段。DeepSeek 官方地址在首次发送前还原已有摘要。
+        // 其它线路仍先按原样发送，只有上游明确报出明文缺失时才回填：有摘要用摘要，
+        // 没有摘要才补占位。Chat 重试使用转换时留下的摘要文本，不保留第二份正文。
+        // 官方线路沿用加密推理语义，不参与该回退。
         let reasoning_text_retry_allowed = matches!(
             bridge,
             ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
@@ -1944,8 +2053,18 @@ impl RouterServer {
             drop(encoded_body.take());
             serde_json::to_vec(&upstream_body).context("序列化转换后的上游请求失败")?.into()
         };
-        // 重发需要完整请求体，只有可能重发时才继续持有它。
-        let mut retryable_body = reasoning_text_retry_allowed.then_some(upstream_body);
+        // 重发只保留紧凑的编码副本。解析出的 JSON 树在发出前丢掉，
+        // 预算从 4 倍工作集收回到这一份正文。
+        let retryable_encoded = reasoning_text_retry_allowed.then(|| encoded.clone());
+        drop(upstream_body);
+        drop(std::mem::take(&mut request.body));
+        let mut admission = request._body_budget_permit.take();
+        retain_compact_request_budget(&mut admission, encoded.len());
+        let retained_after_upload = if retryable_encoded.is_some() || lifecycle.is_active() {
+            encoded.len()
+        } else {
+            0
+        };
         let response_header_timeout = if compacting {
             // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
             // 响应头，两者的等待期限不同，都只约束响应头。
@@ -1969,7 +2088,9 @@ impl RouterServer {
         let mut attempt = 0;
         let response_result = send_lifecycle_http(
             downstream, &mut lifecycle, &upstream_client, upstream_url,
-            &mut headers, encoded, &mut attempt, response_header_timeout,
+            &mut headers, encoded, &mut || {
+                retain_compact_request_budget(&mut admission, retained_after_upload);
+            }, &mut attempt, response_header_timeout,
         ).await?;
         let Some(response) = Self::finish_upstream_http_send(
             downstream,
@@ -2018,11 +2139,28 @@ impl RouterServer {
                 }
                 Ok(Err(error)) | Err(error) => return Err(error),
             };
-            if requires_reasoning_text_fallback(&body)
-                && let Some(retryable_body) = retryable_body.as_mut()
-                && fill_missing_reasoning_text(retryable_body)
-            {
-                let encoded = serde_json::to_vec(retryable_body)
+            let retryable_body = match retryable_encoded.as_deref() {
+                Some(encoded)
+                    if requires_reasoning_text_fallback(&body)
+                        && grow_request_body_budget(
+                            &mut admission,
+                            &self.request_body_budget,
+                            encoded.len(),
+                        )
+                        .is_ok() =>
+                {
+                    let mut retryable_body = serde_json::from_slice::<Value>(encoded)
+                        .context("解析 reasoning 回退请求失败")?;
+                    fill_missing_reasoning_text_with_chat_summaries(
+                        &mut retryable_body,
+                        chat_reasoning_summaries.as_deref().unwrap_or(&[]),
+                    )
+                    .then_some(retryable_body)
+                }
+                _ => None,
+            };
+            if let Some(retryable_body) = retryable_body {
+                let encoded = serde_json::to_vec(&retryable_body)
                     .context("序列化补齐 reasoning 明文的 Responses 请求失败")?;
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.mark_fallback("reasoning_text_placeholder_retry");
@@ -2032,14 +2170,21 @@ impl RouterServer {
                         UpstreamTransport::Http
                     });
                     probe.record_upstream_body(RequestBodySummary::from_responses_body(
-                        retryable_body,
+                        &retryable_body,
                         Some(encoded.len() as u64),
                     ));
                 }
+                let retry_retained = if lifecycle.is_active() {
+                    encoded.len()
+                } else {
+                    0
+                };
                 attempt += 1;
                 let retry_result = send_lifecycle_http(
                     downstream, &mut lifecycle, &upstream_client, upstream_url,
-                    &mut headers, encoded.into(), &mut attempt, response_header_timeout,
+                    &mut headers, encoded.into(), &mut || {
+                        retain_compact_request_budget(&mut admission, retry_retained);
+                    }, &mut attempt, response_header_timeout,
                 ).await?;
                 let Some(retried) = Self::finish_upstream_http_send(
                     downstream,
@@ -2067,26 +2212,12 @@ impl RouterServer {
                 preloaded_error_body = Some(body);
             }
         }
-        // 所有可能的重发结束后再释放请求内存预算，避免等待插件时失去记账。
-        drop(retryable_body);
-        if tool_bridge.upstream_to_response.is_empty()
-            && tool_bridge.response_to_upstream.is_empty()
-        {
-            drop(std::mem::take(&mut request.body));
-            drop(request._body_budget_permit.take());
-        }
+        // 重发已经结束。工具名映射不保留请求正文，响应内存在另一份预算里。
+        drop(retryable_encoded);
+        drop(admission);
+        drop(std::mem::take(&mut request.body));
         if let Some(probe) = downstream.request_log_probe() {
             probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
-        }
-        if resolved.route.official_account
-            && let Some(response) = upstream_response.as_ref()
-        {
-            observe_upstream_turn_state(
-                &self.subagent_turn_states,
-                &headers,
-                upstream_status,
-                response.headers(),
-            );
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {
@@ -2157,7 +2288,15 @@ impl RouterServer {
                 )
                 .await
             }
-            _ => downstream.proxy_response(response).await,
+            _ => {
+                if let Some(fix) = xai_response_fix {
+                    XAI_RESPONSE_FIX
+                        .scope(fix, downstream.proxy_response(response))
+                        .await
+                } else {
+                    downstream.proxy_response(response).await
+                }
+            }
         };
         if let Err(error) = &result
             && downstream_websocket

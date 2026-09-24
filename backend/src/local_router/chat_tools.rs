@@ -4,21 +4,80 @@ pub(crate) fn append_chat_messages_from_responses_input(
     input: Option<&Value>,
     messages: &mut Vec<Value>,
     tool_bridge: &mut ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<Vec<Option<String>>> {
     let Some(input) = input else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut replay = ChatReasoningReplay::default();
     match input {
-        Value::String(text) => push_chat_text_message(messages, "user", text),
+        Value::String(text) => {
+            let start = messages.len();
+            push_chat_text_message(messages, "user", text)?;
+            replay.observe(None, messages, start);
+            Ok(replay.missing)
+        }
         Value::Array(items) => {
             for item in items {
+                let start = messages.len();
                 append_chat_message_item(item, messages, tool_bridge)?;
+                replay.observe(Some(item), messages, start);
             }
             move_tool_images_after_tool_results(messages);
-            Ok(())
+            Ok(replay.missing)
         }
-        Value::Object(_) => append_chat_message_item(input, messages, tool_bridge),
+        Value::Object(_) => {
+            let start = messages.len();
+            append_chat_message_item(input, messages, tool_bridge)?;
+            replay.observe(Some(input), messages, start);
+            Ok(replay.missing)
+        }
         _ => anyhow::bail!("input 必须是字符串、对象或数组"),
+    }
+}
+
+/// 记录转换时被丢掉的摘要，供失败重试写回对应的助手消息。
+/// 首次发送的 messages 保持原样。
+#[derive(Default)]
+struct ChatReasoningReplay {
+    pending: Option<String>,
+    missing: Vec<Option<String>>,
+}
+
+impl ChatReasoningReplay {
+    fn observe(&mut self, item: Option<&Value>, messages: &[Value], start: usize) {
+        if let Some(item) = item
+            && item.get("type").and_then(Value::as_str) == Some("reasoning")
+        {
+            if reasoning_item_has_text(item) {
+                // 已有明文会进入 reasoning_content，未挂上的摘要不能串到后一回合。
+                self.pending = None;
+            } else if let Some(summary) = summary_replay_text(item) {
+                match &mut self.pending {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&summary);
+                    }
+                    None => self.pending = Some(summary),
+                }
+            }
+        }
+        for message in &messages[start..] {
+            match message.get("role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    if message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        self.pending = None;
+                        continue;
+                    }
+                    self.missing.push(self.pending.take());
+                }
+                Some("user" | "system") => self.pending = None,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -82,7 +141,8 @@ pub(crate) fn append_chat_message_item(
             ),
             Some("message") => append_responses_message_object(object, messages, tool_bridge),
             Some("reasoning") => {
-                // Only raw reasoning is replayable; summaries and encrypted provider state are not.
+                // 只回放 content 里的 reasoning_text。summary 和供应商密文不在这里展开，
+                // 否则所有 Chat 上游都会收到摘要。需要摘要的上游须在转换前写回明文。
                 if let Some(parts) = object.get("content").and_then(Value::as_array) {
                     let mut reasoning = String::new();
                     let mut present = false;
@@ -1728,6 +1788,116 @@ pub(crate) fn copy_json_field(
     }
 }
 
+/// Moonshot / Kimi 的 Chat Completions 不接受 `$ref` 与其它关键字并列。
+/// Codex Desktop 的内置工具正好是这个形状。只改这些地址，其它上游的
+/// 工具 schema 保持原样。
+const REF_SIBLING_HOST_SUFFIXES: &[&str] = &["moonshot.cn", "moonshot.ai", "kimi.com"];
+
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependencies",
+];
+
+const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
+const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
+    "items",
+    "additionalItems",
+    "unevaluatedItems",
+    "contains",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contentSchema",
+];
+
+pub(crate) fn upstream_rejects_ref_sibling_keywords(upstream_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(upstream_url.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    REF_SIBLING_HOST_SUFFIXES.iter().any(|suffix| {
+        host == *suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+pub(crate) fn wrap_chat_tool_ref_siblings(body: &mut Value) -> bool {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for tool in tools {
+        let Some(parameters) = tool
+            .get_mut("function")
+            .and_then(Value::as_object_mut)
+            .and_then(|function| function.get_mut("parameters"))
+        else {
+            continue;
+        };
+        if wrap_ref_siblings(parameters) > 0 {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn wrap_ref_siblings(schema: &mut Value) -> usize {
+    let Value::Object(map) = schema else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    if map.len() > 1 && map.get("$ref").is_some_and(Value::is_string) {
+        move_ref_into_all_of(map);
+        rewritten += 1;
+    }
+    for (key, child) in map.iter_mut() {
+        if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
+            if let Value::Object(entries) = child {
+                rewritten += entries.values_mut().map(wrap_ref_siblings).sum::<usize>();
+            }
+        } else if SCHEMA_ARRAY_KEYWORDS.contains(&key.as_str()) {
+            if let Value::Array(entries) = child {
+                rewritten += entries.iter_mut().map(wrap_ref_siblings).sum::<usize>();
+            }
+        } else if SINGLE_SCHEMA_KEYWORDS.contains(&key.as_str()) {
+            match child {
+                Value::Array(entries) => {
+                    rewritten += entries.iter_mut().map(wrap_ref_siblings).sum::<usize>();
+                }
+                other => rewritten += wrap_ref_siblings(other),
+            }
+        }
+    }
+    rewritten
+}
+
+fn move_ref_into_all_of(map: &mut serde_json::Map<String, Value>) {
+    let Some(reference) = map.remove("$ref") else {
+        return;
+    };
+    let branch = json!({ "$ref": reference });
+    match map.get_mut("allOf") {
+        Some(Value::Array(branches)) => branches.push(branch),
+        _ => {
+            map.insert("allOf".to_string(), Value::Array(vec![branch]));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1755,5 +1925,72 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn ref_sibling_rewrite_matches_moonshot_and_kimi_hosts_only() {
+        for url in [
+            "https://api.moonshot.cn/v1/chat/completions",
+            "https://api.moonshot.ai/v1/",
+            "https://api.kimi.com/coding/v1/chat/completions",
+            "https://API.KIMI.COM/coding/v1",
+        ] {
+            assert!(upstream_rejects_ref_sibling_keywords(url), "{url}");
+        }
+        for url in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://moonshot.cn.example.com/v1",
+            "https://notkimi.com/v1",
+            "not a url",
+        ] {
+            assert!(!upstream_rejects_ref_sibling_keywords(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn chat_tool_ref_siblings_move_into_all_of() {
+        let mut body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "automation_update",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": { "$ref": "#/$defs/__schema20", "description": "Prompt to run" },
+                            "mode": { "type": "string", "enum": ["fast", "slow"] }
+                        },
+                        "required": ["prompt"],
+                        "$defs": {
+                            "__schema20": { "$ref": "#/$defs/__schema2", "type": "string", "minLength": 1 },
+                            "__schema2": { "type": "string" }
+                        },
+                        "default": { "$ref": "#/$defs/__schema2", "type": "string" }
+                    }
+                }
+            }]
+        });
+
+        assert!(wrap_chat_tool_ref_siblings(&mut body));
+        let parameters = &body["tools"][0]["function"]["parameters"];
+        assert_eq!(
+            parameters["properties"]["prompt"]["allOf"][0]["$ref"],
+            "#/$defs/__schema20"
+        );
+        assert_eq!(
+            parameters["properties"]["prompt"]["description"],
+            "Prompt to run"
+        );
+        assert!(parameters["properties"]["prompt"].get("$ref").is_none());
+        assert_eq!(parameters["properties"]["mode"]["enum"][0], "fast");
+        assert_eq!(
+            parameters["$defs"]["__schema20"]["allOf"][0]["$ref"],
+            "#/$defs/__schema2"
+        );
+        assert_eq!(parameters["$defs"]["__schema20"]["type"], "string");
+        assert_eq!(parameters["$defs"]["__schema2"]["type"], "string");
+        assert!(parameters["$defs"]["__schema2"].get("allOf").is_none());
+        assert_eq!(parameters["default"]["$ref"], "#/$defs/__schema2");
+        assert!(!wrap_chat_tool_ref_siblings(&mut body));
     }
 }

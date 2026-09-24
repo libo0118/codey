@@ -112,7 +112,6 @@ impl WebSocketResponsesDownstream {
             request_body_budget,
             config_changes,
             idle_registry,
-            subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
         }
     }
 
@@ -400,7 +399,17 @@ impl WebSocketResponsesDownstream {
             self.upstream.take();
         }
         normalize_native_responses_context(body, discard_opaque_reasoning);
-        let mut handshake_turn_state = None;
+        if route.upstream_url.as_ref().is_ok_and(|url| {
+            should_replay_reasoning_text(
+                route.official_account,
+                ProtocolBridge::NativeResponses,
+                ResponsesRequestKind::Create,
+                is_compaction_request(body, ResponsesRequestKind::Create),
+                url,
+            )
+        }) {
+            restore_reasoning_text_from_summary(body);
+        }
         let mut upstream = if let Some(cached) = self.upstream.take() {
             cached
         } else {
@@ -417,8 +426,7 @@ impl WebSocketResponsesDownstream {
                 ))
                 .await?
             {
-                Ok(connected) => {
-                    handshake_turn_state = connected.turn_state;
+                Ok(socket) => {
                     self.websocket_backoffs
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -430,7 +438,7 @@ impl WebSocketResponsesDownstream {
                         response_ids: VecDeque::new(),
                         config_identity: route.websocket_config,
                         liveness: UpstreamWebSocketLiveness::new(Instant::now()),
-                        socket: connected.socket,
+                        socket,
                     }
                 }
                 Err(error) => {
@@ -484,8 +492,6 @@ impl WebSocketResponsesDownstream {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        // 握手和 metadata 里的票据先挂起，这条线程调用成功后才更新续接票据。
-        let mut pending_turn_state = handshake_turn_state;
         let message_body = body
             .as_object_mut()
             .context("Responses WebSocket 上游请求必须是 JSON 对象")?;
@@ -588,9 +594,6 @@ impl WebSocketResponsesDownstream {
                         };
                     let mut raw_json_text = raw_json_text;
                     for mut event in events {
-                        if let Some(state) = turn_state_from_metadata_event(&event) {
-                            pending_turn_state = Some(state.to_string());
-                        }
                         if responses_event_is_failure(&event) {
                             if let Some(probe) = probe {
                                 let original = raw_json_text
@@ -659,16 +662,6 @@ impl WebSocketResponsesDownstream {
                             probe.mark_first_downstream_content();
                         }
                         if terminal {
-                            if event.get("type").and_then(Value::as_str)
-                                == Some("response.completed")
-                                && let Some(state) = pending_turn_state.as_deref()
-                            {
-                                remember_observed_turn_state(
-                                    &self.subagent_turn_states,
-                                    headers,
-                                    state,
-                                );
-                            }
                             let successful_backoff_key = UpstreamWebSocketBackoffKey::for_route(
                                 route,
                                 upstream_url,
@@ -917,16 +910,11 @@ pub(crate) fn upstream_websocket_request(
     Ok(request)
 }
 
-pub(crate) struct UpstreamWebSocketConnection {
-    pub(crate) socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    pub(crate) turn_state: Option<String>,
-}
-
 pub(crate) async fn connect_upstream_responses_websocket(
     url: &str,
     headers: &HeaderMap,
     probe: Option<&RouteRequestLogProbe>,
-) -> Result<UpstreamWebSocketConnection> {
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let request = upstream_websocket_request(url, headers)?;
     if let Some(probe) = probe {
         probe.set_upstream_request_headers(&super::responses::format_upstream_headers(
@@ -957,8 +945,7 @@ pub(crate) async fn connect_upstream_responses_websocket(
             response.headers(),
         ));
     }
-    let turn_state = turn_state_from_headers(response.headers());
-    Ok(UpstreamWebSocketConnection { socket, turn_state })
+    Ok(socket)
 }
 
 pub(crate) fn upstream_websocket_endpoint_is_unsupported(error: &anyhow::Error) -> bool {
@@ -1186,6 +1173,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<()> {
     let status = response.status().as_u16();
+    let xai_fix = current_xai_response_fix();
     let mut prepared = await_upstream(
         downstream,
         prepare_upstream_response(response, "读取 Responses HTTP 上游响应失败", probe),
@@ -1218,8 +1206,11 @@ pub(crate) async fn proxy_native_response_to_websocket(
                     done = true;
                     break;
                 }
-                let event = serde_json::from_str::<Value>(&data)
+                let mut event = serde_json::from_str::<Value>(&data)
                     .context("Responses HTTP 上游 SSE data 不是有效 JSON")?;
+                if let Some(fix) = xai_fix.as_ref() {
+                    fix.apply(&mut event);
+                }
                 terminal |= responses_event_is_terminal(&event);
                 if let Some(probe) = probe {
                     probe.observe_event(&event);
@@ -1245,8 +1236,11 @@ pub(crate) async fn proxy_native_response_to_websocket(
             && let Some(data) = sse_frame_data(&buffer[cursor.consumed..])?
             && data.trim() != "[DONE]"
         {
-            let event = serde_json::from_str::<Value>(&data)
+            let mut event = serde_json::from_str::<Value>(&data)
                 .context("Responses HTTP 上游 SSE 末尾 data 不是有效 JSON")?;
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut event);
+            }
             terminal |= responses_event_is_terminal(&event);
             if let Some(probe) = probe {
                 probe.observe_event(&event);
@@ -1289,7 +1283,10 @@ pub(crate) async fn proxy_native_response_to_websocket(
             anyhow::bail!("Responses HTTP/SSE 降级响应缺少终态事件");
         }
         downstream.start_event_stream().await?;
-        for event in events {
+        for mut event in events {
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut event);
+            }
             if let Some(probe) = probe {
                 probe.observe_event(&event);
             }
@@ -1303,7 +1300,10 @@ pub(crate) async fn proxy_native_response_to_websocket(
         return downstream.finish_event_stream().await;
     }
     match serde_json::from_slice::<Value>(&body) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut value);
+            }
             if let Some(probe) = probe {
                 probe.observe_response(status, &value);
             }
