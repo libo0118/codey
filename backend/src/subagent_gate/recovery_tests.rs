@@ -198,7 +198,19 @@ fn fresh_writer_after_interrupted_batch_does_not_inherit_recovery_deadlines() {
         let session = "new-writer-after-interrupt";
         let runtime = "runtime-a";
         start_recovery_child(&root, session);
-        handle_hook_for_runtime_at(&unavailable_wait(session), &root, runtime, 1_000).unwrap();
+        // Seed only the old batch's deadline; protocol-failure reconciliation
+        // is covered separately and must not be bypassed by this fixture.
+        assert!(
+            !observe_and_check_elapsed(
+                &root,
+                runtime,
+                session,
+                UNAVAILABLE_STATUS_SINCE_FILE,
+                1_000,
+                UNAVAILABLE_STATUS_GRACE_MILLIS,
+            )
+            .unwrap()
+        );
 
         let mut interrupt = input("PreToolUse", session);
         interrupt.turn_id = Some("root-turn-a".into());
