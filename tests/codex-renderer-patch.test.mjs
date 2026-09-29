@@ -673,29 +673,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "the AppServerRequestClient route preflight must patch without compatibility errors",
     );
 
-    const hookStatsSource = [
-      "const hookLabel=`assistantMessage.hookStats.label`;",
-      "const hookTitle=`assistantMessage.hookStats.title`;",
-      "function renderHookStats(r,l,d){",
-      "return (0,R.jsx)(r,{tooltipContent:l,tooltipClassName:`px-3 py-2`,",
-      "tooltipMaxWidth:`min(32rem, var(--radix-tooltip-content-available-width), calc(100vw - 16px))`,",
-      "children:d})}",
-    ].join("");
-    electron.protocol.handle("app", async () => new Response(hookStatsSource));
-    const hookStatsResponse = await installedHandler({
-      url: "app://-/assets/subagent-activity-chip-group-current-build.js",
-    });
-    const patchedHookStatsSource = await hookStatsResponse.text();
-    assert.match(
-      patchedHookStatsSource,
-      /\{interactive:!0,tooltipContent:l,tooltipClassName:`px-3 py-2`/,
-    );
-    assert.equal(
-      patchErrors.length,
-      2,
-      "the compatible hook tooltip patch must not log a skipped renderer gate",
-    );
-
     const subagentHeaderSource = [
       "function formatModel(model){return model}",
       "let t=[];",
@@ -799,6 +776,36 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchedSideEffectPetSettingsSource,
       /const petSettingsId=`settings\.pets\.title`/,
     );
+
+    // Current Codex builds split the pets/Mini preview across three chunks and
+    // drop the semicolon after each import, so every one of them has to be
+    // stubbed from the same settings route chunk.
+    const currentPetSettingsSource = [
+      "import{f as Rt,m as zt,r as Bt,t as Vt}from\"./avatar-mascot-button-7586001b9adf.js\"",
+      "import{n as Ht,t as Ut}from\"./codex-pet-assets-5f01c10f2955.js\"",
+      "import{n as Yt,t as Xt}from\"./use-avatar-options-fda035de15fb.js\"",
+      "const miniSettingsId=`settings.mini.show`;",
+      "function renderMiniSettings(){return [Rt(),Ht(),Yt(),miniSettingsId]}",
+    ].join("\n");
+    electron.protocol.handle("app", async () => new Response(currentPetSettingsSource));
+    const currentPetSettingsResponse = await installedHandler({
+      url: "app://-/assets/pets-settings-route-551771c3ecb9.js",
+    });
+    const patchedCurrentPetSettingsSource =
+      await currentPetSettingsResponse.text();
+    assert.doesNotMatch(
+      patchedCurrentPetSettingsSource,
+      /(avatar-mascot-button|codex-pet-assets|use-avatar-options)-/,
+    );
+    const renderMiniSettings = Function(
+      `${patchedCurrentPetSettingsSource};return renderMiniSettings`,
+    )();
+    assert.deepEqual(renderMiniSettings(), [
+      null,
+      null,
+      null,
+      "settings.mini.show",
+    ]);
 
     const localePropsSource = [
       "function provider(E){return E.localeOverride}",

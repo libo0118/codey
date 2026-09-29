@@ -905,6 +905,47 @@ test("thread title routing prefers official Luna, route Luna, then the default m
       3,
     );
     assert.match(patched, /const unrelated=\{model:tj\}/);
+    const withExtraModelField = [
+      "async function hfe(){let d=await $9({appServerClient:r,",
+      "feature:`thread_title`,prompt:u})}",
+      "async function $9({appServerClient:e,feature:i}){try{",
+      "let h=await V0({model:tj,threadSource:i});",
+      "return WA({feature:i,model:tj}),h}catch(e){",
+      "throw WA({feature:i,model:tj,retryModel:tj}),e}finally{",
+      "WA({feature:i,model:tj})}}",
+      "function yfe(){return {model:tj}}",
+    ].join("");
+    const patchedExtra = runtime.context.__CODEY_PATCH_CODEX_MAIN_THREAD_TITLE_MODEL__(
+      withExtraModelField,
+    );
+    assert.equal(
+      patchedExtra.match(/globalThis\.__CODEY_THREAD_TITLE_MODEL__/g)?.length,
+      4,
+    );
+    assert.match(patchedExtra, /function yfe\(\)\{return \{model:tj\}\}/);
+    // Codex 26.917 (`src-DldfpmrL.js`) destructures the model as a parameter.
+    const withModelParameter = [
+      "async function Wce({appServerClient:r,model:i=z8}){let f=await X9({",
+      "appServerClient:r,model:i,feature:`thread_title`,prompt:d});return f}",
+      "async function X9({appServerClient:e,model:t,feature:a,signal:d}){",
+      "let m=null;try{let g=await L8({model:t,threadSource:a,",
+      "onTokenUsage:e=>{m??=e}});return wN({feature:a,model:t}),g}catch(e){",
+      "throw wN({feature:a,model:t}),e}}",
+      "function qce(e){return{model:t}}",
+    ].join("");
+    const patchedParameter = runtime.context.__CODEY_PATCH_CODEX_MAIN_THREAD_TITLE_MODEL__(
+      withModelParameter,
+    );
+    assert.doesNotThrow(() => new vm.Script(patchedParameter));
+    assert.match(
+      patchedParameter,
+      /async function X9\(\{appServerClient:e,model:t,feature:a,signal:d\}\)\{/,
+    );
+    assert.equal(
+      patchedParameter.match(/globalThis\.__CODEY_THREAD_TITLE_MODEL__\|\|t:t/g)?.length,
+      3,
+    );
+    assert.match(patchedParameter, /function qce\(e\)\{return\{model:t\}\}/);
   } finally {
     runtime.restore();
   }
@@ -1478,7 +1519,7 @@ test("startup patch rejects unobserved runtime overrides on timeout without expo
         subagentGateActive: false,
         requireAppServerRuntimeOverrides: true,
       }),
-      /appServerRuntimeOverrideTimeoutMs = 20_000/,
+      /appServerRuntimeOverrideTimeoutMs = 150_000/,
     );
     assert.equal(runtime.result, "codey-startup-patch-installed-v40");
     assert.equal(
@@ -1486,7 +1527,7 @@ test("startup patch rejects unobserved runtime overrides on timeout without expo
       false,
     );
     const pending = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
-    assert.equal(timeoutMs, 20_000);
+    assert.equal(timeoutMs, 150_000);
     expire();
     await assert.rejects(pending, (error) => {
       assert.match(error.message, /未观察到 app-server 启动调用/);

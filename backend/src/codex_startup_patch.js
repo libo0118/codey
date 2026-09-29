@@ -412,6 +412,27 @@
       .join("");
     return `const ${firstBinding}=(()=>{const target=function(){return null};return new Proxy(target,{get(target,property,receiver){if(property===Symbol.iterator)return function*(){};if(property===\`map\`||property===\`filter\`||property===\`flatMap\`||property===\`slice\`)return()=>[];if(property===\`then\`)return void 0;return Reflect.get(target,property,receiver)},construct(){return{}}})})()${aliasDeclarations};`;
   };
+  // Older Codex builds imported a single codex-avatar chunk from the settings
+  // chunk; current builds split the preview across the mascot button, the pet
+  // asset table, and the avatar option hook. One settings chunk can import
+  // several of them, so every match is stubbed rather than requiring a unique
+  // one.
+  const petRendererResourceImport =
+    /import(?:\s*([^;"']+?)\s*from)?\s*["']\.\/(?:codex-avatar|codex-pet-assets|avatar-mascot-button|use-avatar-options)(?:[~-][^/"']*)?\.js["']/;
+  const petRendererResourceImportAll = new RegExp(
+    petRendererResourceImport.source,
+    "g",
+  );
+  const replacePetRendererResourceImports = (source, name) => {
+    if (activeRendererPatchFailures?.has(name)) return source;
+    let count = 0;
+    const patched = source.replace(petRendererResourceImportAll, (...args) => {
+      count += 1;
+      return replacePetRendererImportWithStubs(...args);
+    });
+    if (count === 0) return recordIncompatibleRendererGate(source, name, count);
+    return patched;
+  };
   const threadOwnerDiscoveryExpression = (
     coordinationName,
     hostIdName,
@@ -506,20 +527,19 @@
     }
     if (
       disablePet
-      && /settings\.(?:(?:appearance|personalization)\.)?pets(?:[."`]|$)/.test(source)
-      && /import(?:\s*[^;"']+?\s*from)?\s*["']\.\/codex-avatar(?:[~-][^/"']*)?\.js["']/.test(source)
+      && /settings\.(?:(?:appearance|personalization)\.)?(?:pets|mini)(?:[."`]|$)/.test(source)
+      && petRendererResourceImport.test(source)
     ) {
-      // Recent Codex builds keep the Pets settings preview in a regular
-      // settings chunk and statically import codex-avatar from it. Hiding the
-      // controls after React mounts is too late: that import has already pulled
-      // the avatar renderer and every bundled spritesheet into the main window.
-      // Replace only that settings-side dependency with inert callable/iterable
-      // bindings. The shared avatar overlay host stays intact because current
-      // Codex builds also use it for voice controls.
-      patched = replaceUniqueRendererGate(
+      // Codex keeps the pets/Mini settings preview in a settings route chunk
+      // and statically imports the avatar renderer, mascot button, pet asset
+      // table, and avatar option hook from it. Hiding the controls after React
+      // mounts is too late: those imports have already pulled every bundled
+      // spritesheet into the main window. Replace each settings-side dependency
+      // with inert callable/iterable bindings. The shared avatar overlay host
+      // stays intact because current Codex builds also use it for voice
+      // controls.
+      patched = replacePetRendererResourceImports(
         patched,
-        /import(?:\s*([^;"']+?)\s*from)?\s*["']\.\/codex-avatar(?:[~-][^/"']*)?\.js["'];?/g,
-        replacePetRendererImportWithStubs,
         "pet settings avatar resources",
       );
     }
@@ -584,22 +604,6 @@
         ) =>
           `(${label}=globalThis.__codeyModelWhitelistPatch?.presentModel?.(${thread}.model)?.displayName||${formatModel}(${thread}.model),${cache}[${keySlot}]===${label}?${label}=${cache}[${valueSlot}]:(${cache}[${keySlot}]=${label},${cache}[${valueSlot}]=${label}))`,
         "subagent header model label",
-      );
-    }
-    if (
-      source.includes("assistantMessage.hookStats.label")
-      && source.includes("assistantMessage.hookStats.title")
-      && source.includes("tooltipMaxWidth:")
-    ) {
-      // Hook details can exceed the collision-limited tooltip height. Opt this
-      // one rich tooltip into Codex's native hover handoff so the pointer can
-      // enter its scrollable content without closing it on trigger leave.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\{\s*)(tooltipContent\s*:\s*[$A-Z_a-z][$\w]*\s*,\s*tooltipClassName\s*:\s*`px-3 py-2`\s*,\s*tooltipMaxWidth\s*:\s*`min\(32rem,\s*var\(--radix-tooltip-content-available-width\),\s*calc\(100vw - 16px\)\)`)/g,
-        (_match, objectStart, tooltipProps) =>
-          `${objectStart}interactive:!0,${tooltipProps}`,
-        "hook details interactivity",
       );
     }
     if (
@@ -1327,7 +1331,12 @@
   // 配置已验证且使用 Codey 转发入口时，消息补丁失配允许降级。
   const appServerRuntimeOverrideDegradedResult =
     "codey-app-server-runtime-overrides-degraded";
-  const appServerRuntimeOverrideTimeoutMs = 20_000;
+  // 与 Rust 的调试会话上限成对：这里先超时并带上标记，启动器才会重试而不是直接退出。
+  // Codex 在窗口显示之后才 spawn app-server。Windows 商店版冷启动常常要一分多钟
+  // 才走到这一步，45 秒会在 spawn 发生前把确认掐掉。
+  const appServerRuntimeOverrideTimeoutMarker =
+    "codey-app-server-runtime-overrides-timeout";
+  const appServerRuntimeOverrideTimeoutMs = 150_000;
   const appServerRuntimeOverrideEvidence = {
     version: 1,
     observed: false,
@@ -1447,9 +1456,9 @@
             timeout = setTimeout(() => {
               reject(
                 new Error(
-                  formatAppServerRuntimeOverrideError(
+                  `${appServerRuntimeOverrideTimeoutMarker} ${formatAppServerRuntimeOverrideError(
                     appServerRuntimeOverrideEvidence,
-                  ),
+                  )}`,
                 ),
               );
             }, appServerRuntimeOverrideTimeoutMs);
@@ -2130,6 +2139,32 @@
   // official account, otherwise use the selected third-party route's Luna or
   // its default model. The native caller already preserves its provisional
   // local title when metadata generation fails.
+  const matchingBrace = (source, openIndex) => {
+    if (source[openIndex] !== "{") return -1;
+    let depth = 0;
+    let quote = "";
+    for (let index = openIndex; index < source.length; index += 1) {
+      const character = source[index];
+      if (quote) {
+        if (character === "\\") {
+          index += 1;
+          continue;
+        }
+        if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "'" || character === "\"" || character === "`") {
+        quote = character;
+        continue;
+      }
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) return index;
+      }
+    }
+    return -1;
+  };
   const patchCodexMainThreadTitleModel = (source) => {
     const titleCalls = [...source.matchAll(
       /await\s+([$A-Z_a-z][$\w]*)\(\{[^{}]{0,1000}\bfeature:(`thread_title`|"thread_title"|'thread_title')/g,
@@ -2140,15 +2175,23 @@
     const helperName = titleCalls[0][1];
     const helperStart = source.indexOf(`async function ${helperName}({`);
     const signatureEnd = source.indexOf("}){", helperStart);
-    const helperEnd = source.indexOf("}function ", signatureEnd);
-    if (helperStart < 0 || signatureEnd < 0 || helperEnd < 0) {
+    // 26.917 把 model 移进参数解构，签名里的 model:x 改成表达式就是语法错误，
+    // 整个 chunk 无法加载、主进程停在启动前。只在函数体内替换。
+    const bodyOpen = signatureEnd + 2;
+    const bodyClose = signatureEnd < 0 ? -1 : matchingBrace(source, bodyOpen);
+    if (
+      helperStart < 0 ||
+      signatureEnd < 0 ||
+      source[bodyOpen] !== "{" ||
+      bodyClose < 0
+    ) {
       throw new Error("Codey thread title metadata helper not found");
     }
-    const helper = source.slice(helperStart, helperEnd + 1);
+    const body = source.slice(bodyOpen, bodyClose + 1);
     const featureName = /\bfeature:([$A-Z_a-z][$\w]*)/.exec(
       source.slice(helperStart, signatureEnd),
     )?.[1];
-    const nativeModelName = /\bmodel:([$A-Z_a-z][$\w]*)/.exec(helper)?.[1];
+    const nativeModelName = /\bmodel:([$A-Z_a-z][$\w]*)/.exec(body)?.[1];
     if (!featureName || !nativeModelName) {
       throw new Error("Codey thread title metadata fields not found");
     }
@@ -2157,8 +2200,8 @@
       `\\bmodel:${escapedNativeModelName}\\b`,
       "g",
     );
-    const modelMatches = helper.match(nativeModelPattern)?.length ?? 0;
-    if (modelMatches !== 3) {
+    const modelMatches = body.match(nativeModelPattern)?.length ?? 0;
+    if (modelMatches < 3 || modelMatches > 6) {
       throw new Error(
         `Codey thread title metadata model matched ${modelMatches} times`,
       );
@@ -2167,11 +2210,11 @@
       `${featureName}===\`thread_title\`?` +
       `globalThis.__CODEY_THREAD_TITLE_MODEL__||${nativeModelName}:` +
       nativeModelName;
-    const patchedHelper = helper.replace(
+    const patchedBody = body.replace(
       nativeModelPattern,
       `model:${selectedModel}`,
     );
-    return source.slice(0, helperStart) + patchedHelper + source.slice(helperEnd + 1);
+    return source.slice(0, bodyOpen) + patchedBody + source.slice(bodyClose + 1);
   };
   Object.defineProperty(
     globalThis,

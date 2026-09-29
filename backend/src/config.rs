@@ -40,6 +40,12 @@ pub struct ProviderProfile {
     /// Stable id of the provider in the source Codex configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
+    /// 这条线路由启用中的原生插件登记。用户填写密钥并改动线路后会清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_owner_id: Option<String>,
+    /// 上次由插件提交并写入的线路描述，用来判断用户是否改过线路本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_route_spec: Option<crate::codey_plugins::PluginRouteSpec>,
     #[serde(default)]
     pub official_account: bool,
     /// Codey account id when this route is derived from one stored official
@@ -227,6 +233,8 @@ impl ProviderProfile {
             model_request_headers: BTreeMap::new(),
             upstream_proxy: String::new(),
             source_provider_id: None,
+            plugin_owner_id: None,
+            plugin_route_spec: None,
             official_account: false,
             official_account_id: None,
             supports_remote_compaction: false,
@@ -405,7 +413,7 @@ impl ProviderProfile {
         }
         validate_outbound_api_url(base_url, &format!("线路「{name}」的 API URL"))?;
         self.runtime_wire_api()?;
-        if self.api_key.trim().is_empty() {
+        if self.api_key.trim().is_empty() && self.plugin_owner_id.is_none() {
             return Err(format!("线路「{name}」缺少第三方 API Key"));
         }
         Ok(())
@@ -860,6 +868,14 @@ pub struct CodeyConfig {
         skip_deserializing
     )]
     pub update_manifest_url: String,
+    /// Optional release-admin Worker endpoint for device-aware publishing.
+    /// This is build-time configuration, never a user setting.
+    #[serde(
+        default = "default_release_admin_url",
+        skip_serializing,
+        skip_deserializing
+    )]
+    pub release_admin_url: String,
 }
 
 /// User-declared operating budget, never proof of upstream model capacity.
@@ -968,6 +984,7 @@ impl Default for CodeyConfig {
             official_account_available_this_launch: false,
             official_account_status_this_launch: LaunchOfficialAccountStatus::Unauthenticated,
             update_manifest_url: default_update_manifest_url(),
+            release_admin_url: default_release_admin_url(),
         }
     }
 }
@@ -979,6 +996,7 @@ fn default_stream_max_retries() -> u32 {
 impl CodeyConfig {
     pub fn normalize(mut self) -> Self {
         self.update_manifest_url = default_update_manifest_url();
+        self.release_admin_url = default_release_admin_url();
         self.stream_max_retries = self.stream_max_retries.min(100);
         self.route_request_log.normalize();
         self.profiles
@@ -1759,6 +1777,16 @@ impl CodeyConfig {
                 .any(|profile| profile.enabled && profile.official_account)
     }
 
+    pub(crate) fn allocate_route_short_name(&self, name: &str) -> String {
+        let used = self
+            .profiles
+            .iter()
+            .map(|profile| profile.short_name.trim().to_string())
+            .filter(|short_name| !short_name.is_empty())
+            .collect::<BTreeSet<_>>();
+        unique_default_route_short_name(name, &used)
+    }
+
     pub(crate) fn looks_like_empty_default_route(&self) -> bool {
         let Some(profile) = self.profiles.first() else {
             return true;
@@ -2451,6 +2479,7 @@ fn default_subagent_reasoning_effort() -> String {
 }
 
 const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
+const DEFAULT_RELEASE_ADMIN_URL: &str = "https://codey-release-admin.kimzane9991.workers.dev";
 
 fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
     let base_url = configured_base_url
@@ -2463,6 +2492,28 @@ fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
 
 pub fn default_update_manifest_url() -> String {
     update_manifest_url_from_base(option_env!("CODEY_UPDATE_BASE_URL"))
+}
+
+pub fn default_release_admin_url() -> String {
+    release_admin_url_from_build(
+        option_env!("CODEY_RELEASE_ADMIN_URL"),
+        option_env!("CODEY_UPDATE_BASE_URL"),
+    )
+}
+
+fn release_admin_url_from_build(admin_url: Option<&str>, update_base_url: Option<&str>) -> String {
+    // A custom manifest remains authoritative unless its build also names an admin service.
+    let fallback = if update_base_url.is_some_and(|url| !url.trim().is_empty()) {
+        ""
+    } else {
+        DEFAULT_RELEASE_ADMIN_URL
+    };
+    admin_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .unwrap_or(fallback)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -2543,6 +2594,38 @@ impl ConfigStore {
     #[cfg(test)]
     pub fn save(&self, config: &CodeyConfig) -> Result<()> {
         self.persist(config.clone()).map(|_| ())
+    }
+
+    /// Copies the config and backups that failed to load out of the backup
+    /// rotation, so later saves of the fallback defaults cannot push the
+    /// user's original out of reach. Copies are named after their content, so
+    /// relaunching with the same broken files adds nothing.
+    pub fn preserve_unreadable(&self) -> Vec<PathBuf> {
+        use sha2::{Digest, Sha256};
+
+        std::iter::once(self.path.clone())
+            .chain((1..=CONFIG_BACKUP_COUNT).map(|index| self.backup_path(index)))
+            .filter_map(|path| {
+                let bytes = fs::read(&path).ok()?;
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                let file_name = path.file_name()?.to_string_lossy().into_owned();
+                let target =
+                    path.with_file_name(format!("{file_name}.unreadable-{}", &digest[..12]));
+                if !target.exists()
+                    && let Err(error) =
+                        crate::fs_util::atomic_write_private_with_parent(&target, &bytes)
+                {
+                    crate::error_log::record_failure(
+                        "config_preserve_failed",
+                        "preserve_unreadable_codey_config",
+                        format!("{error:#}"),
+                        serde_json::json!({ "from": path.display().to_string() }),
+                    );
+                    return None;
+                }
+                Some(target)
+            })
+            .collect()
     }
 
     fn backup_path(&self, index: usize) -> PathBuf {
@@ -2843,6 +2926,31 @@ mod tests {
 
         let recovered = store.load().unwrap();
         assert_eq!(recovered.profiles[0].name, "version-2");
+    }
+
+    // 【自动化测试】配置存储 - 无法读取的配置另存到轮转之外，保存默认值后仍可找回
+    #[test]
+    fn unreadable_configs_are_preserved_outside_the_backup_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        fs::write(store.path(), b"corrupt-primary").unwrap();
+        fs::write(store.backup_path(1), b"corrupt-backup").unwrap();
+        assert!(store.load().is_err());
+
+        let preserved = store.preserve_unreadable();
+        assert_eq!(preserved.len(), 2);
+        assert_eq!(fs::read(&preserved[0]).unwrap(), b"corrupt-primary");
+        assert_eq!(fs::read(&preserved[1]).unwrap(), b"corrupt-backup");
+        assert_eq!(store.preserve_unreadable(), preserved);
+
+        for version in 1..=4 {
+            store
+                .save(&named_config(&format!("version-{version}")))
+                .unwrap();
+        }
+        assert_eq!(fs::read(&preserved[0]).unwrap(), b"corrupt-primary");
+        assert_eq!(fs::read(&preserved[1]).unwrap(), b"corrupt-backup");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 6);
     }
 
     #[cfg(unix)]
@@ -4110,6 +4218,25 @@ mod tests {
         assert_eq!(configured.route_request_log.max_file_bytes, 1024 * 1024);
         assert_eq!(configured.route_request_log.retained_files, 1);
         assert_eq!(configured.route_request_log.retention_days, 1);
+    }
+
+    #[test]
+    fn custom_update_manifest_does_not_use_the_official_release_admin() {
+        let fork = Some("https://github.com/libo0118/codey/releases/latest/download");
+        assert_eq!(release_admin_url_from_build(None, fork), "");
+        assert_eq!(release_admin_url_from_build(Some("  "), fork), "");
+        assert_eq!(
+            release_admin_url_from_build(None, None),
+            DEFAULT_RELEASE_ADMIN_URL
+        );
+        assert_eq!(
+            release_admin_url_from_build(None, Some("  ")),
+            DEFAULT_RELEASE_ADMIN_URL
+        );
+        assert_eq!(
+            release_admin_url_from_build(Some(" https://updates.example.test/ "), fork),
+            "https://updates.example.test"
+        );
     }
 
     #[test]

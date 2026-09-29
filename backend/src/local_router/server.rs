@@ -91,6 +91,57 @@ impl RequestLogCatalog {
     }
 }
 
+/// 本地路由监听的端口区间。落在这个高位区间可以避开常见开发服务的低位端口，
+/// 也避开系统临时端口区间里被出站连接随手拿走的那部分端口。
+pub(crate) const ROUTER_PORT_RANGE_START: u16 = 45_000;
+pub(crate) const ROUTER_PORT_RANGE_END: u16 = 55_000;
+/// 从随机起点最多连续探测多少个候选端口，全都不可用时回退由内核分配。
+pub(crate) const ROUTER_PORT_PROBES: u16 = 64;
+
+/// 在区间内从 `offset` 指定的端口开始顺序探测可用端口，候选被占用就换下一个。
+/// `bind` 成功即独占该端口，所以并发启动的多个实例不会拿到同一个端口。
+pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener> {
+    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
+    let mut occupied = Vec::new();
+    for step in 0..u32::from(ROUTER_PORT_PROBES) {
+        let port = ROUTER_PORT_RANGE_START + ((offset + step) % span) as u16;
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => occupied.push((port, error)),
+        }
+    }
+    // 区间内连续候选都被占用时不能让路由起不来，退回到内核分配并留下诊断。
+    record_router_failure_nonblocking(
+        "local_router_port_candidates_unavailable",
+        "bind_local_router",
+        format!(
+            "高位端口区间 {ROUTER_PORT_RANGE_START}-{ROUTER_PORT_RANGE_END} 内连续 {ROUTER_PORT_PROBES} 个候选端口均不可用，回退由内核分配端口"
+        ),
+        serde_json::json!({
+            "probes": occupied
+                .iter()
+                .take(8)
+                .map(|(port, error)| serde_json::json!({
+                    "port": port,
+                    "error": error.to_string(),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("启动 Codey 本地路由失败")
+}
+
+/// 随机起点避免同一台机器上并发启动的实例都从同一个端口开始竞争。
+pub(crate) async fn bind_router_listener() -> Result<TcpListener> {
+    let seed = Uuid::new_v4();
+    let bytes = seed.as_bytes();
+    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
+    let offset = u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) % span;
+    bind_router_listener_from(offset).await
+}
+
 pub(crate) struct LocalRouter {
     pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
@@ -131,9 +182,7 @@ impl LocalRouter {
         request_log: Arc<RouteRequestLogController>,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .context("启动 Codey 本地路由失败")?;
+        let listener = bind_router_listener().await?;
         let port = listener
             .local_addr()
             .context("读取 Codey 本地路由监听地址失败")?
@@ -163,6 +212,7 @@ impl LocalRouter {
             );
         }
         let server = RouterServer {
+            endpoint: endpoint.clone(),
             token: endpoint.token.clone(),
             bearer_token: format!("Bearer {}", endpoint.token),
             snapshot: Arc::clone(&snapshot),
@@ -187,6 +237,7 @@ impl LocalRouter {
         let server = Arc::new(server);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
+            let mut consecutive_accept_failures = 0_u32;
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
@@ -205,6 +256,7 @@ impl LocalRouter {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, _)) => {
+                                consecutive_accept_failures = 0;
                                 // Chunked SSE writes each event as three small
                                 // writes (size line, payload, CRLF). Nagle would
                                 // hold those back waiting on delayed ACKs and add
@@ -262,13 +314,23 @@ impl LocalRouter {
                                 ));
                             }
                             Err(error) => {
-                                record_router_failure_nonblocking(
-                                    "local_router_accept_failed",
-                                    "accept_local_router_connection",
-                                    error.to_string(),
-                                    serde_json::json!({}),
-                                );
-                                break;
+                                consecutive_accept_failures =
+                                    consecutive_accept_failures.saturating_add(1);
+                                // 同一轮连续失败只记一次，句柄耗尽时不会刷满错误日志。
+                                if consecutive_accept_failures == 1 {
+                                    record_router_failure_nonblocking(
+                                        "local_router_accept_failed",
+                                        "accept_local_router_connection",
+                                        error.to_string(),
+                                        serde_json::json!({}),
+                                    );
+                                }
+                                tokio::select! {
+                                    _ = &mut shutdown_rx => break,
+                                    _ = tokio::time::sleep(accept_retry_delay(
+                                        consecutive_accept_failures,
+                                    )) => {}
+                                }
                             }
                         }
                     }
@@ -309,16 +371,42 @@ impl LocalRouter {
         self.endpoint.clone()
     }
 
-    pub(crate) fn update_config(&self, config: &CodeyConfig) {
-        let next = Arc::new(RouterSnapshot::from_config(config));
-        *self
-            .snapshot
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&next);
+    pub(crate) fn update_config(&self, config: &CodeyConfig) -> RouterSnapshotSwap {
+        let installed = Arc::new(RouterSnapshot::from_config(config));
+        let previous = std::mem::replace(
+            &mut *self
+                .snapshot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Arc::clone(&installed),
+        );
         self.websocket_backoffs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .update_routes(&next);
+            .update_routes(&installed);
+        RouterSnapshotSwap {
+            previous,
+            installed,
+        }
+    }
+
+    /// Puts back the snapshot a failed delivery replaced. A snapshot that a
+    /// later reload installed in the meantime stays in place.
+    pub(crate) fn revert_config(&self, swap: RouterSnapshotSwap) -> bool {
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !Arc::ptr_eq(&current, &swap.installed) {
+            return false;
+        }
+        *current = Arc::clone(&swap.previous);
+        drop(current);
+        self.websocket_backoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update_routes(&swap.previous);
+        true
     }
 
     pub(crate) async fn reconfigure_request_log(
@@ -373,6 +461,7 @@ impl LocalRouter {
                 stats.shutdown_timeouts,
             );
         }
+        crate::appserver_call::shutdown().await;
         task_result
     }
 }
@@ -449,6 +538,40 @@ impl Drop for LocalRouter {
     }
 }
 
+/// The snapshot a hot reload replaced, kept until the renderer confirms the
+/// matching model list.
+#[derive(Debug)]
+pub(crate) struct RouterSnapshotSwap {
+    previous: Arc<RouterSnapshot>,
+    installed: Arc<RouterSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ConnectionPermitError {
+    Busy,
+    Closed,
+}
+
+/// HTTP 连接在名额用尽时立刻返回 503。已建立的 WebSocket 再等一小段时间，
+/// 仍然没有名额就同样返回 503，而不是一直占着这条连接。
+pub(crate) async fn acquire_connection_permit_within(
+    limit: &Arc<Semaphore>,
+    wait: Duration,
+) -> std::result::Result<OwnedSemaphorePermit, ConnectionPermitError> {
+    match tokio::time::timeout(wait, Arc::clone(limit).acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(ConnectionPermitError::Closed),
+        Err(_) => Err(ConnectionPermitError::Busy),
+    }
+}
+
+pub(crate) fn accept_retry_delay(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(16);
+    ACCEPT_RETRY_INITIAL_DELAY
+        .saturating_mul(1_u32 << shift)
+        .min(ACCEPT_RETRY_MAX_DELAY)
+}
+
 fn enable_downstream_keepalive(stream: &TcpStream) {
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(UPSTREAM_TCP_KEEPALIVE_IDLE)
@@ -458,6 +581,7 @@ fn enable_downstream_keepalive(stream: &TcpStream) {
 }
 
 pub(crate) struct RouterServer {
+    pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) token: String,
     pub(crate) bearer_token: String,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,

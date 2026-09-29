@@ -306,6 +306,8 @@ export type UpdateCheck = {
   latestVersion: string;
   updateAvailable: boolean;
   selectedAsset?: UpdateAsset;
+  releaseNotes?: string | null;
+  publishId?: string | null;
 };
 
 export type UpdateAsset = {
@@ -325,6 +327,7 @@ export type UpdateDownload = {
   size: number;
   sha256: string;
   asset: UpdateAsset;
+  publishId?: string | null;
 };
 
 /// 上一次更新安装留给本次启动的结果。助手在退出前写下，控制台读取后删除，

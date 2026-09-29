@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -49,6 +50,7 @@ const MAX_TRANSCRIPT_METADATA_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SPAWN_RESPONSE_JSON_BYTES: usize = 64 * 1024;
 const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_QUARANTINE_FILES_PER_SESSION: usize = 3;
+const MAX_FOLLOWUPS_PER_ATTEMPT: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SessionLedger {
@@ -128,6 +130,8 @@ struct Reservation {
     spawn_failed: bool,
     #[serde(default)]
     pending_init_observed_at_ms: Option<u64>,
+    #[serde(default)]
+    followup_count: u32,
 }
 
 const fn default_fencing_token() -> u64 {
@@ -500,7 +504,63 @@ impl LedgerStore {
     }
 }
 
+fn ledger_temp_sweeps() -> &'static Mutex<Vec<(PathBuf, SystemTime)>> {
+    static SWEEPS: Mutex<Vec<(PathBuf, SystemTime)>> = Mutex::new(Vec::new());
+    &SWEEPS
+}
+
+fn ledger_directory_sweep_is_current(session_dir: &Path) -> bool {
+    let Ok(modified) = fs::metadata(session_dir).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    ledger_temp_sweeps()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|(path, seen)| path == session_dir && *seen == modified)
+}
+
+fn ledger_temp_file_exists(session_dir: &Path) -> bool {
+    let prefix = format!(".{LEDGER_FILE}.codey-");
+    fs::read_dir(session_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
+        })
+}
+
+fn remember_ledger_directory_sweep(session_dir: &Path) {
+    let Ok(modified) = fs::metadata(session_dir).and_then(|metadata| metadata.modified()) else {
+        return;
+    };
+    let mut sweeps = ledger_temp_sweeps()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(seen) = sweeps.iter_mut().find(|(path, _)| path == session_dir) {
+        seen.1 = modified;
+        return;
+    }
+    if sweeps.len() >= 128 {
+        sweeps.remove(0);
+    }
+    sweeps.push((session_dir.to_path_buf(), modified));
+}
+
 fn cleanup_stale_ledger_temps(session_dir: &Path) -> Result<()> {
+    // 临时文件只在进程崩溃时留下。目录修改时间没变时不必每次打开账本都扫描。
+    // Windows can keep a directory timestamp unchanged for files created in
+    // quick succession. If a matching temp file is present, rescan even when
+    // the cached timestamp says the directory is current.
+    if ledger_directory_sweep_is_current(session_dir) && !ledger_temp_file_exists(session_dir) {
+        return Ok(());
+    }
     let entries = match fs::read_dir(session_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -518,6 +578,7 @@ fn cleanup_stale_ledger_temps(session_dir: &Path) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
+    remember_ledger_directory_sweep(session_dir);
     Ok(())
 }
 
@@ -842,6 +903,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             fenced_at_ms: None,
             spawn_failed: false,
             pending_init_observed_at_ms: None,
+            followup_count: 0,
         },
     );
     store.save(&mut ledger, now_ms)?;
@@ -998,7 +1060,7 @@ pub(crate) fn pre_followup_task(
         )));
     };
     let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
         return Ok(Some(followup_without_active_attempt_denial(
             target,
             "当前会话没有可验证的活动委派账本",
@@ -1010,12 +1072,24 @@ pub(crate) fn pre_followup_task(
             "target 无法匹配当前账本中的 reservation",
         )));
     };
-    let reservation = &ledger.reservations[&task_id];
+    let reservation = ledger
+        .reservations
+        .get_mut(&task_id)
+        .expect("resolved task");
     if reservation.state == ReservationState::Running
         && reservation.agent_id_hash.is_some()
         && reservation.fenced_at_ms.is_none()
         && !reservation.spawn_failed
     {
+        if reservation.followup_count >= MAX_FOLLOWUPS_PER_ATTEMPT {
+            return Ok(Some(format!(
+                "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: attempt `{}` 已达到 follow-up 上限 {}；请由主代理接管，或使用新的 task_name 派发范围实质变化的任务。",
+                reservation.attempt_id, MAX_FOLLOWUPS_PER_ATTEMPT
+            )));
+        }
+        reservation.followup_count += 1;
+        reservation.updated_at_ms = now_ms;
+        store.save(&mut ledger, now_ms)?;
         return Ok(None);
     }
     if reservation.state == ReservationState::Pending && reservation.fenced_at_ms.is_none() {
@@ -2096,7 +2170,17 @@ pub(crate) fn authorize_child_tool_with_context(
         tool_input,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
-    let tool_class = crate::subagent::read_only_tool::classify(tool_name, tool_input);
+    let mut tool_class = crate::subagent::read_only_tool::classify(tool_name, tool_input);
+    if tool_class == ToolClass::Unknown
+        && crate::subagent_gate::cached_read_only_tool(
+            state_root,
+            tool_name,
+            tool_input,
+            loaded_rules.rules.revision,
+        )
+    {
+        tool_class = ToolClass::Read;
+    }
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store.load(runtime_id, session_id, now_ms)?;
     let agent_hash = hash_component(agent_id);
@@ -3030,5 +3114,26 @@ mod tests {
             "/repo/tests"
         );
         assert!(normalize_absolute_path("../repo").is_err());
+    }
+
+    #[test]
+    fn opening_a_ledger_removes_crash_temps_created_after_an_earlier_sweep() {
+        let temp = tempdir().unwrap();
+        drop(LedgerStore::open(temp.path(), "session-a").unwrap());
+        let session_dir = fs::read_dir(temp.path())
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                entry.file_type().ok()?.is_dir().then(|| entry.path())
+            })
+            .unwrap();
+        let stale = session_dir.join(format!(".{LEDGER_FILE}.codey-crash.tmp"));
+        fs::write(&stale, b"partial").unwrap();
+        drop(LedgerStore::open(temp.path(), "session-a").unwrap());
+        assert!(!stale.exists());
+        let later = session_dir.join(format!(".{LEDGER_FILE}.codey-later.tmp"));
+        fs::write(&later, b"partial").unwrap();
+        drop(LedgerStore::open(temp.path(), "session-a").unwrap());
+        assert!(!later.exists());
     }
 }
