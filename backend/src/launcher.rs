@@ -46,6 +46,8 @@ mod process;
 
 use platform::*;
 #[cfg(windows)]
+pub(crate) use platform::{activate_visible_windows_codex_window, windows_process_in_session};
+#[cfg(windows)]
 pub(crate) use process::windows_cli_wrapper_target;
 use process::{
     SpawnedCodex, prepare_codex_for_launch, reap_child_after_cleanup, spawn_codex,
@@ -233,6 +235,21 @@ impl RuntimeModelConfig {
     }
 }
 
+struct AppliedModelConfig {
+    catalog: CodeyConfig,
+    snapshot: Arc<RuntimeModelConfig>,
+}
+
+impl AppliedModelConfig {
+    fn new(config: CodeyConfig) -> Self {
+        let snapshot = Arc::new(RuntimeModelConfig::from_config(&config));
+        Self {
+            catalog: config,
+            snapshot,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSubagentConfig {
     model: String,
@@ -260,8 +277,8 @@ pub struct CodeyRuntime {
     pub codex_app_path: PathBuf,
     pub maintenance: MaintenanceStatus,
     pub applied_config: CodeyConfig,
-    applied_model_config: RwLock<CodeyConfig>,
-    applied_subagent_config: RwLock<RuntimeSubagentConfig>,
+    applied_model_config: RwLock<AppliedModelConfig>,
+    applied_subagent_config: RwLock<Arc<RuntimeSubagentConfig>>,
     subagent_route_catalog_installed: bool,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
     injection_scripts: cdp::PreparedInjectionScripts,
@@ -1931,16 +1948,16 @@ impl CodeyRuntime {
         self.injection_websocket_url.read().await.clone()
     }
 
-    pub async fn applied_model_config(&self) -> RuntimeModelConfig {
-        RuntimeModelConfig::from_config(&*self.applied_model_config.read().await)
+    pub async fn applied_model_config(&self) -> Arc<RuntimeModelConfig> {
+        Arc::clone(&self.applied_model_config.read().await.snapshot)
     }
 
     pub async fn applied_model_catalog_config(&self) -> CodeyConfig {
-        self.applied_model_config.read().await.clone()
+        self.applied_model_config.read().await.catalog.clone()
     }
 
     pub async fn mark_model_config_applied(&self, config: &CodeyConfig) {
-        *self.applied_model_config.write().await = config.clone();
+        *self.applied_model_config.write().await = AppliedModelConfig::new(config.clone());
     }
 
     pub(crate) fn validate_subagent_route_hot_reload(&self, config: &CodeyConfig) -> Result<()> {
@@ -1965,12 +1982,21 @@ impl CodeyRuntime {
         Ok(())
     }
 
-    pub fn sync_local_router_routes(&self, config: &CodeyConfig) -> Result<()> {
+    pub(crate) fn sync_local_router_routes(
+        &self,
+        config: &CodeyConfig,
+    ) -> Result<Option<local_router::RouterSnapshotSwap>> {
         self.validate_subagent_route_hot_reload(config)?;
+        Ok(self
+            .local_router
+            .as_ref()
+            .map(|local_router| local_router.update_config(config)))
+    }
+
+    pub(crate) fn revert_local_router_routes(&self, swap: local_router::RouterSnapshotSwap) {
         if let Some(local_router) = self.local_router.as_ref() {
-            local_router.update_config(config);
+            local_router.revert_config(swap);
         }
-        Ok(())
     }
 
     pub(crate) async fn reconfigure_request_log(
@@ -1998,12 +2024,13 @@ impl CodeyRuntime {
         self.local_router.as_ref().map(LocalRouter::endpoint)
     }
 
-    pub async fn applied_subagent_config(&self) -> RuntimeSubagentConfig {
-        self.applied_subagent_config.read().await.clone()
+    pub async fn applied_subagent_config(&self) -> Arc<RuntimeSubagentConfig> {
+        Arc::clone(&*self.applied_subagent_config.read().await)
     }
 
     pub async fn mark_subagent_config_applied(&self, config: &CodeyConfig) {
-        *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
+        *self.applied_subagent_config.write().await =
+            Arc::new(RuntimeSubagentConfig::from_config(config));
     }
 
     pub fn supports_subagent_config_hot_reload(&self, config: &CodeyConfig) -> bool {
@@ -2066,6 +2093,11 @@ impl CodeyRuntime {
         crashpad_pending_stats: CrashpadPendingStatsHandle,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
+        if !crate::codex_config::runtime_router_platform_supported() {
+            return Err(anyhow::anyhow!(
+                crate::codex_config::unsupported_runtime_platform_message()
+            ));
+        }
         let home = codex_home();
         repair_startup_reserved_providers(home).await;
         trace_log_write_protection_active.store(false, Ordering::Release);
@@ -2128,6 +2160,7 @@ impl CodeyRuntime {
         } = match prepared_provider_state {
             Ok(state) => state,
             Err(error) => {
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
                 return Err(restore_runtime_config_after_error(
                     home,
                     config.local_router_enabled,
@@ -2140,6 +2173,7 @@ impl CodeyRuntime {
         let patch = match prepare_startup_patches(home, config).await {
             Ok(patch) => patch,
             Err(error) => {
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
                 return Err(restore_runtime_config_after_error(
                     home,
                     config.local_router_enabled,
@@ -2155,7 +2189,7 @@ impl CodeyRuntime {
             child,
             maintenance,
             injected_target,
-        } = spawn_and_inject_runtime(
+        } = match spawn_and_inject_runtime(
             home,
             config,
             &handler,
@@ -2164,7 +2198,14 @@ impl CodeyRuntime {
             &patch,
             &runtime_config_overrides,
         )
-        .await?;
+        .await
+        {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
+                return Err(error);
+            }
+        };
         stage_timings.mark("spawnAndInjectMs");
         stage_timings.report();
         #[cfg(target_os = "macos")]
@@ -2195,10 +2236,10 @@ impl CodeyRuntime {
             Self {
                 codex_app_path: app_dir,
                 maintenance,
-                applied_model_config: RwLock::new(runtime_config.clone()),
-                applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(
+                applied_model_config: RwLock::new(AppliedModelConfig::new(runtime_config.clone())),
+                applied_subagent_config: RwLock::new(Arc::new(RuntimeSubagentConfig::from_config(
                     &runtime_config,
-                )),
+                ))),
                 subagent_route_catalog_installed: runtime_config_overrides
                     .iter()
                     .any(|entry| entry.starts_with("model_catalog_json=")),
@@ -2317,6 +2358,22 @@ impl CodeyRuntime {
             );
         }
         local_router_stop.context("关闭本地线路路由失败")
+    }
+}
+
+/// 启动失败时路由已经在监听。直接 Drop 会中止 accept 任务，来不及排空
+/// 正在处理的请求，也不会停掉请求日志。
+async fn stop_local_router_after_failed_start(local_router: Option<&LocalRouter>) {
+    let Some(local_router) = local_router else {
+        return;
+    };
+    if let Err(error) = local_router.stop().await {
+        error_log::record_failure(
+            "cleanup_failed",
+            "stop_local_router_after_startup_failure",
+            format!("{error:#}"),
+            serde_json::json!({}),
+        );
     }
 }
 

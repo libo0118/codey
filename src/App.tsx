@@ -25,7 +25,6 @@ import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
 import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
 import { repairOperationResult } from "./injectionRepair";
-import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import {
   getNotificationChannelDefinition,
 } from "./notifications";
@@ -35,10 +34,11 @@ import type { DiagnosticStorageCleanup, DiagnosticStorageTarget } from "./diagno
 import { DiagnosticCleanupNotice } from "./DiagnosticCleanupNotice";
 import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
-import { customContextRestoredNote } from "./modelSelectionNotice";
+import { customContextRestoredNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
+import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
-import { SettingsLayout } from "./SettingsLayout";
 import { SettingsPageHeader } from "./SettingsPageHeader";
+import { SettingsLayout } from "./SettingsLayout";
 import { useModelSelection } from "./useModelSelection";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { useAppUpdates } from "./useAppUpdates";
@@ -313,6 +313,28 @@ export function App({
     };
   }, []);
 
+  const refreshPluginRoutesRef = useRef<() => void>(() => undefined);
+  refreshPluginRoutesRef.current = () => {
+    void invoke<{
+      config: Config;
+      providerStatus?: ProviderStatus;
+      modelState?: ModelState;
+    }>("load_codey_config")
+      .then((result) => {
+        const merged = adoptRouteConfig(result.config);
+        if (!merged) return;
+        setDirty(merged.dirty);
+        if (result.providerStatus) setProviderStatus(result.providerStatus);
+        if (result.modelState) setModelState(result.modelState);
+      })
+      .catch(() => undefined);
+  };
+  useEffect(() => {
+    const refresh = () => refreshPluginRoutesRef.current();
+    window.addEventListener("codey:plugin-routes-changed", refresh);
+    return () => window.removeEventListener("codey:plugin-routes-changed", refresh);
+  }, []);
+
   async function load() {
     const generation = ++loadGenerationRef.current;
     const current = () => generation === loadGenerationRef.current;
@@ -327,6 +349,7 @@ export function App({
         config: Config;
         modelState?: ModelState;
         startupError?: string;
+        configLoadError?: string;
         officialAccountAvailable?: boolean;
         providerStatus?: ProviderStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
@@ -353,8 +376,12 @@ export function App({
       ]);
       if (!current()) return;
       const startupError = next.startupError || result.startupError;
-      if (startupError) {
-        setNotice({ tone: "error", text: `自动启动失败：${startupError}` });
+      const loadErrors = [
+        startupError && `自动启动失败：${startupError}`,
+        result.configLoadError,
+      ].filter(Boolean);
+      if (loadErrors.length > 0) {
+        setNotice({ tone: "error", text: loadErrors.join("；") });
       } else if (next.restartRequired) {
         setNotice({ tone: "info", text: "已保存的配置需重启 Codex 后生效" });
       } else {
@@ -679,6 +706,33 @@ export function App({
     await runOperation("reorder-routes", async () => {
       await persist({ ...config, profiles });
       setNotice({ tone: "success", text: "线路顺序已保存" });
+    });
+  }
+
+  async function reorderRouteModels(routeId: string, models: string[]) {
+    if (!config || dirty || isBusy || !config.localRouterEnabled) return;
+    const route = config.profiles.find((profile) => profile.id === routeId);
+    if (!route) return;
+    await runOperation("reorder-route-models", async () => {
+      const result = await invoke<{
+        config: Config;
+        modelState: ModelState;
+        restartRequired?: boolean;
+      } & ModelRuntimeUpdate>("reorder_route_models", {
+        routeId,
+        models,
+        expectedRevision: config.settingsRevision,
+      });
+      applyRouteResult(result);
+      // 顺序调整即时生效，不按重启状态提示；只有推送到选择器失败时才提醒。
+      setNotice(
+        result.modelHotReloadError
+          ? {
+              tone: "info",
+              text: `模型顺序已保存，但模型列表未刷新：${result.modelHotReloadError}`,
+            }
+          : { tone: "success", text: "模型顺序已保存" },
+      );
     });
   }
 
@@ -1159,6 +1213,7 @@ export function App({
   const handleSaveRoute = useStableEvent(saveRoute);
   const handleSetRouteEnabled = useStableEvent(setRouteEnabled);
   const handleReorderRoute = useStableEvent(reorderRoute);
+  const handleReorderRouteModels = useStableEvent(reorderRouteModels);
   const handleDeleteRoute = useStableEvent(requestDeleteRoute);
   const handleFetchRouteModels = useStableEvent((route: Profile) => {
     void fetchRouteModels(route);
@@ -1550,6 +1605,7 @@ export function App({
               onSaveRoute={handleSaveRoute}
               onSetRouteEnabled={handleSetRouteEnabled}
               onReorderRoute={handleReorderRoute}
+              onReorderRouteModels={handleReorderRouteModels}
               onDeleteRoute={handleDeleteRoute}
               onFetchRouteModels={handleFetchRouteModels}
               onOfficialAccountsChanged={handleOfficialAccountsChanged}

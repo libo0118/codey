@@ -635,6 +635,10 @@ fn render_catalog_for_provider(
             ));
         }
     }
+    // 目录顺序跟随线路配置里的模型顺序，Codex 原生列表与 Codey 分组菜单才一致。
+    model_id::sort_by_selection_order(&mut catalog_models, selected_models, |model| {
+        model.get("slug").and_then(Value::as_str)
+    });
     if let Some(websocket_models) = websocket_models {
         let websocket_model_keys = websocket_models
             .iter()
@@ -1023,6 +1027,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
     let mut catalogs = Vec::new();
     let mut bundled_fast_model_slugs = HashSet::new();
     let mut last_error = None;
+    let mut account_snapshot_models = None;
     for path in paths {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -1039,7 +1044,15 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
                 continue;
             }
         };
+        let account_snapshot = path.ends_with(DEBUG_CATALOG_RELATIVE_PATH)
+            && value
+                .get("codey_account_snapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let models = official_models_from_value(&value);
+        if account_snapshot {
+            account_snapshot_models = Some(models.clone());
+        }
         if !models.is_empty() {
             catalogs.push(models);
         }
@@ -1069,21 +1082,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
     // the signed-in account can actually use. A generic models_cache.json is
     // intentionally not treated as dynamic input because older Codex builds
     // can leave retired models in that file.
-    let dynamic_source = paths
-        .iter()
-        .position(|path| path.ends_with(DEBUG_CATALOG_RELATIVE_PATH))
-        .and_then(|index| {
-            fs::read(&paths[index])
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .filter(|value| {
-                    value
-                        .get("codey_account_snapshot")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                })
-                .map(|value| official_models_from_value(&value))
-        });
+    let dynamic_source = account_snapshot_models;
     // Account `/models` payloads name the slugs the signed-in account can call,
     // but they omit the instruction templates Codex needs to launch a model.
     // Fill those from the local cache before deciding the snapshot is unusable,
@@ -3337,6 +3336,48 @@ mod tests {
     }
 
     #[test]
+    fn generated_catalog_follows_the_configured_model_order() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let catalog_slugs = || {
+            let catalog: Value = serde_json::from_slice(
+                &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+            )
+            .unwrap();
+            catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let official_selection = vec![
+            "gpt-5.6-luna".to_string(),
+            "gpt-5.5".to_string(),
+            "gpt-6-astra".to_string(),
+        ];
+        assert_eq!(
+            refresh_for_provider(home.path(), true, None, &official_selection).unwrap(),
+            3
+        );
+        assert_eq!(catalog_slugs(), official_selection);
+
+        // 本地路由目录里官方原生 ID 与第三方别名混排，也按线路配置的顺序输出。
+        let mixed_selection = vec![
+            "kimi/k3".to_string(),
+            "gpt-5.6-sol".to_string(),
+            "kimi/kimi-for-coding".to_string(),
+        ];
+        assert_eq!(
+            refresh_for_provider(home.path(), false, Some(&mixed_selection), &mixed_selection)
+                .unwrap(),
+            3
+        );
+        assert_eq!(catalog_slugs(), mixed_selection);
+    }
+
+    #[test]
     fn generated_catalog_preserves_official_multi_agent_markers() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
@@ -3807,9 +3848,9 @@ mod tests {
                 .map(|model| model["slug"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-luna",
+                "gpt-6-astra",
                 "route-oc/deepseek-flash",
             ]
         );
@@ -3855,9 +3896,9 @@ mod tests {
                 .map(|model| model["slug"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-luna",
+                "gpt-6-astra",
                 "route-oc/deepseek-flash",
             ]
         );
@@ -4359,8 +4400,19 @@ mod tests {
         )
         .unwrap();
         let models = catalog["models"].as_array().unwrap();
-        let model = models.last().unwrap();
+        // 已配置的模型排在最前，未同步时补入的官方模型保持固定顺序跟在后面。
+        let model = models.first().unwrap();
         assert_eq!(model["slug"], "provider-fast-coder");
+        assert_eq!(
+            models[1..]
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            OFFICIAL_MODELS
+                .iter()
+                .map(|(slug, _)| *slug)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(model["codey_source"], "third_party");
         assert_eq!(model["visibility"], "list");
         assert_eq!(model["supported_in_api"], true);

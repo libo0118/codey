@@ -1000,6 +1000,32 @@ fn only_endpoint_capability_statuses_use_long_websocket_backoff() {
     }
 }
 
+// 【自动化测试】本地路由 - 热更新送达失败时退回原快照，不覆盖之后装入的快照
+#[tokio::test]
+async fn failed_delivery_reverts_only_its_own_router_snapshot() {
+    let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let original = router.snapshot.read().unwrap().model_ids().to_vec();
+    let mut added = config.clone();
+    added.selected_models_by_provider.insert(
+        provider_id.clone(),
+        vec![model.clone(), "added-model".into()],
+    );
+    let current_models = || router.snapshot.read().unwrap().model_ids().to_vec();
+
+    let swap = router.update_config(&added);
+    assert_ne!(current_models(), original);
+    assert!(router.revert_config(swap));
+    assert_eq!(current_models(), original);
+
+    let stale = router.update_config(&added);
+    let newer = current_models();
+    router.update_config(&added);
+    assert!(!router.revert_config(stale));
+    assert_eq!(current_models(), newer);
+    router.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn router_config_update_invalidates_only_changed_websocket_routes() {
     let (mut config, provider_id, _) = router_config("http://127.0.0.1:9/v1".into());
@@ -1778,6 +1804,139 @@ async fn local_responses_websocket_rejects_missing_router_token() {
         panic!("expected HTTP handshake rejection");
     };
     assert_eq!(response.status(), WebSocketStatusCode::UNAUTHORIZED);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_activity_is_readable_without_the_router_token() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    let body = r#"{"schema":"codey.appserver.v1","call":"codey://getTasks"}"#;
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut rejected = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut rejected))
+        .await
+        .expect("task counts should reject an anonymous request")
+        .unwrap();
+    assert!(rejected.starts_with("HTTP/1.1 401 "), "{rejected}");
+    assert!(rejected.contains("invalid_router_token"), "{rejected}");
+
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                endpoint.token,
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .expect("task counts should respond")
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(
+        response.contains("\"schema\":\"codey.appserver.v1\""),
+        "{response}"
+    );
+    assert!(response.contains("\"running\""), "{response}");
+    assert!(response.contains("\"failed\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_server_call_rejects_an_invalid_method_without_the_router_token() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            b"POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
+    let mut rejected = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut rejected))
+        .await
+        .expect("anonymous app-server call should be rejected")
+        .unwrap();
+    assert!(rejected.starts_with("HTTP/1.1 401 "), "{rejected}");
+    assert!(rejected.contains("invalid_router_token"), "{rejected}");
+
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                endpoint.token
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+        .await
+        .expect("invalid app-server call should respond")
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    assert!(response.contains("\"error\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
+
+    let method =
+        r#"{"schema":"codey.appserver.v1","call":"codey://appServer/thread/list","params":{}}"#;
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{method}",
+                endpoint.token,
+                method.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+        .await
+        .expect("unlisted app-server method should be rejected")
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    assert!(response.contains("\"error\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
     router.stop().await.unwrap();
 }
 
@@ -6717,6 +6876,146 @@ fn responses_request_converts_messages_images_tools_and_results_to_anthropic() {
     assert_eq!(anthropic["stream"], true);
 }
 
+#[tokio::test]
+async fn omitted_high_effort_output_limit_reaches_every_upstream_protocol() {
+    let cases = [
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "claude-opus-5",
+            "high",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            Some(64_000_u64),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            "claude-opus-5",
+            "ultra",
+            None,
+            "/v1/chat/completions",
+            "max_tokens",
+            Some(64_000),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+            "claude-opus-5",
+            "xhigh",
+            None,
+            "/v1/messages",
+            "max_tokens",
+            Some(64_000),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "provider-model",
+            "high",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            None,
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            "claude-opus-5",
+            "high",
+            Some(2048_u64),
+            "/v1/chat/completions",
+            "max_tokens",
+            Some(2048),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+            "claude-3-5-sonnet",
+            "high",
+            None,
+            "/v1/messages",
+            "max_tokens",
+            Some(DEFAULT_ANTHROPIC_MAX_TOKENS),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "claude-opus-5",
+            "medium",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            None,
+        ),
+    ];
+    for (protocol, model, effort, explicit_limit, path, field, expected) in cases {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let protocol_name = protocol.to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let response = if protocol_name == crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES {
+                json!({
+                    "id":"msg-1",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude",
+                    "content":[{"type":"text","text":"ok"}],
+                    "stop_reason":"end_turn"
+                })
+            } else if protocol_name == crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS {
+                json!({
+                    "id":"chatcmpl-1",
+                    "choices":[{
+                        "index":0,
+                        "message":{"role":"assistant","content":"ok"},
+                        "finish_reason":"stop"
+                    }]
+                })
+            } else {
+                json!({"id":"resp-1","object":"response","status":"completed","output":[]})
+            };
+            write_json_response(&mut stream, 200, &response)
+                .await
+                .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, _) = router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].normalize();
+        config
+            .selected_models_by_provider
+            .insert(provider_id.clone(), vec![model.to_string()]);
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let mut request = json!({
+            "model": model_alias(&provider_id, model),
+            "input": "hello",
+            "reasoning": {"effort": effort}
+        });
+        if let Some(limit) = explicit_limit {
+            request["max_output_tokens"] = json!(limit);
+        }
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{protocol} {model} {effort}"
+        );
+        let (actual_path, body) = upstream_task.await.unwrap();
+        assert_eq!(actual_path, path, "{protocol}");
+        assert_eq!(
+            body.get(field).and_then(Value::as_u64),
+            expected,
+            "{protocol} {model} {effort} {body}"
+        );
+        router.stop().await.unwrap();
+    }
+}
+
 #[test]
 fn removed_minimal_effort_still_maps_to_low_for_anthropic() {
     // `minimal` 已不再是界面档位，但旧会话和自定义档位的 value 仍可能带上它；
@@ -10996,6 +11295,22 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
         usage.json::<Value>().await.unwrap()["status"],
         "unavailable"
     );
+    let invalid_usage = client
+        .post(format!(
+            "{gateway_root}/codey/api/query_official_account_usage"
+        ))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"forceRefresh": "yes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_usage.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_usage = invalid_usage.json::<Value>().await.unwrap();
+    assert!(
+        invalid_usage["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("额度查询参数无效"))
+    );
 
     // 系统浏览器里的请求日志页无法走 Codey 应用桥，账号筛选、账号名显示和按
     // 账号推算额度都要靠本地路由提供同一份账号目录。
@@ -11458,4 +11773,45 @@ async fn chat_stream_keeps_distinct_tools_separate_across_both_shapes() {
         names.sort();
         assert_eq!(names, vec!["alpha", "beta"], "{output:#?}");
     }
+}
+
+#[tokio::test]
+async fn router_listener_stays_inside_the_high_port_range_and_never_repeats() {
+    // 绑定成功即独占端口，所以并发/连续启动不会把同一个端口分配两次。
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    for _ in 0..16 {
+        let listener = bind_router_listener().await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            (ROUTER_PORT_RANGE_START..=ROUTER_PORT_RANGE_END).contains(&port),
+            "端口 {port} 落在高位区间之外"
+        );
+        for existing in &listeners {
+            assert_ne!(
+                existing.local_addr().unwrap().port(),
+                port,
+                "端口 {port} 被重复分配"
+            );
+        }
+        listeners.push(listener);
+    }
+}
+
+#[tokio::test]
+async fn an_occupied_candidate_port_is_skipped() {
+    // 占住区间内第一个可用端口，再让探测从它开始，验证会换到下一个候选。
+    let mut first_free = None;
+    for step in 0..u32::from(ROUTER_PORT_PROBES) {
+        let port = ROUTER_PORT_RANGE_START + step as u16;
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            first_free = Some((step, listener));
+            break;
+        }
+    }
+    let (offset, blocked) = first_free.expect("高位端口区间内没有可用端口，无法构造跳过占用的场景");
+    let blocked_port = blocked.local_addr().unwrap().port();
+    let listener = bind_router_listener_from(offset).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert_ne!(port, blocked_port, "被占用的端口 {blocked_port} 仍被分配");
+    assert!((ROUTER_PORT_RANGE_START..=ROUTER_PORT_RANGE_END).contains(&port));
 }

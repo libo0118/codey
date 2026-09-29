@@ -129,27 +129,7 @@ pub async fn save_official_route_models(
         .cloned()
         .unwrap_or_else(model_catalog::default_official_model_slugs);
     // 官方线路不接受上下文预算或思考强度声明变更，保留已有配置。
-    let official_by_key = official_models
-        .iter()
-        .map(|model| (model_id::key(model), model.as_str()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let requested_keys = requested_models
-        .iter()
-        .map(|model| model_id::key(model))
-        .collect::<HashSet<_>>();
-    if requested_keys.is_empty() {
-        return Err("官方账号线路至少需要保留一个模型".to_string());
-    }
-    if let Some(model) = requested_keys
-        .iter()
-        .find(|model| !official_by_key.contains_key(model.as_str()))
-    {
-        return Err(format!("模型 {model} 不在官方模型列表中"));
-    }
-    let selected_models = official_models
-        .into_iter()
-        .filter(|model| requested_keys.contains(&model_id::key(model)))
-        .collect::<Vec<_>>();
+    let selected_models = ordered_official_selection(&official_models, &requested_models)?;
     config
         .selected_models_by_provider
         .insert(provider_id, selected_models);
@@ -257,6 +237,37 @@ pub async fn save_official_route_models(
     ))
 }
 
+/// 官方线路启用的模型按请求顺序保存，线路卡片和选择器都按这个顺序显示；
+/// 模型 ID 统一回写为官方目录里的拼写。
+pub(crate) fn ordered_official_selection(
+    official_models: &[String],
+    requested_models: &[String],
+) -> Result<Vec<String>, String> {
+    let official_by_key = official_models
+        .iter()
+        .map(|model| (model_id::key(model), model.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut selected = Vec::with_capacity(requested_models.len());
+    let mut seen = HashSet::new();
+    for model in requested_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+    {
+        let key = model_id::key(model);
+        let Some(official_model) = official_by_key.get(key.as_str()) else {
+            return Err(format!("模型 {model} 不在官方模型列表中"));
+        };
+        if seen.insert(key) {
+            selected.push((*official_model).to_string());
+        }
+    }
+    if selected.is_empty() {
+        return Err("官方账号线路至少需要保留一个模型".to_string());
+    }
+    Ok(selected)
+}
+
 /// Keeps the official-account store in step with the proxy edited on the
 /// official route card.
 async fn persist_official_account_proxy(
@@ -305,14 +316,21 @@ pub(crate) async fn hot_reload_runtime_models(
         } else {
             config_with_launch_pinned_transport(&runtime.applied_config, config)
         };
-    if delivered.local_router_enabled
-        && let Err(error) = runtime.sync_local_router_routes(&delivered)
-    {
-        return ModelHotReloadOutcome {
-            error: Some(format!("{error:#}")),
-            ..ModelHotReloadOutcome::default()
-        };
-    }
+    // 路由快照和渲染端模型列表成对送达，失败回退时不能覆盖另一次送达的结果。
+    let _delivery = state.model_delivery_lock.lock().await;
+    let router_swap = if delivered.local_router_enabled {
+        match runtime.sync_local_router_routes(&delivered) {
+            Ok(swap) => swap,
+            Err(error) => {
+                return ModelHotReloadOutcome {
+                    error: Some(format!("{error:#}")),
+                    ..ModelHotReloadOutcome::default()
+                };
+            }
+        }
+    } else {
+        None
+    };
     let expected_catalog = renderer_model_catalog_value(&delivered, model_state);
     let expected_models = expected_catalog
         .get("models")
@@ -330,6 +348,11 @@ pub(crate) async fn hot_reload_runtime_models(
             }
         }
         Err(error) => {
+            // 未确认送达时仍以已应用的模型配置为准（需要重启的判断也以它为基准），
+            // 路由退回原快照，与 Codex 仍在显示的模型列表一致。
+            if let Some(swap) = router_swap {
+                runtime.revert_local_router_routes(swap);
+            }
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",

@@ -6,6 +6,9 @@ impl RouterServer {
         mut stream: TcpStream,
         connection_permit: OwnedSemaphorePermit,
     ) -> Result<()> {
+        // 协议探测和读取请求头共用这一次超时。慢客户端不能先占满探测窗口，
+        // 再单独占满读头窗口。
+        let header_started = Instant::now();
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
                 return self
@@ -29,10 +32,9 @@ impl RouterServer {
             }
         }
         let _connection_permit = connection_permit;
+        let header_budget = REQUEST_READ_TIMEOUT.saturating_sub(header_started.elapsed());
         let pending =
-            match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_http_request_head(&mut stream))
-                .await
-            {
+            match tokio::time::timeout(header_budget, read_http_request_head(&mut stream)).await {
                 Ok(Ok(request)) => request,
                 Ok(Err(error)) if error.is::<RequestBodyTooLarge>() => {
                     write_error_response(
@@ -72,6 +74,55 @@ impl RouterServer {
             write_json_response(&mut stream, 200, &json!({"status":"ok"})).await?;
             return Ok(());
         }
+        // 与本地路由使用同一地址和令牌。没有令牌不会统计，也不会启动共享 app-server。
+        if pending.request.method == "POST"
+            && pending.request.path == crate::appserver_call::HTTP_PATH
+        {
+            if !self.authorized(&pending.request) {
+                self.record_rejected_request(
+                    &pending.request,
+                    "http_rejected",
+                    401,
+                    "invalid_router_token",
+                );
+                write_error_response(
+                    &mut stream,
+                    401,
+                    "invalid_router_token",
+                    "Codey 本地路由认证失败",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            if crate::appserver_call::call_is_too_large(pending.content_length) {
+                write_error_response(
+                    &mut stream,
+                    413,
+                    "request_too_large",
+                    "app-server 请求过大",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            let Some(request) = self
+                .read_admitted_request_body(&mut stream, pending)
+                .await?
+            else {
+                return Ok(());
+            };
+            let route = crate::appserver_call::Route {
+                base_url: self.endpoint.base_url.clone(),
+                token: self.endpoint.token.clone(),
+                requires_openai_auth: self.endpoint.requires_openai_auth,
+                supports_websockets: self.endpoint.supports_websockets,
+                supports_remote_compaction: self.endpoint.supports_remote_compaction,
+            };
+            let (status, body) = crate::appserver_call::handle(&route, &request.body).await;
+            write_json_response(&mut stream, status, &body).await?;
+            return Ok(());
+        }
         if pending.request.method == "GET" && pending.request.path == REQUEST_LOG_PAGE_PATH {
             write_static_response(
                 &mut stream,
@@ -107,74 +158,11 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        let admission = match acquire_request_body_budget_within(
-            &self.request_body_budget,
-            pending.content_length,
-            REQUEST_BODY_BUDGET_WAIT,
-        )
-        .await
-        {
-            Ok(permit) => permit,
-            Err(error)
-                if error
-                    .downcast_ref::<RequestBodyBudgetUnavailable>()
-                    .is_some() =>
-            {
-                write_error_response(
-                    &mut stream,
-                    503,
-                    "router_memory_busy",
-                    "Codey 本地路由请求缓冲区已满，请稍后重试",
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(error) if error.is::<RequestBodyTooLarge>() => {
-                write_error_response(
-                    &mut stream,
-                    413,
-                    "request_too_large",
-                    error.to_string(),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let request = match tokio::time::timeout(
-            REQUEST_READ_TIMEOUT,
-            read_http_request_body_with_budget(&mut stream, pending, None),
-        )
-        .await
-        {
-            Ok(Ok(mut request)) => {
-                request._body_budget_permit = admission;
-                request
-            }
-            Ok(Err(error)) => {
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "invalid_http_request",
-                    format!("本地路由请求无效：{error:#}"),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(_) => {
-                write_error_response(
-                    &mut stream,
-                    408,
-                    "request_timeout",
-                    "读取本地路由请求超时",
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
+        let Some(request) = self
+            .read_admitted_request_body(&mut stream, pending)
+            .await?
+        else {
+            return Ok(());
         };
         let route_path = request.path.as_str();
         match (request.method.as_str(), route_path) {
@@ -207,7 +195,14 @@ impl RouterServer {
                 let args = match serde_json::from_slice::<UsageQuery>(&request.body) {
                     Ok(args) => args,
                     Err(error) => {
-                        write_json_response(&mut stream, 400, &json!({"status": "error", "message": format!("额度查询参数无效：{error}")})).await?;
+                        write_error_response(
+                            &mut stream,
+                            400,
+                            "invalid_usage_query",
+                            format!("额度查询参数无效：{error}"),
+                            None,
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
@@ -272,7 +267,7 @@ impl RouterServer {
                 let store = crate::official_accounts::OfficialAccountStore::for_config_path(
                     &crate::config::default_config_path(),
                 );
-                let value = match tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                let message = match tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
                     let default_account_id = store.default_account_id()?;
                     Ok(json!({
                         "status": "ok",
@@ -282,17 +277,21 @@ impl RouterServer {
                 })
                 .await
                 {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => json!({
-                        "status": "error",
-                        "message": format!("读取官方账号列表失败：{error:#}"),
-                    }),
-                    Err(error) => json!({
-                        "status": "error",
-                        "message": format!("读取官方账号列表任务异常退出：{error}"),
-                    }),
+                    Ok(Ok(value)) => {
+                        write_json_response(&mut stream, 200, &value).await?;
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => format!("读取官方账号列表失败：{error:#}"),
+                    Err(error) => format!("读取官方账号列表任务异常退出：{error}"),
                 };
-                write_json_response(&mut stream, 200, &value).await?;
+                write_error_response(
+                    &mut stream,
+                    500,
+                    "official_accounts_unavailable",
+                    message,
+                    None,
+                )
+                .await?;
             }
             ("POST", "/codey/api/load_codey_config") => {
                 let catalog = self
@@ -331,21 +330,16 @@ impl RouterServer {
                     crate::route_request_log::query_route_request_log_models(&root, backend, query)
                 })
                 .await;
-                match result {
+                let message = match result {
                     Ok(Ok(page)) => {
-                        write_json_response(&mut stream, 200, &serde_json::to_value(page)?).await?
+                        write_json_response(&mut stream, 200, &serde_json::to_value(page)?).await?;
+                        return Ok(());
                     }
-                    error => {
-                        write_error_response(
-                            &mut stream,
-                            500,
-                            "request_log_query_failed",
-                            format!("查询模型候选失败：{error:?}"),
-                            None,
-                        )
-                        .await?
-                    }
-                }
+                    Ok(Err(error)) => format!("查询模型候选失败：{error:#}"),
+                    Err(error) => format!("模型候选查询任务异常退出：{error}"),
+                };
+                write_error_response(&mut stream, 500, "request_log_query_failed", message, None)
+                    .await?;
             }
             (
                 "POST",
@@ -453,6 +447,72 @@ impl RouterServer {
             }
         }
         Ok(())
+    }
+
+    /// Waits briefly for request-buffer budget, then reads the body under the
+    /// router read timeout. Returns `None` after writing the error response.
+    async fn read_admitted_request_body(
+        &self,
+        stream: &mut TcpStream,
+        pending: PendingHttpRequest,
+    ) -> Result<Option<HttpRequest>> {
+        let admission = match acquire_request_body_budget_within(
+            &self.request_body_budget,
+            pending.content_length,
+            REQUEST_BODY_BUDGET_WAIT,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error)
+                if error
+                    .downcast_ref::<RequestBodyBudgetUnavailable>()
+                    .is_some() =>
+            {
+                write_error_response(
+                    stream,
+                    503,
+                    "router_memory_busy",
+                    "Codey 本地路由请求缓冲区已满，请稍后重试",
+                    None,
+                )
+                .await?;
+                return Ok(None);
+            }
+            Err(error) if error.is::<RequestBodyTooLarge>() => {
+                write_error_response(stream, 413, "request_too_large", error.to_string(), None)
+                    .await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match tokio::time::timeout(
+            REQUEST_READ_TIMEOUT,
+            read_http_request_body_with_budget(stream, pending, None),
+        )
+        .await
+        {
+            Ok(Ok(mut request)) => {
+                request._body_budget_permit = admission;
+                Ok(Some(request))
+            }
+            Ok(Err(error)) => {
+                write_error_response(
+                    stream,
+                    400,
+                    "invalid_http_request",
+                    format!("本地路由请求无效：{error:#}"),
+                    None,
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(_) => {
+                write_error_response(stream, 408, "request_timeout", "读取本地路由请求超时", None)
+                    .await?;
+                Ok(None)
+            }
+        }
     }
 
     pub(crate) async fn proxy_image_generation(
@@ -941,12 +1001,28 @@ impl RouterServer {
                 break;
             };
             if matches!(message, WebSocketMessage::Text(_)) {
-                connection_permit = Some(
-                    Arc::clone(&self.connection_limit)
-                        .acquire_owned()
-                        .await
-                        .context("等待本地路由连接名额失败")?,
-                );
+                match acquire_connection_permit_within(
+                    &self.connection_limit,
+                    REQUEST_BODY_BUDGET_WAIT,
+                )
+                .await
+                {
+                    Ok(permit) => connection_permit = Some(permit),
+                    Err(ConnectionPermitError::Busy) => {
+                        downstream
+                            .write_error(
+                                503,
+                                "router_busy",
+                                "Codey 本地路由当前请求过多，请稍后重试".to_string(),
+                                None,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    Err(ConnectionPermitError::Closed) => {
+                        anyhow::bail!("等待本地路由连接名额失败");
+                    }
+                }
             }
             downstream.clear_stream_id();
             match message {
@@ -1686,6 +1762,18 @@ impl RouterServer {
             && restore_reasoning_text_from_summary(&mut body)
         {
             body_mutated = true;
+        }
+        // Codex 不发送输出上限。高推理强度在 Claude 网关上会变成超过 8192 的思考预算，
+        // 三种协议都会因此被拒。只在客户端省略该字段时按模型补上；输出预留仍只缩减上下文。
+        if !compacting
+            && !resolved.route.official_account
+            && ensure_omitted_reasoning_output_limit(&mut body, bridge)
+        {
+            body_mutated = true;
+            if bridge == ProtocolBridge::NativeResponses {
+                // 原生透传只改写少数顶层字段，新增的输出上限必须整段重编码才会发出。
+                encoded_body = None;
+            }
         }
         let mut tool_bridge = ResponsesToolBridge::default();
         let offload_conversion = bridge != ProtocolBridge::NativeResponses
