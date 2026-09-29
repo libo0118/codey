@@ -198,7 +198,7 @@ fn fresh_writer_after_interrupted_batch_does_not_inherit_recovery_deadlines() {
         let session = "new-writer-after-interrupt";
         let runtime = "runtime-a";
         start_recovery_child(&root, session);
-        handle_hook_for_runtime_at(&root_command(session), &root, runtime, 1_000).unwrap();
+        handle_hook_for_runtime_at(&unavailable_wait(session), &root, runtime, 1_000).unwrap();
 
         let mut interrupt = input("PreToolUse", session);
         interrupt.turn_id = Some("root-turn-a".into());
@@ -216,7 +216,7 @@ fn fresh_writer_after_interrupted_batch_does_not_inherit_recovery_deadlines() {
             0
         );
 
-        let now = 1_001 + STOP_ABSOLUTE_GRACE_MILLIS;
+        let now = 1_001 + UNAVAILABLE_STATUS_GRACE_MILLIS;
         let mut spawn = input("PreToolUse", session);
         spawn.turn_id = Some("new-root-turn".into());
         spawn.cwd = Some(temp.path().to_string_lossy().into_owned());
