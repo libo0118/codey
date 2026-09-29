@@ -59,6 +59,7 @@ import type {
   FastContextToolsStatus,
   ModelState,
   PluginMarketplaceStatus,
+  Notice,
   Profile,
 } from "./App.types";
 import { Badge, Button, Tooltip } from "./components/ui";
@@ -139,6 +140,7 @@ export function App({
     });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
+  const [computerUseNotice, setComputerUseNotice] = useState<Notice | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(
     null,
   );
@@ -861,7 +863,7 @@ export function App({
     models: string[],
     showAccountUsageInHeader: boolean,
     enabled: boolean,
-    modelContexts: Record<string, import("./App.types").ModelContextConfig>,
+    modelContexts: Record<string, import("./App.types").ModelContextConfig> | undefined,
     upstreamProxy?: string,
     routeSettings?: {
       accountId: string;
@@ -888,7 +890,7 @@ export function App({
       } & import("./App.types").OfficialAccountsResult>("save_official_route_models", {
         routeId,
         models,
-        modelContexts,
+        ...(modelContexts === undefined ? {} : { modelContexts }),
         enabled,
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
@@ -1091,6 +1093,25 @@ export function App({
     });
   }
 
+  async function prepareComputerUse() {
+    await runOperation("prepare-computer-use", async () => {
+      setComputerUseNotice(null);
+      try {
+        const result = await withTimeout(
+          invoke<PluginMarketplaceStatus>("prepare_computer_use"),
+          30_000,
+          "桌面插件准备超时，请重新打开设置检查状态",
+        );
+        setPluginMarketplaceStatus(result);
+        setComputerUseNotice(result.computerUse?.ready
+          ? { tone: "success", text: "桌面插件已准备，请在 Codex 插件页面安装或更新 Codey Computer Use。" }
+          : { tone: "error", text: "桌面插件尚未准备完整，请重新准备。" });
+      } catch (error) {
+        setComputerUseNotice({ tone: "error", text: errorText(error) });
+      }
+    });
+  }
+
   async function repairMainProcessInjection() {
     if (!config || restartStatusError || !canRepairMainProcessInjection(status)) return;
     await runOperation("repair-main-process-injection", async () => {
@@ -1185,6 +1206,9 @@ export function App({
   const handleSaveCurrent = useStableEvent(() => void saveCurrent());
   const handleRepairPluginMarketplace = useStableEvent(
     () => void repairPluginMarketplace(),
+  );
+  const handlePrepareComputerUse = useStableEvent(
+    () => void prepareComputerUse(),
   );
   const handleRestartCodex = useStableEvent(askRestartCodex);
   const handleRepairMainProcessInjection = useStableEvent(
@@ -1562,6 +1586,8 @@ export function App({
                 isBusy={isBusy}
                 pluginMarketplaceStatus={pluginMarketplaceStatus}
                 onRepairPluginMarketplace={handleRepairPluginMarketplace}
+                onPrepareComputerUse={handlePrepareComputerUse}
+                computerUseNotice={computerUseNotice}
                 onRepairMainProcessInjection={handleRepairMainProcessInjection}
                 onRepairCodexConfig={askRepairCodexConfig}
                 configRepairNotice={configRepairNotice}
@@ -1586,8 +1612,9 @@ export function App({
               />
             </>
           ),
-          models: (
+          models: (active) => (
             <ModelSection
+              active={active}
               config={config}
               currentProvider={provider ?? null}
               officialAccountAvailable={status.officialAccountAvailable === true}

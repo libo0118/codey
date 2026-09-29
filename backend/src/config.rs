@@ -1293,6 +1293,34 @@ impl CodeyConfig {
             .map(|(_, policy)| policy)
     }
 
+    pub(crate) fn runtime_plugin_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        let qualify_official = self.qualifies_official_model_ids();
+        let mut contexts = BTreeMap::new();
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|p| p.enabled && p.plugin_owner_id.is_some())
+        {
+            if let Some(transport) = profile
+                .plugin_route_spec
+                .as_ref()
+                .and_then(|s| s.transport.as_ref())
+            {
+                for (model, caps) in &transport.models {
+                    contexts.insert(
+                        runtime_catalog_model_id(profile, model, qualify_official),
+                        ModelContextConfig {
+                            context_window_tokens: caps.context_window,
+                            auto_compact_token_limit: Some(caps.auto_compact_token_limit),
+                            reserve_output_tokens: None,
+                        },
+                    );
+                }
+            }
+        }
+        contexts
+    }
+
     pub(crate) fn runtime_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
         let qualify_official = self.qualifies_official_model_ids();
         self.profiles
@@ -1311,6 +1339,29 @@ impl CodeyConfig {
                             )
                         })
                     })
+            })
+            .collect()
+    }
+
+    /// 运行时覆盖仅针对启用的模型；未勾选模型的预算仍保留在配置里。
+    pub(crate) fn runtime_enabled_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        if !self.local_router_enabled {
+            return BTreeMap::new();
+        }
+        let policies = self
+            .runtime_plugin_model_contexts()
+            .into_iter()
+            .chain(self.runtime_model_contexts())
+            .map(|(model, policy)| (model_id::key(&model), policy))
+            .collect::<BTreeMap<_, _>>();
+        self.runtime_catalog_models()
+            .1
+            .into_iter()
+            .filter_map(|model| {
+                policies
+                    .get(&model_id::key(&model))
+                    .cloned()
+                    .map(|policy| (model, policy))
             })
             .collect()
     }
@@ -1523,7 +1574,13 @@ impl CodeyConfig {
         profile: &ProviderProfile,
         outbound_proxy_configured: bool,
     ) -> bool {
-        if !profile.enabled || outbound_proxy_configured {
+        if !profile.enabled
+            || outbound_proxy_configured
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {
@@ -1573,7 +1630,12 @@ impl CodeyConfig {
         &self,
         profile: &ProviderProfile,
     ) -> bool {
-        if !profile.enabled {
+        if !profile.enabled
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {
@@ -1650,7 +1712,12 @@ impl CodeyConfig {
         &self,
         profile: &ProviderProfile,
     ) -> bool {
-        if !profile.enabled {
+        if !profile.enabled
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {

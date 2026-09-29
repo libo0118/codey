@@ -302,6 +302,50 @@ impl RouterServer {
                     .clone();
                 write_json_response(&mut stream, 200, &json!({"config": catalog})).await?;
             }
+            ("POST", "/codey/api/query_route_request_log_quota_usage") => {
+                let query = match serde_json::from_slice::<
+                    crate::route_request_log::RouteRequestLogQuotaQuery,
+                >(&request.body)
+                {
+                    Ok(query) => query,
+                    Err(error) => {
+                        write_error_response(
+                            &mut stream,
+                            400,
+                            "invalid_request_log_query",
+                            format!("额度用量查询参数无效：{error}"),
+                            None,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let backend = self
+                    .snapshot
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .request_log_backend;
+                let root = self.request_log.root().to_path_buf();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::route_request_log::query_route_request_log_quota_usage(
+                        &root, backend, query,
+                    )
+                })
+                .await;
+                let message = match result {
+                    Ok(Ok(usage)) => {
+                        let mut value = serde_json::to_value(usage)?;
+                        value["recordingHealth"] =
+                            serde_json::to_value(self.request_log.health().await)?;
+                        write_json_response(&mut stream, 200, &value).await?;
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => format!("查询额度用量失败：{error:#}"),
+                    Err(error) => format!("额度用量查询任务异常退出：{error}"),
+                };
+                write_error_response(&mut stream, 500, "request_log_query_failed", message, None)
+                    .await?;
+            }
             ("POST", "/codey/api/query_route_request_log_models") => {
                 let query = match serde_json::from_slice::<
                     crate::route_request_log::RouteRequestLogModelQuery,
@@ -424,7 +468,10 @@ impl RouterServer {
                 self.proxy_responses(request, stream, ResponsesRequestKind::Create)
                     .await?;
             }
-            ("POST", "/v1/images/generations") | ("POST", "/images/generations") => {
+            ("POST", "/v1/images/generations")
+            | ("POST", "/images/generations")
+            | ("POST", "/v1/images/edits")
+            | ("POST", "/images/edits") => {
                 self.proxy_image_generation(request, stream).await?;
             }
             ("POST", "/v1/responses/compact")
@@ -521,6 +568,7 @@ impl RouterServer {
         mut stream: TcpStream,
     ) -> Result<()> {
         let probe = self.begin_basic_request_log(&request, "images_generations");
+        let editing = request.path.ends_with("/images/edits");
         let _log_guard = RouteRequestLogGuard::new(probe.clone());
         let mark_error = |status, code: &str| {
             if let Some(probe) = &probe {
@@ -644,7 +692,7 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let upstream_url = match image_generation_endpoint(upstream_base_url) {
+        let mut upstream_url = match image_generation_endpoint(upstream_base_url) {
             Ok(url) => url,
             Err(error) => {
                 mark_error(502, "route_configuration_error");
@@ -662,6 +710,9 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        if editing {
+            upstream_url = format!("{}/edits", upstream_url.trim_end_matches("/generations"));
+        }
         let headers = match self
             .prepare_upstream_request_headers(&request, &route)
             .await
@@ -717,8 +768,17 @@ impl RouterServer {
         } else {
             UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
         };
-        let response = match send_for_response_headers(
-            upstream_client.post(&upstream_url).headers(headers),
+        let operation = if editing {
+            codey_plugin_sdk::transport::Operation::ImageEdit
+        } else {
+            codey_plugin_sdk::transport::Operation::ImageGeneration
+        };
+        let response = match send_route_response_headers(
+            route.plugin_transport.as_ref(),
+            operation,
+            &upstream_client,
+            &upstream_url,
+            &headers,
             request_body,
             response_header_timeout,
             || {},
@@ -799,21 +859,23 @@ impl RouterServer {
         request: &HttpRequest,
         kind: &str,
     ) -> Option<RouteRequestLogProbe> {
-        self.request_log.begin(|producer| {
-            let request_id = current_router_request_id().unwrap_or_default();
-            let (session, parent) = request_log_codex_session(request);
-            producer.begin(RouteRequestLogStart {
-                request_id: &request_id,
-                started_at: current_router_request_started_at().unwrap_or_else(Instant::now),
-                request_protocol: RequestProtocol::Http,
-                request_kind: kind,
-                requested_model: "",
-                reasoning_effort: None,
-                thinking_budget_tokens: None,
-                codex_session_id: session,
-                codex_session_is_parent: parent,
+        self.request_log
+            .begin(|producer| {
+                let request_id = current_router_request_id().unwrap_or_default();
+                let (session, parent) = request_log_codex_session(request);
+                producer.begin(RouteRequestLogStart {
+                    request_id: &request_id,
+                    started_at: current_router_request_started_at().unwrap_or_else(Instant::now),
+                    request_protocol: RequestProtocol::Http,
+                    request_kind: kind,
+                    requested_model: "",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: session,
+                    codex_session_is_parent: parent,
+                })
             })
-        })
+            .inspect(|probe| probe.set_subagent(request_is_subagent(request)))
     }
 
     fn record_rejected_request(&self, request: &HttpRequest, kind: &str, status: u16, code: &str) {
@@ -825,6 +887,8 @@ impl RouterServer {
                 | "/responses"
                 | "/v1/images/generations"
                 | "/images/generations"
+                | "/v1/images/edits"
+                | "/images/edits"
                 | "/v1/responses/compact"
                 | "/responses/compact"
                 | "/v1/v1/responses/compact"
@@ -869,6 +933,11 @@ impl RouterServer {
         // 原样发到上游。Codey 内部请求 ID 只写入下游响应和本地日志，不随上游
         // 请求外发，避免向上游暴露代理痕迹。
         apply_upstream_headers(&mut headers, prepared_headers);
+        if let Some(target) = &route.plugin_transport {
+            return plugin_transport::account_headers(target)
+                .await
+                .map_err(|message| (401, "plugin_account_unavailable", message));
+        }
         if route.official_account {
             let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
                 Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
@@ -1449,6 +1518,7 @@ impl RouterServer {
                 .await;
         }
         if let Some(probe) = &probe {
+            probe.set_subagent(request_is_subagent(&request));
             probe.set_requested_service_tier(body.get("service_tier").and_then(Value::as_str));
             probe.record_request_body(RequestBodySummary::from_responses_body(
                 &body,
@@ -1695,6 +1765,10 @@ impl RouterServer {
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
         if bridge == ProtocolBridge::NativeResponses {
             if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            if resolved.route.official_account && sanitize_official_upstream_history(&mut body) {
                 body_mutated = true;
                 encoded_body = None;
             }
@@ -2026,6 +2100,10 @@ impl RouterServer {
                 body_mutated = true;
                 encoded_body = None;
             }
+            if resolved.route.official_account && sanitize_official_upstream_history(&mut upstream_body) {
+                body_mutated = true;
+                encoded_body = None;
+            }
         }
         // 原生请求可能刚被 WebSocket 回退展开，摘要要在这份最终正文上还原。
         // Chat 已在转换前还原；转换后的 messages 里没有 summary，再扫一次没有结果。
@@ -2178,7 +2256,7 @@ impl RouterServer {
             downstream, &mut lifecycle, &upstream_client, upstream_url,
             &mut headers, encoded, &mut || {
                 retain_compact_request_budget(&mut admission, retained_after_upload);
-            }, &mut attempt, response_header_timeout,
+            }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
         ).await?;
         let Some(response) = Self::finish_upstream_http_send(
             downstream,
@@ -2272,7 +2350,7 @@ impl RouterServer {
                     downstream, &mut lifecycle, &upstream_client, upstream_url,
                     &mut headers, encoded.into(), &mut || {
                         retain_compact_request_budget(&mut admission, retry_retained);
-                    }, &mut attempt, response_header_timeout,
+                    }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
                 ).await?;
                 let Some(retried) = Self::finish_upstream_http_send(
                     downstream,

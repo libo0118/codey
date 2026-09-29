@@ -39,6 +39,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: Setup Go for native desktop tools
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Test native Windows MCP protocol
+        working-directory: vendor/ComputerUse/windows
+        run: go test ./...
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
