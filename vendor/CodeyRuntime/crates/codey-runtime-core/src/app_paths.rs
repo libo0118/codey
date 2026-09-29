@@ -18,6 +18,7 @@ struct AppPackageSpec {
 
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
+const CODEX_APP_ENTRY_DIRS: &[&str] = &["app", "bin", "current", "versions/current"];
 
 /// `package.json` names the Codex desktop client has shipped under. The client
 /// merged into the ChatGPT app still identifies as `openai-codex-electron`, so
@@ -102,25 +103,71 @@ fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn registered_codex_app_dirs() -> Option<Vec<PathBuf>> {
+    registered_codex_packages()?
+        .iter()
+        .map(|package| normalize_codex_app_path(&package.install_location))
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RegisteredCodexPackage {
+    package_full_name: String,
+    install_location: PathBuf,
+}
+
+#[cfg(windows)]
+fn registered_codex_packages() -> Option<Vec<RegisteredCodexPackage>> {
     let output = Command::new("powershell")
         .creation_flags(crate::windows_create_no_window())
         .args([
             "-NoProfile",
             "-Command",
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $names=@('OpenAI.Codex','OpenAI.CodexBeta'); Get-AppxPackage | Where-Object { $names -contains $_.Name } | Select-Object -ExpandProperty InstallLocation",
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $names=@('OpenAI.Codex','OpenAI.CodexBeta'); $packages=@(Get-AppxPackage | Where-Object { $names -contains $_.Name } | Select-Object PackageFullName,InstallLocation); ConvertTo-Json -InputObject $packages -Compress",
         ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|location| normalize_codex_app_path(Path::new(location)))
-        .collect()
+    registered_codex_packages_from_output(&output.stdout)
+}
+
+#[cfg(any(windows, test))]
+fn registered_codex_packages_from_output(output: &[u8]) -> Option<Vec<RegisteredCodexPackage>> {
+    let packages: Vec<RegisteredCodexPackage> = serde_json::from_slice(output).ok()?;
+    packages
+        .iter()
+        .all(|package| {
+            supported_codex_package_identity(&package.package_full_name)
+                && package.install_location.is_absolute()
+        })
+        .then_some(packages)
+}
+
+#[cfg(any(windows, test))]
+fn registered_package_full_name(
+    app_dir: &Path,
+    packages: &[RegisteredCodexPackage],
+) -> Option<String> {
+    let app_dir = std::fs::canonicalize(app_dir).ok()?;
+    let mut matches = packages
+        .iter()
+        .filter_map(|package| {
+            let root = std::fs::canonicalize(&package.install_location).ok()?;
+            let entry = normalize_codex_app_path(&root)?;
+            let entry = std::fs::canonicalize(entry).ok()?;
+            // 注册位置必须指向同一个入口，不能只按祖先目录匹配或跟随越界链接。
+            (entry == app_dir && entry.starts_with(root)).then_some(&package.package_full_name)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    if matches.len() != 1 || !supported_codex_package_identity(matches[0]) {
+        return None;
+    }
+    Some(matches[0].clone())
 }
 
 fn unique_installation(paths: Vec<PathBuf>) -> Option<PathBuf> {
@@ -259,15 +306,11 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
-    let nested = [
-        path.join("app"),
-        path.join("bin"),
-        path.join("current"),
-        path.join("versions").join("current"),
-    ]
-    .into_iter()
-    .filter(|nested| executable_in_dir(nested).is_some())
-    .collect::<Vec<_>>();
+    let nested = CODEX_APP_ENTRY_DIRS
+        .iter()
+        .map(|entry| path.join(entry))
+        .filter(|nested| executable_in_dir(nested).is_some())
+        .collect::<Vec<_>>();
     if let Some(first) = nested.first().cloned() {
         // Preserve the selected layout, but refuse different installations
         // underneath it. Canonicalization allows aliases of the same install.
@@ -370,28 +413,102 @@ pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
                 == Some("com.openai.codex"),
             "macOS 应用标识不属于已支持的 Codex 客户端"
         );
-    } else if let Some(package_name) = package_name_from_app_dir(&root)
-        && let Some((_, version, publisher)) = codex_package_parts(&package_name)
-    {
+    } else if let Some(package_name) = packaged_app_full_name(&root) {
         anyhow::ensure!(
-            publisher == "2p2nqsd0c76g0"
-                && version.split('.').count() == 4
-                && version.split('.').all(|part| part.parse::<u16>().is_ok()),
-            "不支持的 Codex Windows 包身份或版本"
+            supported_codex_package_identity(&package_name),
+            "不支持的 Codex Windows 包身份或版本：{package_name}"
         );
     } else {
         anyhow::ensure!(
             !root
                 .components()
-                .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
-                && !root.join("AppxManifest.xml").exists()
-                && !root
-                    .parent()
-                    .is_some_and(|parent| parent.join("AppxManifest.xml").exists()),
-            "无法安全识别 Windows 打包安装，未按独立安装处理"
+                .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps")),
+            "无法安全识别 Windows 打包安装，未按独立安装处理；安装目录：{}",
+            root.display()
         );
+        // Standalone distributions can ship an AppxManifest.xml too. The file
+        // alone does not give the executable a Windows package identity.
+        for directory in root.ancestors().take(3) {
+            if directory
+                .join("AppxManifest.xml")
+                .try_exists()
+                .context("无法检查 Codex 安装清单")?
+            {
+                ensure_unregistered_windows_install(&root)?;
+                break;
+            }
+        }
     }
     Ok(())
+}
+
+fn ensure_unregistered_windows_install(app_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use anyhow::Context;
+
+        // Include all identities: an unrecognized registered package must not
+        // fall back to standalone launch just because its name is unfamiliar.
+        let output = Command::new("powershell")
+            .creation_flags(crate::windows_create_no_window())
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r#"$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new()
+Get-AppxPackage | ForEach-Object {
+    try { $_ | Select-Object -ExpandProperty InstallLocation }
+    catch {
+        # Removed packages can leave registrations with no installation location.
+        if ($_.Exception.InnerException -isnot [System.IO.FileNotFoundException]) { throw }
+    }
+}"#,
+            ])
+            .output()
+            .context("无法查询 Windows 包注册信息，未按独立安装处理")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "查询 Windows 包注册信息失败，未按独立安装处理"
+        );
+        let locations =
+            String::from_utf8(output.stdout).context("Windows 包注册路径不是有效 UTF-8")?;
+        anyhow::ensure!(
+            !app_dir_is_within_registered_package(app_dir, &locations)?,
+            "无法安全识别 Windows 打包安装，未按独立安装处理：{}",
+            app_dir.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    anyhow::bail!(
+        "无法核实 Windows 包注册信息，未按独立安装处理：{}",
+        app_dir.display()
+    )
+}
+
+#[cfg(any(windows, test))]
+fn app_dir_is_within_registered_package(app_dir: &Path, locations: &str) -> anyhow::Result<bool> {
+    use anyhow::Context;
+
+    for location in locations
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let location = Path::new(location);
+        anyhow::ensure!(location.is_absolute(), "Windows 包注册路径不是绝对路径");
+        let package_root = std::fs::canonicalize(location)
+            .with_context(|| format!("无法核实 Windows 包注册路径：{}", location.display()))?;
+        if app_dir.ancestors().any(|ancestor| {
+            ancestor
+                .as_os_str()
+                .eq_ignore_ascii_case(package_root.as_os_str())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
@@ -707,7 +824,7 @@ fn is_same_file(left: &Path, right: &Path) -> bool {
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
-    let package_name = package_name_from_app_dir(app_dir)?;
+    let package_name = packaged_app_full_name(app_dir)?;
     let (spec, _, publisher_id) = codex_package_parts(&package_name)?;
     if publisher_id.is_empty() {
         return None;
@@ -715,14 +832,54 @@ pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
     Some(format!("{}_{publisher_id}!{}", spec.identity, spec.app_id))
 }
 
+/// 校验、Store 更新和激活共用包身份，非标准目录名由当前用户的注册信息确认。
+pub fn packaged_app_full_name(app_dir: &Path) -> Option<String> {
+    if let Some(name) = package_name_from_app_dir(app_dir) {
+        return Some(name);
+    }
+    #[cfg(windows)]
+    if has_windows_package_marker(app_dir) {
+        return registered_package_full_name(app_dir, &registered_codex_packages()?);
+    }
+    None
+}
+
+#[cfg(any(windows, test))]
+fn has_windows_package_marker(app_dir: &Path) -> bool {
+    app_dir
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+        || app_dir
+            .ancestors()
+            .take(3)
+            .any(|root| root.join("AppxManifest.xml").try_exists().unwrap_or(true))
+}
+
 fn package_name_from_app_dir(app_dir: &Path) -> Option<String> {
     let path = app_dir.to_string_lossy().replace('\\', "/");
-    let mut parts = path.split('/').filter(|part| !part.is_empty());
-    let mut package_name = parts.next_back()?;
-    if package_name.eq_ignore_ascii_case("app") {
-        package_name = parts.next_back()?;
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    for entry in std::iter::once(&"").chain(CODEX_APP_ENTRY_DIRS.iter()) {
+        let suffix = entry
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() <= suffix.len() {
+            continue;
+        }
+        let index = parts.len() - suffix.len() - 1;
+        if parts[index + 1..]
+            .iter()
+            .zip(&suffix)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+            && codex_package_parts(parts[index]).is_some()
+        {
+            return Some(parts[index].to_string());
+        }
     }
-    Some(package_name.to_string())
+    None
 }
 
 fn macos_app_version(app_dir: &Path) -> Option<String> {
@@ -806,24 +963,21 @@ fn compare_app_dir_candidates(left: &Path, right: &Path) -> std::cmp::Ordering {
 
 fn app_dir_sort_key(app_dir: &Path) -> Option<(std::cmp::Reverse<u8>, Vec<u32>)> {
     let spec = package_spec_from_path(app_dir)?;
-    let package_dir = if app_dir
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("app"))
-    {
-        app_dir.parent().unwrap_or(app_dir)
-    } else {
-        app_dir
-    };
+    let package_name = package_name_from_app_dir(app_dir)?;
     Some((
         std::cmp::Reverse(spec.priority),
-        version_tuple(package_dir)?,
+        version_tuple(Path::new(&package_name))?,
     ))
 }
 
 fn package_entry_dir(package_dir: &Path) -> Option<PathBuf> {
     [package_dir.join("app"), package_dir.to_path_buf()]
         .into_iter()
+        .chain(
+            CODEX_APP_ENTRY_DIRS[1..]
+                .iter()
+                .map(|entry| package_dir.join(entry)),
+        )
         .find(|dir| executable_in_dir(dir).is_some())
 }
 
@@ -874,6 +1028,14 @@ fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str
         return Some((*spec, version, publisher_id));
     }
     None
+}
+
+fn supported_codex_package_identity(package_name: &str) -> bool {
+    codex_package_parts(package_name).is_some_and(|(_, version, publisher)| {
+        publisher == "2p2nqsd0c76g0"
+            && version.split('.').count() == 4
+            && version.split('.').all(|part| part.parse::<u16>().is_ok())
+    })
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1098,6 +1260,221 @@ mod tests {
             write_windows_client(&app);
             assert!(validate_codex_app_dir(&app).is_err(), "{name}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn standalone_client_with_appx_manifest_is_not_a_registered_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Programs/Codex");
+        write_windows_client(&app);
+        // Standalone distributions can retain the Store manifest even though
+        // their executable is flattened out of the manifest's app/ directory.
+        std::fs::write(
+            app.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+        validate_codex_app_dir(&app).unwrap();
+        assert!(packaged_app_user_model_id(&app).is_none());
+        std::fs::rename(
+            app.join("AppxManifest.xml"),
+            app.parent().unwrap().join("AppxManifest.xml"),
+        )
+        .unwrap();
+        validate_codex_app_dir(&app).unwrap();
+        assert!(packaged_app_user_model_id(&app).is_none());
+        std::fs::rename(
+            app.parent().unwrap().join("AppxManifest.xml"),
+            temp.path().join("AppxManifest.xml"),
+        )
+        .unwrap();
+        validate_codex_app_dir(&app).unwrap();
+        assert!(packaged_app_user_model_id(&app).is_none());
+    }
+
+    #[test]
+    fn registered_package_locations_match_whole_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("UnknownPackage");
+        let nested = package.join("app");
+        let sibling = temp.path().join("UnknownPackage-copy");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let locations = format!("\r\n{}\r\n", package.display());
+        for app in [&package, &nested] {
+            let app = std::fs::canonicalize(app).unwrap();
+            assert!(app_dir_is_within_registered_package(&app, &locations).unwrap());
+            #[cfg(windows)]
+            assert!(
+                app_dir_is_within_registered_package(&app, &locations.to_ascii_uppercase())
+                    .unwrap()
+            );
+        }
+        let sibling = std::fs::canonicalize(sibling).unwrap();
+        assert!(!app_dir_is_within_registered_package(&sibling, &locations).unwrap());
+        let parent = std::fs::canonicalize(temp.path()).unwrap();
+        assert!(!app_dir_is_within_registered_package(&parent, &locations).unwrap());
+        assert!(!app_dir_is_within_registered_package(&parent, "\r\n").unwrap());
+    }
+
+    #[test]
+    fn registered_package_locations_fail_closed_on_unverifiable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = std::fs::canonicalize(temp.path()).unwrap();
+        assert!(app_dir_is_within_registered_package(&app, "relative/package").is_err());
+        let missing = temp.path().join("missing");
+        assert!(app_dir_is_within_registered_package(&app, &missing.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn packaged_identity_follows_every_supported_entry_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, entry) in ["", "app", "bin", "current", "versions/current"]
+            .into_iter()
+            .enumerate()
+        {
+            let package = temp.path().join(format!(
+                "WindowsApps/OpenAI.Codex_26.924.{index}.0_x64__2p2nqsd0c76g0"
+            ));
+            let app = package.join(entry);
+            write_windows_client(&app);
+            let discovered = normalize_codex_app_path(&package).unwrap();
+            validate_codex_app_dir(&discovered)
+                .unwrap_or_else(|error| panic!("{entry}: {error:#}"));
+            assert_eq!(
+                packaged_app_user_model_id(&discovered).as_deref(),
+                Some("OpenAI.Codex_2p2nqsd0c76g0!App"),
+                "{entry}"
+            );
+            assert_eq!(
+                find_latest_codex_app_dir(package.parent().unwrap()),
+                Some(app)
+            );
+        }
+    }
+
+    #[test]
+    fn registered_package_output_preserves_identity_and_install_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = temp.path().join("Codex 安装");
+        let full_name = "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0";
+        let output = serde_json::to_vec(&serde_json::json!([{
+            "PackageFullName": full_name,
+            "InstallLocation": location,
+        }]))
+        .unwrap();
+        let packages = registered_codex_packages_from_output(&output).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].package_full_name, full_name);
+        assert_eq!(packages[0].install_location, location);
+        assert!(
+            registered_codex_packages_from_output(b"[]")
+                .unwrap()
+                .is_empty()
+        );
+        for output in [b"".as_slice(), b"null", b"{}", b"not JSON", b"[{}]"] {
+            assert!(registered_codex_packages_from_output(output).is_none());
+        }
+        for (full_name, location) in [
+            ("Other.App_26.924.22138.0_x64__2p2nqsd0c76g0", temp.path()),
+            ("OpenAI.Codex_26.924.22138.0_x64__unknown", temp.path()),
+            (
+                "OpenAI.Codex_26.924.99999.0_x64__2p2nqsd0c76g0",
+                temp.path(),
+            ),
+            (full_name, Path::new("relative")),
+        ] {
+            let output = serde_json::to_vec(&serde_json::json!([{
+                "PackageFullName": full_name, "InstallLocation": location,
+            }]))
+            .unwrap();
+            assert!(
+                registered_codex_packages_from_output(&output).is_none(),
+                "{full_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_identity_matches_only_the_exact_normalized_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let location = temp.path().join("自定义 Store 目录");
+        let app = location.join("app");
+        write_windows_client(&app);
+        std::fs::write(location.join("AppxManifest.xml"), b"fixture").unwrap();
+        assert!(has_windows_package_marker(&app));
+        assert!(package_name_from_app_dir(&app).is_none());
+        let full_name = "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0";
+        let mut packages = vec![RegisteredCodexPackage {
+            package_full_name: full_name.into(),
+            install_location: location.clone(),
+        }];
+        assert_eq!(
+            registered_package_full_name(&app, &packages).as_deref(),
+            Some(full_name)
+        );
+        assert!(registered_package_full_name(&app, &[]).is_none());
+        assert!(registered_package_full_name(&app.join("resources"), &packages).is_none());
+        let unrelated = temp.path().join("unrelated");
+        write_windows_client(&unrelated);
+        assert!(registered_package_full_name(&unrelated, &packages).is_none());
+        packages.push(RegisteredCodexPackage {
+            package_full_name: full_name.into(),
+            install_location: location.clone(),
+        });
+        assert_eq!(
+            registered_package_full_name(&app, &packages).as_deref(),
+            Some(full_name)
+        );
+        packages[1].package_full_name = "OpenAI.CodexBeta_26.924.22138.0_x64__2p2nqsd0c76g0".into();
+        assert!(registered_package_full_name(&app, &packages).is_none());
+        packages.truncate(1);
+        packages[0].package_full_name = "OpenAI.Codex_26.924.22138.0_x64__unknown".into();
+        assert!(registered_package_full_name(&app, &packages).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_identity_rejects_entry_links_outside_the_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registered");
+        std::fs::create_dir(&root).unwrap();
+        let external = temp.path().join("external");
+        write_windows_client(&external);
+        let app = root.join("app");
+        std::os::unix::fs::symlink(&external, &app).unwrap();
+        let packages = [RegisteredCodexPackage {
+            package_full_name: "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0".into(),
+            install_location: root,
+        }];
+        assert!(registered_package_full_name(&app, &packages).is_none());
+        assert!(registered_package_full_name(&external, &packages).is_none());
+    }
+
+    #[test]
+    fn unrecognized_packaged_layouts_never_become_standalone_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("WindowsApps/unregistered");
+        let app = root.join("versions/current");
+        write_windows_client(&app);
+        std::fs::write(root.join("AppxManifest.xml"), b"fixture").unwrap();
+        let error = validate_codex_app_dir(&app).unwrap_err().to_string();
+        assert!(error.contains("无法安全识别 Windows 打包安装"), "{error}");
+        assert!(error.contains(&std::fs::canonicalize(&app).unwrap().display().to_string()));
+        assert!(packaged_app_user_model_id(&app).is_none());
+        assert!(
+            packaged_app_user_model_id(Path::new(
+                r"C:\WindowsApps\Other.App_1.2.3.4_x64__2p2nqsd0c76g0\app"
+            ))
+            .is_none()
+        );
+        assert!(
+            packaged_app_user_model_id(Path::new(
+                r"C:\WindowsApps\OpenAI.Codex_1.2.3.4_x64__2p2nqsd0c76g0\app\resources"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
