@@ -46,7 +46,7 @@ use models::{
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
-use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
+use plugins::{plugin_marketplace_status, prepare_computer_use, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
@@ -1131,6 +1131,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(format!("模型候选查询参数无效：{error}")),
             }
         }
+        "query_route_request_log_quota_usage" => {
+            match serde_json::from_value::<crate::route_request_log::RouteRequestLogQuotaQuery>(
+                args.clone(),
+            ) {
+                Ok(query) => query_route_request_log_quota_usage(state, query).await,
+                Err(error) => Err(format!("额度用量查询参数无效：{error}")),
+            }
+        }
         "query_route_request_log_stats" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_log_stats(state, query).await,
@@ -1185,12 +1193,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             }
         }
         "check_for_updates"
+        | "get_device_machine_no"
         | "download_update"
         | "update_install_report"
         | "install_downloaded_update" => updates::invoke(state, command, &args).await,
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
+        "prepare_computer_use" => prepare_computer_use().await,
         "list_codey_plugins"
         | "get_codey_plugin_config_file"
         | "select_codey_plugin_package"
@@ -1321,6 +1331,28 @@ pub async fn query_route_request_logs(
     .map_err(|error| format!("请求日志查询任务异常退出：{error}"))?
     .map_err(|error| format!("查询请求日志失败：{error:#}"))?;
     serde_json::to_value(page).map_err(|error| format!("请求日志查询结果序列化失败：{error}"))
+}
+
+async fn query_route_request_log_quota_usage(
+    state: &Arc<AppState>,
+    query: crate::route_request_log::RouteRequestLogQuotaQuery,
+) -> Result<Value, String> {
+    let backend = state.config.read().await.route_request_log.backend;
+    let root = codey_runtime_core::paths::default_app_state_dir();
+    let usage = tokio::task::spawn_blocking(move || {
+        crate::route_request_log::query_route_request_log_quota_usage(&root, backend, query)
+    })
+    .await
+    .map_err(|error| format!("额度用量查询任务异常退出：{error}"))?
+    .map_err(|error| format!("查询额度用量失败：{error:#}"))?;
+    let mut value =
+        serde_json::to_value(usage).map_err(|error| format!("额度用量序列化失败：{error}"))?;
+    let runtime = state.runtime.lock().await.clone();
+    if let Some(runtime) = runtime {
+        value["recordingHealth"] = serde_json::to_value(runtime.request_log_health().await)
+            .map_err(|error| format!("请求日志状态序列化失败：{error}"))?;
+    }
+    Ok(value)
 }
 
 async fn query_route_request_log_stats(
@@ -1949,6 +1981,25 @@ async fn save_codey_config_locked(
 }
 
 pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
+    let account_state = Arc::downgrade(&state);
+    crate::codey_plugins::transport::set_account_handler(Arc::new(move |email| {
+        let weak = account_state.clone();
+        Box::pin(async move {
+            let state = weak.upgrade().ok_or("宿主正在关闭")?;
+            let store = state.official_accounts();
+            let lookup_email = email.clone();
+            let original = tokio::task::spawn_blocking(move || store.by_email(&lookup_email))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|e| e.to_string())?;
+            official_accounts::refresh_official_account_tokens(&state, &original.id).await?;
+            let store = state.official_accounts();
+            tokio::task::spawn_blocking(move || store.plugin_credentials(&email, &original))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|error| error.to_string())
+        })
+    }));
     let state = Arc::clone(&state);
     crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
         let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;
@@ -1971,7 +2022,7 @@ fn apply_plugin_route_change(
         crate::codey_plugins::RouteChange::Upsert {
             spec,
             create_if_missing,
-        } => crate::plugin_routes::upsert(&mut next, plugin_id, spec, create_if_missing)?,
+        } => crate::plugin_routes::upsert(&mut next, plugin_id, *spec, create_if_missing)?,
         crate::codey_plugins::RouteChange::Release => {
             crate::plugin_routes::release(&mut next, plugin_id);
             None
@@ -2677,10 +2728,13 @@ async fn query_official_account_usage(
         .map(|account_id| account_id.trim().to_string())
         .filter(|account_id| !account_id.is_empty())
     {
-        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+        // 账号列表带来的查询由用户打开「线路与模型」菜单触发，套餐跟着更新。
+        return query_stored_official_account_usage(state, force_refresh, account_id, true).await;
     }
     if let Some(account_id) = header_official_account_id(state).await {
-        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+        // 页头的定时读取只刷新显示，不写回套餐：账号记录里的套餐只在打开的
+        // 线路菜单里更新，后台轮询不会悄悄改账号信息。
+        return query_stored_official_account_usage(state, force_refresh, account_id, false).await;
     }
     let official_proxy;
     {
@@ -2746,6 +2800,7 @@ async fn query_stored_official_account_usage(
     state: &Arc<AppState>,
     force_refresh: bool,
     account_id: String,
+    write_back_plan: bool,
 ) -> Value {
     let store = state.official_accounts();
     let home = codex_home().to_path_buf();
@@ -2804,6 +2859,31 @@ async fn query_stored_official_account_usage(
         )
         .await
     };
+    // 官方额度接口每次都带当前的套餐类型：降级或升级之后它最先变化，账号
+    // 记录跟着更新，卡片和账号列表才不会一直显示历史套餐。页头的定时读取
+    // 只负责显示，不带这个参数，避免后台轮询改账号信息。
+    if write_back_plan
+        && snapshot.get("status").and_then(Value::as_str) == Some("ok")
+        && let Some(plan_type) = snapshot.get("planType").and_then(Value::as_str)
+    {
+        let plan_store = store.clone();
+        let plan_id = account_id.clone();
+        let plan_type = plan_type.to_string();
+        match tokio::task::spawn_blocking(move || {
+            plan_store.update_plan_type(&plan_id, Some(&plan_type))
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => error_log::record_failure(
+                "official_account_plan_update_failed",
+                "query_official_account_usage",
+                format!("{error:#}"),
+                json!({ "accountId": account_id }),
+            ),
+            Err(_) => {}
+        }
+    }
     // 令牌刚刷新过、本地仍判定有效，官方却以 401 拒绝，说明凭据已被撤销。
     // 默认账号尚未刷新的过期令牌会落在此判断之外，不会被误标。
     let credential_rejected = snapshot.get("reason").and_then(Value::as_str)

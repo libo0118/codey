@@ -61,6 +61,7 @@ pub fn marketplaces_status(home: &Path) -> Value {
         "remotePath": remote.marketplace_root,
         "managedConfigCompatible": managed_config_compatible,
         "needsRepair": needs_repair,
+        "computerUse": crate::computer_use::status(home),
     })
 }
 
@@ -163,12 +164,13 @@ pub fn list_plugins(home: &Path) -> Result<Value> {
     Ok(json!({"plugins": plugins, "count": count}))
 }
 
-fn marketplace_paths(home: &Path) -> [PathBuf; 4] {
+fn marketplace_paths(home: &Path) -> [PathBuf; 5] {
     [
         home.join(".tmp/plugins/.agents/plugins/marketplace.json"),
         home.join(".tmp/plugins/.agents/plugins/api_marketplace.json"),
         home.join(".tmp/plugins-remote/.agents/plugins/marketplace.json"),
         home.join(".tmp/marketplaces/role-specific-plugins/.agents/plugins/marketplace.json"),
+        crate::computer_use::marketplace_path(home),
     ]
 }
 
@@ -297,6 +299,8 @@ mod tests {
         assert_eq!(status["needsRepair"], true);
         assert_eq!(status["officialMarketplace"], false);
         assert_eq!(status["remoteMarketplace"], false);
+        assert_eq!(status["computerUse"]["ready"], false);
+        assert_eq!(list_plugins(home).unwrap()["count"], 0);
         assert_eq!(fs::read(&config_path).unwrap(), original);
         assert!(!home.join(".tmp").exists());
     }
@@ -316,6 +320,69 @@ mod tests {
         assert_eq!(status["remoteRegistered"], true);
         assert_eq!(status["managedConfigCompatible"], true);
         assert_eq!(status["needsRepair"], false);
+        assert_eq!(status["computerUse"]["ready"], false);
+        assert!(!home.join(".tmp/marketplaces/codey-local").exists());
+        assert!(
+            !fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("codey-local")
+        );
+        assert!(
+            list_plugins(home).unwrap()["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["id"] != "codey-computer-use@codey-local")
+        );
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn desktop_plugin_preparation_is_independent_of_marketplace_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::computer_use::prepare(home).unwrap();
+        let listed = list_plugins(home).unwrap();
+        let plugin = listed["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "codey-computer-use@codey-local")
+            .unwrap();
+        assert_eq!(plugin["installed"], false);
+        assert_eq!(plugin["enabled"], false);
+        assert_eq!(plugin["interface"]["displayName"], "Codey Computer Use");
+        assert_eq!(plugin["policy"]["installation"], "AVAILABLE");
+        let marketplace = crate::computer_use::marketplace_path(home);
+        fs::remove_file(&marketplace).unwrap();
+        ensure_marketplaces(home).unwrap();
+        assert!(!marketplace.exists());
+        let status = marketplaces_status(home);
+        assert_eq!(status["needsRepair"], false);
+        assert_eq!(status["computerUse"]["ready"], false);
+        crate::computer_use::prepare(home).unwrap();
+        assert_eq!(marketplaces_status(home)["computerUse"]["ready"], true);
+    }
+
+    #[test]
+    fn marketplace_repair_preserves_custom_desktop_marketplace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join("config.toml"),
+            "[marketplaces.codey-local]\nsource_type='local'\nsource='/custom'\n",
+        )
+        .unwrap();
+        ensure_marketplaces(home).unwrap();
+        assert!(!home.join(".tmp/marketplaces/codey-local").exists());
+        let config = codey_runtime_core::config_manager::ConfigManager::for_home(home)
+            .load()
+            .unwrap();
+        assert_eq!(
+            config.document()["marketplaces"]["codey-local"]["source"].as_str(),
+            Some("/custom")
+        );
+        assert_eq!(marketplaces_status(home)["needsRepair"], false);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 // main.tsx via a dynamic import that only exists in Vite dev builds, so this
 // module never ships in the production overlay.
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
+import type { QuotaUsage, QuotaUsageAggregate } from "../quotaEstimate";
 import { pluginConfigBusinessValuesEqual, validatePluginConfigText, type CodeyPlugin } from "../codeyPlugins";
 import { createCodexExtensionsPreview } from "./codexExtensionsMock";
 import {
@@ -550,12 +551,27 @@ if (import.meta.env.DEV) {
     let activePluginConfigContent: string | null = null;
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
+    let computerUseReady = false;
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
 
       if (command === "codex_extensions") return extensionsPreview(args?.request as Record<string, unknown>);
+
+      if (command === "plugin_marketplace_status" || command === "repair_plugin_marketplace" || command === "prepare_computer_use") {
+        const supported = previewClientPlatform === "macos" || previewClientPlatform === "windows";
+        if (command === "prepare_computer_use") {
+          if (!supported) throw new Error("当前平台不支持桌面工具");
+          computerUseReady = true;
+        }
+        return {
+          status: "ready", needsRepair: false,
+          officialMarketplace: false, remoteMarketplace: true,
+          remoteRegistered: true, managedConfigCompatible: true,
+          computerUse: { supported, ready: computerUseReady },
+        };
+      }
 
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
@@ -863,11 +879,11 @@ if (import.meta.env.DEV) {
         // 预览模式按账号返回不同的额度，避免所有线路显示同一份数据。
         let seed = 0;
         for (const character of accountId) seed = (seed * 31 + character.charCodeAt(0)) % 60;
-        return { status: "ok", fetchedAt, secondary: {
+        return { status: "ok", fetchedAt, planType: account?.planType, secondary: {
           usedPercent: 20 + seed, windowMinutes: 10080, resetsAt: fetchedAt + 3 * 86400,
         } };
       }
-      if (command === "query_route_request_logs" || command === "query_route_request_log_stats" || command === "query_route_request_log_models") {
+      if (command === "query_route_request_logs" || command === "query_route_request_log_stats" || command === "query_route_request_log_models" || command === "query_route_request_log_quota_usage") {
         const page = Math.max(1, Number(args.page) || 1);
         const pageSize = Math.min(100, Math.max(1, Number(args.pageSize) || 20));
         const search = String(args.search || "").trim().toLocaleLowerCase();
@@ -886,6 +902,7 @@ if (import.meta.env.DEV) {
           if (args.requestKind && item.requestKind !== args.requestKind) return false;
           if (provider && item.provider !== provider && item.providerName !== provider) return false;
           if (officialAccountId && item.officialAccountId !== officialAccountId) return false;
+          if (args.unassignedOnly && item.officialAccountId) return false;
           if (model && item.model !== model && item.requestedModel !== model) return false;
           if (status && item.status !== status) return false;
           if (protocol && item.upstreamTransport !== protocol) return false;
@@ -904,6 +921,35 @@ if (import.meta.env.DEV) {
           ].some((value) => value?.toLocaleLowerCase().includes(search));
         });
         filtered.sort((left, right) => right.timestampUnixMs - left.timestampUnixMs || right.requestId.localeCompare(left.requestId));
+        if (command === "query_route_request_log_quota_usage") {
+          const groups = new Map<string, QuotaUsageAggregate>();
+          for (const item of filtered) {
+            const usage: QuotaUsage = item;
+            const model = item.model?.trim() || item.requestedModel?.trim() || "未知模型";
+            const serviceTier = usage.serviceTier?.trim() || null;
+            const requestedServiceTier = usage.requestedServiceTier?.trim() || null;
+            const input = item.inputTokens ?? 0, cached = item.cachedInputTokens ?? 0;
+            const writes = item.cacheCreationInputTokens ?? 0;
+            const longContext = input > 272_000;
+            const key = JSON.stringify([model.toLowerCase(), serviceTier, requestedServiceTier, longContext]);
+            const group = groups.get(key) ?? { model, serviceTier, requestedServiceTier, longContext,
+              calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0,
+              cacheCreationInputTokens: 0, cacheHits: 0, missingUsage: 0, missingCacheCreation: 0,
+              billedCachedInputTokens: 0, billedCacheCreationInputTokens: 0 };
+            group.calls++; group.inputTokens += input; group.outputTokens += item.outputTokens ?? 0;
+            group.totalTokens += item.totalTokens ?? 0; group.cachedInputTokens += cached;
+            group.cacheCreationInputTokens += writes; group.cacheHits += Number(cached > 0);
+            group.missingUsage += Number(item.inputTokens == null || item.outputTokens == null || item.totalTokens == null);
+            group.missingCacheCreation += Number(item.cacheCreationInputTokens == null);
+            const billedCached = Math.min(input, cached);
+            group.billedCachedInputTokens += billedCached;
+            group.billedCacheCreationInputTokens += Math.min(input - billedCached, writes);
+            groups.set(key, group);
+          }
+          return { queryable: true, groups: [...groups.values()], totalCalls: filtered.length,
+            recordingHealth: { active: true, sampleRatePerMillion: 1_000_000,
+              droppedFull: 0, droppedClosed: 0, writeDropped: 0, writeFailures: 0 } };
+        }
         if (command === "query_route_request_log_models") {
           const models = [...new Set(filtered.map((item) => item.model ?? item.requestedModel))]
             .filter((model) => model && (!args.afterModel || model > String(args.afterModel))).sort();
@@ -1439,6 +1485,9 @@ if (import.meta.env.DEV) {
           repaired: configRepairPreview !== "unchanged",
           backupPath: null,
         };
+      }
+      if (command === "get_device_machine_no") {
+        return "m_preview_codey_device_001";
       }
       if (command === "check_for_updates") {
         return {

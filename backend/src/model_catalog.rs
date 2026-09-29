@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -229,6 +229,8 @@ pub(crate) struct CapabilityLists<'a> {
 /// 生成目录时一并应用的上下文与思考等级覆盖。
 #[derive(Clone, Copy)]
 pub(crate) struct CatalogOverrides<'a> {
+    pub(crate) plugin_contexts:
+        &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) reasoning_efforts:
         &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
@@ -320,8 +322,87 @@ pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'
     Ok(())
 }
 
+/// 用户目录只覆盖明确配置的预算，保留模型指令和其余元数据，也不执行
+/// Codey 缓存迁移。每次从原目录生成，恢复默认不会继承旧副本的预算。
+pub(crate) fn render_context_catalog_overlay(
+    source: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<Option<Vec<u8>>> {
+    if contexts.is_empty() {
+        return Ok(None);
+    }
+    let bytes = fs::read(source)
+        .with_context(|| format!("读取自定义模型目录失败：{}", source.display()))?;
+    let mut catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析自定义模型目录失败：{}", source.display()))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("自定义模型目录缺少 models 数组：{}", source.display()))?;
+    let mut indices = BTreeMap::new();
+    for (index, model) in models.iter().enumerate() {
+        if let Some(slug) = model.get("slug").and_then(Value::as_str) {
+            indices
+                .entry(model_id::key(slug))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
+        }
+    }
+    for (model, policy) in contexts {
+        let index = match indices.get(&model_id::key(model)) {
+            Some(Some(index)) => *index,
+            Some(None) => bail!(
+                "自定义模型目录中的预算模型重复：{model}（{}）",
+                source.display()
+            ),
+            None => bail!(
+                "自定义模型目录缺少已启用的预算模型：{model}（{}）",
+                source.display()
+            ),
+        };
+        apply_model_context(&mut models[index], Some(policy))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&catalog).context("序列化模型预算副本失败")?;
+    bytes.push(b'\n');
+    Ok(Some(bytes))
+}
+
+pub(crate) fn prepare_context_catalog_overlay(
+    home: &Path,
+    source: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<PathBuf> {
+    let Some(bytes) = render_context_catalog_overlay(source, contexts)? else {
+        return Ok(source.to_path_buf());
+    };
+    // 内容变化使用新路径，保存设置或另一个进程启动不会改写运行中的目录。
+    let path = home
+        .join("model-catalogs/context-overrides")
+        .join(format!("{}.json", crate::fs_util::sha256_hex(&bytes)));
+    if fs::read(&path).is_ok_and(|current| current == bytes) {
+        protect_catalog_file(&path)?;
+    } else {
+        atomic_write(&path, &bytes)?;
+    }
+    Ok(path)
+}
+
 fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'_>) -> Result<()> {
     for model in models {
+        // Always start from the catalog declaration, including when an override
+        // was removed or only a plugin policy remains.
+        prepare_cached_context_window(model);
+        let plugin_policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .plugin_contexts
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, policy)| policy)
+        });
+        if let Some(policy) = plugin_policy {
+            apply_model_context(model, Some(policy))?;
+            model["codey_context_source"] = json!("plugin_declared");
+        }
         let policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
             overrides
                 .contexts
@@ -2400,6 +2481,175 @@ fn prepare_cached_context_window(model: &mut Value) {
 
 #[cfg(test)]
 #[test]
+fn removing_context_override_restores_the_original_model_budget() {
+    let original = json!({
+        "slug":"gpt-5.6-sol",
+        "context_window":272000,
+        "max_context_window":1000000,
+        "effective_context_window_percent":95,
+        "auto_compact_token_limit":null,
+        "codey_context_source":"official_catalog"
+    });
+    let mut models = vec![original.clone()];
+    let empty = std::collections::BTreeMap::new();
+    let contexts = std::collections::BTreeMap::from([(
+        "gpt-5.6-sol".to_string(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    for overrides in [&contexts, &empty] {
+        apply_overrides_to_models(
+            &mut models,
+            CatalogOverrides {
+                plugin_contexts: &empty,
+                contexts: overrides,
+                reasoning_efforts: &Default::default(),
+            },
+        )
+        .unwrap();
+        if !overrides.is_empty() {
+            assert_eq!(models[0]["context_window"], 128_000);
+            assert_eq!(models[0]["auto_compact_token_limit"], 100_000);
+        }
+    }
+    models[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("codey_context_base");
+    assert_eq!(models[0], original);
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_preserves_source_and_uses_immutable_versions() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let original = json!({
+        "revision": "user-owned",
+        "models": [
+            {"slug": "GPT-5.6-SOL", "context_window": 1000000,
+             "base_instructions": "Keep user instructions", "custom_field": [1, 2]},
+            {"slug": "unmodified", "context_window": 1000000,
+             "effective_context_window_percent": 95}
+        ]
+    });
+    let source_bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&source, &source_bytes).unwrap();
+    let mut policies = BTreeMap::from([(
+        "gpt-5.6-sol".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 272_000,
+            auto_compact_token_limit: Some(220_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let first = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(first, source);
+    assert_eq!(
+        first,
+        prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap()
+    );
+    let first_bytes = fs::read(&first).unwrap();
+    let first_value: Value = serde_json::from_slice(&first_bytes).unwrap();
+    let mut expected = original.clone();
+    apply_model_context(&mut expected["models"][0], policies.values().next()).unwrap();
+    assert_eq!(first_value, expected);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    policies
+        .get_mut("gpt-5.6-sol")
+        .unwrap()
+        .context_window_tokens = 400_000;
+    let second = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert_eq!(
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new()).unwrap(),
+        source
+    );
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    let mut updated = original;
+    updated["models"][0]["base_instructions"] = json!("Updated by user");
+    fs::write(&source, serde_json::to_vec(&updated).unwrap()).unwrap();
+    let third = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(second, third);
+    let latest: Value = serde_json::from_slice(&fs::read(third).unwrap()).unwrap();
+    assert_eq!(latest["models"][0]["base_instructions"], "Updated by user");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let policies = BTreeMap::from([(
+        "route/model".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: None,
+            reserve_output_tokens: None,
+        },
+    )]);
+    for (catalog, message) in [
+        (json!({"models": []}), "缺少已启用的预算模型"),
+        (
+            json!({"models": [{"slug": "other/model"}]}),
+            "缺少已启用的预算模型",
+        ),
+        (
+            json!({"models": [{"slug": "route/model"}, {"slug": "ROUTE/MODEL"}]}),
+            "预算模型重复",
+        ),
+        (json!({"models": {}}), "缺少 models 数组"),
+    ] {
+        let bytes = serde_json::to_vec(&catalog).unwrap();
+        fs::write(&source, &bytes).unwrap();
+        let error = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
+        );
+    }
+    fs::write(&source, b"not json").unwrap();
+    assert!(render_context_catalog_overlay(&source, &policies).is_err());
+    assert!(
+        render_context_catalog_overlay(&source, &BTreeMap::new())
+            .unwrap()
+            .is_none()
+    );
+    let original = br#"{"models":[{"slug":"route/model"}]}"#;
+    fs::write(&source, original).unwrap();
+    let mut invalid = policies;
+    invalid
+        .get_mut("route/model")
+        .unwrap()
+        .auto_compact_token_limit = Some(128_000);
+    assert!(prepare_context_catalog_overlay(home.path(), &source, &invalid).is_err());
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert!(
+        !home
+            .path()
+            .join("model-catalogs/context-overrides")
+            .exists()
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn cached_context_projection_preserves_missing_fields_and_is_idempotent() {
     for mut model in [
         json!({"slug": "route/gpt-5.6-sol", "codey_source": "third_party"}),
@@ -2971,6 +3221,7 @@ mod tests {
             }],
         )]);
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2996,6 +3247,7 @@ mod tests {
         apply_catalog_overrides(
             combined.path(),
             CatalogOverrides {
+                plugin_contexts: &Default::default(),
                 contexts: &contexts,
                 reasoning_efforts: &no_efforts,
             },
@@ -3033,6 +3285,7 @@ mod tests {
         )]);
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -3085,6 +3338,7 @@ mod tests {
             .collect();
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -5348,4 +5602,62 @@ mod tests {
             "CACHED instructions for gpt-5.6-sol"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
+    use crate::config::ModelContextConfig;
+    use std::collections::BTreeMap;
+    let plugin = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 918000,
+            auto_compact_token_limit: Some(826000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let user = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 100000,
+            auto_compact_token_limit: Some(80000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let empty = BTreeMap::new();
+    let reasoning = BTreeMap::new();
+    let mut models = vec![json!({"slug":"route/model"})];
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
+    assert_eq!(models[0]["codey_context_source"], "plugin_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &user,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 100000);
+    assert_eq!(models[0]["codey_context_source"], "user_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
 }

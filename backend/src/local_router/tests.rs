@@ -8272,6 +8272,9 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let upstream_task = tokio::spawn(async move {
         for value in [
             json!({"output":[{"type":"message","content":"not a compaction"}]}),
+            json!({"status":"failed","output":[{"type":"compaction","encrypted_content":"failed"}]}),
+            json!({"status":"incomplete","output":[{"type":"compaction","encrypted_content":"partial"}]}),
+            json!({"status":"completed","error":{"code":"server_error"},"output":[{"type":"compaction","encrypted_content":"failed"}]}),
             json!({"output":[{"type":"compaction","encrypted_content":"valid"}]}),
         ] {
             let (mut socket, _) = upstream.accept().await.unwrap();
@@ -8282,7 +8285,7 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
     let body = json!({"model":model_alias(&provider_id, &model),"input":"full context"});
-    for status in [502, 200] {
+    for status in [502, 502, 502, 502, 200] {
         let response = reqwest::Client::new()
             .post(format!("{}/responses/compact", endpoint.base_url))
             .bearer_auth(&endpoint.token)
@@ -11037,6 +11040,117 @@ async fn router_rejects_unknown_raw_models_instead_of_guessing_a_route() {
 }
 
 #[tokio::test]
+async fn request_log_preserves_subagent_source_before_route_resolution() {
+    for backend in [
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogBackend::Ndjson,
+    ] {
+        let logs = tempfile::tempdir().unwrap();
+        let (mut config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
+        config.route_request_log.enabled = true;
+        config.route_request_log.backend = backend;
+        let router = LocalRouter::start_with_logger(
+            &config,
+            Arc::new(RouteRequestLogController::with_root(
+                logs.path().to_path_buf(),
+            )),
+        )
+        .await
+        .unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::new();
+        for (model, subagent, parent) in [
+            ("missing-memory-model", true, None),
+            ("missing-worker-model", true, Some("parent-thread")),
+            ("missing-main-model", false, None),
+        ] {
+            let mut request = client
+                .post(format!("{}/responses", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .header("thread-id", "request-thread")
+                .json(&json!({"model":model,"reasoning":{"effort":"medium"},"input":"private content"}));
+            if subagent {
+                request = request.header("x-openai-subagent", "memory_consolidation");
+            }
+            if let Some(parent) = parent {
+                request = request.header("x-codex-parent-thread-id", parent);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "model_not_enabled"
+            );
+        }
+        let response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("x-codex-parent-thread-id", "early-parent")
+            .body("invalid json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        router.stop().await.unwrap();
+        let items: Vec<Value> = match backend {
+            RouteRequestLogBackend::Sqlite => {
+                let page = crate::route_request_log::query_route_request_logs(
+                    logs.path(),
+                    backend,
+                    RouteRequestLogQuery::default(),
+                )
+                .unwrap();
+                assert!(page.queryable);
+                page.items
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).unwrap())
+                    .collect()
+            }
+            RouteRequestLogBackend::Ndjson => {
+                std::fs::read_to_string(logs.path().join("route-requests.ndjson"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            }
+        };
+        assert_eq!(items.len(), 4, "{backend:?}");
+        for item in &items {
+            assert!(item["provider"].is_null());
+            assert!(item["upstreamTransport"].is_null());
+            assert!(item["totalTokens"].is_null());
+            assert!(item["tokenUsage"]["totalTokens"].is_null());
+            assert_eq!(item["usageReported"], false);
+            assert!(!item.to_string().contains("private content"));
+            match item["requestedModel"].as_str().unwrap() {
+                "missing-memory-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert!(item["codexSessionId"].is_null());
+                }
+                "missing-worker-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "parent-thread");
+                }
+                "missing-main-model" => {
+                    assert_eq!(item["subagent"], false);
+                    assert_eq!(item["codexSessionIsParent"], false);
+                    assert_eq!(item["codexSessionId"], "request-thread");
+                }
+                "" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "early-parent");
+                    assert_eq!(item["errorCode"], "invalid_request_body");
+                }
+                model => panic!("unexpected request model: {model}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn router_rejects_requests_without_the_launch_token() {
     let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".to_string());
     let router = LocalRouter::start(&config).await.unwrap();
@@ -11176,6 +11290,52 @@ async fn request_log_excludes_non_model_paths_but_keeps_rejected_model_requests(
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn request_log_quota_api_returns_aggregates_and_health_with_authentication() {
+    let logs = tempfile::tempdir().unwrap();
+    let (mut config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let url = format!(
+        "{}/codey/api/query_route_request_log_quota_usage",
+        endpoint.base_url.trim_end_matches("/v1")
+    );
+    let client = reqwest::Client::new();
+    let unauthorized = client.post(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let invalid = client
+        .post(&url)
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"toUnixMs": 300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response = client
+        .post(&url)
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"fromUnixMs": 100, "toUnixMs": 300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let value = response.json::<Value>().await.unwrap();
+    assert_eq!(value["queryable"], true);
+    assert_eq!(value["totalCalls"], 0);
+    assert_eq!(value["groups"], json!([]));
+    assert!(value["recordingHealth"]["enabled"].is_boolean());
+    assert!(value.get("items").is_none());
+    router.stop().await.unwrap();
 }
 
 #[tokio::test]
