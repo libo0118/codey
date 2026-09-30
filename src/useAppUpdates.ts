@@ -69,7 +69,12 @@ const updateAvailable = (
   check: UpdateCheck | null | undefined,
 ): check is UpdateCheck => check?.updateAvailable === true;
 
+function updatePromptKey(result: Pick<UpdateCheck, "latestVersion" | "rollback">): string {
+  return result.rollback ? `rollback:${result.rollback.id}` : result.latestVersion;
+}
+
 function updateCheckText(result: UpdateCheck) {
+  if (result.rollback) return `可从 v${result.currentVersion} 回退至 v${result.latestVersion}：${result.rollback.reason}`;
   const base = result.updateAvailable
     ? result.selectedAsset
       ? `发现 v${result.latestVersion} 更新（当前 v${result.currentVersion}）`
@@ -229,10 +234,10 @@ export function useAppUpdates({
           const deferredVersion = readDeferredVersion();
           if (
             result.selectedAsset &&
-            promptedVersionRef.current !== result.latestVersion &&
-            deferredVersion !== result.latestVersion
+            promptedVersionRef.current !== updatePromptKey(result) &&
+            deferredVersion !== updatePromptKey(result)
           ) {
-            promptedVersionRef.current = result.latestVersion;
+            promptedVersionRef.current = updatePromptKey(result);
             askDownloadUpdate(result);
           }
           return;
@@ -288,10 +293,11 @@ export function useAppUpdates({
         text,
       });
       if (result.updateAvailable && result.selectedAsset) {
-        promptedVersionRef.current = result.latestVersion;
+        promptedVersionRef.current = updatePromptKey(result);
         if (
           downloadedUpdate?.latestVersion === result.latestVersion &&
           downloadedUpdate.publishId === result.publishId &&
+          downloadedUpdate.policyId === result.policyId &&
           downloadedUpdate.fileName === result.selectedAsset.fileName &&
           downloadedUpdate.sha256 === result.selectedAsset.sha256 &&
           downloadedUpdate.size === result.selectedAsset.size
@@ -316,9 +322,9 @@ export function useAppUpdates({
     if (!target?.updateAvailable || !target.selectedAsset || isBusy) return;
     setConfirmation({
       action: "download-update",
-      title: `发现 Codey 新版本 v${target.latestVersion}`,
+      title: target.rollback ? `回退 Codey 至 v${target.latestVersion}` : `发现 Codey 新版本 v${target.latestVersion}`,
       description: [
-        `当前版本为 v${target.currentVersion}，检测到新版本 v${target.latestVersion}。`,
+        target.rollback ? `管理员已授权从 v${target.currentVersion} 降级至 v${target.latestVersion}。回退原因：${target.rollback.reason}。请保存工作，确认后下载安装旧版本并重启。` : `当前版本为 v${target.currentVersion}，检测到新版本 v${target.latestVersion}。`,
         target.releaseNotes?.trim()
           ? `更新日志：\n${target.releaseNotes.trim()}`
           : null,
@@ -326,10 +332,10 @@ export function useAppUpdates({
       ]
         .filter(Boolean)
         .join("\n\n"),
-      confirmLabel: "立即更新",
+      confirmLabel: target.rollback ? "下载回退版本" : "立即更新",
       run: () => void downloadUpdate(target),
       // 用户已经在这次运行里明确推迟过这个版本，自动检查就不再反复弹窗。
-      onDismiss: () => writeDeferredVersion(target.latestVersion),
+      onDismiss: () => writeDeferredVersion(updatePromptKey(target)),
     });
   }
 
@@ -347,7 +353,7 @@ export function useAppUpdates({
     setUpdateResult({ tone: "pending", text: "正在下载并校验更新…" });
     try {
       const result = await withTimeout(
-        invoke<UpdateDownload>("download_update"),
+        invoke<UpdateDownload>("download_update", { expectedVersion: target.latestVersion, expectedPolicyId: target.policyId ?? null }),
         300_000,
         "下载更新超时，请稍后重试",
       );
@@ -370,12 +376,12 @@ export function useAppUpdates({
     if (!target || isBusy) return;
     setConfirmation({
       action: "install-update",
-      title: "安装更新",
-      description: `Codey 会先保存未保存的设置，再退出当前实例，安装 ${target.fileName}，然后尝试启动新版。`,
-      confirmLabel: "安装并重启",
+      title: target.rollback ? "确认回退并重启" : "安装更新",
+      description: target.rollback ? `将安装旧版本 v${target.latestVersion} 并重启。原因：${target.rollback.reason}。安装前会再次验证回退授权，若已发布新版本则停止本次回退。` : `Codey 会先保存未保存的设置，再退出当前实例，安装 ${target.fileName}，然后尝试启动新版。`,
+      confirmLabel: target.rollback ? "回退并重启" : "安装并重启",
       run: () => void installDownloadedUpdate(target),
       // 安装包已经下载好，"稍后"只影响自动提示，不影响用户从版本入口手动安装。
-      onDismiss: () => writeDeferredVersion(target.latestVersion),
+      onDismiss: () => writeDeferredVersion(updatePromptKey(target)),
     });
   }
 
