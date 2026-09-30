@@ -114,19 +114,22 @@ fn plugin_reasoning_limits_preserve_capabilities_and_reject_unsupported_settings
         BTreeMap::from([("DEMO".into(), synced.clone())]),
     );
     let state = current_model_state_at(&config, home.path()).unwrap();
-    let metadata = &state.third_party_model_metadata[0];
+    let metadata = state
+        .third_party_model_metadata
+        .iter()
+        .find(|entry| entry.slug == "demo")
+        .unwrap();
     assert_eq!(metadata.supported_reasoning_efforts, ["high", "xhigh"]);
     assert_eq!(metadata.auto_supported_reasoning_efforts, ["high", "xhigh"]);
     set_model_reasoning_efforts(&mut config, &provider_id, Some(&requested), &available).unwrap();
     let state = current_model_state_at(&config, home.path()).unwrap();
-    assert_eq!(
-        state.third_party_model_metadata[0].supported_reasoning_efforts,
-        ["high"]
-    );
-    assert_eq!(
-        state.third_party_model_metadata[0].auto_supported_reasoning_efforts,
-        ["high", "xhigh"]
-    );
+    let metadata = state
+        .third_party_model_metadata
+        .iter()
+        .find(|entry| entry.slug == "demo")
+        .unwrap();
+    assert_eq!(metadata.supported_reasoning_efforts, ["high"]);
+    assert_eq!(metadata.auto_supported_reasoning_efforts, ["high", "xhigh"]);
     config
         .model_reasoning_efforts_by_provider
         .remove(&provider_id);
