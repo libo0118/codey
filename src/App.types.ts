@@ -265,6 +265,7 @@ export type Confirmation = {
     | "install-update"
     | "download-update"
     | "disable-auto-update-check"
+    | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"
     | "delete-official-account";
@@ -302,6 +303,8 @@ export type CrashpadCleanup = {
   errors: string[];
 };
 
+export type RollbackDirective = { id: string; sourceVersion: string; targetVersion: string; reason: string };
+
 export type UpdateCheck = {
   currentVersion: string;
   latestVersion: string;
@@ -309,6 +312,8 @@ export type UpdateCheck = {
   selectedAsset?: UpdateAsset;
   releaseNotes?: string | null;
   publishId?: string | null;
+  policyId?: string | null;
+  rollback?: RollbackDirective | null;
 };
 
 export type UpdateAsset = {
@@ -329,6 +334,8 @@ export type UpdateDownload = {
   sha256: string;
   asset: UpdateAsset;
   publishId?: string | null;
+  policyId?: string | null;
+  rollback?: RollbackDirective | null;
 };
 
 /// 上一次更新安装留给本次启动的结果。助手在退出前写下，控制台读取后删除，
