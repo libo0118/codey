@@ -649,11 +649,13 @@ pub(crate) async fn restore_default_context_budgets(state: &AppState) -> Result<
 /// 返回 false 表示用户选择保留预算或对话框不可用，调用方应保留原始错误。
 pub(crate) async fn recover_default_context_budgets_for_launch(
     state: &Arc<AppState>,
+    reason: &str,
 ) -> Result<bool, String> {
     recover_default_context_budgets_with_prompt(
         state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
-        crate::native_update_ui::confirm_context_recovery,
+        reason,
+        |purpose| crate::native_update_ui::confirm_context_recovery_with_reason(purpose, reason),
     )
     .await
 }
@@ -661,12 +663,23 @@ pub(crate) async fn recover_default_context_budgets_for_launch(
 async fn recover_default_context_budgets_with_prompt<F, Fut>(
     state: &Arc<AppState>,
     purpose: crate::native_update_ui::ContextRecoveryPurpose,
+    reason: &str,
     prompt: F,
 ) -> Result<bool, String>
 where
     F: FnOnce(crate::native_update_ui::ContextRecoveryPurpose) -> Fut,
     Fut: std::future::Future<Output = Result<bool, String>>,
 {
+    if !state
+        .config
+        .read()
+        .await
+        .model_context_by_provider
+        .values()
+        .any(|models| !models.is_empty())
+    {
+        return Ok(false);
+    }
     // 询问失败按用户未确认处理：保留自定义预算比静默丢弃更安全。
     if !prompt(purpose).await.unwrap_or(false) {
         return Ok(false);
@@ -675,7 +688,7 @@ where
     error_log::record_failure(
         "context_recovery",
         "restore_default_context_budgets_for_launch",
-        crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE.to_string(),
+        reason.to_string(),
         json!({ "purpose": purpose.as_str() }),
     );
     Ok(true)
@@ -2126,12 +2139,12 @@ fn merge_profile_secrets(
                     profile.official_account_id = None;
                 }
             } else {
-                // Keep source-owned identity and capability fields attached to
-                // the saved route even though the renderer sends the whole form back.
+                // Keep source-owned identity fields attached to the saved route
+                // even though the renderer sends the whole form back. Transport
+                // capabilities are user-editable route settings.
                 profile.source_provider_id = previous_profile.source_provider_id.clone();
                 profile.official_account = previous_profile.official_account;
                 profile.official_account_id = previous_profile.official_account_id.clone();
-                profile.supports_remote_compaction = previous_profile.supports_remote_compaction;
             }
             crate::plugin_routes::retain_plugin_ownership(profile, previous_profile)?;
         } else {
