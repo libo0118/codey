@@ -36,7 +36,7 @@ import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { customContextRestoredNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
-import { CodeyBrandMark, SettingsDrawerShell } from "./SettingsDrawerShell";
+import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { SettingsLayout } from "./SettingsLayout";
 import { useModelSelection } from "./useModelSelection";
@@ -269,6 +269,7 @@ export function App({
     updateDraftModelContext,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
+    modelPickerReasoningCapabilities,
     updateDraftReasoningEffort,
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,
@@ -1347,7 +1348,7 @@ export function App({
       </main>
     );
     return embedded ? (
-      <SettingsDrawerShell
+      <SettingsModalShell
         afterClose={onAfterClose}
         container={modalContainer}
         onCancel={handleCloseSettings}
@@ -1355,7 +1356,7 @@ export function App({
         visible={modalVisible}
       >
         {loadingContent}
-      </SettingsDrawerShell>
+      </SettingsModalShell>
     ) : (
       loadingContent
     );
@@ -1691,6 +1692,7 @@ export function App({
         modelSyncWarning={modelSyncWarning}
         loading={modelPickerLoading}
         autoReviewSupported={draftAutoReviewSupported}
+        reasoningEffortCapabilities={modelPickerReasoningCapabilities}
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelEditorState}
         draftModelSet={draftModelSet}
@@ -1732,7 +1734,7 @@ export function App({
     </main>
   );
   return embedded ? (
-    <SettingsDrawerShell
+    <SettingsModalShell
       afterClose={onAfterClose}
       container={modalContainer}
       header={
@@ -1744,7 +1746,7 @@ export function App({
       visible={modalVisible}
     >
       {appContent}
-    </SettingsDrawerShell>
+    </SettingsModalShell>
   ) : (
     appContent
   );
