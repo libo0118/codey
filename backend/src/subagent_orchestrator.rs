@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::subagent::api::{TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
 use crate::subagent::protocol::{AgentState, InterruptAcknowledgement};
-use crate::subagent::rules::{self, RoleAccess, RuleActor, RuleContext, RuleEffect, ToolClass};
+use crate::subagent::rules::{self, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
     self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
 };
@@ -733,17 +733,6 @@ fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
             reservation
                 .capabilities
                 .retain(|capability| capability != "workspace.write");
-        }
-        if let Some(policy) = rules::embedded().role_policy(&reservation.role) {
-            let before = reservation.capabilities.len();
-            reservation
-                .capabilities
-                .retain(|capability| match capability.as_str() {
-                    "command.execute" | "workspace.write" => policy.access == RoleAccess::Write,
-                    "visual.inspect" => policy.visual,
-                    _ => true,
-                });
-            changed |= before != reservation.capabilities.len();
         }
         changed |= reservation.legacy_write_capable.take().is_some();
     }
@@ -1882,61 +1871,6 @@ pub(crate) fn active_reservation_projection(
     Ok(Some((active.len(), identities)))
 }
 
-pub(crate) fn verified_local_read_only_active_count(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    active_marker_hashes: &BTreeSet<String>,
-    now_ms: u64,
-) -> Result<Option<usize>> {
-    if active_marker_hashes.is_empty() {
-        return Ok(None);
-    }
-    let loaded_rules = rules::load_logged(state_root);
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(None);
-    };
-    let active = ledger
-        .reservations
-        .values()
-        .filter(|reservation| reservation.state.is_active())
-        .collect::<Vec<_>>();
-    if active.is_empty() || active.len() != active_marker_hashes.len() {
-        return Ok(None);
-    }
-
-    let mut bound_agent_hashes = BTreeSet::new();
-    for reservation in &active {
-        let role_is_read_only = loaded_rules
-            .rules
-            .role_policy(&reservation.role)
-            .is_some_and(|policy| policy.access == RoleAccess::ReadOnly);
-        let files_read_only = matches!(
-            reservation.capabilities.as_slice(),
-            [capability] if capability == "files.read"
-        );
-        let Some(agent_id_hash) = reservation.agent_id_hash.as_ref() else {
-            return Ok(None);
-        };
-        if reservation.spawn_failed
-            || reservation.fenced_at_ms.is_some()
-            || reservation.started_at_ms.is_none()
-            || reservation.outcome != ExecutionOutcome::Unknown
-            || !role_is_read_only
-            || reservation_declares_write(reservation)
-            || !files_read_only
-            || !bound_agent_hashes.insert(agent_id_hash.clone())
-        {
-            return Ok(None);
-        }
-    }
-    if &bound_agent_hashes != active_marker_hashes {
-        return Ok(None);
-    }
-    Ok(Some(active.len()))
-}
-
 /// Atomically fences every still-active reservation before the gate discards
 /// legacy marker files. This keeps the ledger as the authoritative source of
 /// truth and prevents a Stop recovery loop from resurrecting stale work.
@@ -2323,19 +2257,8 @@ pub(crate) fn authorize_child_tool_with_workspace(
         tool_input,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
-    let mut tool_class = crate::subagent::read_only_tool::classify(tool_name, tool_input);
-    if tool_class == ToolClass::Unknown
-        && crate::subagent_gate::cached_read_only_tool(
-            state_root,
-            tool_name,
-            tool_input,
-            loaded_rules.rules.revision,
-        )
-    {
-        tool_class = ToolClass::Read;
-    }
-    let needs_write_claim = !matches!(tool_class, ToolClass::Read | ToolClass::Network)
-        && tool_requires_workspace_write(tool_name);
+    let tool_class = rules::classify_tool(tool_name);
+    let needs_write_claim = tool_requires_workspace_write(tool_name);
     // Always acquire the cross-session lock before the session lock. Reads and
     // lifecycle updates use only the latter and never wait for a write claim.
     let _admission = if needs_write_claim {
@@ -2493,7 +2416,7 @@ pub(crate) fn authorize_child_tool_with_workspace(
                 ))
             }
             Some(reservation) if !reservation_declares_command(reservation) => Some(format!(
-                "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止未经证明只读的工具 `{tool_name}`。可用规范包装 text(await tools.exec_command({{\"cmd\":\"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files\"}})); 或直接调用同样的 exec_command。仅单次 JSON literal 包装可用，任意 JS、脚本、链式命令及未知参数仍禁止；其他读取请用专用工具或交回根代理。",
+                "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止工具 `{tool_name}`。读取被拒绝时不得用 Bash 回退；应由根代理修正契约或直接接管。",
                 reservation.attempt_id
             )),
             Some(_) => None,
@@ -2954,55 +2877,28 @@ mod tests {
     }
 
     #[test]
-    fn native_capsule_assigns_role_capabilities() {
+    fn native_capsule_assigns_the_same_capabilities_to_every_role() {
         let temp = tempdir().unwrap();
         let rules = rules::load(temp.path()).rules;
-        let readonly = prepare_task_capsule(
-            Some(&spawn_input("read_task", "codey_quick_scan")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(readonly.capabilities, ["files.read"]);
-
-        let visual = prepare_task_capsule(
-            Some(&spawn_input("visual_task", "codey_visual_analysis")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(visual.capabilities, ["files.read", "visual.inspect"]);
-
-        let writer = prepare_task_capsule(
-            Some(&spawn_input("write_task", "codey_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            writer.capabilities,
-            ["command.execute", "files.read", "workspace.write"]
-        );
-
-        let visual_writer = prepare_task_capsule(
-            Some(&spawn_input("visual_write_task", "codey_visual_worker")),
-            Some("/repo"),
-            &rules,
-        )
-        .unwrap();
-        assert_eq!(
-            visual_writer.capabilities,
-            [
-                "command.execute",
-                "files.read",
-                "workspace.write",
-                "visual.inspect"
-            ]
-        );
+        for role in crate::config::SUBAGENT_ROLE_IDS {
+            let task =
+                prepare_task_capsule(Some(&spawn_input("task", role)), Some("/repo"), &rules)
+                    .unwrap();
+            assert_eq!(
+                task.capabilities,
+                [
+                    "command.execute",
+                    "files.read",
+                    "workspace.write",
+                    "visual.inspect"
+                ],
+                "{role}"
+            );
+        }
     }
 
     #[test]
-    fn visual_tools_require_a_bound_visual_role() {
+    fn analysis_roles_can_use_tools_and_still_require_an_active_attempt() {
         let temp = tempdir().unwrap();
         let root = temp.path();
         admit_and_bind(
@@ -3046,26 +2942,57 @@ mod tests {
             "plain_reader",
             "codey_quick_scan",
             "scan-agent",
-            "/repo",
+            "/scan-repo",
             0,
             30,
         );
-        let denied = authorize_child_tool_with_context(
-            root,
-            "runtime-a",
-            "scan-session",
-            ChildToolContext {
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            let context = || ChildToolContext {
                 agent_id: "scan-agent",
                 agent_type: Some("codey_quick_scan"),
                 transcript_path: None,
-                tool_name: "mcp__cua_repl__js",
+                tool_name,
                 tool_input: None,
-            },
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denied.contains("visual.inspect"));
+            };
+            assert_eq!(
+                authorize_child_tool_with_context(root, "runtime-a", "scan-session", context(), 40)
+                    .unwrap(),
+                None,
+                "{tool_name}"
+            );
+        }
+        subagent_stopped(root, "runtime-a", "scan-session", "scan-agent", 41).unwrap();
+        for tool_name in [
+            "mcp__cua_repl__js",
+            "apply_patch",
+            "exec_command",
+            "mcp__custom__tool",
+        ] {
+            assert!(
+                authorize_child_tool_with_context(
+                    root,
+                    "runtime-a",
+                    "scan-session",
+                    ChildToolContext {
+                        agent_id: "scan-agent",
+                        agent_type: Some("codey_quick_scan"),
+                        transcript_path: None,
+                        tool_name,
+                        tool_input: None,
+                    },
+                    42,
+                )
+                .unwrap()
+                .unwrap()
+                .contains(UNBOUND_ATTEMPT_ERROR_CODE),
+                "{tool_name}"
+            );
+        }
     }
 
     #[test]
@@ -3301,52 +3228,6 @@ mod tests {
             "agents.send_message",
             Some(&json!({ "target": "/root/peer" }))
         ));
-    }
-
-    #[test]
-    fn unknown_model_spawn_failure_releases_the_workspace_reservation() {
-        let temp = tempdir().unwrap();
-        let input = spawn_input("failed_writer", "codey_worker");
-        assert_eq!(
-            pre_spawn_with_workspace(
-                temp.path(),
-                "runtime-a",
-                "session-a",
-                Some(&input),
-                Some("/repo"),
-                0,
-                10,
-            )
-            .unwrap(),
-            None
-        );
-        post_spawn(
-            temp.path(), "runtime-a", "session-a", Some(&input),
-            Some(&json!("Unknown model `gpt-6-luna` for spawn_agent. Available models: gpt-6-astra, gpt-5.6-luna")),
-            11,
-        ).unwrap();
-        let ledger = LedgerStore::open(temp.path(), "session-a")
-            .unwrap()
-            .load("runtime-a", "session-a", 12)
-            .unwrap()
-            .unwrap();
-        let reservation = &ledger.reservations["failed_writer"];
-        assert!(reservation.spawn_failed);
-        assert_eq!(reservation.state, ReservationState::Terminal);
-        assert_eq!(reservation.outcome, ExecutionOutcome::Failed);
-        assert_eq!(
-            pre_spawn_with_workspace(
-                temp.path(),
-                "runtime-a",
-                "session-a",
-                Some(&spawn_input("next_writer", "codey_worker")),
-                Some("/repo"),
-                0,
-                12,
-            )
-            .unwrap(),
-            None
-        );
     }
 
     #[test]

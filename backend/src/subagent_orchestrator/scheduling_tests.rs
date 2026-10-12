@@ -61,19 +61,18 @@ fn every_role_can_read_in_the_same_workspace_without_claiming_writing() {
         let session = format!("session-{index}");
         let task = format!("task_{index}");
         spawn(temp.path(), &session, &task, role, "/repo");
-        for name in ["mcp__codey_fastctx__grep", "web.run", "read_mcp_resource"] {
+        for name in [
+            "mcp__codey_fastctx__grep",
+            "functions.view_image",
+            "web.run",
+            "read_mcp_resource",
+        ] {
             assert_eq!(
                 tool(temp.path(), &session, &task, name).unwrap(),
                 None,
                 "{role} {name}"
             );
         }
-        let visual = tool(temp.path(), &session, &task, "functions.view_image").unwrap();
-        assert_eq!(
-            visual.is_none(),
-            rules::embedded().role_policy(role).unwrap().visual,
-            "{role}"
-        );
         assert!(!claimed(temp.path(), &session, &task));
     }
 }
@@ -102,6 +101,7 @@ fn review_starts_and_reads_while_another_task_owns_writing() {
     for name in [
         "mcp__codey_fastctx__inspect_local_file",
         "mcp__codey_fastctx__glob",
+        "view_image",
     ] {
         assert_eq!(
             tool(temp.path(), "review-session", "review", name).unwrap(),
@@ -119,7 +119,7 @@ fn review_starts_and_reads_while_another_task_owns_writing() {
             tool(temp.path(), "review-session", "review", name)
                 .unwrap()
                 .unwrap()
-                .contains("门禁"),
+                .contains("CODEY_SUBAGENT_WORKSPACE_BUSY"),
             "{name}"
         );
     }
@@ -200,10 +200,9 @@ fn same_session_review_and_writer_obey_concurrency_and_write_exclusivity() {
             .is_some()
     );
     subagent_stopped(temp.path(), "runtime", "session", "writer", 22).unwrap();
-    assert!(
-        tool(temp.path(), "session", "review", "apply_patch")
-            .unwrap()
-            .is_some()
+    assert_eq!(
+        tool(temp.path(), "session", "review", "apply_patch").unwrap(),
+        None
     );
 }
 
@@ -211,7 +210,13 @@ fn same_session_review_and_writer_obey_concurrency_and_write_exclusivity() {
 fn write_claim_survives_interrupt_until_acknowledgement() {
     let temp = tempdir().unwrap();
     spawn(temp.path(), "a", "writer_a", "codey_worker", "/repo");
-    spawn(temp.path(), "b", "writer_b", "codey_visual_worker", "/repo");
+    spawn(
+        temp.path(),
+        "b",
+        "writer_b",
+        "codey_visual_analysis",
+        "/repo",
+    );
     assert_eq!(
         tool(temp.path(), "a", "writer_a", "apply_patch").unwrap(),
         None
@@ -251,7 +256,13 @@ fn write_claim_survives_interrupt_until_acknowledgement() {
 fn coordination_lock_does_not_block_spawn_or_reads_and_timeout_does_not_claim_writing() {
     let temp = tempdir().unwrap();
     let guard = AdmissionGuard::acquire(temp.path()).unwrap();
-    spawn(temp.path(), "session", "review", "codey_worker", "/repo");
+    spawn(
+        temp.path(),
+        "session",
+        "review",
+        "codey_quick_scan",
+        "/repo",
+    );
     assert_eq!(
         tool(temp.path(), "session", "review", "grep").unwrap(),
         None

@@ -4,23 +4,6 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("subagent default permissions preserve read-only analysis and writable implementation", async () => {
-  const rules = JSON.parse(await readFile(new URL("backend/resources/subagent-rules.default.json", root), "utf8"));
-  for (const role of ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"]) {
-    assert.equal(rules.roles[role].access, "read_only", role);
-    for (const [id, toolClass] of [["deny-readonly-write", "write"], ["deny-unknown-child-tool", "unknown"]]) {
-      const deny = rules.rules.find((rule) => rule.id === id);
-      assert.equal(deny?.effect, "deny", id);
-      assert.ok(deny.roles.includes(role), role);
-      assert.ok(deny.toolClasses.includes(toolClass), toolClass);
-    }
-  }
-  for (const role of ["codey_worker", "codey_visual_worker", "default"]) {
-    assert.equal(rules.roles[role].access, "write", role);
-  }
-  assert.equal(rules.fallback, "deny");
-});
-
 test("subagent settings expose the five supported role controls", async () => {
   const [featurePolicySource, modelHookSource, modelOptionsSource, comboboxSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -47,9 +30,8 @@ test("subagent settings expose the five supported role controls", async () => {
   assert.match(featurePolicySource, /config\.subagentRoles\[task\.id\]/);
   assert.match(featurePolicySource, /checked=\{selection\.enabled\}/);
   assert.match(featurePolicySource, /onCheckedChange=\{\(enabled\) => updateRole\(\{ enabled \}\)\}/);
-  assert.match(featurePolicySource, /快速定位、深度检索和视觉分析保持只读/);
-  assert.match(featurePolicySource, /实施角色可写/);
-  assert.match(featurePolicySource, /按文件范围协调/);
+  assert.match(featurePolicySource, /各角色工具权限一致/);
+  assert.doesNotMatch(featurePolicySource, /默认只读|默认可写|不产生写入操作/);
   assert.match(featurePolicySource, /roleDisabled/);
   assert.match(featurePolicySource, /kind: "analysis"/);
   assert.match(featurePolicySource, /kind: "implementation"/);

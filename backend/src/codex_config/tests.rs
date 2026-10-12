@@ -1206,7 +1206,7 @@ fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
 }
 
 #[test]
-fn runtime_guidance_keeps_analysis_roles_read_only_when_writers_are_disabled() {
+fn runtime_guidance_keeps_analysis_roles_available_for_authorized_writes() {
     let mut configured = crate::config::default_subagent_roles();
     configured
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
@@ -1228,13 +1228,13 @@ fn runtime_guidance_keeps_analysis_roles_read_only_when_writers_are_disabled() {
 
     let instructions = runtime_root_instructions_for_roles("BASE", &runtime_roles);
     assert!(instructions.contains("BASE"));
-    assert!(instructions.contains(NO_WRITABLE_SUBAGENT_GUIDANCE));
+    assert_eq!(instructions, "BASE");
     assert_eq!(
         runtime_root_instructions_for_roles(
             &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
             &runtime_roles
         ),
-        instructions
+        "BASE"
     );
 
     let writable_roles = runtime_subagent_roles(
@@ -1244,13 +1244,6 @@ fn runtime_guidance_keeps_analysis_roles_read_only_when_writers_are_disabled() {
     );
     assert_eq!(
         runtime_root_instructions_for_roles("BASE", &writable_roles),
-        "BASE"
-    );
-    assert_eq!(
-        runtime_root_instructions_for_roles(
-            &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
-            &writable_roles,
-        ),
         "BASE"
     );
 }
@@ -1372,7 +1365,7 @@ enabled = true
 }
 
 #[test]
-fn runtime_analysis_agents_keep_read_only_permissions_and_task_boundaries() {
+fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");
     let roles = crate::config::default_subagent_roles();
@@ -1394,9 +1387,9 @@ fn runtime_analysis_agents_keep_read_only_permissions_and_task_boundaries() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_QUICK_SCAN)
         .unwrap();
     let quick_scan = String::from_utf8(quick_scan.contents.clone()).unwrap();
-    assert!(quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
-    assert!(quick_scan.contains("sandbox_mode = \"read-only\""));
-    assert!(quick_scan.contains("不修改任何文件"));
+    assert!(!quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(quick_scan.contains("sandbox_mode = \"workspace-write\""));
+    assert!(quick_scan.contains("按本次任务授权使用所需工具"));
 
     let worker = plans
         .iter()
@@ -1464,7 +1457,7 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
             .find(|plan| plan.registration.role == role)
             .unwrap();
         let rendered = parse_document(std::str::from_utf8(&plan.contents).unwrap()).unwrap();
-        assert_eq!(rendered["sandbox_mode"].as_str(), Some("read-only"));
+        assert_eq!(rendered["sandbox_mode"].as_str(), Some("workspace-write"));
         assert_eq!(
             rendered["description"].as_str(),
             parse_document(current).unwrap()["description"].as_str()
@@ -1472,20 +1465,8 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
 
         let customized = format!("{previous}\n# User customization\n");
         fs::write(&source_path, &customized).unwrap();
-        let plans = plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
+        plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
         assert_eq!(fs::read_to_string(&source_path).unwrap(), customized);
-        let plan = plans
-            .iter()
-            .find(|plan| plan.registration.role == role)
-            .unwrap();
-        let rendered = parse_document(std::str::from_utf8(&plan.contents).unwrap()).unwrap();
-        assert_eq!(rendered["sandbox_mode"].as_str(), Some("read-only"));
-        assert!(
-            rendered["developer_instructions"]
-                .as_str()
-                .unwrap()
-                .contains(READ_ONLY_AGENT_WRITE_GUARD)
-        );
     }
 }
 

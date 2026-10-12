@@ -164,69 +164,6 @@ fn v17_migration_preserves_both_unclaimed_readers_and_workspace_writers() {
 }
 
 #[test]
-fn analysis_roles_never_inherit_command_or_write_capabilities_from_old_ledgers() {
-    for version in [15, 17, LEDGER_SCHEMA_VERSION] {
-        for role in [
-            "codey_quick_scan",
-            "codey_deep_research",
-            "codey_visual_analysis",
-        ] {
-            let temp = tempdir().unwrap();
-            let path = legacy_ledger(temp.path(), version, true);
-            let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            value["reservations"]["task_a"]["role"] = json!(role);
-            value["reservations"]["task_a"]["capabilities"] = json!([
-                "files.read",
-                "command.execute",
-                "workspace.write",
-                "visual.inspect"
-            ]);
-            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            let authorize = |name, input: &Value| {
-                authorize_child_tool_with_context(
-                    temp.path(),
-                    "runtime",
-                    "session",
-                    ChildToolContext {
-                        agent_id: "agent-a",
-                        agent_type: Some(role),
-                        transcript_path: None,
-                        tool_name: name,
-                        tool_input: Some(input),
-                    },
-                    20,
-                )
-                .unwrap()
-            };
-            assert!(authorize("apply_patch", &json!({})).is_some());
-            assert!(
-                authorize(
-                    "functions.exec",
-                    &json!("await tools.exec_command({cmd:'node -e script'})")
-                )
-                .is_some()
-            );
-            assert!(authorize("exec_command", &json!({"cmd":"git push"})).is_some());
-            assert_eq!(
-                authorize(
-                    "exec_command",
-                    &json!({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false ls-files"})
-                ),
-                None,
-            );
-            let ledger: SessionLedger = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            let reservation = &ledger.reservations["task_a"];
-            assert!(!reservation_declares_command(reservation));
-            assert!(!reservation_declares_write(reservation));
-            assert_eq!(
-                reservation_declares_visual(reservation),
-                role == "codey_visual_analysis"
-            );
-        }
-    }
-}
-
-#[test]
 fn v18_missing_or_invalid_file_claims_are_rejected_without_overwriting_the_ledger() {
     for invalid in [
         None,

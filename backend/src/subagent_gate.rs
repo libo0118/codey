@@ -10,27 +10,22 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::subagent::protocol::{self, AgentState as ObservedAgentState};
-use crate::subagent::rules::{self, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::{
     api::TraceContext,
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
 };
 
-mod read_only_sql;
 mod runtime_policy;
 mod state;
 #[cfg(test)]
 mod tests;
-mod tool_capability_cache;
 
-use read_only_sql::database_mcp_is_read_only;
 use runtime_policy::{RuntimeSubagentPolicy, read_optional_runtime_policy_file};
 pub(crate) use runtime_policy::{
     begin_runtime_subagent_policy_update, clear_runtime_subagent_policy,
     commit_runtime_subagent_policy, runtime_subagent_policy_matches, runtime_subagent_policy_paths,
 };
 use state::*;
-use tool_capability_cache::{cached_read_only_class, looks_read_only, record_read_only};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
 pub(crate) const COMBINED_HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook-with-fastctx";
@@ -1105,15 +1100,6 @@ fn pre_tool_use_output(
     if active == 0 {
         return Ok(json!({}));
     }
-    if trusted_root_turn
-        && verified_local_read_only_active_count(state_root, runtime_id, &input.session_id, now_ms)?
-            == Some(active)
-        && input.tool_name.as_deref().is_some_and(|tool_name| {
-            root_read_tool_allowed(state_root, tool_name, input.tool_input.as_ref())
-        })
-    {
-        return Ok(json!({}));
-    }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     Ok(pre_tool_denial(active, protocol_issue.as_deref()))
 }
@@ -1195,22 +1181,6 @@ fn post_tool_use_output(
     let Some(tool_name) = input.tool_name.as_deref() else {
         return Ok(json!({}));
     };
-    if rules::classify_tool(tool_name) == ToolClass::Unknown
-        && looks_read_only(tool_name)
-        && input
-            .tool_response
-            .as_ref()
-            .is_some_and(tool_response_is_successful)
-    {
-        let policy_revision = rules::load_logged(state_root).rules.revision;
-        let _ = record_read_only(
-            state_root,
-            tool_name,
-            input.tool_input.as_ref(),
-            policy_revision,
-            now_ms,
-        );
-    }
     if is_contract_spawn_tool(tool_name) {
         crate::subagent_orchestrator::post_spawn(
             state_root,
@@ -1377,14 +1347,6 @@ fn post_tool_use_output(
         return Ok(json!({}));
     }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
-    let root_local_reads_allowed =
-        trusted_root_turn_matches(input, state_root, runtime_id, now_ms)?
-            && verified_local_read_only_active_count(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                now_ms,
-            )? == Some(active);
     if is_single_agent_status_tool(tool_name) {
         let returned_update =
             render_untrusted_tool_result(input.tool_response.as_ref(), "agent_status");
@@ -1397,14 +1359,12 @@ fn post_tool_use_output(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
-            root_local_reads_allowed,
         ))
     } else {
         Ok(post_list_continuation(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
-            root_local_reads_allowed,
         ))
     }
 }
@@ -1536,9 +1496,6 @@ fn recover_root_active_state(
         return Ok(0);
     };
     if active == 0 {
-        for file_name in [UNAVAILABLE_STATUS_SINCE_FILE, PENDING_INIT_OBSERVED_FILE] {
-            remove_session_auxiliary_file(state_root, runtime_id, &input.session_id, file_name)?;
-        }
         return Ok(0);
     }
     let ledger_pending_recovery =
@@ -1743,7 +1700,6 @@ fn post_wait_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
-    root_local_reads_allowed: bool,
 ) -> Value {
     let returned_update = render_untrusted_tool_result(tool_response, "wait_agent");
     let task_body_recovery = tool_response
@@ -1757,11 +1713,7 @@ fn post_wait_continuation(
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
-    let local_read_guidance = if root_local_reads_allowed {
-        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可继续使用规则确认的本地读取、网页检索、MCP Resource 与数据库 schema/只读 SQL 工具消化本次部分结果。写入、命令、视觉、无法证明只读的工具和结束任务仍被拒绝；完成有界读取后继续 wait/list 汇合。"
-    } else {
-        " 在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。"
-    };
+    let local_read_guidance = " 在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。";
     json!({
         "decision": "block",
         "reason": format!(
@@ -1774,17 +1726,12 @@ fn post_list_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
-    root_local_reads_allowed: bool,
 ) -> Value {
     let returned_update = render_untrusted_tool_result(tool_response, "list_agents");
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
-    let local_read_guidance = if root_local_reads_allowed {
-        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可继续使用规则确认的本地读取、网页检索、MCP Resource 与数据库 schema/只读 SQL 工具消化已返回证据，但写入、命令、视觉、无法证明只读的工具和结束任务仍被拒绝，随后必须继续汇合。"
-    } else {
-        " 所有活动代理结算前继续保持全局本地工具屏障。"
-    };
+    let local_read_guidance = " 所有活动代理结算前继续保持全局本地工具屏障。";
     json!({
         "decision": "block",
         "reason": format!(
@@ -2162,73 +2109,6 @@ fn object_reports_agent_completion(values: &Map<String, Value>) -> bool {
 
 fn normalized_ascii_identifier(value: &str) -> String {
     protocol::normalize_identifier(value)
-}
-
-fn verified_local_read_only_active_count(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<Option<usize>> {
-    let marker_hashes = active_marker_hashes_for_runtime(state_root, runtime_id, session_id)?;
-    crate::subagent_orchestrator::verified_local_read_only_active_count(
-        state_root,
-        runtime_id,
-        session_id,
-        &marker_hashes,
-        now_ms,
-    )
-}
-
-fn root_read_tool_allowed(state_root: &Path, tool_name: &str, tool_input: Option<&Value>) -> bool {
-    let Some(tool_class) = root_read_tool_class(tool_name, tool_input) else {
-        return false;
-    };
-    crate::subagent::rules::load_logged(state_root)
-        .rules
-        .evaluate(&RuleContext {
-            actor: RuleActor::Root,
-            role: None,
-            tool_name,
-            tool_class,
-        })
-        .effect
-        == RuleEffect::Allow
-}
-
-fn tool_response_is_successful(response: &Value) -> bool {
-    let Some(object) = response.as_object() else {
-        return true;
-    };
-    if object.contains_key("error") || object.contains_key("errors") {
-        return false;
-    }
-    !object
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "error" | "failed" | "rejected"))
-}
-
-pub(crate) fn cached_read_only_tool(
-    state_root: &Path,
-    tool_name: &str,
-    tool_input: Option<&Value>,
-    policy_revision: u64,
-) -> bool {
-    if cached_read_only_class(state_root, tool_name, tool_input, policy_revision).is_some() {
-        return true;
-    }
-    false
-}
-
-fn root_read_tool_class(tool_name: &str, tool_input: Option<&Value>) -> Option<ToolClass> {
-    let tool_class = crate::subagent::read_only_tool::classify(tool_name, tool_input);
-    if matches!(tool_class, ToolClass::Read | ToolClass::Network) {
-        return Some(tool_class);
-    }
-
-    let normalized = tool_name.trim().to_ascii_lowercase();
-    database_mcp_is_read_only(&normalized, tool_input).then_some(ToolClass::Read)
 }
 
 fn is_collaboration_tool(tool_name: &str) -> bool {

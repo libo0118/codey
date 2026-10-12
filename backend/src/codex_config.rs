@@ -838,19 +838,10 @@ fn registered_roles_for_lease(state: &RuntimeConfigLease) -> Vec<String> {
 
 fn runtime_root_instructions_for_roles(
     root_instructions: &str,
-    roles: &BTreeMap<String, SubagentRoleConfig>,
+    _roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> String {
-    let has_writable_role = roles.keys().any(|role| {
-        crate::subagent::rules::embedded()
-            .role_policy(role)
-            .is_some_and(|policy| policy.access == crate::subagent::rules::RoleAccess::Write)
-    });
-    if has_writable_role {
-        remove_owned_guidance_paragraph(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
-            .unwrap_or_else(|| root_instructions.to_string())
-    } else {
-        append_constraint_text(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
-    }
+    remove_owned_guidance_paragraph(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
+        .unwrap_or_else(|| root_instructions.to_string())
 }
 
 fn prepare_runtime_agent_files(
@@ -1001,24 +992,11 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
-    if crate::subagent::rules::embedded()
-        .role_policy(role)
-        .is_some_and(|policy| policy.access == crate::subagent::rules::RoleAccess::ReadOnly)
-    {
-        document["sandbox_mode"] = value("read-only");
-        append_table_constraint_text(
-            document.as_table_mut(),
-            "developer_instructions",
-            READ_ONLY_AGENT_WRITE_GUARD,
-            "developer_instructions",
-        )?;
-    } else {
-        remove_guidance_from_table(
-            document.as_table_mut(),
-            "developer_instructions",
-            |current| remove_owned_guidance_paragraph(current, READ_ONLY_AGENT_WRITE_GUARD),
-        );
-    }
+    remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        |current| remove_owned_guidance_paragraph(current, READ_ONLY_AGENT_WRITE_GUARD),
+    );
     append_table_constraint_text(
         document.as_table_mut(),
         "developer_instructions",
