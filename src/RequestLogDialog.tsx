@@ -26,6 +26,7 @@ import { loadRequestLogModels, type ModelPage } from "./requestLogModels";
 import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
 import { modelIdsEqual } from "./modelIds";
+import { formatRouteName } from "./routeShortNames";
 import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
 import type { LogAnalytics } from "./usageAnalysis";
 import { maskEmail } from "./sensitiveText";
@@ -139,7 +140,7 @@ type ActionNotice = {
 
 export type RequestLogCatalog = {
   officialAccountAvailable: boolean;
-  profiles: Array<Pick<Profile, "id" | "name" | "sourceProviderId" | "officialAccount" | "officialAccountId">>;
+  profiles: Array<Pick<Profile, "id" | "name" | "shortName" | "sourceProviderId" | "officialAccount" | "officialAccountId">>;
   selectedModelsByProvider: Config["selectedModelsByProvider"];
   declaredOfficialModelsByProvider: Config["declaredOfficialModelsByProvider"];
   upstreamModelsByProvider: Config["upstreamModelsByProvider"];
@@ -487,8 +488,23 @@ function CopyIdButton({
   );
 }
 
+function requestLogProviderLabel(item: RouteRequestLogItem, profiles: RequestLogCatalog["profiles"]) {
+  const profile = profiles.find((profile) =>
+    Boolean(item.provider) && (profile.sourceProviderId === item.provider || profile.id === item.provider)
+    && (!item.officialAccountId || profile.officialAccountId === item.officialAccountId),
+  ) ?? (item.officialAccountId
+    ? profiles.find((profile) => profile.officialAccountId === item.officialAccountId)
+    : undefined);
+  if (profile) {
+    const label = formatRouteName(profile.name, profile.shortName || "");
+    if (label) return label;
+  }
+  return item.providerName || item.provider || "—";
+}
+
 function buildRequestLogRow(
   item: RouteRequestLogItem,
+  providerLabel: string,
   officialAccountLabel: (accountId?: string | null) => string,
   handleCopyId: (requestId: string) => void,
 ): RequestLogTableRow {
@@ -563,9 +579,9 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               ) : null}
                               <strong
                                 className="truncate font-semibold text-[var(--codey-text,#1d1d1f)]"
-                                title={item.providerName || item.provider || undefined}
+                                title={providerLabel}
                               >
-                                {item.providerName || item.provider || "—"}
+                                {providerLabel}
                               </strong>
                             </div>
                             {item.officialAccountId ? (
@@ -864,7 +880,7 @@ export function RequestLogDialog({
     const providers = new Map<string, string>();
     for (const profile of catalog.profiles) {
       const value = profile.sourceProviderId || profile.id;
-      if (value) providers.set(value, profile.name || value);
+      if (value) providers.set(value, formatRouteName(profile.name, profile.shortName || "") || value);
     }
     return [
       { label: "全部供应商", value: "all" },
@@ -1120,8 +1136,8 @@ export function RequestLogDialog({
   };
 
   const requestLogRows = useMemo(
-    () => (result?.items ?? []).map((item) => buildRequestLogRow(item, officialAccountLabel, handleCopyId)),
-    [result?.items, officialAccountLabel, handleCopyId],
+    () => (result?.items ?? []).map((item) => buildRequestLogRow(item, requestLogProviderLabel(item, catalog.profiles), officialAccountLabel, handleCopyId)),
+    [result?.items, catalog.profiles, officialAccountLabel, handleCopyId],
   );
 
   if (!opened) return null;
@@ -2061,7 +2077,7 @@ export function RequestLogDialog({
                   <div>
                     <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">供应商</dt>
                     <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
-                      {selectedItem.providerName || selectedItem.provider || "—"}
+                      {requestLogProviderLabel(selectedItem, catalog.profiles)}
                     </dd>
                   </div>
                   {selectedItem.officialAccountId ? (

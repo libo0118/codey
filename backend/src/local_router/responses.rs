@@ -1069,6 +1069,13 @@ impl RouterServer {
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
+            if downstream.handle_steering_message(&message).await? {
+                downstream.write_steering_notifications().await?;
+                continue;
+            }
+            if downstream.handle_idle_response_interrupt(&message)? {
+                continue;
+            }
             if matches!(message, WebSocketMessage::Text(_)) {
                 match acquire_connection_permit_within(
                     &self.connection_limit,
@@ -1148,16 +1155,37 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    let message_type = body
-                        .as_object_mut()
-                        .and_then(|body| body.remove("type"))
-                        .and_then(|value| value.as_str().map(str::to_string));
-                    if message_type.as_deref() != Some("response.create") {
+                    if body["type"] == "response.steer" {
+                        let event = downstream.steering.accept(&body, &self.request_body_budget);
+                        downstream.write_steering_event(&event).await?;
+                        downstream.write_steering_notifications().await?;
+                        continue;
+                    }
+                    let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
+                    if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
+                        // 仅显示有界的协议标识，不把任意字段内容写入错误信息。
+                        let received = match message_type.as_ref() {
+                            None => "缺少 type 字段".to_string(),
+                            Some(Value::String(value))
+                                if !value.is_empty()
+                                    && value.len() <= 64
+                                    && value.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric()
+                                            || matches!(byte, b'.' | b'_' | b'-')
+                                    }) =>
+                            {
+                                format!("收到事件类型 {value}")
+                            }
+                            Some(Value::String(_)) => "type 不是有效的事件标识".to_string(),
+                            Some(_) => "type 字段必须为字符串".to_string(),
+                        };
                         downstream
                             .write_error(
                                 400,
                                 "unsupported_websocket_message",
-                                "Codey Responses WebSocket 仅支持 response.create".to_string(),
+                                format!(
+                                    "Codey Responses WebSocket 支持 response.create、response.steer 和 response.interrupt；{received}"
+                                ),
                                 None,
                             )
                             .await?;
@@ -1212,6 +1240,34 @@ impl RouterServer {
                         body.remove("stream");
                         body.remove("background");
                     }
+                    match downstream
+                        .steering
+                        .begin_request(&mut body, &self.request_body_budget)
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                downstream.write_steering_event(&event).await?;
+                            }
+                        }
+                        Err(error) => {
+                            // 这次 create 校验失败，不改变仍在等待工具结果的原响应。
+                            let mut event = ResponsesFailure::new(
+                                400,
+                                "steering_required_input",
+                                error.to_string(),
+                                None,
+                            )
+                            .normalized_event();
+                            downstream.steering.sequence_response_event(&mut event);
+                            downstream
+                                .write_text(encode_responses_websocket_event(
+                                    &event,
+                                    stream_id.as_deref(),
+                                )?)
+                                .await?;
+                            continue;
+                        }
+                    }
                     downstream.set_stream_id(stream_id);
                     let request = HttpRequest {
                         method: "POST".to_string(),
@@ -1257,16 +1313,22 @@ impl RouterServer {
                             serde_json::json!({ "requestId": request_id }),
                         );
                         if !downstream.terminal_started {
+                            let timeout = is_upstream_timeout_error(&error);
                             downstream
                                 .write_error(
-                                    502,
-                                    "websocket_proxy_failed",
+                                    if timeout { 504 } else { 502 },
+                                    if timeout {
+                                        "upstream_timeout"
+                                    } else {
+                                        "websocket_proxy_failed"
+                                    },
                                     format!("Codey 本地路由处理请求失败；请求 ID：{request_id}"),
                                     None,
                                 )
                                 .await?;
                         }
                     }
+                    downstream.write_steering_notifications().await?;
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}
@@ -1466,6 +1528,11 @@ impl RouterServer {
     where
         D: ResponsesDownstream + ?Sized,
     {
+        downstream.set_streaming_errors(
+            request_kind == ResponsesRequestKind::Create
+                && !is_compaction_request(&body, request_kind)
+                && body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        );
         let probe = self.request_log.begin(|producer| {
             let request_id = current_router_request_id().unwrap_or_default();
             let (codex_session_id, codex_session_is_parent) = request_log_codex_session(&request);
@@ -1665,6 +1732,23 @@ impl RouterServer {
             }
         }
         let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.resolve_route(
+                &resolved.provider_id,
+                &resolved.route.route_name,
+                resolved
+                    .route
+                    .official_auth
+                    .as_ref()
+                    .map(|auth| auth.account_id.as_str()),
+                &resolved.requested_model,
+                &resolved.upstream_model,
+                &resolved.route.upstream_authority,
+                bridge.upstream_protocol().label(),
+                bridge.label(),
+                subagent_request,
+            );
+        }
         if compacting && !resolved.route.supports_remote_compaction {
             return downstream
                 .write_error(
@@ -1696,23 +1780,6 @@ impl RouterServer {
                     )
                     .await;
             }
-        }
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.resolve_route(
-                &resolved.provider_id,
-                &resolved.route.route_name,
-                resolved
-                    .route
-                    .official_auth
-                    .as_ref()
-                    .map(|auth| auth.account_id.as_str()),
-                &resolved.requested_model,
-                &resolved.upstream_model,
-                &resolved.route.upstream_authority,
-                bridge.upstream_protocol().label(),
-                bridge.label(),
-                subagent_request,
-            );
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
@@ -1803,9 +1870,14 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let upstream_url = match request_kind {
-            ResponsesRequestKind::Create => &resolved.route.upstream_url,
-            ResponsesRequestKind::Compact => &resolved.route.upstream_compact_url,
+        let compact_endpoint_compat = compacting
+            && request_kind == ResponsesRequestKind::Create
+            && !resolved.route.official_account
+            && resolved.route.remote_compaction_protocol
+                == crate::config::RemoteCompactionProtocol::CompactEndpoint;
+        let upstream_url = match (request_kind, compact_endpoint_compat) {
+            (ResponsesRequestKind::Compact, _) | (_, true) => &resolved.route.upstream_compact_url,
+            _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
@@ -2013,6 +2085,7 @@ impl RouterServer {
             && !resolved.route.official_account
             && chat_reasoning_summaries.iter().any(Option::is_some))
         .then_some(chat_reasoning_summaries);
+        let (result, stream_failure) = CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -2114,7 +2187,29 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
-        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+        if compact_endpoint_compat {
+            if let Err(error) = adapt_compaction_trigger_to_compact(&mut upstream_body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_compaction_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+            headers.insert(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Some(probe) = downstream.request_log_probe() {
+                probe.mark_fallback("compaction_compact_endpoint");
+            }
+        }
+        let xai_response_fix = if !compacting
+            && bridge == ProtocolBridge::NativeResponses
             && !resolved.route.official_account
             && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
         {
@@ -2274,6 +2369,7 @@ impl RouterServer {
         };
         let mut upstream_status = response.status().as_u16();
         let mut upstream_request_id = upstream_request_id_from_headers(response.headers());
+        let mut retry_advice = ResponseRetryAdvice::from_headers(response.headers());
         if let Some(probe) = downstream.request_log_probe() {
             probe.set_upstream_response_headers(&format_upstream_response_headers(
                 response.headers(),
@@ -2368,6 +2464,7 @@ impl RouterServer {
                 };
                 upstream_status = retried.status().as_u16();
                 upstream_request_id = upstream_request_id_from_headers(retried.headers());
+                retry_advice = ResponseRetryAdvice::from_headers(retried.headers());
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.set_upstream_response_headers(&format_upstream_response_headers(
                         retried.headers(),
@@ -2389,9 +2486,12 @@ impl RouterServer {
         let Some(response) = upstream_response else {
             return write_upstream_http_error(
                 downstream,
-                upstream_status,
-                upstream_request_id.as_deref(),
-                preloaded_error_body.as_deref().unwrap_or_default(),
+                UpstreamHttpErrorResponse {
+                    status: upstream_status,
+                    upstream_request_id: upstream_request_id.as_deref(),
+                    retry_advice,
+                    body: preloaded_error_body.as_deref().unwrap_or_default(),
+                },
                 &resolved,
                 bridge,
                 request_kind,
@@ -2399,8 +2499,6 @@ impl RouterServer {
             .await;
         };
         let result = match bridge {
-            // Every upstream protocol surfaces its real HTTP status. Mapping
-            // Anthropic 4xx to 502 made Codex retry non-retryable failures.
             _ if !response.status().is_success() => {
                 let probe = downstream.request_log_probe().cloned();
                 let deadline = upstream_response_body_deadline();
@@ -2415,9 +2513,12 @@ impl RouterServer {
                     Ok(Ok(body)) => {
                         write_upstream_http_error(
                             downstream,
-                            upstream_status,
-                            upstream_request_id.as_deref(),
-                            &body,
+                            UpstreamHttpErrorResponse {
+                                status: upstream_status,
+                                upstream_request_id: upstream_request_id.as_deref(),
+                                retry_advice,
+                                body: &body,
+                            },
                             &resolved,
                             bridge,
                             request_kind,
@@ -2435,7 +2536,13 @@ impl RouterServer {
                 write_validated_compaction(
                     downstream,
                     response,
-                    request_kind == ResponsesRequestKind::Create,
+                    if compact_endpoint_compat {
+                        CompactionResponseFormat::CompactToResponses
+                    } else if request_kind == ResponsesRequestKind::Create {
+                        CompactionResponseFormat::Responses
+                    } else {
+                        CompactionResponseFormat::Compact
+                    },
                     stream_requested,
                     &resolved.route,
                 )
@@ -2481,8 +2588,8 @@ impl RouterServer {
                 .unwrap_or_else(|| "上游响应未能完成".to_string());
             return downstream
                 .write_error(
-                    502,
-                    "upstream_response_failed",
+                    if is_upstream_timeout_error(error) { 504 } else { 502 },
+                    if is_upstream_timeout_error(error) { "upstream_timeout" } else { "upstream_response_failed" },
                     format!(
                         "Codey 线路「{}」处理上游 HTTP 响应失败：{detail}",
                         route_display_name(&resolved.route)
@@ -2493,6 +2600,12 @@ impl RouterServer {
         }
         result
         }.await;
+        (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
+        }).await;
+        if let Some((status, code)) = stream_failure {
+            observed.status = Some(status);
+            observed.error = Some(code);
+        }
         let result = match result {
             Err(error) if error.is::<crate::codey_plugins::lifecycle::LifecycleError>() => {
                 let error = error
@@ -2596,11 +2709,6 @@ impl RouterServer {
                         ),
                     )
                 };
-                // Codex currently reduces JSON bodies from locally generated
-                // gateway failures to "Unknown error". A concise text body is
-                // preserved in its surfaced `unexpected status` message. A
-                // transport setup failure uses non-retryable 424 so Codex does
-                // not repeat the same deterministic failure four more times.
                 downstream.write_text_error(status, code, message).await?;
                 return Ok(None);
             }

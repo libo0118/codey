@@ -43,7 +43,8 @@ test("pull requests enforce the unified Rust quality gate", () => {
   assertRustQualityGates(ciWorkflow);
   assert.match(ciWorkflow, /runs-on: windows-latest/);
   assert.doesNotMatch(ciWorkflow, /runs-on: (?:ubuntu|macos)/);
-  assert.match(ciWorkflow, /tests\/overlay-recovery-native\.ps1/);
+  assert.doesNotMatch(ciWorkflow, /tests\/overlay-recovery-native\.ps1/);
+  assert.match(ciWorkflow, /working-directory: vendor\/ComputerUse\/windows\s+run: go test \.\/\.\.\./);
 });
 
 test("tag-triggered Windows releases independently enforce Rust quality gates", () => {
@@ -52,11 +53,16 @@ test("tag-triggered Windows releases independently enforce Rust quality gates", 
   assertRustQualityGates(windowsJob);
   assert.match(windowsJob, /pnpm run check/);
   assert.match(windowsJob, /pnpm run test:js/);
-  assert.match(windowsJob, /overlay-recovery-native\.ps1/);
+  assert.doesNotMatch(windowsJob, /overlay-recovery-native\.ps1/);
+  assert.match(windowsJob, /working-directory: vendor\/ComputerUse\/windows\s+run: go test \.\/\.\.\./);
   assert.match(workflow, /runs-on: windows-latest/);
   assert.doesNotMatch(workflow, /runs-on: (?:ubuntu|macos)/);
-  assert.match(workflow, /CODEY_UPDATE_BASE_URL: https:\/\/github\.com\/\$\{\{ github.repository \}\}\/releases\/latest\/download/);
+  assert.match(workflow, /CODEY_UPDATE_BASE_URL: https:\/\/github\.com\/libo0118\/codey\/releases\/latest\/download/);
   assert.match(workflow, /files: dist\/windows\/\*/);
+  assert.doesNotMatch(workflow, /CLOUDFLARE|CODEY_RELEASE_ADMIN_URL|RELEASE_ADMIN_CALLBACK_SECRET/);
+  assert.match(workflow, /import \{ releaseIdentity \} from/);
+  assert.match(workflow, /make_latest:.*outputs.prerelease == 'true' && 'false' \|\| 'true'/);
+  assert.match(workflow, /prerelease:.*outputs.prerelease == 'true'/);
 });
 
 test("Windows release reuses the prebuilt frontend overlay", () => {

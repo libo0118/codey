@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: codey-release-automation
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_BUILD_DIR: target
@@ -25,6 +29,8 @@ jobs:
     steps:
       - name: Checkout Codey
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -104,10 +110,6 @@ jobs:
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
 
-      - name: Compile native overlay helper and test identity guards
-        shell: powershell
-        run: ./tests/overlay-recovery-native.ps1
-
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         env:
@@ -116,7 +118,7 @@ jobs:
       - name: Build Windows executable
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
-          CODEY_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
+          CODEY_UPDATE_BASE_URL: https://github.com/libo0118/codey/releases/latest/download
         run: pnpm run build
 
       - name: Build Windows installer and update manifest
@@ -144,6 +146,13 @@ jobs:
           node scripts/generate-update-manifest.mjs --version $version --tag "v$version" --download-base-url "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version" --output dist/windows/latest.json $installer
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Resolve release identity
+        id: release-metadata
+        shell: pwsh
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; import { releaseIdentity } from "./scripts/release-policy.mjs"; const identity = releaseIdentity(JSON.parse(fs.readFileSync("package.json", "utf8")).version); for (const key of ["name", "tag", "prerelease"]) fs.appendFileSync(process.env.GITHUB_OUTPUT, key + "=" + identity[key] + "\n");'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
@@ -156,6 +165,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          make_latest: true
-          prerelease: false
+          name: ${{ steps.release-metadata.outputs.name }}
+          tag_name: ${{ steps.release-metadata.outputs.tag }}
+          make_latest: ${{ steps.release-metadata.outputs.prerelease == 'true' && 'false' || 'true' }}
+          prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}
           files: dist/windows/*

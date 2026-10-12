@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::subagent::api::TraceContext;
-use crate::subagent::rules::{RoleAccess, RolePolicy, RuleSet};
+use crate::subagent::rules::{RoleAccess, RuleSet};
 
 use super::identity::consistent_string_field;
 
@@ -22,7 +22,6 @@ pub(super) struct TaskCapsule {
 pub(super) struct PreparedContract {
     pub(super) capsule: TaskCapsule,
     pub(super) role: String,
-    pub(super) policy: RolePolicy,
     pub(super) workspace_root: Option<String>,
     pub(super) trace: TraceContext,
     pub(super) capabilities: Vec<String>,
@@ -62,8 +61,6 @@ pub(super) fn prepare_task_capsule(
     }
     let mut capabilities = match policy.access {
         RoleAccess::ReadOnly => vec!["files.read".to_string()],
-        // ponytail: one workspace-wide writer lock; add narrower native ownership
-        // only if the executor exposes a trusted path field.
         RoleAccess::Write => vec![
             "command.execute".to_string(),
             "files.read".to_string(),
@@ -78,7 +75,6 @@ pub(super) fn prepare_task_capsule(
             id: task_name.to_string(),
         },
         role: role.to_string(),
-        policy,
         workspace_root,
         trace: TraceContext::new(None),
         capabilities,

@@ -13,6 +13,8 @@ import {
   uniqueModelIds,
 } from "../modelIds";
 import { routeModelAlias } from "../modelRoutes";
+import { fallbackRouteShortName, validateThirdPartyRouteShortName } from "../routeShortNames";
+import { MAX_ROUTE_NAME_CHARACTERS, validateOfficialRouteSettings } from "../officialRouteSettings";
 import { previewOfficialModels, previewUpstreamModels } from "../previewModels";
 import {
   previewCrashpadPendingStats,
@@ -41,14 +43,7 @@ if (import.meta.env.DEV) {
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
       ntfy: "https://ntfy.example.invalid",
     } as const;
-    // 官方线路按存储账号逐条派生；账号没有自定义名称时，使用按添加顺序生成的
-    // 默认线路名和短名称，例如第一个账号是「官方账号1」和「官1」。
     const previewOfficialRouteName = (index: number) => `官方账号${index}`;
-    const previewOfficialRouteShortName = (index: number) => {
-      if (index <= 9) return `官${index}`;
-      const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-      return `官${letters[Math.min(index - 10, letters.length - 1)] ?? "Z"}`;
-    };
     const previewAccountRouteIndex = (account: OfficialAccount) => {
       const value = (account.routeName ?? account.routeShortName ?? "").trim();
       const digits = value.startsWith("官方账号")
@@ -62,22 +57,29 @@ if (import.meta.env.DEV) {
     // 与后端保持一致：还没有名称的账号补上当前最小编号，已有名称保持不动。
     const previewEnsureGeneratedRouteSettings = () => {
       const used = new Set<number>();
+      const usedShortNames = new Set(previewOfficialAccounts.map((account) => account.routeShortName?.trim()).filter(Boolean));
       for (const account of previewOfficialAccounts) {
         const index = previewAccountRouteIndex(account);
         if (index !== null) used.add(index);
       }
       for (const account of [...previewOfficialAccounts].sort((left, right) => left.addedAt - right.addedAt)) {
-        if (account.routeName && account.routeShortName) continue;
+        if (account.routeName !== undefined && account.routeShortName?.trim()) continue;
         let index = 1;
         while (used.has(index)) index += 1;
         used.add(index);
         account.routeName ??= previewOfficialRouteName(index);
-        account.routeShortName ??= previewOfficialRouteShortName(index);
+        if (!account.routeShortName?.trim()) {
+          let shortName = fallbackRouteShortName(account.routeName) || `官${index}`;
+          let suffix = 1;
+          while (usedShortNames.has(shortName)) shortName = `官${suffix++}`;
+          account.routeShortName = shortName;
+          usedShortNames.add(shortName);
+        }
       }
     };
     let previewConfig: Config = {
       settingsRevision: 0,
-      autoCheckCodeyUpdates: true,
+      codeyUpdatePolicy: "stable",
       localRouterEnabled: true,
       routeRequestLog: {
         enabled: true,
@@ -205,6 +207,7 @@ if (import.meta.env.DEV) {
         upstreamProtocol: "openaiResponses",
         instruction: "",
       },
+      conversationGit: { enabled: false, model: "" },
       codexAppPath: "/Applications/ChatGPT.app",
       userScripts: [],
       selectedModelsByProvider: {
@@ -277,7 +280,7 @@ if (import.meta.env.DEV) {
           id: previewOfficialProviderId(account),
           enabled: true,
           name: account.routeName ?? previewOfficialRouteName(index),
-          shortName: account.routeShortName ?? previewOfficialRouteShortName(index),
+          shortName: account.routeShortName || fallbackRouteShortName(account.routeName ?? previewOfficialRouteName(index)),
           baseUrl: account.baseUrl ?? "",
           apiKey: "",
           upstreamProtocol: "official",
@@ -552,6 +555,7 @@ if (import.meta.env.DEV) {
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
     let computerUseReady = false;
+    const previewPackageUploads = new Map<string, { name: string; size: number; signature: string }>();
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
@@ -573,6 +577,9 @@ if (import.meta.env.DEV) {
         };
       }
 
+      if (command === "get_codey_plugin_host_info" || command === "validate_codey_plugin_config") {
+        throw new Error("预览环境不提供真实宿主查询或配置预检查，请连接 Codey bridge。");
+      }
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
         if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
@@ -627,13 +634,35 @@ if (import.meta.env.DEV) {
       }
       if (command === "select_codey_plugin_package") return structuredClone(previewPluginPackage);
       if (command === "inspect_codey_plugin") {
+        if (typeof args?.discardUpload === "string") {
+          previewPackageUploads.delete(args.discardUpload);
+          return { status: "ok" };
+        }
+        if (args?.upload) {
+          const chunk = args.upload as { id?: string; name: string; offset: number; contentBase64: string; complete: boolean };
+          if (typeof chunk.name !== "string" || !chunk.name.endsWith(".codey-plugin")) throw new Error("仅支持 .codey-plugin 安装包");
+          const content = atob(chunk.contentBase64);
+          const uploadId = chunk.id ?? crypto.randomUUID();
+          const upload = chunk.id ? previewPackageUploads.get(chunk.id) : { name: chunk.name, size: 0, signature: content.slice(0, 4) };
+          if (!upload || upload.name !== chunk.name || upload.size !== chunk.offset) throw new Error("插件包上传顺序无效，请重新检查");
+          upload.size += content.length;
+          if (upload.size > 64 * 1024 * 1024) throw new Error("插件包超过 64 MiB");
+          previewPackageUploads.set(uploadId, upload);
+          if (!chunk.complete) return { uploadId };
+          if (upload.signature !== "PK\x03\x04") {
+            previewPackageUploads.delete(uploadId);
+            throw new Error("预览：ZIP 格式无效，请选择完整的插件包");
+          }
+          return { ...structuredClone(previewPluginPackage), path: `/preview/imports/${uploadId}.codey-plugin`, uploadId };
+        }
         const path = typeof args?.path === "string" ? args.path.trim() : "";
-        if (!path.toLowerCase().endsWith(".codey-plugin")) throw new Error("请选择 .codey-plugin 安装包");
+        if (!path.endsWith(".codey-plugin")) throw new Error("请选择 .codey-plugin 安装包");
         return { ...structuredClone(previewPluginPackage), path };
       }
       if (command === "install_codey_plugin") {
         if (args?.sha256 !== previewPluginPackage.sha256) throw new Error("插件包在检查后发生变化，请重新检查");
         const installed = previewPlugins.find(item => item.id === previewPluginPackage.manifest.id);
+        if (installed?.version === previewPluginPackage.manifest.version) throw new Error("仅允许安装更高版本；相同版本不可覆盖");
         if (installed) {
           installed.version = previewPluginPackage.manifest.version;
           installed.capabilities = [...previewPluginPackage.manifest.capabilities];
@@ -847,15 +876,22 @@ if (import.meta.env.DEV) {
       if (command === "save_official_account_route_settings") {
         const account = previewOfficialAccounts.find((item) => item.id === args.accountId);
         if (!account) return { status: "failed", message: "找不到官方账号" };
+        const errors = validateOfficialRouteSettings({
+          routeName: String(args.routeName ?? ""),
+          routeShortName: String(args.routeShortName ?? ""),
+          baseUrl: String(args.baseUrl ?? ""),
+          upstreamProxy: String(args.upstreamProxy ?? ""),
+        }, previewConfig.profiles, previewOfficialAccounts, account.id);
+        const error = Object.values(errors).find(Boolean);
+        if (error) return { status: "failed", message: error };
         const routeOverride = (value: unknown) => {
           const text = String(value ?? "").trim();
           return text ? text : undefined;
         };
-        account.routeName = routeOverride(args.routeName);
+        account.routeName = String(args.routeName ?? "").trim();
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
         account.baseUrl = routeOverride(args.baseUrl);
-        // 清空设置后后端会立刻补回生成的默认名称，预览保持一致。
         previewDeriveOfficialProfiles();
         return {
           status: "ok",
@@ -1041,6 +1077,15 @@ if (import.meta.env.DEV) {
       }
       if (command === "save_codey_config") {
         const incoming = args.config as Config;
+        for (const profile of incoming.profiles) {
+          const error = profile.authMode === "officialAccount"
+            ? ""
+            : validateThirdPartyRouteShortName(profile.shortName, incoming.profiles, profile.id);
+          if (error) return { status: "failed", message: error };
+          if (Array.from(profile.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS) {
+            return { status: "failed", message: `线路名最多 ${MAX_ROUTE_NAME_CHARACTERS} 个字符` };
+          }
+        }
         previewConfig = {
           ...incoming,
           profiles: incoming.profiles.map((profile) => ({
@@ -1387,6 +1432,20 @@ if (import.meta.env.DEV) {
         if (!targetProfile || targetProfile.authMode !== "officialAccount" || models.length === 0) {
           return { status: "failed", message: "官方线路至少需要保留一个模型" };
         }
+        if (args.accountId) {
+          const accountId = String(args.accountId).trim();
+          if (!previewOfficialAccounts.some((account) => account.id === accountId)) {
+            return { status: "failed", message: "找不到官方账号" };
+          }
+          const errors = validateOfficialRouteSettings({
+            routeName: String(args.routeName ?? ""),
+            routeShortName: String(args.routeShortName ?? ""),
+            baseUrl: String(args.baseUrl ?? ""),
+            upstreamProxy: String(args.upstreamProxy ?? ""),
+          }, previewConfig.profiles, previewOfficialAccounts, accountId);
+          const error = Object.values(errors).find(Boolean);
+          if (error) return { status: "failed", message: error };
+        }
         const providerId = routeProviderId(targetProfile);
         const availableModels = previewOfficialModels.map((model) => model.slug);
         previewConfig.modelContextByProvider = { ...previewConfig.modelContextByProvider,
@@ -1445,7 +1504,7 @@ if (import.meta.env.DEV) {
             const text = String(value ?? "").trim();
             return text ? text : undefined;
           };
-          account.routeName = routeOverride(args.routeName);
+          account.routeName = String(args.routeName ?? "").trim();
           account.routeShortName = routeOverride(args.routeShortName);
           account.upstreamProxy = routeOverride(args.upstreamProxy);
           if ("baseUrl" in args) account.baseUrl = routeOverride(args.baseUrl);

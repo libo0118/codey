@@ -65,6 +65,10 @@ pub(crate) struct RequestLogCatalog {
 pub(crate) struct RequestLogProfile {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) short_name: String,
+    pub(crate) official_account: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) official_account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_provider_id: Option<String>,
 }
@@ -79,6 +83,9 @@ impl RequestLogCatalog {
                 .map(|profile| RequestLogProfile {
                     id: profile.id.clone(),
                     name: profile.name.clone(),
+                    short_name: profile.display_short_name(),
+                    official_account: profile.official_account,
+                    official_account_id: profile.official_account_id.clone(),
                     source_provider_id: profile.source_provider_id.clone(),
                 })
                 .collect(),
@@ -208,7 +215,8 @@ impl LocalRouter {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
             supports_websockets: config.runtime_supports_websockets(),
-            supports_remote_compaction: config.runtime_supports_remote_compaction(),
+            // 未携带线路信息的原生会话只在全部线路兼容时默认使用远程压缩。
+            supports_remote_compaction: config.remote_compaction_mode() == "remote",
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
@@ -834,6 +842,7 @@ impl RouterSnapshot {
                     && config.route_supports_websockets_this_launch(profile),
                 supports_remote_compaction: config
                     .route_supports_remote_compaction_this_launch(profile),
+                remote_compaction_protocol: profile.remote_compaction_protocol,
                 models: HashSet::new(),
                 websocket_config: [0; 32],
                 context_config: [0; 32],
@@ -1163,6 +1172,7 @@ pub(crate) struct RouteTarget {
     pub(crate) plugin_transport: Option<plugin_transport::Target>,
     pub(crate) supports_websockets: bool,
     pub(crate) supports_remote_compaction: bool,
+    pub(crate) remote_compaction_protocol: crate::config::RemoteCompactionProtocol,
     pub(crate) models: HashSet<String>,
     pub(crate) websocket_config: [u8; 32],
     pub(crate) context_config: [u8; 32],

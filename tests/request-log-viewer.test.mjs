@@ -4,6 +4,34 @@ import ts from "typescript";
 
 import { readSource } from "./helpers/read-source.mjs";
 
+test("request log provider labels use route short names and distinguish official accounts", async () => {
+  const viewer = await readSource("src/RequestLogDialog.tsx");
+  const routeNames = await readSource("src/routeShortNames.ts");
+  const source = [
+    routeNames.match(/export function fallbackRouteShortName\([\s\S]*?\n\}/)?.[0],
+    routeNames.match(/export function formatRouteName\([\s\S]*?\n\}/)?.[0],
+    viewer.match(/function requestLogProviderLabel\([\s\S]*?\n\}/)?.[0],
+  ];
+  source.forEach((part) => assert.ok(part));
+  const compiled = ts.transpileModule(source.join("\n").replaceAll("export function", "function"), {}).outputText;
+  const label = new Function(`${compiled}; return requestLogProviderLabel;`)();
+  const profiles = [
+    { id: "local-a", sourceProviderId: "route-a", name: "线路甲", shortName: "甲" },
+    { id: "route-b", name: "", shortName: "乙" },
+    { id: "official-a", sourceProviderId: "official", name: "官方甲", shortName: "官甲", officialAccountId: "account-a" },
+    { id: "official-b", sourceProviderId: "official", name: "官方乙", shortName: "官乙", officialAccountId: "account-b" },
+  ];
+  assert.equal(label({ provider: "route-a", providerName: "route-a" }, profiles), "[甲] 线路甲");
+  assert.equal(label({ provider: "local-a" }, profiles), "[甲] 线路甲");
+  assert.equal(label({ provider: "route-b" }, profiles), "乙");
+  assert.equal(label({ provider: "official", officialAccountId: "account-b" }, profiles), "[官乙] 官方乙");
+  assert.equal(label({ provider: "removed", providerName: "历史线路" }, profiles), "历史线路");
+  assert.equal(label({ provider: "removed" }, profiles), "removed");
+  assert.equal(label({}, profiles), "—");
+  assert.equal(label({ provider: "legacy" }, [{ id: "legacy", name: "自建" }]), "自建");
+  assert.equal(label({ provider: "empty", providerName: "历史线路" }, [{ id: "empty", name: "", shortName: "" }]), "历史线路");
+});
+
 test("request log cache hit rate uses input tokens and preserves unknown usage", async () => {
   const viewer = await readSource("src/RequestLogDialog.tsx");
   const source = viewer.match(/function formatCacheHitRate\([\s\S]*?\n\}/)?.[0];

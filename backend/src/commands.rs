@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 mod config_repair;
+mod conversation_git;
 mod diagnostics;
 mod extensions;
 mod models;
@@ -34,15 +35,16 @@ pub(crate) use models::native_subagent_model_state;
 #[cfg(test)]
 use models::{
     config_with_current_provider_models, config_with_launch_pinned_transport,
-    preserve_selected_third_party_models, preserve_selected_third_party_models_except,
-    provider_route_requires_restart, renderer_model_catalog_value, should_refresh_model_catalog,
+    model_catalog_config_for_runtime, preserve_selected_third_party_models,
+    preserve_selected_third_party_models_except, provider_route_requires_restart,
+    renderer_model_catalog_value, should_refresh_model_catalog,
     startup_model_sync_models_or_fallback, sync_provider_state_with,
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_provider_status_async, current_renderer_model_catalog_async,
-    hot_reload_runtime_models, native_web_search_capability_requires_restart,
-    official_route_snapshots_for_runtime, reconcile_subagent_models_for_mode,
+    current_model_state_async, current_provider_status_async, hot_reload_runtime_models,
+    native_web_search_capability_requires_restart, official_route_snapshots_for_runtime,
+    reconcile_subagent_models_for_mode, runtime_renderer_model_catalog,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
@@ -411,32 +413,9 @@ impl AppState {
                 serde_json::to_value(redacted_config(&config))
                     .expect("CodeyConfig must be JSON-serializable")
             }
-            "/codex-model-catalog" => {
-                let runtime = self.runtime.lock().await.clone();
-                let applied_catalog_config = match runtime.as_ref() {
-                    Some(runtime) => Some(runtime.applied_model_catalog_config().await),
-                    None => None,
-                };
-                let catalog_config = {
-                    let config = self.config.read().await;
-                    let current_config = runtime
-                        .as_ref()
-                        .filter(|runtime| {
-                            runtime.validate_subagent_route_hot_reload(&config).is_err()
-                        })
-                        .and(applied_catalog_config.as_ref())
-                        .unwrap_or(&config);
-                    model_catalog_config_for_runtime(
-                        current_config,
-                        runtime.as_ref().map(|runtime| &runtime.applied_config),
-                        applied_catalog_config.as_ref(),
-                    )
-                    .clone()
-                };
-                current_renderer_model_catalog_async(catalog_config)
-                    .await
-                    .unwrap_or_else(api_error_message)
-            }
+            "/codex-model-catalog" => runtime_renderer_model_catalog(self)
+                .await
+                .unwrap_or_else(api_error_message),
             "/backend/status" => {
                 let mut value = runtime_status(self).await.unwrap_or_else(api_error_message);
                 if let Some(object) = value.as_object_mut() {
@@ -1160,10 +1139,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         }
         "clear_route_request_logs" => clear_route_request_logs(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
-        "clear_diagnostic_storage"
-        | "repair_codex_overlays"
-        | "repair_codex_config"
-        | "repair_main_process_injection" => diagnostics::invoke(state, command, &args).await,
+        "clear_diagnostic_storage" | "repair_codex_config" | "repair_main_process_injection" => {
+            diagnostics::invoke(state, command, &args).await
+        }
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
@@ -1193,6 +1171,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
         },
+        "conversation_git_status" | "conversation_git_preview" | "conversation_git_execute" => {
+            conversation_git::invoke(state, command, &args).await
+        }
         "test_prompt_optimization" => {
             match optional_argument::<PromptOptimizationConfig>(&args, "config") {
                 Ok(draft) => test_prompt_optimization_command(state, draft).await,
@@ -1214,7 +1195,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
         "prepare_computer_use" => prepare_computer_use().await,
-        "list_codey_plugins"
+        "get_codey_plugin_host_info"
+        | "validate_codey_plugin_config"
+        | "list_codey_plugins"
         | "get_codey_plugin_config_file"
         | "select_codey_plugin_package"
         | "inspect_codey_plugin"
@@ -1611,7 +1594,7 @@ pub async fn save_codey_config(
 
 struct CodeyConfigSaveInput {
     config: CodeyConfig,
-    auto_check_codey_updates_present: bool,
+    codey_update_policy_present: bool,
     model_reasoning_efforts_present: bool,
     model_context_present: bool,
     local_router_enabled_present: bool,
@@ -1628,7 +1611,7 @@ impl CodeyConfigSaveInput {
     fn complete(config: CodeyConfig) -> Self {
         Self {
             config,
-            auto_check_codey_updates_present: true,
+            codey_update_policy_present: true,
             model_reasoning_efforts_present: true,
             model_context_present: true,
             local_router_enabled_present: true,
@@ -1650,7 +1633,8 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
-    let auto_check_codey_updates_present = fields.contains_key("autoCheckCodeyUpdates");
+    let codey_update_policy_present =
+        fields.contains_key("codeyUpdatePolicy") || fields.contains_key("autoCheckCodeyUpdates");
     let local_router_enabled_present = fields.contains_key("localRouterEnabled");
     let model_reasoning_efforts_present = fields.contains_key("modelReasoningEffortsByProvider");
     let model_context_present = fields.contains_key("modelContextByProvider");
@@ -1664,7 +1648,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
         config,
-        auto_check_codey_updates_present,
+        codey_update_policy_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1700,7 +1684,7 @@ async fn save_codey_config_locked(
 ) -> Result<SavedCodeyConfig, String> {
     let CodeyConfigSaveInput {
         config: mut config_input,
-        auto_check_codey_updates_present,
+        codey_update_policy_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1811,8 +1795,8 @@ async fn save_codey_config_locked(
                     .contains_key(provider_id)
             });
     }
-    if auto_check_codey_updates_present {
-        config.auto_check_codey_updates = config_input.auto_check_codey_updates;
+    if codey_update_policy_present {
+        config.codey_update_policy = config_input.codey_update_policy;
     }
     if local_router_enabled_present {
         config.local_router_enabled = config_input.local_router_enabled;
@@ -1839,6 +1823,8 @@ async fn save_codey_config_locked(
         .merge_redacted_secrets(&previous.prompt_optimization);
     config_input.prompt_optimization.validate()?;
     config.prompt_optimization = config_input.prompt_optimization;
+    config_input.conversation_git.validate()?;
+    config.conversation_git = config_input.conversation_git;
     config.codex_app_path = config_input.codex_app_path;
     config.user_scripts = config_input.user_scripts;
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
@@ -1980,6 +1966,12 @@ async fn save_codey_config_locked(
         }
     };
     *state.config.write().await = config.clone();
+    if previous.codey_update_policy != config.codey_update_policy {
+        *state.available_update.write().await = None;
+        if let Ok(mut cache) = state.update_candidate_cache.try_lock() {
+            *cache = None;
+        }
+    }
     if let Some(report) = trace_guard_report {
         state.trace_log_write_protection_active.store(
             report.protection_active(config.disable_trace_log_writes),
@@ -2074,20 +2066,10 @@ fn schedule_plugin_route_hot_reload(state: &Arc<AppState>) {
     let state = Arc::clone(state);
     runtime.spawn(async move {
         let _serial = state.plugin_route_reload_lock.lock().await;
-        let config = state.config.read().await.clone();
-        let model_state = match current_model_state_async(&config).await {
-            Ok(model_state) => model_state,
-            Err(error) => {
-                record_plugin_route_hot_reload_failure(error);
-                return;
-            }
-        };
-        if let Some(error) = hot_reload_runtime_models(&state, &config, &model_state)
-            .await
-            .error
-        {
+        if let Some(error) = hot_reload_runtime_models(&state).await.error {
             record_plugin_route_hot_reload_failure(error);
         }
+        let config = state.config.read().await.clone();
         if config.subagent_optimization {
             let outcome = hot_reload_runtime_subagent_config(&state, &config).await;
             if outcome.requires_restart()
@@ -2150,6 +2132,14 @@ fn merge_profile_secrets(
         } else {
             profile.plugin_owner_id = None;
             profile.plugin_route_spec = None;
+        }
+        if profile.short_name.trim().is_empty()
+            && !profile.is_unconfigured_default()
+            && !previous_profile.is_some_and(|saved| {
+                saved.short_name.trim().is_empty() && saved.name.trim() == profile.name.trim()
+            })
+        {
+            return Err("请输入短名称".to_string());
         }
         profile.normalize();
         // 线路名上限与渲染层一致。旧配置里已经超限的名称只要这次没有改动就
@@ -2263,7 +2253,7 @@ async fn finish_codey_config_save(
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
     let model_state = current_model_state_async(&saved.config).await?;
-    let model_hot_reload = hot_reload_runtime_models(state, &saved.config, &model_state).await;
+    let model_hot_reload = hot_reload_runtime_models(state).await;
     let route_request_log_hot_reload = hot_reload_runtime_request_log(state, &saved.config).await;
     let subagent_hot_reload = if saved.reconcile_subagent_config {
         hot_reload_runtime_subagent_config(state, &saved.config).await
@@ -2494,6 +2484,7 @@ enum SubagentHotReloadStatus {
     Unchanged,
     Applied,
     Repaired,
+    PendingRestart,
     Superseded,
     Failed,
 }
@@ -2506,6 +2497,14 @@ pub(super) struct SubagentHotReloadOutcome {
 }
 
 impl SubagentHotReloadOutcome {
+    fn pending_restart(reason: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::PendingRestart,
+            error: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             status: SubagentHotReloadStatus::Unchanged,
@@ -2553,7 +2552,10 @@ impl SubagentHotReloadOutcome {
     }
 
     pub(super) fn requires_restart(&self) -> bool {
-        self.status == SubagentHotReloadStatus::Failed
+        matches!(
+            self.status,
+            SubagentHotReloadStatus::Failed | SubagentHotReloadStatus::PendingRestart
+        )
     }
 
     pub(super) fn health(&self) -> &'static str {
@@ -2562,6 +2564,7 @@ impl SubagentHotReloadOutcome {
             SubagentHotReloadStatus::Unchanged => "healthy",
             SubagentHotReloadStatus::Applied => "applied",
             SubagentHotReloadStatus::Repaired => "repaired",
+            SubagentHotReloadStatus::PendingRestart => "pending_restart",
             SubagentHotReloadStatus::Superseded => "superseded",
             SubagentHotReloadStatus::Failed => "restart_required",
         }
@@ -2635,12 +2638,11 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
-    let result = tokio::task::spawn_blocking(move || {
-        reconcile_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
-    })
-    .await
-    .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
-    .and_then(std::convert::identity);
+    let result =
+        tokio::task::spawn_blocking(move || reconcile_runtime_subagent_roles(&runtime_config))
+            .await
+            .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
+            .and_then(std::convert::identity);
     match result {
         Ok(report) => {
             if !report.repaired && !applied_config_changed {
@@ -2676,6 +2678,9 @@ pub(super) async fn hot_reload_runtime_subagent_config(
             )
         }
         Err(error) => {
+            if error.is::<crate::codex_config::SubagentRoleRegistrationChanged>() {
+                return SubagentHotReloadOutcome::pending_restart(error.to_string());
+            }
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",
@@ -3041,6 +3046,7 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.slim_codex_pet != current.slim_codex_pet
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
+        || applied.conversation_git.enabled != current.conversation_git.enabled
         || applied.subagent_optimization != current.subagent_optimization
         || !applied
             .misc_model
@@ -3060,18 +3066,6 @@ pub(super) fn provider_route_restart_required_for_runtime(
             != official_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
-}
-
-fn model_catalog_config_for_runtime<'a>(
-    current: &'a CodeyConfig,
-    runtime_applied: Option<&'a CodeyConfig>,
-    applied_catalog: Option<&'a CodeyConfig>,
-) -> &'a CodeyConfig {
-    runtime_applied
-        .filter(|applied| !runtime_supports_current_routes_for_hot_reload(applied, current))
-        // 待重启的能力变更保留最近已生效的模型，不能退回启动时的旧目录。
-        .map(|applied| applied_catalog.unwrap_or(applied))
-        .unwrap_or(current)
 }
 
 async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyConfig) -> bool {

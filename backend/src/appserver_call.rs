@@ -251,7 +251,11 @@ fn route_key(route: &Route) -> String {
 }
 
 fn router_overrides(route: &Route) -> Vec<String> {
-    let provider = crate::local_router::ROUTER_PROVIDER_ID;
+    let provider = if route.supports_remote_compaction {
+        crate::local_router::REMOTE_COMPACTION_PROVIDER_ID
+    } else {
+        crate::local_router::ROUTER_PROVIDER_ID
+    };
     let name = if route.supports_remote_compaction {
         "OpenAI"
     } else {
@@ -384,6 +388,11 @@ mod tests {
                 .contains("model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"")
         );
         assert!(rendered.contains("experimental_bearer_token=\"router-secret\""));
+        let mut remote = route();
+        remote.supports_remote_compaction = true;
+        let remote_overrides = router_overrides(&remote).join("\n");
+        assert!(remote_overrides.contains("model_provider=\"codey_router_remote\""));
+        assert!(remote_overrides.contains("model_providers.codey_router_remote.name=\"OpenAI\""));
         let response = redact(
             json!({"result":{"note":"router-secret","nested":["router-secret"]}}),
             "router-secret",

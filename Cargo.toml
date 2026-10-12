@@ -3,7 +3,6 @@ members = [
   "backend",
   "crates/codey-codex-extensions",
   "crates/codey-plugin-sdk",
-  "examples/plugins/header-demo",
   "vendor/CodeyRuntime/crates/codey-runtime-core",
   "vendor/CodeyRuntime/crates/codey-runtime-data",
 ]
@@ -11,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "1.2.4-libo.1"
+version = "1.2.8-libo.1"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]

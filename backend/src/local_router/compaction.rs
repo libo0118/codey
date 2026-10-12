@@ -34,6 +34,54 @@ pub(crate) fn is_compaction_request(body: &Value, kind: ResponsesRequestKind) ->
             .any(|item| item["type"] == "compaction_trigger")
 }
 
+/// 只转换明确选择兼容端点的压缩请求。调用前须先恢复 WebSocket 增量历史。
+pub(crate) fn adapt_compaction_trigger_to_compact(body: &mut Value) -> Result<()> {
+    for field in ["conversation", "prompt"] {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("兼容压缩端点无法保留 {field} 引用，请使用原生 Responses 压缩");
+        }
+    }
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("兼容压缩要求 input 为完整历史数组"))?;
+    let trigger = items
+        .last()
+        .filter(|item| item["type"] == "compaction_trigger")
+        .ok_or_else(|| anyhow::anyhow!("兼容压缩要求 compaction_trigger 位于历史末尾"))?;
+    if trigger.as_object().is_none_or(|object| object.len() != 1)
+        || items[..items.len() - 1]
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+    {
+        anyhow::bail!("兼容压缩只支持单个不带额外参数的 compaction_trigger");
+    }
+    // compact 接口接收整个历史窗口，保留其中所有消息、工具结果和加密项。
+    body["input"].as_array_mut().expect("validated input").pop();
+    body.as_object_mut()
+        .expect("validated compaction request")
+        .retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "model"
+                    | "input"
+                    | "instructions"
+                    | "previous_response_id"
+                    | "prompt_cache_key"
+                    | "prompt_cache_options"
+                    | "prompt_cache_retention"
+                    | "service_tier"
+            )
+        });
+    Ok(())
+}
+
+pub(crate) enum CompactionResponseFormat {
+    Responses,
+    Compact,
+    CompactToResponses,
+}
+
 pub(crate) fn validate_portable_context(body: &Value) -> Result<()> {
     let is_compaction = |item: &Value| {
         matches!(
@@ -1708,10 +1756,11 @@ impl SseFrameAccumulator for CompactionAccumulator {
 pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
     response: reqwest::Response,
-    v2: bool,
+    format: CompactionResponseFormat,
     stream: bool,
     route: &RouteTarget,
 ) -> Result<()> {
+    let v2 = matches!(format, CompactionResponseFormat::Responses);
     let probe = downstream.request_log_probe().cloned();
     let result = await_upstream(downstream, async {
         let mut prepared =
@@ -1733,8 +1782,14 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
                 probe.as_ref(),
             )
             .await?;
-            let value: Value = serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
+            let mut value: Value =
+                serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
             validate_compaction_result(&value, v2)?;
+            if matches!(format, CompactionResponseFormat::CompactToResponses) {
+                // 先校验旧接口的完整结果，再补 Responses 终态；output 与密文原样保留。
+                value["object"] = json!("response");
+                value["status"] = json!("completed");
+            }
             Ok(value)
         }
     })

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": 9,
+  "revision": 11,
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
@@ -29,6 +29,14 @@
       "explanation": "子代理不能继续派生子代理，避免权限与预算跨层扩散。"
     },
     {
+      "id": "deny-child-orchestration",
+      "priority": 950,
+      "effect": "deny",
+      "actors": ["child"],
+      "tools": ["wait_agent", "list_agents", "agent_status", "interrupt_agent", "followup_task"],
+      "explanation": "子代理只可向根代理回报，不得等待、查看、中断或追派其他代理。"
+    },
+    {
       "id": "deny-readonly-write",
       "priority": 900,
       "effect": "deny",
@@ -36,14 +44,6 @@
       "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
       "toolClasses": ["write"],
       "explanation": "只读角色不得调用写入工具。"
-    },
-    {
-      "id": "deny-child-orchestration",
-      "priority": 950,
-      "effect": "deny",
-      "actors": ["child"],
-      "tools": ["wait_agent", "list_agents", "agent_status", "interrupt_agent", "followup_task"],
-      "explanation": "子代理只可向根代理回报，不得等待、查看、中断或追派其他代理。"
     },
     {
       "id": "allow-visual-capabilities",
@@ -61,7 +61,7 @@
       "actors": ["child"],
       "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
       "toolClasses": ["read", "command", "network", "collaboration"],
-      "explanation": "只读角色可使用本地与网络只读检索、显式声明的命令和协作能力；文件写入仍由角色与原生沙箱限制。"
+      "explanation": "只读角色可使用本地与网络只读检索及协作能力；未经证明只读的命令仍由 capability 门禁拒绝。"
     },
     {
       "id": "allow-worker-capabilities",
