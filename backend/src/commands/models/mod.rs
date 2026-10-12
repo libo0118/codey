@@ -15,9 +15,7 @@ use super::{
 use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::codex_provider;
-use crate::config::{
-    CodeyConfig, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile, validate_provider_profiles,
-};
+use crate::config::{CodeyConfig, ProviderProfile, validate_provider_profiles};
 use crate::error_log;
 use crate::local_router;
 use crate::model_catalog;
@@ -67,6 +65,7 @@ impl Drop for ModelOperationTimings {
 
 mod catalog_refresh;
 mod defaults;
+mod delivery;
 mod native;
 mod routes;
 mod selection;
@@ -77,6 +76,7 @@ mod tests;
 
 pub(crate) use catalog_refresh::*;
 pub use defaults::*;
+pub(crate) use delivery::*;
 pub(crate) use native::*;
 pub use routes::*;
 pub use selection::*;

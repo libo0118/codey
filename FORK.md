@@ -1,16 +1,10 @@
 # 自定义分支维护
 
-本仓库的 `master` 跟随 [SuperGness/codey](https://github.com/SuperGness/codey) 上游主分支；`custom` 基于上游 v1.2.4，保留模型思考档位同步与只读子代理修复。日常使用和构建选择 `custom`，不要把自定义提交合并回 `master`。
+本仓库的 `master` 跟随 [SuperGness/codey](https://github.com/SuperGness/codey) 上游主分支；`custom` 基于上游 v1.2.8，保留模型思考档位同步与 fork 更新配置。日常使用和构建选择 `custom`，不要把自定义提交合并回 `master`。
 
 同步模型时保留上游声明的思考档位。Responses 兼容服务缺少普通模型元数据时，会补查 Codex 模型目录；手动档位设置优先，但不能超出插件声明的支持范围，上游请求失败时保留上次成功结果。不同线路的同名模型互不覆盖。该功能同时作用于 Codex 模型列表与 Codey 子代理角色选择。
 
-只读子代理可以通过严格的单调用 JSON 包装使用网页/MCP 资源读取，以及受限的 Git 对象查询、HTTP GET/HEAD。仍只有 `files.read` 能力，不授予通用命令或文件写入权限；原生沙箱、身份绑定、失效隔离和写代理互斥保持生效。只读查询示例：
-
-```javascript
-text(await tools.exec_command({"cmd":"git --no-pager --no-optional-locks --no-lazy-fetch -c core.fsmonitor=false log --oneline --no-show-signature -n 5"}));
-```
-
-Git 工作区 `status`/`diff` 可能运行仓库的 clean filter，`ls-remote` 可能调用凭证程序或写入 Cookie，因此不在白名单内；这些操作由主代理处理。暂存区差异使用 `diff --cached --no-ext-diff --no-textconv --ignore-submodules=all`。任意脚本、提交、推送、命令拼接和未识别参数均不因此获得权限。命令分类信任已安装的 Git/curl/gh 与继承的运行环境，不替代操作系统沙箱；安装新版并重启 Codey 后生效。
+子代理权限、调度和生命周期完全沿用上游：各角色使用一致的工具能力，操作受任务范围和 Codex 原生权限约束；并发上限为两个，写入按目标文件协调。角色仅用于任务分工和模型选择，不再额外维护分析角色只读限制或命令白名单。
 
 ## 合并上游更新
 

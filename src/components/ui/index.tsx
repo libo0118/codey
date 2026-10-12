@@ -331,6 +331,7 @@ export type SelectOption = { disabled?: boolean; label: React.ReactNode; value: 
 export interface SelectProps {
   "aria-label"?: string;
   "aria-labelledby"?: string;
+  "aria-required"?: boolean;
   className?: string;
   disabled?: boolean;
   filter?: boolean;

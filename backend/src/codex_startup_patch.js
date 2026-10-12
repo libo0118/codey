@@ -651,6 +651,20 @@
       );
     }
     if (
+      source.includes("supportsIndependentSpeedModes") &&
+      source.includes("ultrafast_mode")
+    ) {
+      // Ultrafast 与 Fast 是两条独立的授权字段。上一条只放开了 fast_mode，
+      // 这里把 ultrafast_mode 的判定一并收敛，避免上游把它默认置否后
+      // 速度档控件静默消失。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\bultrafast\s*:\s*)\([^;{}\n]{0,400}?\)\s*&&\s*[$A-Z_a-z][$\w]*\s*\?\.\s*ultrafast_mode\s*!==\s*!1/g,
+        (_match, prefix) => `${prefix}!0`,
+        "ultrafast tier entitlement",
+      );
+    }
+    if (
       source.includes("isServiceTierAllowed") &&
       source.includes("serviceTierForRequest:") &&
       source.includes("availableOptions:")
@@ -1108,7 +1122,32 @@
     }
     return null;
   };
-  const localRouterRuntimeEnabled = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_provider") === "codey_router";
+  const localRouterProviderIds = new Set(["codey_router", "codey_router_remote"]);
+  const defaultRouterProvider = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_provider");
+  const localRouterRuntimeEnabled = localRouterProviderIds.has(defaultRouterProvider);
+  const routerProviderForParams = (method, params) => {
+    const requestedModel = typeof params?.model === "string" ? params.model.trim() : "";
+    // Resume/fork inherit their model from history. A saved carrier or the
+    // launch default does not prove that history's route still supports compact.
+    if (!requestedModel && method !== "thread/start") return "codey_router";
+    const model = requestedModel || runtimeConfigValue(nativeRuntimeConfigOverrides, "model");
+    if (!model) return defaultRouterProvider;
+    const catalogPath = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_catalog_json");
+    // Built-in-catalog launches have no model metadata file. Only an all-capable
+    // launch may default to remote; a renderer-selected carrier stays explicit.
+    if (!catalogPath) return localRouterProviderIds.has(params?.modelProvider)
+      ? params.modelProvider : defaultRouterProvider;
+    try {
+      const catalog = JSON.parse(process.getBuiltinModule("fs").readFileSync(catalogPath, "utf8"));
+      const entry = catalog.models?.find((entry) => (
+        typeof entry.slug === "string" && entry.slug.trim().toLowerCase() === String(model).trim().toLowerCase()
+      ));
+      if (entry?.codey_remote_compaction === true) return "codey_router_remote";
+    } catch {
+      // An unknown model has no verified remote compaction route.
+    }
+    return "codey_router";
+  };
   if (localRouterRuntimeEnabled) {
     // A shared daemon or external WebSocket can retain another provider and
     // never read this launch's overrides. Use Codex's own process-local mode.
@@ -1121,7 +1160,8 @@
         !["thread/start", "thread/resume", "thread/fork"].includes(message?.method)) {
       return message;
     }
-    const params = { ...message.params, modelProvider: "codey_router" };
+    const params = { ...message.params, modelProvider: routerProviderForParams(message.method, message.params) };
+    delete params.model_provider;
     if (params.config != null && typeof params.config === "object" && !Array.isArray(params.config)) {
       params.config = Object.fromEntries(Object.entries(params.config).filter(([key]) =>
         key !== "model_provider" && !key.startsWith("model_provider.") &&
@@ -1586,7 +1626,7 @@
       const configs = JSON.parse(environment.CODEY_CODEX_CLI_WRAPPER_OVERRIDES);
       if (!Array.isArray(configs) || !configs.every((config) => typeof config === "string")) return false;
       const effectiveConfigs = uniqueRuntimeConfigsByKey(configs);
-      return runtimeConfigValue(effectiveConfigs, "model_provider") === "codey_router" &&
+      return localRouterProviderIds.has(runtimeConfigValue(effectiveConfigs, "model_provider")) &&
         uniqueRuntimeConfigsByKey(nativeRuntimeConfigOverrides)
           .every((config) => effectiveConfigs.includes(config));
     } catch {

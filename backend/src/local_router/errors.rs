@@ -9,6 +9,7 @@ pub(crate) fn is_context_length_error(value: &Value) -> bool {
         value,
         &[
             "/response/error/code",
+            "/response/error/type",
             "/error/code",
             "/error/type",
             "/code",
@@ -47,6 +48,77 @@ pub(crate) fn check_context_length_error(value: &Value) -> Result<()> {
         return Err(ContextLengthExceeded.into());
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct UpstreamStreamFailure(pub(crate) Value);
+
+impl std::fmt::Display for UpstreamStreamFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "上游流返回错误：{}", self.0)
+    }
+}
+
+impl std::error::Error for UpstreamStreamFailure {}
+
+pub(crate) fn check_upstream_stream_failure(value: &Value) -> Result<()> {
+    check_context_length_error(value)?;
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("type").and_then(Value::as_str) == Some("error")
+    {
+        return Err(UpstreamStreamFailure(value.clone()).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn streaming_response_failure(
+    error: &anyhow::Error,
+    route: &RouteTarget,
+    retry_advice: Option<ResponseRetryAdvice>,
+) -> ResponsesFailure {
+    let (code, message) = streaming_failure_message(error, route);
+    let mut failure = ResponsesFailure::new(
+        if is_upstream_timeout_error(error) {
+            504
+        } else {
+            502
+        },
+        code,
+        message,
+        Some(route),
+    );
+    if let Some(upstream) = error.downcast_ref::<UpstreamStreamFailure>() {
+        let summary = upstream_error_summary(&upstream.0, route);
+        if let Some(message) = summary.message {
+            failure.event["response"]["error"]["message"] = message.into();
+        }
+        let metadata = &mut failure.event["response"]["error"]["codey"];
+        if let Some(code) = summary.code {
+            metadata["upstreamCode"] = code.into();
+        }
+        if let Some(kind) = summary.error_type {
+            metadata["upstreamType"] = kind.into();
+        }
+        if let Some(status) = upstream
+            .0
+            .get("status")
+            .or_else(|| upstream.0.pointer("/error/status"))
+            .and_then(Value::as_u64)
+            .filter(|status| (400..600).contains(status))
+        {
+            failure.status = status as u16;
+            metadata["httpStatus"] = status.into();
+        }
+        if let Some(delay) = upstream
+            .0
+            .pointer("/error/retry_after_ms")
+            .and_then(Value::as_u64)
+        {
+            failure.event["response"]["error"]["retry_after_ms"] = delay.into();
+        }
+    }
+    failure.retry_advice = retry_advice;
+    failure
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -271,11 +343,16 @@ where
         .await
 }
 
+pub(crate) struct UpstreamHttpErrorResponse<'a> {
+    pub(crate) status: u16,
+    pub(crate) upstream_request_id: Option<&'a str>,
+    pub(crate) retry_advice: Option<ResponseRetryAdvice>,
+    pub(crate) body: &'a [u8],
+}
+
 pub(crate) async fn write_upstream_http_error<D>(
     downstream: &mut D,
-    status: u16,
-    upstream_request_id: Option<&str>,
-    body: &[u8],
+    response: UpstreamHttpErrorResponse<'_>,
     resolved: &RouteSelection,
     bridge: ProtocolBridge,
     request_kind: ResponsesRequestKind,
@@ -283,6 +360,12 @@ pub(crate) async fn write_upstream_http_error<D>(
 where
     D: ResponsesDownstream + ?Sized,
 {
+    let UpstreamHttpErrorResponse {
+        status,
+        upstream_request_id,
+        retry_advice,
+        body,
+    } = response;
     let upstream_request_id = upstream_request_id.map(str::to_string);
     let probe = downstream.request_log_probe().cloned();
     let parsed = serde_json::from_slice::<Value>(body).ok();
@@ -334,24 +417,24 @@ where
             "requestId": current_router_request_id(),
         }),
     );
-    if context_exceeded || downstream.is_websocket() {
-        downstream
-            .write_error(
-                status,
-                if context_exceeded {
-                    CONTEXT_LENGTH_EXCEEDED
-                } else {
-                    "upstream_http_error"
-                },
-                message,
-                Some(&resolved.route),
-            )
-            .await
+    let code = if context_exceeded {
+        CONTEXT_LENGTH_EXCEEDED
     } else {
-        downstream
-            .write_text_error(status, "upstream_http_error", message)
-            .await
+        "upstream_http_error"
+    };
+    let mut failure = ResponsesFailure::new(status, code, message, Some(&resolved.route));
+    let metadata = &mut failure.event["response"]["error"]["codey"];
+    if let Some(code) = summary.code {
+        metadata["upstreamCode"] = code.into();
     }
+    if let Some(kind) = summary.error_type {
+        metadata["upstreamType"] = kind.into();
+    }
+    if let Some(request_id) = upstream_request_id {
+        metadata["upstreamRequestId"] = request_id.into();
+    }
+    failure.retry_advice = retry_advice;
+    downstream.write_response_failure(&failure).await
 }
 
 pub(crate) fn annotate_upstream_websocket_failure(

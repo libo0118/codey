@@ -12,6 +12,26 @@ use crate::fs_util::atomic_write_private_with_parent as atomic_write;
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
+
+/// Only exact catalog IDs carry route capabilities. A raw model name may exist
+/// on several routes and must never inherit capability from a matching suffix.
+pub(crate) fn remote_compaction_models_from_catalog(path: &Path) -> HashSet<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|model| {
+            model
+                .get("codey_remote_compaction")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .map(model_id::key)
+        .collect()
+}
 /// Raw `codex debug models` output Codey captured itself. Recent Codex builds
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
 /// durable source for models that need instruction-bearing entries.
@@ -44,6 +64,13 @@ const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 6] = [
 ];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
+/// Ultrafast 是 Fast 之上的速度档。上游目录目前只声明 Fast，所以这一档由 Codey
+/// 本地合成。开放的判据是上游对 Fast 的描述：账号快照里只有 6.1 Sol 和 6 Astra
+/// 标成 “2x speed”，其余模型是 “1.5x speed”。客户端同时要求 `service_tiers`
+/// 里出现该档，只补 `additional_speed_tiers` 会被 Codex 判定为“未声明”并丢弃。
+const ULTRAFAST_SERVICE_TIER_ID: &str = "ultrafast";
+const ULTRAFAST_SPEED_TIER_ID: &str = "ultrafast";
+const ULTRAFAST_MODEL_SLUGS: [&str; 2] = ["gpt-6.1-sol", "gpt-6-astra"];
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// Official account models Codey exposes. Upstream retires a model by dropping
 /// it from the Codex model cache, so a retired slug has to leave this list in
@@ -235,6 +262,7 @@ pub(crate) struct CapabilityLists<'a> {
     pub(crate) websocket_models: Option<&'a [String]>,
     pub(crate) native_web_search_models: Option<&'a [String]>,
     pub(crate) image_detail_original_models: Option<&'a [String]>,
+    pub(crate) remote_compaction_models: Option<&'a [String]>,
 }
 
 /// 生成目录时一并应用的上下文与思考等级覆盖。
@@ -605,6 +633,7 @@ fn render_catalog_for_provider(
         websocket_models,
         native_web_search_models,
         image_detail_original_models,
+        remote_compaction_models,
     } = capabilities;
     if !official_provider
         && upstream_models.is_some_and(|models| models.is_empty())
@@ -677,6 +706,9 @@ fn render_catalog_for_provider(
         expose_supported_model(model);
         if declares_fast_support {
             add_fast_speed_controls(model);
+        }
+        if supports_ultrafast_speed(model) {
+            add_ultrafast_speed_controls(model);
         }
     }
 
@@ -773,6 +805,10 @@ fn render_catalog_for_provider(
         // 选中它，请求会被静默改成该模型的默认档（luna 是 medium）。
         ensure_forwarded_ultra_level(model);
     }
+    apply_remote_compaction_models(
+        &mut catalog_models,
+        remote_compaction_models.unwrap_or_default(),
+    );
     // Third-party routes still fail closed when their template lacks runtime
     // fields. Official-only catalogs never drop incompatible slugs above, so
     // this remains all-or-nothing for that path.
@@ -1012,12 +1048,15 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     home: &Path,
     native_web_search_models: &[String],
     image_detail_original_models: &[String],
+    remote_compaction_models: &[String],
 ) -> Result<bool> {
     if !is_available(home) {
         return Ok(false);
     }
 
     let mut models = read_runtime_catalog_models(home)?;
+    let original_models = models.clone();
+    apply_remote_compaction_models(&mut models, remote_compaction_models);
     let allowed_model_keys = native_web_search_models
         .iter()
         .map(|model| model_id::key(model))
@@ -1026,7 +1065,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
-    let mut changed = false;
+    let mut changed = models != original_models;
     for model in &mut models {
         let previous = model.clone();
         gate_cached_native_web_search(model, &allowed_model_keys);
@@ -1040,6 +1079,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
 
     let written_models = read_runtime_catalog_models(home)?;
     let mut safely_gated_models = written_models.clone();
+    apply_remote_compaction_models(&mut safely_gated_models, remote_compaction_models);
     for model in &mut safely_gated_models {
         gate_cached_native_web_search(model, &allowed_model_keys);
         gate_cached_image_detail_original(model, &image_detail_original_model_keys);
@@ -1049,6 +1089,21 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         bail!("复用的 Codey 模型目录仍包含与当前线路不匹配的模型能力");
     }
     Ok(true)
+}
+
+fn apply_remote_compaction_models(models: &mut [Value], allowed: &[String]) {
+    let allowed = allowed
+        .iter()
+        .map(|model| model_id::key(model))
+        .collect::<HashSet<_>>();
+    for model in models {
+        let enabled = model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| allowed.contains(&model_id::key(slug)));
+        // Codex 忽略扩展字段，Codey 的原生请求入口用它选择会话 Provider。
+        model["codey_remote_compaction"] = json!(enabled);
+    }
 }
 
 /// Repairs catalogs written by older Codey versions that copied model-cache
@@ -1251,6 +1306,11 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
                 add_fast_speed_controls(&mut model);
             } else {
                 remove_fast_speed_controls(&mut model);
+            }
+            if supports_ultrafast_speed(&model) {
+                add_ultrafast_speed_controls(&mut model);
+            } else {
+                remove_ultrafast_speed_controls(&mut model);
             }
             Ok(model)
         })
@@ -2299,6 +2359,80 @@ fn remove_fast_speed_controls(model: &mut Value) {
     }
 }
 
+/// 上游会为同一个模型下发多个 slug：`-wm` 是 Work 模式，`-priority` 是 Fast 档，
+/// `-ultrafast` 是预留的 Ultrafast 档。只认这几种后缀，免得把 `gpt-6-astra-max`
+/// 这类无关变体也当成同族。
+const SPEED_VARIANT_SUFFIXES: [&str; 3] = ["-wm", "-priority", "-ultrafast"];
+
+/// 只有上游标成 “2x speed” 的模型补 Ultrafast。路由前缀和后缀先归一化再比较，
+/// 否则 `route-x/gpt-6.1-sol` 和 `gpt-6.1-sol-wm` 都会漏掉。
+fn supports_ultrafast_speed(model: &Value) -> bool {
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    let upstream = route_scoped_upstream_model_id(slug)
+        .trim()
+        .to_ascii_lowercase();
+    ULTRAFAST_MODEL_SLUGS.iter().any(|candidate| {
+        upstream.as_str() == *candidate
+            || SPEED_VARIANT_SUFFIXES.iter().any(|suffix| {
+                upstream
+                    .as_str()
+                    .strip_suffix(*suffix)
+                    .is_some_and(|base| base == *candidate)
+            })
+    })
+}
+
+fn ultrafast_service_tier() -> Value {
+    json!({
+        "id": ULTRAFAST_SERVICE_TIER_ID,
+        "name": "Ultrafast",
+        "description": "The fastest available responses for latency-sensitive work."
+    })
+}
+
+fn add_ultrafast_speed_controls(model: &mut Value) {
+    let service_tier = ultrafast_service_tier();
+    let service_tiers = model.get_mut("service_tiers").and_then(Value::as_array_mut);
+    if let Some(service_tiers) = service_tiers {
+        if !service_tiers
+            .iter()
+            .any(|tier| tier.get("id").and_then(Value::as_str) == Some(ULTRAFAST_SERVICE_TIER_ID))
+        {
+            service_tiers.push(service_tier);
+        }
+    } else {
+        model["service_tiers"] = json!([service_tier]);
+    }
+
+    let speed_tiers = model
+        .get_mut("additional_speed_tiers")
+        .and_then(Value::as_array_mut);
+    if let Some(speed_tiers) = speed_tiers {
+        if !speed_tiers
+            .iter()
+            .any(|tier| tier.as_str() == Some(ULTRAFAST_SPEED_TIER_ID))
+        {
+            speed_tiers.push(json!(ULTRAFAST_SPEED_TIER_ID));
+        }
+    } else {
+        model["additional_speed_tiers"] = json!([ULTRAFAST_SPEED_TIER_ID]);
+    }
+}
+
+fn remove_ultrafast_speed_controls(model: &mut Value) {
+    if let Some(service_tiers) = model.get_mut("service_tiers").and_then(Value::as_array_mut) {
+        service_tiers.retain(|tier| {
+            tier.get("id").and_then(Value::as_str) != Some(ULTRAFAST_SERVICE_TIER_ID)
+        });
+    }
+    if let Some(speed_tiers) = model
+        .get_mut("additional_speed_tiers")
+        .and_then(Value::as_array_mut)
+    {
+        speed_tiers.retain(|tier| tier.as_str() != Some(ULTRAFAST_SPEED_TIER_ID));
+    }
+}
+
 fn official_template_for_route_alias<'a>(
     official_models: &'a [Value],
     route_model_id: &str,
@@ -2387,6 +2521,9 @@ fn synthetic_model(
     ensure_catalog_compatibility(&mut model);
     clamp_reasoning_efforts(&mut model);
     add_fast_speed_controls(&mut model);
+    if supports_ultrafast_speed(&model) {
+        add_ultrafast_speed_controls(&mut model);
+    }
     model
 }
 
@@ -3044,6 +3181,163 @@ mod tests {
     }
 
     #[test]
+    fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-6.1-sol",
+                    "display_name": "GPT-6.1-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6.1-Sol"
+                },
+                {
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "visibility": "list",
+                    "description": "GPT-6-Astra"
+                },
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-5.6-Sol"
+                }
+            ]
+        });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for slug in ["gpt-6.1-sol", "gpt-6-astra"] {
+            let Some(model) = models.iter().find(|model| model["slug"] == slug) else {
+                panic!("目录里缺少 {slug}");
+            };
+            // Fast 仍是第一档，Ultrafast 追加在它后面，选择器的默认顺序不变。
+            assert_eq!(model["service_tiers"][0]["id"], FAST_SERVICE_TIER_ID);
+            assert_native_fast(model);
+            assert_native_ultrafast(model);
+        }
+        // 上游只按 1.5x 声明 Fast 的模型不会被顺带升级。
+        let sol56 = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert!(
+            !sol56["service_tiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)
+        );
+    }
+
+    #[test]
+    fn route_alias_for_six_one_sol_keeps_ultrafast_speed() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        cache["models"].as_array_mut().unwrap().push(json!({
+            "slug": "gpt-6.1-sol",
+            "display_name": "GPT-6.1-Sol",
+            "visibility": "list",
+            "priority": 0,
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
+            "service_tiers": [{"id": "priority"}],
+            "additional_speed_tiers": ["fast"]
+        }));
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let selection = vec!["route-x/gpt-6.1-sol".to_string()];
+        refresh_for_provider(home.path(), false, Some(&selection), &selection).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let alias = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "route-x/gpt-6.1-sol")
+            .unwrap();
+        assert_native_fast(alias);
+        assert_native_ultrafast(alias);
+    }
+
+    #[test]
+    fn ultrafast_speed_support_is_limited_to_the_two_x_fast_family() {
+        for slug in [
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-wm",
+            "gpt-6.1-sol-priority",
+            "route-mu5dql1a/gpt-6.1-sol",
+            "my%20route/gpt-6.1-sol-wm",
+            "gpt-6-astra",
+            "gpt-6-astra-wm",
+            "codey-official-account-x/gpt-6-astra",
+        ] {
+            let model = json!({ "slug": slug });
+            assert!(supports_ultrafast_speed(&model), "{slug} 应支持 Ultrafast");
+        }
+        for slug in [
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol2",
+            "gpt-6-astra2",
+            "route-x/gpt-6-astra-max",
+        ] {
+            let model = json!({ "slug": slug });
+            assert!(
+                !supports_ultrafast_speed(&model),
+                "{slug} 不应支持 Ultrafast"
+            );
+        }
+    }
+
+    #[test]
+    fn ultrafast_speed_controls_keep_fast_first_and_stay_idempotent() {
+        let mut model = json!({
+            "slug": "gpt-6.1-sol",
+            "service_tiers": [{ "id": FAST_SERVICE_TIER_ID, "name": "Fast" }],
+            "additional_speed_tiers": [FAST_SPEED_TIER_ID]
+        });
+        add_ultrafast_speed_controls(&mut model);
+        add_ultrafast_speed_controls(&mut model);
+
+        let tiers = model["service_tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0]["id"], FAST_SERVICE_TIER_ID);
+        assert_eq!(tiers[1]["id"], ULTRAFAST_SERVICE_TIER_ID);
+        assert_eq!(
+            model["additional_speed_tiers"],
+            json!([FAST_SPEED_TIER_ID, ULTRAFAST_SPEED_TIER_ID])
+        );
+
+        remove_ultrafast_speed_controls(&mut model);
+        assert_eq!(model["service_tiers"].as_array().unwrap().len(), 1);
+        assert_eq!(model["additional_speed_tiers"], json!([FAST_SPEED_TIER_ID]));
+    }
+
+    #[test]
     fn account_snapshot_borrows_a_local_template_for_slugs_the_fallback_list_omits() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
@@ -3537,6 +3831,25 @@ mod tests {
             model["additional_speed_tiers"]
                 .as_array()
                 .is_some_and(|tiers| tiers.iter().any(|tier| tier == FAST_SPEED_TIER_ID))
+        );
+    }
+
+    fn assert_native_ultrafast(model: &Value) {
+        assert!(
+            model["service_tiers"].as_array().is_some_and(|tiers| tiers
+                .iter()
+                .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)),
+            "{} 的 service_tiers 缺少 Ultrafast：{}",
+            model["slug"],
+            model["service_tiers"]
+        );
+        assert!(
+            model["additional_speed_tiers"]
+                .as_array()
+                .is_some_and(|tiers| tiers.iter().any(|tier| tier == ULTRAFAST_SPEED_TIER_ID)),
+            "{} 的 additional_speed_tiers 缺少 Ultrafast：{}",
+            model["slug"],
+            model["additional_speed_tiers"]
         );
     }
 
@@ -4331,7 +4644,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
             "the legacy window must be rewritten"
         );
         let catalog: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -4392,6 +4705,48 @@ mod tests {
     }
 
     #[test]
+    fn remote_compaction_catalog_and_cached_refresh_keep_routes_independent() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "route-a/gpt-5.6-sol".to_string(),
+            "route-b/gpt-5.6-sol".to_string(),
+        ];
+        refresh_for_provider_with_capabilities(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists {
+                remote_compaction_models: Some(&selected[..1]),
+                ..CapabilityLists::default()
+            },
+            "",
+        )
+        .unwrap();
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        assert_eq!(
+            remote_compaction_models_from_catalog(&path),
+            HashSet::from([selected[0].clone()])
+        );
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &selected[1..],)
+                .unwrap()
+        );
+        assert_eq!(
+            remote_compaction_models_from_catalog(&path),
+            HashSet::from([selected[1].clone()])
+        );
+        let models = read_runtime_catalog_models(home.path()).unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .all(|model| model["base_instructions"].as_str().is_some())
+        );
+    }
+
+    #[test]
     fn cached_catalog_fallback_removes_stale_image_detail_original_metadata() {
         let home = tempfile::tempdir().unwrap();
         write_cache_with_image_detail_original(home.path());
@@ -4413,7 +4768,9 @@ mod tests {
         let stale: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stale["models"][0]["supports_image_detail_original"], true);
 
-        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap()
+        );
         let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
             sanitized["models"][0]
@@ -4650,7 +5007,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
             "a valid cached catalog should remain usable after stale capabilities are removed"
         );
         let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -4662,7 +5019,9 @@ mod tests {
         );
         let sanitized_bytes = fs::read(&path).unwrap();
 
-        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap()
+        );
         assert_eq!(fs::read(&path).unwrap(), sanitized_bytes);
     }
 
