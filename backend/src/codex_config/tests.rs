@@ -37,21 +37,30 @@ fn assert_resume_shim(document: &DocumentMut, base_url: &str, requires_openai_au
                 .is_none_or(|headers| !headers.contains_key(local_router::ROUTER_AUTH_HEADER))
         );
         assert!(router.get("experimental_bearer_token").is_none());
+        assert_eq!(
+            router
+                .get("capabilities")
+                .and_then(Item::as_table_like)
+                .and_then(|capabilities| table_like_str(capabilities, "remote_compaction")),
+            Some("v2")
+        );
     }
 }
 
 fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &str) {
-    for (id, name) in [
-        (local_router::ROUTER_PROVIDER_ID, LOCAL_ROUTER_PROVIDER_NAME),
-        (
-            local_router::REMOTE_COMPACTION_PROVIDER_ID,
-            OPENAI_PROVIDER_NAME,
-        ),
-    ] {
+    {
+        let (id, name) = (local_router::ROUTER_PROVIDER_ID, LOCAL_ROUTER_PROVIDER_NAME);
         let router = document["model_providers"][id]
             .as_table_like()
             .expect("codey_router runtime disk provider");
         assert_eq!(router.get("name").and_then(Item::as_str), Some(name));
+        assert_eq!(
+            router
+                .get("capabilities")
+                .and_then(Item::as_table_like)
+                .and_then(|capabilities| table_like_str(capabilities, "remote_compaction")),
+            Some("v2")
+        );
         assert_eq!(
             router.get("base_url").and_then(Item::as_str),
             Some(base_url)
@@ -617,7 +626,7 @@ fn runtime_disk_provider_replaces_chatgpt_resume_shim() {
 
 #[test]
 fn runtime_disk_provider_leaves_a_user_owned_codey_router_untouched() {
-    for id in local_router::ROUTER_PROVIDER_IDS {
+    for id in local_router::OWNED_ROUTER_PROVIDER_IDS {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -756,10 +765,14 @@ http_headers = {{ x-codey-router-token = "expired-launch-token" }}
             document["model_providers"][user_id].to_string(),
             original.parse::<DocumentMut>().unwrap()["model_providers"][user_id].to_string()
         );
-        assert_eq!(
-            document["model_providers"][owned_id]["base_url"].as_str(),
-            Some(CHATGPT_CODEX_BASE_URL)
-        );
+        if owned_id == local_router::REMOTE_COMPACTION_PROVIDER_ID {
+            assert!(document_provider_item(&document, owned_id).is_none());
+        } else {
+            assert_eq!(
+                document["model_providers"][owned_id]["base_url"].as_str(),
+                Some(CHATGPT_CODEX_BASE_URL)
+            );
+        }
         assert!(!restored.contains("expired-launch-token"));
         assert!(!repair_persistent_codey_runtime_config(home).unwrap());
     }
@@ -789,8 +802,8 @@ fn remote_compaction_runtime_identity_returns_to_a_secret_free_resume_shim() {
         .parse::<DocumentMut>()
         .unwrap();
     assert_eq!(
-        live["model_providers"][local_router::REMOTE_COMPACTION_PROVIDER_ID]["name"].as_str(),
-        Some("OpenAI")
+        live["model_providers"][local_router::ROUTER_PROVIDER_ID]["name"].as_str(),
+        Some("Codey Local Router")
     );
 
     assert!(prepare_persistent_router_resume_shim_at(&home).unwrap());
@@ -1412,7 +1425,7 @@ fn runtime_agents_select_compaction_from_their_own_model() {
     let source = subagent_source_config(SUBAGENT_ROLE_DEFAULT).unwrap();
     let remote_models = HashSet::from(["remote/shared".to_string()]);
     for (model, expected) in [
-        ("remote/shared", "codey_router_remote"),
+        ("remote/shared", "codey_router"),
         ("local/shared", "codey_router"),
         ("shared", "codey_router"),
     ] {
@@ -2107,12 +2120,15 @@ fn runtime_router_separates_openai_identity_from_auth_shape() {
     );
 
     endpoint.supports_remote_compaction = true;
-    let [(local_id, local), (remote_id, remote)] = runtime_router_provider_tables(&endpoint);
+    let [(local_id, local)] = runtime_router_provider_tables(&endpoint);
     assert_eq!(local_id, local_router::ROUTER_PROVIDER_ID);
-    assert_eq!(remote_id, local_router::REMOTE_COMPACTION_PROVIDER_ID);
     assert_eq!(local["name"].as_str(), Some("Codey Local Router"));
-    assert_eq!(remote["name"].as_str(), Some("OpenAI"));
-    for provider in [&local, &remote] {
+    assert_eq!(
+        local["capabilities"]["remote_compaction"].as_str(),
+        Some("v2")
+    );
+    {
+        let provider = &local;
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
         assert_eq!(
             provider["experimental_bearer_token"].as_str(),
@@ -3399,12 +3415,62 @@ fn local_router_runtime_override_validation_rejects_dangling_provider_selection(
         "model_providers.codey_router.wire_api=\"responses\"".to_string(),
         "model_providers.codey_router.requires_openai_auth=false".to_string(),
         "model_providers.codey_router.supports_websockets=false".to_string(),
+        "model_providers.codey_router.capabilities.remote_compaction_extra=\"v2\"".to_string(),
     ];
 
     let error = validate_runtime_router_overrides(&overrides, local_router::ROUTER_PROVIDER_ID)
         .unwrap_err();
 
     assert!(format!("{error:#}").contains("model_providers.codey_router.base_url"));
+    assert!(
+        format!("{error:#}")
+            .contains("model_providers.codey_router.capabilities.remote_compaction")
+    );
+}
+
+#[test]
+fn router_capabilities_upgrade_missing_nested_and_inline_tables() {
+    let endpoint = test_runtime_router_endpoint();
+    let desired = local_router_provider_table(endpoint);
+    let shim = persistent_router_shim_table(&DocumentMut::new());
+    for inline in [false, true] {
+        for (table, runtime) in [(desired.clone(), true), (shim.clone(), false)] {
+            let mut legacy = table.clone();
+            legacy.remove("capabilities");
+            let mut document = if inline {
+                "model_providers = {}".parse::<DocumentMut>().unwrap()
+            } else {
+                DocumentMut::new()
+            };
+            write_persistent_router_shim(&mut document, local_router::ROUTER_PROVIDER_ID, legacy)
+                .unwrap();
+            let matches = |document: &DocumentMut| {
+                if runtime {
+                    runtime_router_disk_provider_matches(
+                        document,
+                        local_router::ROUTER_PROVIDER_ID,
+                        &table,
+                    )
+                } else {
+                    persistent_router_shim_matches(
+                        document,
+                        local_router::ROUTER_PROVIDER_ID,
+                        &table,
+                    )
+                }
+            };
+            assert!(!matches(&document));
+            write_persistent_router_shim(
+                &mut document,
+                local_router::ROUTER_PROVIDER_ID,
+                table.clone(),
+            )
+            .unwrap();
+            assert!(matches(&document));
+            let reparsed = document.to_string().parse::<DocumentMut>().unwrap();
+            assert!(matches(&reparsed));
+        }
+    }
 }
 
 #[test]
@@ -3446,9 +3512,11 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     .unwrap();
 
     let rendered = applied.runtime_config_overrides.join("\n");
-    assert!(rendered.contains("model_provider=\"codey_router_remote\""));
+    assert!(rendered.contains("model_provider=\"codey_router\""));
     assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
-    assert!(rendered.contains("model_providers.codey_router_remote.name=\"OpenAI\""));
+    assert!(
+        rendered.contains("model_providers.codey_router.capabilities.remote_compaction=\"v2\"")
+    );
     assert!(rendered.contains("model_providers.codey_router.name=\"Codey Local Router\""));
     assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=true"));
     assert!(rendered.contains("model_providers.codey_router.supports_websockets=true"));
@@ -3493,7 +3561,7 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
         .unwrap();
     assert_eq!(
         role["model_provider"].as_str(),
-        Some(local_router::REMOTE_COMPACTION_PROVIDER_ID)
+        Some(local_router::ROUTER_PROVIDER_ID)
     );
 }
 

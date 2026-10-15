@@ -34,6 +34,16 @@ test("native and routed subagents use synced route-specific efforts and preserve
     config.modelReasoningEffortsByProvider = { a: { [model]: declaration(["high"]) } };
     options = buildSubagentModelOptions(config, state, false, { id: "a", name: "A", official: false });
     assert.deepEqual(options.find((item) => item.providerId === "a").supportedReasoningEfforts, ["high"]);
+    config.upstreamModelReasoningEffortsByProvider.a[model] = [{ level: "xhigh", value: "snapshot-peak" }];
+    options = buildSubagentModelOptions(config, state, false, { id: "a", name: "A", official: false });
+    assert.deepEqual(options.find((item) => item.providerId === "a").supportedReasoningEfforts, ["high"]);
+    config.modelReasoningEffortsByProvider.a[model] = [{ level: "xhigh", value: "manual-peak" }];
+    options = buildSubagentModelOptions(config, state, false, { id: "a", name: "A", official: false });
+    assert.deepEqual(options.find((item) => item.providerId === "a").supportedReasoningEfforts, ["manual-peak"]);
+    delete config.modelReasoningEffortsByProvider.a;
+    options = buildSubagentModelOptions(config, state, false, { id: "a", name: "A", official: false });
+    assert.deepEqual(options.find((item) => item.providerId === "a").supportedReasoningEfforts, ["snapshot-peak"]);
+    if (localRouterEnabled) assert.deepEqual(options.find((item) => item.providerId === "b").supportedReasoningEfforts, ["low", "high", "xhigh"]);
   }
 });
 

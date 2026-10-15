@@ -515,7 +515,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
     assert_eq!(catalog["default_model"], "gpt-5.6-sol");
     assert_eq!(
         catalog["model_provider"],
-        crate::local_router::REMOTE_COMPACTION_PROVIDER_ID
+        crate::local_router::ROUTER_PROVIDER_ID
     );
     assert_eq!(
         catalog["model_metadata"][0],
@@ -524,7 +524,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
             "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
             "route_prefix": "默认",
-            "provider_id": crate::local_router::REMOTE_COMPACTION_PROVIDER_ID,
+            "provider_id": crate::local_router::ROUTER_PROVIDER_ID,
             "supports_remote_compaction": true,
             "source_model": "gpt-5.6-sol",
             "official_account": true,
@@ -1306,6 +1306,20 @@ fn conversation_git_toggle_requires_restart_but_model_change_is_live() {
         &enabled,
         &RuntimeModelConfig::from_config(&enabled),
         &RuntimeSubagentConfig::from_config(&enabled),
+        &current
+    ));
+}
+
+#[test]
+fn codex_launch_proxy_change_requires_restart() {
+    let applied = CodeyConfig::default();
+    let mut current = applied.clone();
+    current.codex_launch_proxy = "http://127.0.0.1:7890".into();
+    assert!(config_requires_restart_with_route_status(
+        false,
+        &applied,
+        &RuntimeModelConfig::from_config(&applied),
+        &RuntimeSubagentConfig::from_config(&applied),
         &current
     ));
 }

@@ -352,6 +352,7 @@ function loadInjection({
     alerts,
     bridgeCalls,
     confirmations,
+    document,
     emitMutations: (mutations) => mutationHandler?.(mutations),
     flushTimers: () => {
       while (timers.length) timers.shift()();
@@ -459,6 +460,60 @@ test("usage-only manager remains available when deletion and reconciliation are 
   assert.equal(runtime.alerts.length, 0);
   assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1"]);
   assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "unavailable");
+});
+
+test("native model routing discovers the local request client without sending a request", async () => {
+  const client = { hostId: "local", enqueueRequest() { throw Error("must not send"); }, createRequest() {}, onResult() {} };
+  const manager = { requestClient: client, sendRequest() { throw Error("must not send"); } };
+  const runtime = loadInjection({ localAppServerManager: manager, initialSessionId: "" });
+  assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
+  assert.equal(runtime.window.__codeyPageCapabilities.modelRouting.status, "available");
+});
+
+test("native model routing cannot use a remote or incomplete client", async () => {
+  const manager = { requestClient: { hostId: "remote" }, getConversation() { return null; } };
+  const runtime = loadInjection({ localAppServerManager: manager, initialSessionId: "" });
+  await assert.rejects(runtime.window.__codeyLoadCodexRequestClient(), /模型请求校验/);
+});
+
+test("native model routing retries a real discovery inside the failure backoff", async () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  await assert.rejects(runtime.window.__codeyLoadCodexRequestClient(), /模型请求校验/);
+
+  // 第一次失败把 retryAt 推到了将来；模型请求校验的重试节奏由宿主注入流程
+  // 控制，所以下一次调用必须重新走发现流程，而不是被退避直接拒绝。
+  const client = {
+    hostId: "local",
+    enqueueRequest() { throw Error("must not send"); },
+    createRequest() {},
+    onResult() {},
+  };
+  const manager = { requestClient: client, sendRequest() { throw Error("must not send"); } };
+  const scope = {
+    query: null,
+    get(_key, hostId) { return hostId === "local" ? manager : null; },
+    set() {},
+    watch() {},
+    when() {},
+    forHost() {},
+  };
+  runtime.document.body.__reactFiber$late = {
+    dependencies: null,
+    memoizedProps: null,
+    memoizedState: { scope },
+    return: null,
+    updateQueue: null,
+  };
+  runtime.document.scripts.push({ src: "app://-/assets/app-initial-late.js" });
+  runtime.window.__codeyImportCodexAsset = async () => ({
+    LocalRegistry: class {
+      getAll() { return this.scope.get("managers"); }
+      getForHostId(hostId) { return this.scope.get("manager", hostId); }
+    },
+  });
+
+  assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
+  assert.equal(runtime.window.__codeyPageCapabilities.modelRouting.status, "available");
 });
 
 test("MCP reload prefers the patched AppServerRequestClient over fiber discovery", async () => {

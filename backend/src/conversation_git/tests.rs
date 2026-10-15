@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn gate_denied_edit_reconciles_only_exact_pending_call_without_granting_ownership() {
+    for scenario in [
+        "denied",
+        "different_turn",
+        "different_args",
+        "different_time",
+        "missing",
+        "failed",
+        "unrecorded",
+    ] {
+        let repo = Repo::new();
+        let args = json!({"path":repo.root.join("owned.txt"),"pattern":"old","replacement":"blocked","literal":true});
+        let hook = repo.hook(SESSION, "mcp__codey_fastctx__replace", args.clone());
+        let start = chrono::Utc::now() - chrono::Duration::seconds(1);
+        repo.observe(&hook).unwrap();
+        let turn = if scenario == "different_turn" {
+            json!(OTHER)
+        } else {
+            hook["turn_id"].clone()
+        };
+        let call_args = if scenario == "different_args" {
+            json!({"path":repo.root.join("owned.txt"),"pattern":"old","replacement":"another","literal":true})
+        } else {
+            args
+        };
+        let start = if scenario == "different_time" {
+            start - chrono::Duration::hours(1)
+        } else {
+            start
+        };
+        repo.append_record(SESSION, &json!({"timestamp":start.to_rfc3339(), "type":"response_item", "payload":{
+            "type":"function_call","namespace":"mcp__codey_fastctx","name":"replace","call_id":"denied-edit",
+            "arguments":call_args.to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":turn}
+        }}));
+        if scenario != "missing" {
+            let end = if scenario == "different_time" {
+                start + chrono::Duration::seconds(1)
+            } else {
+                chrono::Utc::now() + chrono::Duration::seconds(1)
+            };
+            let output = if scenario == "failed" {
+                "编辑失败"
+            } else {
+                "Tool call blocked by PreToolUse hook: Codey 子代理门禁：该调用未执行。. Tool: mcp__codey_fastctx__replace"
+            };
+            repo.append_record(
+                SESSION,
+                &json!({"timestamp":end.to_rfc3339(), "type":"response_item", "payload":{
+                    "type":"function_call_output","call_id":"denied-edit","output":output
+                }}),
+            );
+        }
+        repo.old_patch(SESSION, "owned.txt", "old", "new", 1);
+        if scenario == "unrecorded" {
+            fs::write(repo.root.join("owned.txt"), "new\nunknown\n").unwrap();
+        }
+        let ledger_path = repo.home.join("codey-conversation-git-v2").join(format!(
+            "{}.json",
+            digest(repo.root.as_os_str().as_encoded_bytes())
+        ));
+        let ledger_before = fs::read(&ledger_path).unwrap();
+        let prepared = snapshot(&repo.home, SESSION);
+        assert_eq!(prepared.is_ok(), scenario == "denied", "{scenario}");
+        if let Ok(prepared) = prepared {
+            assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, b"new\n");
+        }
+        assert_eq!(
+            fs::read(ledger_path).unwrap(),
+            ledger_before,
+            "查询不得制造完成回执或修改基线"
+        );
+    }
+}
+
+#[test]
 #[ignore = "仅由格式化子进程测试启动"]
 fn formatter_process_child() {
     let Some(marker) = std::env::var_os("CODEY_FORMATTER_TEST_MARKER") else {
@@ -45,6 +120,34 @@ fn formatter_process_receives_eof_and_collects_output_without_pipes() {
     .unwrap();
     assert_eq!(fs::read(marker).unwrap(), input);
     assert!(output.ends_with(&input));
+}
+
+#[test]
+fn cancelling_blocking_validation_stops_process_and_restores_thread_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("heartbeat");
+    let cancellation = Arc::new(Cancellation::default());
+    let cancel = Arc::clone(&cancellation);
+    let watched = marker.clone();
+    let thread = std::thread::spawn(move || {
+        let started = Instant::now();
+        while !watched.exists() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cancel.cancel();
+    });
+    let error = with_cancellation(cancellation, || {
+        let mut command = formatter_child_command(&marker);
+        command.env("CODEY_FORMATTER_TEST_WAIT", "1");
+        run_formatter(&mut command, b"input", Duration::from_secs(30))
+    })
+    .unwrap_err();
+    thread.join().unwrap();
+    assert!(error.to_string().contains("已取消"));
+    check_cancelled().unwrap();
+    let modified = fs::metadata(&marker).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(fs::metadata(&marker).unwrap().modified().unwrap(), modified);
 }
 
 #[test]
@@ -465,6 +568,47 @@ fn shared_fastctx_history_requires_reversible_edits_and_matching_receipts() {
             complete.as_bytes()
         );
     }
+}
+
+#[test]
+fn isolate_accepts_disk_when_the_full_history_reproduces_it() {
+    let repo = Repo::new();
+    let base = (1..=12)
+        .map(|line| format!("line{line}\n"))
+        .collect::<String>();
+    fs::write(repo.root.join("owned.txt"), &base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "spread edits"], None, None).unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    // 两段本对话补丁相隔足够远，后一段单独套用到 HEAD 也成立，于是除了完整后缀之外
+    // 还会多出一个只含后一段改动的候选。完整后缀已经能还原磁盘，说明整份文件都属于
+    // 本对话，较短的候选只是少套用了前面的本对话改动。
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.txt",
+            "@@ -10 +10 @@\n-line10\n+line10-own\n",
+            1,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-line2\n+line2-own\n", 2),
+    );
+    let disk = base
+        .replace("line2\n", "line2-own\n")
+        .replace("line10\n", "line10-own\n");
+    fs::write(repo.root.join("owned.txt"), &disk).unwrap();
+    let history = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    let before = head_entry(&repo.root, "HEAD", "owned.txt").unwrap();
+    let after = disk_entry(&repo.root, "owned.txt").unwrap();
+    assert_eq!(
+        history
+            .isolate_changes(&repo.root, "owned.txt", before.as_ref(), after.as_ref())
+            .unwrap(),
+        after.clone().unwrap()
+    );
 }
 
 #[test]
@@ -927,6 +1071,57 @@ fn history_replays_successful_explicit_formatter_after_committed_add() {
 }
 
 #[test]
+fn wrapped_rustfmt_after_readonly_checks_recovers_format() {
+    let repo = Repo::new();
+    let base = "fn main(){let value=1;}\n";
+    fs::write(repo.root.join("owned.rs"), base).unwrap();
+    git(&repo.root, &["add", "--", "owned.rs"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "Rust baseline"], None, None).unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.rs",
+            "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+            1,
+        ),
+    );
+    // 使用简单 shell 路径，避免 Windows 规范化路径的前缀和反斜杠。
+    let directory = repo.root.to_string_lossy().replace('\\', "/");
+    let directory = directory.strip_prefix("//?/").unwrap_or(&directory);
+    let command = format!(
+        "cd {directory} && git diff --stat && rustfmt --edition 2024 owned.rs 2>&1 | head -5; git diff --stat"
+    );
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"wrapped-fmt","arguments":json!({"cmd":command}).to_string()}}),
+    );
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:03.200Z","type":"response_item","payload":{"type":"function_call_output","call_id":"wrapped-fmt","output":"Chunk ID: aaa\nWall time: 0.1 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"}}),
+    );
+    let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+    fs::write(repo.root.join("owned.rs"), &formatted).unwrap();
+    let recovered = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    let before = head_entry(&repo.root, "HEAD", "owned.rs").unwrap();
+    let after = disk_entry(&repo.root, "owned.rs").unwrap();
+    assert!(
+        recovered
+            .replay("owned.rs", before.as_ref(), after.as_ref())
+            .is_ok()
+    );
+    assert_eq!(
+        snapshot(&repo.home, SESSION).unwrap().changes[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .bytes,
+        formatted
+    );
+}
+
+#[test]
 fn historical_cargo_format_tracks_only_prior_owned_files_and_resolves_polls() {
     for outcome in ["success", "failed", "running", "unsafe"] {
         let repo = Repo::new();
@@ -1116,6 +1311,111 @@ fn wrapped_cargo_all_format_recovers_committed_edits_without_claiming_other_file
 }
 
 #[test]
+fn wrapped_patch_before_cargo_format_keeps_format_record() {
+    let repo = Repo::new();
+    fs::create_dir_all(repo.root.join("backend/src")).unwrap();
+    fs::write(
+        repo.root.join("Cargo.toml"),
+        "[workspace.package]\nedition = '2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.root.join("backend/Cargo.toml"),
+        "[package]\nname = 'codey'\nedition.workspace = true\n",
+    )
+    .unwrap();
+    let path = "backend/src/owned.rs";
+    fs::write(repo.root.join(path), "fn main(){let value=1;}\n").unwrap();
+    git(&repo.root, &["add", "--", path], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "rust baseline"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            path,
+            "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+            1,
+        ),
+    );
+    let patch = "*** Begin Patch\n*** Update File: backend/src/owned.rs\n@@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n*** End Patch";
+    let code = format!(
+        "text(await tools.apply_patch({}));\ntext(await tools.exec_command({}));",
+        serde_json::to_string(patch).unwrap(),
+        json!({"cmd":"cargo fmt --all"})
+    );
+    repo.history(
+        SESSION,
+        None,
+        "exec",
+        json!(code),
+        json!({"content":[
+            {"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type":"text","text":"{}"},
+            {"type":"text","text":"{\"exit_code\":0}"}
+        ]}),
+        2,
+    );
+    let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+    fs::write(repo.root.join(path), &formatted).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes.len(), 1);
+    assert_eq!(prepared.changes[0].path, path);
+    assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, formatted);
+}
+
+#[test]
+fn expired_pending_does_not_block_proven_history() {
+    let repo = Repo::new();
+    let hook = repo.hook(
+        SESSION,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Update File: owned.txt\n@@\n-old\n+new\n*** End Patch"),
+    );
+    repo.observe(&hook).unwrap();
+    let ledger = repo.home.join("codey-conversation-git-v2").join(format!(
+        "{}.json",
+        digest(repo.root.as_os_str().as_encoded_bytes())
+    ));
+    let mut value: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+    for pending in value["pending"].as_object_mut().unwrap().values_mut() {
+        pending["created_millis"] = json!(1);
+    }
+    fs::write(&ledger, serde_json::to_vec(&value).unwrap()).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -1 +1 @@\n-old\n+new\n", 1),
+    );
+    fs::write(repo.root.join("owned.txt"), "new\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes[0].path, "owned.txt");
+    assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, b"new\n");
+    // 过期记录只在读取时解除阻塞，不要求立刻回写；再次取快照必须仍然成功。
+    assert!(snapshot(&repo.home, SESSION).is_ok());
+}
+
+#[test]
+fn duplicate_tool_call_identity_is_rejected() {
+    let repo = Repo::new();
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:01.000Z","ordinal":1,"type":"response_item","payload":{
+            "type":"custom_tool_call","name":"apply_patch","call_id":"dup",
+            "input":"*** Begin Patch\n*** Update File: owned.txt\n@@\n-old\n+new\n*** End Patch"}}),
+    );
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:02.000Z","ordinal":2,"type":"response_item","payload":{
+            "type":"function_call","name":"exec_command","call_id":"dup",
+            "arguments":json!({"cmd":"ls"}).to_string()}}),
+    );
+    let error = snapshot(&repo.home, SESSION).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("重复工具调用身份"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn committed_other_session_claim_does_not_block_proven_later_history() {
     let repo = Repo::new();
     repo.fastctx(repo.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":repo.root.join("owned.txt"), "pattern":"old", "replacement":"outside", "literal":true})));
@@ -1248,6 +1548,151 @@ fn successful_patch_keeps_full_context_when_native_receipt_is_shortened() {
         } else {
             assert!(result.is_err());
         }
+    }
+}
+
+#[test]
+fn native_diff_stays_authoritative_when_request_context_indentation_differs() {
+    let repo = Repo::new();
+    let base = "context-a\n                let value = 1;\ncontext-b\n";
+    let native = "context-a\n                let value = 2;\ncontext-b\n";
+    fs::write(repo.root.join("owned.txt"), base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "indented baseline"],
+        None,
+        None,
+    )
+    .unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    // 成功请求的上下文缩进与真实文件不一致，不能覆盖原生补丁。
+    let patch = "*** Begin Patch\n*** Update File: owned.txt\n@@\n context-a\n-             let value = 1;\n+             let value = 2;\n context-b\n*** End Patch";
+    let code = format!(
+        "text(await tools.apply_patch({}));",
+        serde_json::to_string(patch).unwrap()
+    );
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.000Z","ordinal":101,"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"context-indent","input":code}}));
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.txt",
+            "@@ -1,3 +1,3 @@\n context-a\n-                let value = 1;\n+                let value = 2;\n context-b\n",
+            1,
+        ),
+    );
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.500Z","ordinal":103,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"context-indent","output":[{"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"{}"}]}}));
+    fs::write(repo.root.join("owned.txt"), native).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.public()["files"], json!(["owned.txt"]));
+    assert_eq!(
+        prepared.changes[0].after.as_ref().unwrap().bytes,
+        native.as_bytes()
+    );
+}
+
+#[test]
+fn concurrent_patches_use_file_scope_to_pair_native_receipts() {
+    let repo = Repo::new();
+    // 两个补丁的调用时间窗完全重叠，各自的原生完成记录也落在对方的时间窗内。
+    // 配对原生回执时必须依据文件范围，否则窗口内其他文件的记录会被误认为本次调用的回执。
+    let millis = |second: u64| {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{second:02}.100Z"))
+            .unwrap()
+            .timestamp_millis()
+    };
+    let call = |ordinal: usize,
+                timestamp: &str,
+                id: &str,
+                file: &str,
+                before: &str,
+                after: &str| {
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"response_item", "payload":{
+            "type":"custom_tool_call", "name":"apply_patch", "call_id": id,
+            "input": format!("*** Begin Patch\n*** Update File: {file}\n@@\n-{before}\n+{after}\n*** End Patch")}})
+    };
+    let output = |ordinal: usize, timestamp: &str, id: &str, file: &str| {
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"response_item", "payload":{
+            "type":"function_call_output", "call_id": id,
+            "output": format!("Success. Updated the following files:\nM {file}")}})
+    };
+    let native = |ordinal: usize,
+                  timestamp: &str,
+                  file: &str,
+                  before: &str,
+                  after: &str,
+                  second: u64| {
+        let start = millis(second);
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"event_msg", "payload":{
+            "type":"item_completed", "thread_id": SESSION, "started_at_ms": start, "completed_at_ms": start + 50,
+            "item":{"type":"FileChange", "id": uuid::Uuid::new_v4().to_string(), "status":"completed",
+                "stdout": format!("Success. Updated the following files:\nM {}\n", repo.root.join(file).display()),
+                "changes": {repo.root.join(file).to_string_lossy().to_string(): {
+                    "type":"update", "move_path": null,
+                    "unified_diff": format!("@@ -1 +1 @@\n-{before}\n+{after}\n")}}}}})
+    };
+    repo.append_record(
+        SESSION,
+        &call(
+            201,
+            "2026-10-08T00:00:01.000Z",
+            "first",
+            "owned.txt",
+            "old",
+            "owned-new",
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &call(
+            202,
+            "2026-10-08T00:00:02.000Z",
+            "second",
+            "other.txt",
+            "other",
+            "other-new",
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &native(
+            203,
+            "2026-10-08T00:00:03.200Z",
+            "owned.txt",
+            "old",
+            "owned-new",
+            3,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &native(
+            204,
+            "2026-10-08T00:00:04.200Z",
+            "other.txt",
+            "other",
+            "other-new",
+            4,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &output(205, "2026-10-08T00:00:09.000Z", "first", "owned.txt"),
+    );
+    repo.append_record(
+        SESSION,
+        &output(206, "2026-10-08T00:00:10.000Z", "second", "other.txt"),
+    );
+    fs::write(repo.root.join("owned.txt"), "owned-new\n").unwrap();
+    fs::write(repo.root.join("other.txt"), "other-new\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        prepared.public()["files"],
+        json!(["other.txt", "owned.txt"])
+    );
+    for change in &prepared.changes {
+        assert_eq!(change.after, change.disk);
     }
 }
 
@@ -1474,6 +1919,33 @@ fn display_batch_failure_still_rejects_invalid_first_path() {
     fs::remove_file(repo.root.join("aa-first.txt")).unwrap();
     std::os::unix::fs::symlink("owned.txt", repo.root.join("aa-first.txt")).unwrap();
     assert!(display_status(&repo.home, SESSION).is_err());
+}
+
+#[test]
+#[ignore = "显式运行多文件快照和安全复核耗时比较"]
+fn benchmark_snapshot_revalidation() {
+    let repo = Repo::new();
+    let paths: Vec<_> = (0..64).map(|i| format!("snapshot-{i}.txt")).collect();
+    for path in &paths {
+        fs::write(repo.root.join(path), "baseline\n").unwrap();
+    }
+    git(&repo.root, &["add", "--all"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "baseline"], None, None).unwrap();
+    for path in &paths {
+        repo.edit(SESSION, path, "baseline", "changed");
+    }
+    let start = Instant::now();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    let snapshot_time = start.elapsed();
+    assert_eq!(prepared.changes.len(), 64);
+    let start = Instant::now();
+    revalidate_snapshot(&repo.home, &prepared).unwrap();
+    eprintln!(
+        "64 文件：完整快照 {snapshot_time:?}，安全复核 {:?}",
+        start.elapsed()
+    );
+    fs::write(repo.root.join(&paths[63]), "unrecorded\n").unwrap();
+    assert!(revalidate_snapshot(&repo.home, &prepared).is_err());
 }
 
 #[test]
@@ -2677,7 +3149,7 @@ fn no_edits_reverted_committed_failed_or_non_git_have_no_eligible_files() {
 }
 
 #[test]
-fn rejects_conflict_detached_head_index_lock_and_unpublished_commits() {
+fn rejects_conflicts_and_busy_index() {
     let repo = Repo::new();
     let prepared = repo.snapshot();
     fs::write(repo.root.join(".git/MERGE_HEAD"), &prepared.head).unwrap();
@@ -2696,6 +3168,65 @@ fn rejects_conflict_detached_head_index_lock_and_unpublished_commits() {
             .contains("暂存区正被")
     );
     fs::remove_file(repo.root.join(".git/index.lock")).unwrap();
+}
+
+#[test]
+fn detached_head_commits_only_and_explains_why_push_is_unavailable() {
+    const DETACHED: &str = "44444444-4444-4444-8444-444444444444";
+    let repo = Repo::new();
+    repo.session(DETACHED, None);
+    repo.edit(DETACHED, "owned.txt", "old", "new");
+    git(&repo.root, &["checkout", "--detach"], None, None).unwrap();
+    let prepared = snapshot(&repo.home, DETACHED).unwrap();
+    let preview = save_preview(
+        prepared.clone(),
+        "chore(files): 更新文件".into(),
+        "model".into(),
+    )
+    .unwrap();
+    assert!(preview["branch"].is_null() && preview["remote"].is_null());
+    assert!(
+        preview["pushReason"]
+            .as_str()
+            .unwrap()
+            .contains("分离 HEAD")
+    );
+    let token = preview["token"].as_str().unwrap();
+    assert!(
+        execute(&repo.home, DETACHED, token, "model", true)
+            .unwrap_err()
+            .to_string()
+            .contains("分离 HEAD")
+    );
+    let preview = save_preview(
+        prepared.clone(),
+        "chore(files): 更新文件".into(),
+        "model".into(),
+    )
+    .unwrap();
+    let token = preview["token"].as_str().unwrap();
+    let result = execute(&repo.home, DETACHED, token, "model", false).unwrap();
+    assert_eq!(result["status"], "committed");
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(),
+        result["commit"].as_str().unwrap()
+    );
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "--symbolic-full-name", "HEAD"]).unwrap(),
+        "HEAD"
+    );
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/heads/main"]).unwrap(),
+        prepared.head
+    );
+}
+
+#[test]
+fn unpushed_local_commits_are_listed_and_fast_forwarded_with_the_commit() {
+    const AHEAD: &str = "55555555-5555-4555-8555-555555555555";
+    let repo = Repo::new();
+    repo.session(AHEAD, None);
+    repo.edit(AHEAD, "owned.txt", "old", "new");
     git(
         &repo.root,
         &["commit", "--allow-empty", "-m", "unpublished"],
@@ -2703,15 +3234,232 @@ fn rejects_conflict_detached_head_index_lock_and_unpublished_commits() {
         None,
     )
     .unwrap();
-    let newer = snapshot(&repo.home, SESSION).unwrap();
+    let unpublished = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    // 名称尾部相同的远端分支不能被当作上游分支。
+    git(
+        &repo.root,
+        &["push", "origin", "HEAD:refs/heads/x/refs/heads/main"],
+        None,
+        None,
+    )
+    .unwrap();
+    let prepared = snapshot(&repo.home, AHEAD).unwrap();
+    let preview = save_preview(prepared, "chore(files): 更新文件".into(), "model".into()).unwrap();
+    assert_eq!(preview["remote"], "origin");
+    assert_eq!(preview["upstreamBranch"], "main");
+    assert_eq!(preview["unpushedCount"], 1);
+    let listed = preview["unpushedCommits"].as_array().unwrap();
+    assert!(listed.len() == 1 && listed[0].as_str().unwrap().ends_with(" unpublished"));
+    let token = preview["token"].as_str().unwrap();
+    let result = execute(&repo.home, AHEAD, token, "model", true).unwrap();
+    assert_eq!(result["status"], "pushed");
     assert!(
-        commit_and_push(&newer, "chore(files): 更新文件", None)
-            .unwrap_err()
-            .to_string()
-            .contains("不同步")
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 个未推送提交")
     );
-    git(&repo.root, &["checkout", "--detach"], None, None).unwrap();
-    assert!(snapshot(&repo.home, SESSION).is_err());
+    let commit = result["commit"].as_str().unwrap();
+    assert_eq!(
+        git_text(&repo.remote, &["rev-parse", "refs/heads/main"]).unwrap(),
+        commit
+    );
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", &format!("{commit}^")]).unwrap(),
+        unpublished
+    );
+    // 推送后同步远端跟踪分支，本地不再显示领先。
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+        commit
+    );
+}
+
+#[test]
+fn push_failure_rechecks_the_remote_without_repeating_the_push() {
+    let repo = Repo::new();
+    let prepared = repo.snapshot();
+    let target = push_target(&prepared).unwrap();
+    let tracking = tracking_branch(&prepared, &target).unwrap();
+    let outcome = commit_transaction(&prepared, "fix: 更新文件", false, None).unwrap();
+    let commit = outcome["commit"].as_str().unwrap();
+    let timeout = || Err(anyhow::anyhow!("模拟传输超时"));
+    let before = push_outcome(&repo.root, &target, Some(&tracking), commit, timeout());
+    assert_eq!(before["status"], "committed");
+    assert_eq!(before["pushStatus"], "unknown");
+    git(
+        &repo.root,
+        &["push", &target.url, &format!("{commit}:{}", target.merge)],
+        None,
+        None,
+    )
+    .unwrap();
+    let recovered = push_outcome(&repo.root, &target, Some(&tracking), commit, timeout());
+    assert_eq!(recovered["status"], "pushed");
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+        commit
+    );
+    let mut missing = target.clone();
+    missing.url = "../missing-remote.git".into();
+    let unknown = push_outcome(&repo.root, &missing, None, commit, timeout());
+    assert_eq!(unknown["status"], "committed");
+    assert_eq!(unknown["pushStatus"], "unknown");
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(),
+        commit
+    );
+}
+
+#[test]
+fn tracking_sync_does_not_follow_a_changed_upstream() {
+    let repo = Repo::new();
+    let prepared = repo.snapshot();
+    let target = push_target(&prepared).unwrap();
+    let tracking = tracking_branch(&prepared, &target).unwrap();
+    git(
+        &repo.root,
+        &["update-ref", "refs/remotes/origin/other", &prepared.head],
+        None,
+        None,
+    )
+    .unwrap();
+    git(
+        &repo.root,
+        &["config", "branch.main.merge", "refs/heads/other"],
+        None,
+        None,
+    )
+    .unwrap();
+    let commit = git_text(
+        &repo.root,
+        &[
+            "commit-tree",
+            &prepared.tree,
+            "-p",
+            &prepared.head,
+            "-m",
+            "new",
+        ],
+    )
+    .unwrap();
+    assert!(tracking_branch(&prepared, &target).is_none());
+    update_tracking_branch(&repo.root, Some(&tracking), &commit);
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+        commit
+    );
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/remotes/origin/other"]).unwrap(),
+        prepared.head
+    );
+}
+
+#[test]
+fn tracking_sync_does_not_overwrite_a_concurrent_fetch() {
+    let repo = Repo::new();
+    let prepared = repo.snapshot();
+    let target = push_target(&prepared).unwrap();
+    let tracking = tracking_branch(&prepared, &target).unwrap();
+    let commit = git_text(
+        &repo.root,
+        &[
+            "commit-tree",
+            &prepared.tree,
+            "-p",
+            &prepared.head,
+            "-m",
+            "new",
+        ],
+    )
+    .unwrap();
+    let fetched = git_text(
+        &repo.root,
+        &[
+            "commit-tree",
+            &prepared.tree,
+            "-p",
+            &commit,
+            "-m",
+            "fetched",
+        ],
+    )
+    .unwrap();
+    git(
+        &repo.root,
+        &["update-ref", "refs/remotes/origin/main", &fetched],
+        None,
+        None,
+    )
+    .unwrap();
+    update_tracking_branch(&repo.root, Some(&tracking), &commit);
+    assert_eq!(
+        git_text(&repo.root, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+        fetched
+    );
+}
+
+#[test]
+fn push_target_explains_unsynced_and_unpublished_branches() {
+    let repo = Repo::new();
+    let prepared = repo.snapshot();
+    let reason = |snapshot: &Snapshot| format!("{:#}", push_target(snapshot).unwrap_err());
+    // 直接在远端生成提交，本地对象库中没有它。
+    let tree = git_text(&repo.root, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    let remote_only = git_text(
+        &repo.remote,
+        &[
+            "-c",
+            "user.name=Git Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit-tree",
+            &tree,
+            "-p",
+            &prepared.head,
+            "-m",
+            "remote only",
+        ],
+    )
+    .unwrap();
+    git(
+        &repo.remote,
+        &["update-ref", "refs/heads/main", &remote_only],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(reason(&prepared).contains("远端 origin/main 有本地没有的新提交"));
+    git(&repo.root, &["fetch", "origin"], None, None).unwrap();
+    assert!(reason(&prepared).contains("本地落后 origin/main 1 个提交"));
+    git(
+        &repo.root,
+        &["commit", "--allow-empty", "-m", "local"],
+        None,
+        None,
+    )
+    .unwrap();
+    let diverged = snapshot(&repo.home, SESSION).unwrap();
+    assert!(reason(&diverged).contains("已分叉（本地领先 1 个、远端领先 1 个提交）"));
+    git(&repo.root, &["checkout", "-b", "feature"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["config", "branch.feature.remote", "origin"],
+        None,
+        None,
+    )
+    .unwrap();
+    git(
+        &repo.root,
+        &["config", "branch.feature.merge", "refs/heads/feature"],
+        None,
+        None,
+    )
+    .unwrap();
+    let feature = snapshot(&repo.home, SESSION).unwrap();
+    assert!(reason(&feature).contains("远端没有上游分支 origin/feature"));
+    git(&repo.root, &["branch", "--unset-upstream"], None, None).unwrap();
+    assert!(reason(&feature).contains("当前分支没有上游分支"));
 }
 
 #[test]
@@ -2749,7 +3497,7 @@ fn remote_advance_stops_before_creating_commit() {
         commit_and_push(&prepared, "chore(files): 更新文件", None)
             .unwrap_err()
             .to_string()
-            .contains("不同步")
+            .contains("本地落后")
     );
     assert_eq!(
         git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(),
@@ -3053,6 +3801,63 @@ fn preview_tokens_are_bound_to_session_model_state_and_single_use() {
 }
 
 #[test]
+fn local_preview_is_network_independent_and_requires_separate_push_confirmation() {
+    let repo = Repo::new();
+    let prepared = repo.snapshot();
+    let request = uuid::Uuid::new_v4().to_string();
+    let preview = save_local_preview(
+        prepared.clone(),
+        "fix: 更新文件".into(),
+        "model".into(),
+        request.clone(),
+    )
+    .unwrap();
+    assert_eq!(preview["pushPending"], true);
+    let token = preview["token"].as_str().unwrap();
+    assert!(prepare_push_preview(OTHER, token, "model").is_err());
+    assert!(
+        execute(&repo.home, SESSION, token, "model", true)
+            .unwrap_err()
+            .to_string()
+            .contains("尚未校验")
+    );
+    let preview = save_local_preview(
+        prepared.clone(),
+        "fix: 更新文件".into(),
+        "model".into(),
+        request.clone(),
+    )
+    .unwrap();
+    let token = preview["token"].as_str().unwrap();
+    assert_eq!(
+        prepare_push_preview(SESSION, token, "model").unwrap()["remote"],
+        "origin"
+    );
+    cancel_preview(OTHER, &request, Some(token)).unwrap();
+    assert!(PREVIEWS.get().unwrap().lock().unwrap().contains_key(token));
+    cancel_preview(SESSION, &request, None).unwrap();
+    assert!(!PREVIEWS.get().unwrap().lock().unwrap().contains_key(token));
+    let preview = save_local_preview(
+        prepared,
+        "fix: 更新文件".into(),
+        "model".into(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        execute(
+            &repo.home,
+            SESSION,
+            preview["token"].as_str().unwrap(),
+            "model",
+            false
+        )
+        .unwrap()["status"],
+        "committed"
+    );
+}
+
+#[test]
 fn execute_supports_commit_only_without_push() {
     let repo = Repo::new();
     let prepared = repo.snapshot();
@@ -3319,7 +4124,7 @@ fn remote_target_changes_after_preview_are_rejected() {
     let repo = Repo::new();
     let prepared = repo.snapshot();
     let mut target = push_target(&prepared).unwrap();
-    target.1 = "refs/heads/different".into();
+    target.merge = "refs/heads/different".into();
     assert!(
         commit_and_push(&prepared, "chore(files): 更新文件", Some(&target))
             .unwrap_err()

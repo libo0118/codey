@@ -68,6 +68,11 @@ pub struct ProviderProfile {
     /// account. Every stored account owns exactly one derived official route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub official_account_id: Option<String>,
+    /// 该官方账号当前持有可用的 SIWC（官方直连）凭据；由账号同步写入。
+    /// 直连线路只走 OpenAI 公开 API，backend-api 专属能力（WS 传输、远程
+    /// 压缩等）随之关闭，凭据失效时回落到 Codex 通道。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub official_siwc: bool,
     /// Preserve the exact Codex provider identity required for remote
     /// compaction when it was explicitly enabled by the source configuration.
     #[serde(default)]
@@ -238,6 +243,7 @@ impl ProviderProfile {
             plugin_route_spec: None,
             official_account: false,
             official_account_id: None,
+            official_siwc: false,
             supports_remote_compaction: false,
             remote_compaction_protocol: RemoteCompactionProtocol::default(),
             supports_websockets: false,
@@ -333,6 +339,7 @@ impl ProviderProfile {
             self.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
         } else {
             self.official_account = false;
+            self.official_siwc = false;
             if self.upstream_protocol == UPSTREAM_PROTOCOL_OFFICIAL {
                 self.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string();
             }
@@ -580,6 +587,25 @@ pub(crate) fn validate_outbound_proxy_url(value: &str, label: &str) -> Result<()
         });
     if unusable_host {
         return Err(format!("{label}不能指向未指定地址或链路本地地址"));
+    }
+    Ok(())
+}
+
+/// Codex 启动代理地址。除线路上游代理的通用要求外，Chromium 的
+/// `--proxy-server` 不支持代理认证，SOCKS 地址也必须显式端口，这里
+/// 叠加更严的约束。
+pub(crate) fn validate_codex_launch_proxy(value: &str) -> Result<(), String> {
+    validate_outbound_proxy_url(value, "Codex 启动代理")?;
+    let url = reqwest::Url::parse(value).expect("启动代理地址已通过校验");
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Codex 启动代理不能包含用户名或密码；Chromium 命令行代理不支持认证".into());
+    }
+    // 非特殊协议（socks5/socks5h）解析出的 path 是空串而非 "/"。
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("Codex 启动代理只能包含协议、地址和端口".into());
+    }
+    if matches!(url.scheme(), "socks5" | "socks5h") && url.port().is_none() {
+        return Err("Codex 启动代理的 SOCKS 地址必须带端口".into());
     }
     Ok(())
 }
@@ -855,6 +881,11 @@ pub struct CodeyConfig {
     /// Codey-managed Codex launch. Disabled by default and ignored on macOS.
     #[serde(default)]
     pub gpu_launch_mode: GpuLaunchMode,
+    /// Optional launch proxy (http/https/socks5/socks5h) applied to the next
+    /// Codey-managed Codex launch: `--proxy-server` for the client and proxy
+    /// environment variables for the app-server processes it spawns.
+    #[serde(default)]
+    pub codex_launch_proxy: String,
     /// Publishes Codey's embedded FastCtx file tools to Codex for the next
     /// runtime. Disabled by default so existing tool behavior is unchanged.
     #[serde(default)]
@@ -1017,6 +1048,7 @@ impl Default for CodeyConfig {
             protect_crashpad_pending: true,
             slim_codex_pet: true,
             gpu_launch_mode: GpuLaunchMode::Off,
+            codex_launch_proxy: String::new(),
             fast_context_tools: false,
             subagent_optimization: false,
             subagent_model: default_subagent_model(),
@@ -1114,6 +1146,7 @@ impl CodeyConfig {
         self.webhook.normalize();
         self.prompt_optimization.normalize();
         self.conversation_git.model = self.conversation_git.model.trim().to_string();
+        self.codex_launch_proxy = self.codex_launch_proxy.trim().to_string();
         self
     }
 
@@ -1711,13 +1744,9 @@ impl CodeyConfig {
 
     pub(crate) fn runtime_gateway_provider_id_for_profile(
         &self,
-        profile: &ProviderProfile,
+        _profile: &ProviderProfile,
     ) -> &'static str {
-        if self.route_supports_remote_compaction_this_launch(profile) {
-            local_router::REMOTE_COMPACTION_PROVIDER_ID
-        } else {
-            local_router::ROUTER_PROVIDER_ID
-        }
+        local_router::ROUTER_PROVIDER_ID
     }
 
     /// Whether a route can use upstream Responses WebSocket this launch.
@@ -1745,7 +1774,8 @@ impl CodeyConfig {
             return false;
         }
         if profile.official_account {
-            return self.official_route_usable(profile);
+            // SIWC 直连只提供公开 API 的 HTTP Responses，没有上游 WS。
+            return self.official_route_usable(profile) && !profile.official_siwc;
         }
         profile.supports_websockets
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
@@ -1882,13 +1912,15 @@ impl CodeyConfig {
             return false;
         }
         if profile.official_account {
-            return self.official_route_usable(profile);
+            // 远程压缩走 Codex backend-api 的 /responses/compact，SIWC 直连
+            // 线路没有该端点。
+            return self.official_route_usable(profile) && !profile.official_siwc;
         }
         profile.supports_remote_compaction
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
     }
 
-    /// 这里只汇总可用能力；会话通过独立 Provider 选择压缩方式。
+    /// 这里只汇总可用能力；压缩方式由网关按所选线路热切换。
     pub(crate) fn runtime_supports_remote_compaction(&self) -> bool {
         self.remote_compaction_runtime_profiles()
             .any(|profile| self.route_supports_remote_compaction_this_launch(profile))
@@ -2232,6 +2264,42 @@ impl CodeyConfig {
         )
     }
 
+    /// Native display names keyed by the route-qualified runtime catalog id.
+    ///
+    /// Codex renders this field directly in places Codey cannot patch, such as
+    /// the synthetic model-change divider. Raw ids keep the native official
+    /// names so a single-account setup stays unchanged; aliased ids gain the
+    /// same `[短名] 模型名` form the Codey model menu already shows.
+    pub(crate) fn runtime_catalog_display_names(&self) -> BTreeMap<String, String> {
+        let qualify_official = self.qualifies_official_model_ids();
+        let mut names = BTreeMap::new();
+        for profile in &self.profiles {
+            if !profile.enabled {
+                continue;
+            }
+            let provider_id = profile.provider_id();
+            if profile.official_account {
+                if !self.official_route_usable(profile) {
+                    continue;
+                }
+                for model in self.enabled_official_route_models(provider_id) {
+                    let id = runtime_catalog_model_id(profile, &model, qualify_official);
+                    if id.contains('/') {
+                        names.insert(id, route_model_display_name(profile, &model));
+                    }
+                }
+                continue;
+            }
+            for model in self.enabled_route_models(provider_id) {
+                names.insert(
+                    local_router::model_alias(provider_id, &model),
+                    route_model_display_name(profile, &model),
+                );
+            }
+        }
+        names
+    }
+
     /// Catalog id of one runtime model target. It matches the ids produced by
     /// `runtime_catalog_models` so the default model always names a model that
     /// Codex can find in the generated catalog.
@@ -2467,6 +2535,12 @@ fn runtime_catalog_model_id(
     } else {
         local_router::model_alias(profile.provider_id(), model)
     }
+}
+
+/// One line for the Codex model picker and other native surfaces: route short
+/// name plus the upstream model, without the internal provider selector.
+fn route_model_display_name(profile: &ProviderProfile, model: &str) -> String {
+    format!("[{}] {}", profile.display_short_name(), model.trim())
 }
 
 fn model_references_provider(model: &str, provider_id: &str) -> bool {
@@ -3061,6 +3135,39 @@ mod tests {
         );
         config.profiles[0].upstream_proxy = "socks5://127.0.0.1:1080".to_string();
         assert!(config.profiles[0].validate().is_ok());
+    }
+
+    #[test]
+    fn codex_launch_proxy_rejects_credentials_paths_and_portless_socks() {
+        for accepted in [
+            "http://127.0.0.1:7890",
+            "https://proxy.example.com:8443",
+            "https://proxy.example.com",
+            "socks5://127.0.0.1:1080",
+            "socks5h://proxy.example.com:1080",
+            "http://[::1]:7890",
+        ] {
+            assert!(validate_codex_launch_proxy(accepted).is_ok(), "{accepted}");
+        }
+        for rejected in [
+            // Chromium 命令行代理不支持认证。
+            "http://user:pass@proxy.example.com:8080",
+            "socks5://user@127.0.0.1:1080",
+            // 只允许协议、地址和端口；非特殊协议的 path 解析为空串。
+            "http://127.0.0.1:7890/v1",
+            "socks5://127.0.0.1:1080/v1",
+            "http://127.0.0.1:7890?x=1",
+            "http://127.0.0.1:7890#frag",
+            // Chromium 需要 host:port，SOCKS 不能省略端口。
+            "socks5://127.0.0.1",
+            "socks5h://proxy.example.com",
+            // 通用约束沿用线路上游代理。
+            "ftp://proxy.example.com:21",
+            "127.0.0.1:7890",
+            "http://0.0.0.0:7890",
+        ] {
+            assert!(validate_codex_launch_proxy(rejected).is_err(), "{rejected}");
+        }
     }
 
     #[test]
@@ -3705,6 +3812,54 @@ mod tests {
     }
 
     #[test]
+    fn runtime_catalog_display_names_use_route_short_names_for_aliased_ids() {
+        let mut first = ProviderProfile::new("Official");
+        first.id = "codey-official-account-one".into();
+        first.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        first.official_account_id = Some("acct-one".into());
+        first.short_name = "main".into();
+        first.normalize();
+
+        let mut second = ProviderProfile::new("Official Two");
+        second.id = "codey-official-account-two".into();
+        second.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        second.official_account_id = Some("acct-two".into());
+        second.short_name = "alt".into();
+        second.normalize();
+
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.short_name = "pro".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: first.id.clone(),
+            profiles: vec![first, second, relay],
+            local_router_enabled: true,
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("relay".into(), vec!["shared-model".into()]);
+
+        let names = config.runtime_catalog_display_names();
+
+        assert_eq!(
+            names.get("relay/shared-model").map(String::as_str),
+            Some("[pro] shared-model")
+        );
+        assert_eq!(
+            names
+                .get("codey-official-account-one/gpt-5.6-sol")
+                .map(String::as_str),
+            Some("[main] gpt-5.6-sol")
+        );
+    }
+
+    #[test]
     fn normalize_drops_retired_official_models_from_saved_selections() {
         let mut official = ProviderProfile::new("Official");
         official.id = "official-profile".into();
@@ -3992,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_compaction_uses_separate_providers_for_mixed_routes() {
+    fn remote_compaction_uses_one_provider_for_mixed_routes() {
         let mut capable = ProviderProfile::new("Responses Route");
         capable.id = "route-capable".into();
         capable.base_url = "https://responses.example/v1".into();
@@ -4020,7 +4175,7 @@ mod tests {
         assert_eq!(config.remote_compaction_mode(), "mixed");
         assert_eq!(
             config.runtime_gateway_provider_id_for_profile(&config.profiles[0]),
-            local_router::REMOTE_COMPACTION_PROVIDER_ID
+            local_router::ROUTER_PROVIDER_ID
         );
         assert_eq!(
             config.runtime_gateway_provider_id_for_profile(&config.profiles[1]),

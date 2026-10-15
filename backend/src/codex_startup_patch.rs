@@ -1159,53 +1159,11 @@ fn runtime_override_string(overrides: &[String], name: &str) -> Option<String> {
 
 #[cfg(any(windows, target_os = "macos", test))]
 fn router_provider_for_params(
-    method: &str,
-    params: &serde_json::Map<String, serde_json::Value>,
-    overrides: &[String],
+    _method: &str,
+    _params: &serde_json::Map<String, serde_json::Value>,
+    _overrides: &[String],
 ) -> &'static str {
-    use crate::local_router::{REMOTE_COMPACTION_PROVIDER_ID, ROUTER_PROVIDER_ID};
-    let default_provider = if runtime_override_string(overrides, "model_provider").as_deref()
-        == Some(REMOTE_COMPACTION_PROVIDER_ID)
-    {
-        REMOTE_COMPACTION_PROVIDER_ID
-    } else {
-        ROUTER_PROVIDER_ID
-    };
-    let explicit_provider = params
-        .get("modelProvider")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|provider| match provider {
-            REMOTE_COMPACTION_PROVIDER_ID => Some(REMOTE_COMPACTION_PROVIDER_ID),
-            ROUTER_PROVIDER_ID => Some(ROUTER_PROVIDER_ID),
-            _ => None,
-        });
-    let requested_model = params
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    // 缺少模型的恢复和分支请求沿用历史模型；旧 Provider 和启动默认模型
-    // 都不能证明该历史所属线路的当前能力，保守使用 Codex 本地摘要。
-    if requested_model.is_none() && method != "thread/start" {
-        return ROUTER_PROVIDER_ID;
-    }
-    let default_model = runtime_override_string(overrides, "model");
-    let model = requested_model.or(default_model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty()));
-    let Some(model) = model else {
-        return default_provider;
-    };
-    let Some(path) = runtime_override_string(overrides, "model_catalog_json") else {
-        return explicit_provider.unwrap_or(default_provider);
-    };
-    if crate::model_catalog::remote_compaction_models_from_catalog(std::path::Path::new(&path))
-        .contains(&crate::model_id::key(model))
-    {
-        REMOTE_COMPACTION_PROVIDER_ID
-    } else {
-        ROUTER_PROVIDER_ID
-    }
+    crate::local_router::ROUTER_PROVIDER_ID
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1723,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_input_uses_exact_compaction_capabilities_in_mixed_catalogs() {
+    fn cli_input_uses_one_provider_in_mixed_catalogs() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("catalog.json");
         std::fs::write(
@@ -1746,7 +1704,7 @@ mod tests {
         assert!(local_router_runtime_enabled(&overrides));
         for method in ["thread/start", "thread/resume", "thread/fork"] {
             for (model, provider) in [
-                ("remote/shared", "codey_router_remote"),
+                ("remote/shared", "codey_router"),
                 ("local/shared", "codey_router"),
                 ("shared", "codey_router"),
             ] {
@@ -1760,12 +1718,12 @@ mod tests {
         let empty = serde_json::Map::new();
         assert_eq!(
             router_provider_for_params("thread/start", &empty, &overrides),
-            "codey_router_remote"
+            "codey_router"
         );
         let params = serde_json::json!({"modelProvider":"codey_router"});
         assert_eq!(
             router_provider_for_params("thread/start", params.as_object().unwrap(), &overrides),
-            "codey_router_remote"
+            "codey_router"
         );
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
@@ -1775,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn model_less_history_requests_keep_the_model_and_use_local_compaction() {
+    fn model_less_history_requests_keep_the_model_and_use_the_shared_provider() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("catalog.json");
         std::fs::write(

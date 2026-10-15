@@ -764,7 +764,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             document.get("model_provider").and_then(Item::as_str),
-            local_router.map(|_| local_router::REMOTE_COMPACTION_PROVIDER_ID)
+            local_router.map(|_| local_router::ROUTER_PROVIDER_ID)
         );
         fs::remove_file(&role_path).unwrap();
         let report = repair_at(&home, &marker, true).unwrap();

@@ -699,8 +699,9 @@ mod tests {
         unmanaged.local_router_enabled = false;
         for (saved, applied, configured, active, restart) in [
             (&remote, None, true, json!(null), false),
-            (&remote, Some(&local), true, json!(false), true),
-            (&local, Some(&remote), false, json!(true), true),
+            // 统一 Provider 后，线路原生压缩能力变化由网关热切换，不再要求重启。
+            (&remote, Some(&local), true, json!(false), false),
+            (&local, Some(&remote), false, json!(true), false),
             (&remote, Some(&remote), true, json!(true), false),
             (&local, Some(&local), false, json!(false), false),
             (&unmanaged, Some(&remote), false, json!(true), true),

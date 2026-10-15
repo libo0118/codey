@@ -23,17 +23,15 @@ export function remoteCompactionStatusText(status?: RuntimeStatus | null) {
         ? "当前按线路选择压缩方式"
         : activeMode === "remote"
           ? "当前已启用远程压缩"
-          : "当前使用本地压缩";
+          : "当前由 Codey 网关生成压缩摘要";
   const saved = configuredMode === "mixed"
-    ? "已保存配置中，支持的线路独立使用远程压缩，其余线路使用本地压缩"
+    ? "已保存配置中，原生支持的线路透传上游压缩，其余线路由网关生成摘要"
     : compaction.configured
-      ? "已保存配置支持远程压缩"
-      : "已保存配置未启用远程压缩";
+      ? "已保存配置声明了原生远程压缩"
+      : "已保存配置未声明原生远程压缩，由网关生成摘要";
   return {
     title,
-    detail: compaction.restartRequired
-      ? `${saved}；需重启 Codex 生效。`
-      : `${saved}。`,
+    detail: `${saved}；压缩方式随所选线路自动生效。`,
   };
 }
 
@@ -43,7 +41,6 @@ export function getRouteCompactionStatus(
   officialAccountAvailable?: boolean,
 ): RouteCompactionStatus {
   const isOfficial = profile.authMode === "officialAccount" || profile.officialAccount;
-  const restartRequired = Boolean(runtimeStatus?.remoteCompaction?.restartRequired);
 
   if (isOfficial) {
     if (officialAccountAvailable === false) {
@@ -59,56 +56,47 @@ export function getRouteCompactionStatus(
       mode: "remote",
       badgeText: "远程压缩",
       badgeVariant: "success",
-      tooltip: restartRequired
-        ? "官方账号原生支持远程压缩；若刚修改此线路，需重启 Codex 生效"
-        : "官方账号原生支持远程压缩",
+      tooltip: "官方账号原生支持远程压缩；压缩方式随所选线路自动生效",
     };
   }
 
-  // 检查运行时阻塞列表中是否有该线路的具体原因
+  // 检查运行时阻塞列表中是否有该线路的具体原因。未声明原生压缩的线路
+  // 仍会经过网关生成等价摘要，因此这里只记录原因，不改变压缩方式。
   const blocker = runtimeStatus?.remoteCompaction?.blockingRoutes?.find(
     (b) => b.routeId === profile.id
   );
-
-  if (blocker) {
-    return {
-      mode: "local",
-      badgeText: "本地压缩",
-      badgeVariant: "secondary",
-      tooltip: `使用本地压缩（${blocker.reason}）`,
-      reason: blocker.reason,
-    };
-  }
 
   const hasPluginTransport = Boolean(
     profile.pluginRouteSpec && (profile.pluginRouteSpec as any).transport
   );
   if (hasPluginTransport) {
     return {
-      mode: "local",
-      badgeText: "本地压缩",
-      badgeVariant: "secondary",
-      tooltip: "使用本地压缩（插件传输不支持原生压缩）",
+      mode: "remote",
+      badgeText: "网关压缩",
+      badgeVariant: "success",
+      tooltip: "由 Codey 网关生成等价摘要（插件传输不支持上游原生压缩）",
       reason: "插件传输不支持原生压缩",
     };
   }
 
   if (profile.upstreamProtocol && profile.upstreamProtocol !== "openaiResponses") {
     return {
-      mode: "local",
-      badgeText: "本地压缩",
-      badgeVariant: "secondary",
-      tooltip: "使用本地压缩（上游协议不支持原生压缩）",
+      mode: "remote",
+      badgeText: "网关压缩",
+      badgeVariant: "success",
+      tooltip: "由 Codey 网关生成等价摘要（上游协议不支持原生压缩）",
       reason: "上游协议不支持原生压缩",
     };
   }
 
   if (!profile.supportsRemoteCompaction) {
     return {
-      mode: "local",
-      badgeText: "本地压缩",
-      badgeVariant: "secondary",
-      tooltip: "使用本地压缩（未开启远程压缩）",
+      mode: "remote",
+      badgeText: "网关压缩",
+      badgeVariant: "success",
+      tooltip: blocker
+        ? `由 Codey 网关生成等价摘要（${blocker.reason}）`
+        : "由 Codey 网关生成等价摘要（未声明原生远程压缩）",
       reason: "未开启远程压缩",
     };
   }
@@ -117,12 +105,11 @@ export function getRouteCompactionStatus(
     profile.remoteCompactionProtocol === "compactEndpoint"
       ? "独立压缩接口 /responses/compact"
       : "原生 Responses";
-  const restartSuffix = restartRequired ? "；需重启 Codex 生效" : "";
 
   return {
     mode: "remote",
     badgeText: "远程压缩",
     badgeVariant: "success",
-    tooltip: `原生远程压缩（接口：${protocolLabel}${restartSuffix}）`,
+    tooltip: `原生远程压缩（接口：${protocolLabel}）；压缩方式随所选线路自动生效`,
   };
 }

@@ -305,9 +305,15 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       url: "app://-/assets/app-initial-current-codex-build.js",
     });
     const patchedCurrentRendererSource = await currentRendererResponse.text();
+    // The Fast control no longer depends on the current model exposing more
+    // than one service tier. Only the draft guard survives.
     assert.match(
       patchedCurrentRendererSource,
-      /Ee=!w&&M\.availableOptions\.length>1/,
+      /Ee=!w&&!0/,
+    );
+    assert.doesNotMatch(
+      patchedCurrentRendererSource,
+      /Ee=[^;]*availableOptions\.length>1/,
     );
     assert.match(patchedCurrentRendererSource, /Re=!w&&!K&&xe!=null/);
     assert.match(patchedCurrentRendererSource, /pe=!r/);
@@ -347,7 +353,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         await reorderedServiceTierControlResponse.text();
       assert.match(
         patchedReorderedServiceTierControlSource,
-        /show=(?:settings\.availableOptions\.length>1&&!draft|!draft&&settings\.availableOptions\.length>1)/,
+        /show=(?:!0&&!draft|!draft&&!0|!draft)/,
+      );
+      assert.doesNotMatch(
+        patchedReorderedServiceTierControlSource,
+        /show=[^;]*availableOptions\.length>1/,
       );
       assert.doesNotMatch(
         patchedReorderedServiceTierControlSource,
@@ -387,7 +397,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const patchedElectron151Source = await electron151Response.text();
     assert.match(
       patchedElectron151Source,
-      /De=!w&&N\.availableOptions\.length>1/,
+      /De=!w&&!0/,
+    );
+    assert.doesNotMatch(
+      patchedElectron151Source,
+      /De=[^,]*availableOptions\.length>1/,
     );
     assert.doesNotMatch(
       patchedElectron151Source,
@@ -436,6 +450,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /unrelated=!draft&&allowed&&settings\.availableOptions\.length>1/,
     );
     assert.match(
+      patchedScopedServiceTierSource,
+      /show=!draft/,
+    );
+    assert.doesNotMatch(
       patchedScopedServiceTierSource,
       /show=!draft&&settings\.availableOptions\.length>1/,
     );
@@ -618,6 +636,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "Date",
       `${patchedAppServerRequestSource};return AppServerRequestClient`,
     )(appServerGlobal, Date);
+    assert.equal(appServerGlobal.__codeyModelRequestSourceGateInstalled, true);
     const requestClient = new AppServerRequestClient();
     await requestClient.enqueueRequest("thread/start", {
       model: "route-mt6lv4lx-i2bfax/gpt-5.5",
@@ -672,6 +691,28 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       2,
       "the AppServerRequestClient route preflight must patch without compatibility errors",
     );
+
+    // Codex 26.1007 moved AppServerRequestClient and the Electron bridge
+    // forwarder into app-shared-*.js. That chunk must stay in the patch filter
+    // or the model-request source gate never installs and startup aborts at
+    // the request-gate verification stage.
+    const sharedChunkResponse = await installedHandler({
+      url: "app://-/webview/assets/app-shared-8bd9d0399038.js",
+    });
+    const patchedSharedChunk = await sharedChunkResponse.text();
+    assert.match(
+      patchedSharedChunk,
+      /__codeyModelRequestSourceGateInstalled=true/,
+    );
+    assert.match(
+      patchedSharedChunk,
+      /__codeyAppServerRequestClients/,
+    );
+    // Assets outside the patch set must pass through untouched.
+    const unrelatedChunkResponse = await installedHandler({
+      url: "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+    });
+    assert.equal(await unrelatedChunkResponse.text(), appServerRequestSource);
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",

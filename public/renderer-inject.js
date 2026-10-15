@@ -837,7 +837,7 @@
     const response = await window.__codeyReadAccountRateLimits();
     const snapshot = normalizeAppServerAccountUsage(response);
     if (snapshot.status !== "ok") return snapshot;
-    // Publish Codex's managed-auth result so the independent log window can reuse it.
+    // 同步 Codex 管理的账号额度，让官方账号面板可以复用当前快照。
     if (Number.isSafeInteger(backendResult?.authGeneration)) {
       const stored = await callBridge("/api/store_official_account_usage", {
         authGeneration: backendResult.authGeneration, snapshot,
@@ -846,37 +846,6 @@
       snapshot.authGeneration = backendResult.authGeneration;
     }
     return snapshot;
-  };
-
-  let quotaUsageRequest = null;
-  window.__codeyReadQuotaAccountUsage = ({ forceRefresh = false } = {}) => {
-    const displayed = accountUsagePollingEnabled && accountUsageLastResult?.status === "ok"
-      ? accountUsageLastResult : null;
-    const now = Date.now();
-    const age = now - Number(displayed?.fetchedAt) * 1000;
-    const weekly = [displayed?.primary, displayed?.secondary]
-      .find((value) => Number(value?.windowMinutes) === 10080);
-    if (!forceRefresh && displayed && age >= 0 && age < accountUsageRefreshIntervalMs
-      && Number(weekly?.resetsAt) * 1000 > now) return Promise.resolve(displayed);
-    if (quotaUsageRequest) return quotaUsageRequest;
-    quotaUsageRequest = (async () => {
-      let result = await withTimeout(
-        callBridge("/api/query_official_account_usage", { forceRefresh }, { timeoutMs: accountUsageTimeoutMs }),
-        accountUsageTimeoutMs, "读取官方周额度超时",
-      );
-      if (result?.status === "error" || result?.stale) {
-        try {
-          const fallback = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
-          if (fallback?.status === "ok") result = fallback;
-        } catch { /* Keep the backend error when the fallback is unavailable. */ }
-      }
-      // A dialog query never enables the account display or its polling.
-      if (displayed && accountUsagePollingEnabled && accountUsageLastResult === displayed && result?.status === "ok") {
-        renderAccountUsage(result);
-      }
-      return result;
-    })().finally(() => { quotaUsageRequest = null; });
-    return quotaUsageRequest;
   };
 
   const checkAccountUsage = async () => {
@@ -939,9 +908,8 @@
       : "Codey 内嵌配置面板尚未加载，请退出 Codex 后重新启动 Codey");
   };
 
-  const visibleMountRect = (element) => {
+  const mountableRect = (element) => {
     if (!(element instanceof HTMLElement)) return null;
-    if (element.closest("[hidden], [aria-hidden=true]")) return null;
     const style = window.getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.display !== "none"
@@ -951,6 +919,18 @@
       ? rect
       : null;
   };
+
+  const visibleMountRect = (element) =>
+    element instanceof HTMLElement && element.closest("[hidden], [aria-hidden=true]")
+      ? null
+      : mountableRect(element);
+
+  // Codex 打开模态对话框时只给图标栏等背景内容补 aria-hidden，布局不变；
+  // 把它当成隐藏会让对话框弹出期间的扫描把入口当成失效挂载卸载。
+  const railMountRect = (element) =>
+    element instanceof HTMLElement && element.closest("[hidden]")
+      ? null
+      : mountableRect(element);
 
   const isTopChromeMountTarget = (element) => {
     const rect = visibleMountRect(element);
@@ -1028,14 +1008,14 @@
     const rail = document.querySelector(navigationRailSelector);
     if (!(rail instanceof HTMLElement)) return null;
     navigationRailSeen = true;
-    if (!visibleMountRect(rail)) return null;
+    if (!railMountRect(rail)) return null;
     const cluster = [...rail.children]
-      .filter((child) => visibleMountRect(child))
+      .filter((child) => railMountRect(child))
       .at(-1);
     const stack = cluster?.firstElementChild;
     if (!(stack instanceof HTMLElement)) return null;
     const controls = [...stack.querySelectorAll("button")]
-      .filter((candidate) => candidate.id !== buttonId && visibleMountRect(candidate));
+      .filter((candidate) => candidate.id !== buttonId && railMountRect(candidate));
     const anchor = controls.find((candidate) => railHelpLabelPattern.test(candidate.getAttribute("aria-label") || ""))
       || controls.find((candidate) => railProfileLabelPattern.test(candidate.getAttribute("aria-label") || ""));
     if (!(anchor instanceof HTMLElement)) return null;
@@ -1051,15 +1031,20 @@
       return false;
     }
     const parent = button.parentElement;
-    if (!(parent instanceof HTMLElement) || button.closest("[hidden], [aria-hidden=true]")) {
+    if (!(parent instanceof HTMLElement)) {
       return false;
     }
     if (button.dataset.codeyRailSlot === "true") {
+      // 模态对话框给背景补的 aria-hidden 不算真实隐藏，与 railMountRect 一致。
+      if (button.closest("[hidden]")) return false;
       const rail = button.closest?.(navigationRailSelector);
       return !!rail
         && rail.isConnected !== false
         && parent === button.__codeyRailStack
         && button.nextElementSibling === button.__codeyRailAnchor;
+    }
+    if (button.closest("[hidden], [aria-hidden=true]")) {
+      return false;
     }
     // 页面先渲染顶部、后渲染侧栏时，已挂载的顶部入口也需要迁移。
     if (document.querySelector(navigationRailSelector)) return false;

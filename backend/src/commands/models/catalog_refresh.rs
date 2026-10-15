@@ -33,6 +33,7 @@ fn refresh_model_catalog_or_fallback_at(
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
     let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
+    let runtime_display_names = config.runtime_catalog_display_names();
     let refresh = try_refresh_model_catalog(config, home);
     let reused_cached_catalog = refresh.is_err();
     let result = model_catalog_fallback(
@@ -67,6 +68,7 @@ fn refresh_model_catalog_or_fallback_at(
                         plugin_contexts: &runtime_plugin_model_contexts,
                         contexts: &runtime_model_contexts,
                         reasoning_efforts: &runtime_model_reasoning_efforts,
+                        display_names: &runtime_display_names,
                     },
                 )
             {
@@ -314,6 +316,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
             plugin_contexts: &config.runtime_plugin_model_contexts(),
             contexts: &config.runtime_model_contexts(),
             reasoning_efforts: &config.runtime_model_reasoning_efforts(),
+            display_names: &config.runtime_catalog_display_names(),
         },
         &config.codex_app_path,
     )
