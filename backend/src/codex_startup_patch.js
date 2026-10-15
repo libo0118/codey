@@ -637,6 +637,64 @@
       );
     }
     if (
+      source.includes("serviceTierAccess:") &&
+      source.includes("serviceTierForRequest:") &&
+      source.includes("hasManagedNewThreadSettings:")
+    ) {
+      // API routes use only tiers declared by the current model; native account
+      // access and loading stay authoritative for ChatGPT/PAT and other auth.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(?<prefix>\b(?<auth>[$A-Z_a-z][$\w]*)\s*=\s*[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\)\?\.authMethod\?\?null[\s\S]{0,1024}?let\s*\{serviceTierAccess:(?<access>[$A-Z_a-z][$\w]*)\}\s*=\s*[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\)),(?<body>[\s\S]{0,2048}?\blet\s+(?<model>[$A-Z_a-z][$\w]*)\s*=\s*(?<lookup>[$A-Z_a-z][$\w]*)\((?<models>[$A-Z_a-z][$\w]*)\?\.models,(?<settings>[$A-Z_a-z][$\w]*)\.model\)[\s\S]{0,4096}?\b[$A-Z_a-z][$\w]*\s*=\s*(?<options>[$A-Z_a-z][$\w]*)\(\k<model>\)\.filter\([\s\S]{0,3072}?\{availableOptions:[^{}]{0,300}?selectedServiceTier:(?<selected>[$A-Z_a-z][$\w]*),serviceTierForRequest:)(?<request>[$A-Z_a-z][$\w]*)\}/g,
+        (...args) => {
+          const g = args.at(-1);
+          const body = g.body.replace(
+            /\|\|([$A-Z_a-z][$\w]*)==null&&([$A-Z_a-z][$\w]*)(?=,[$A-Z_a-z][$\w]*=async)/,
+            "||!__codeyApiServiceTier&&$1==null&&$2",
+          );
+          return `${g.prefix};const __codeyApiServiceTier=${g.auth}===\`apikey\`;${g.access}=__codeyApiServiceTier?Object.fromEntries(${g.options}(${g.lookup}(${g.models}?.models,${g.settings}.model)).filter(e=>e.iconKind!=null).map(e=>[e.iconKind,!0])):${g.access};let ${body}__codeyApiServiceTier?${g.selected}:${g.request},serviceTierAccess:${g.access}}`;
+        },
+        "API model service tier access",
+      );
+    }
+    if (
+      source.includes("serviceTierAccess:") &&
+      source.includes("modelPickerTriggerConfig:") &&
+      source.includes("selectedServiceTierIconKind:")
+    ) {
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\b[$A-Z_a-z][$\w]*\s*=\s*![$A-Z_a-z][$\w]*\s*&&\s*![$A-Z_a-z][$\w]*\s*&&\s*)([$A-Z_a-z][$\w]*)\s*!=\s*null\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1/g,
+        (_match, prefix, access, settings) =>
+          `${prefix}(${settings}.serviceTierAccess??${access})!=null&&${settings}.availableOptions.length>1`,
+        "API model speed control",
+      );
+    }
+    if (
+      source.includes("serviceTierAccess:") &&
+      /availableOptions\.length\s*<=\s*1/.test(source)
+    ) {
+      patched = replaceUniqueRendererGate(
+        patched,
+        /if\s*\(\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\|\|\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*<=\s*1\s*\)\s*return\s+null/g,
+        (_match, access, settings) =>
+          `if((${settings}.serviceTierAccess??${access})==null||${settings}.availableOptions.length<=1)return null`,
+        "API model speed settings",
+      );
+    }
+    if (
+      source.includes("serviceTierAccess:") &&
+      source.includes("composer.speedSlashCommand.disableDescription")
+    ) {
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(enabled\s*:\s*)([$A-Z_a-z][$\w]*)\(([$A-Z_a-z][$\w]*)\.value,([$A-Z_a-z][$\w]*)\)\s*&&\s*!([$A-Z_a-z][$\w]*)\.isLoading/g,
+        (_match, prefix, allowed, option, access, settings) =>
+          `${prefix}${allowed}(${option}.value,${settings}.serviceTierAccess??${access})&&!${settings}.isLoading`,
+        "API model speed commands",
+      );
+    }
+    if (
       source.includes("isServiceTierAllowed") &&
       source.includes("featureRequirements?.fast_mode") &&
       source.includes("authMethod:")
@@ -954,7 +1012,7 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|app-shared|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+          /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
           ) ||
           (
