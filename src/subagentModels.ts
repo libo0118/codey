@@ -123,7 +123,7 @@ export function buildSubagentModelOptions(
           ([model]) => modelKey(model) === modelKey(modelId),
         )?.[1]
       : undefined;
-    const boundedEfforts = capability
+    const boundedEfforts = !official
       ? resolveModelReasoningEfforts(efforts, routeEfforts, capability).efforts.map((effort) => effort.value)
       : efforts;
     const supportedReasoningEfforts = boundedEfforts.length > 0 ? boundedEfforts : ["low"];

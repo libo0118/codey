@@ -28,21 +28,11 @@ fn alias_set(aliases: Vec<String>) -> std::collections::BTreeSet<String> {
 }
 
 pub(crate) fn remote_compaction_transport_requires_restart(
-    applied: &CodeyConfig,
-    current: &CodeyConfig,
+    _applied: &CodeyConfig,
+    _current: &CodeyConfig,
 ) -> bool {
-    let remote_routes = |config: &CodeyConfig| {
-        config
-            .remote_compaction_route_capabilities()
-            .into_iter()
-            .filter_map(|(id, supported)| supported.then_some(id))
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    // Adding or removing local-only routes needs no new Provider capability.
-    // The all-remote default is also launch-scoped when using Codex's catalog.
-    remote_routes(applied) != remote_routes(current)
-        || (applied.remote_compaction_mode() == "remote")
-            != (current.remote_compaction_mode() == "remote")
+    // 统一 Provider 后，网关可按线路热切换原生或等价压缩。
+    false
 }
 
 pub(crate) fn native_web_search_capability_requires_restart(
@@ -161,6 +151,8 @@ pub(crate) fn provider_route_snapshots_for_runtime(
     provider_route_snapshots(config)
         .into_iter()
         .map(|(provider_id, mut route)| {
+            // 原生压缩能力由统一网关随配置热更新。
+            route.supports_remote_compaction = false;
             if route.official_account {
                 route.base_url.clear();
             }
@@ -197,15 +189,13 @@ pub(crate) fn config_with_launch_pinned_transport(
         };
         profile.supports_websockets = previous.supports_websockets;
         profile.supports_native_web_search = previous.supports_native_web_search;
-        profile.supports_remote_compaction = previous.supports_remote_compaction;
-        // 协议决定上面三个能力的实际取值，必须一起固定在启动时的状态。
+        // 协议影响 WebSocket 和网页搜索能力，保持启动时的状态。
         profile.upstream_protocol = previous.upstream_protocol.clone();
         if profile.official_account && previous.official_account {
             let launch_scoped_official_change = profile.api_key != previous.api_key
                 || profile.auth_mode != previous.auth_mode
                 || profile.model_request_headers != previous.model_request_headers
                 || profile.upstream_protocol != previous.upstream_protocol
-                || profile.supports_remote_compaction != previous.supports_remote_compaction
                 || profile.supports_websockets != previous.supports_websockets
                 || profile.supports_native_web_search != previous.supports_native_web_search;
             if launch_scoped_official_change {
@@ -257,7 +247,7 @@ pub(crate) fn renderer_model_catalog_value(
                 "route_name": entry.route_name,
                 "route_prefix": entry.route_prefix,
                 "provider_id": entry.request_provider_id,
-                "supports_remote_compaction": entry.request_provider_id == local_router::REMOTE_COMPACTION_PROVIDER_ID,
+                "supports_remote_compaction": entry.native_remote_compaction,
                 "source_model": entry.request_model,
                 "official_account": entry.official_account,
                 "supported_reasoning_efforts": entry.supported_reasoning_efforts,
@@ -367,6 +357,7 @@ pub(crate) struct RendererRouteModelEntry {
     pub(crate) provider_id: String,
     pub(crate) request_provider_id: String,
     pub(crate) request_model: String,
+    pub(crate) native_remote_compaction: bool,
     pub(crate) official_account: bool,
     pub(crate) route_name: String,
     pub(crate) route_prefix: String,
@@ -500,6 +491,8 @@ pub(crate) fn renderer_route_model_catalog(
                 provider_id: provider_id.clone(),
                 request_provider_id,
                 request_model,
+                native_remote_compaction: config
+                    .route_supports_remote_compaction_this_launch(profile),
                 official_account: profile.official_account,
                 route_name: route_name.to_string(),
                 route_prefix: route_prefix.clone(),

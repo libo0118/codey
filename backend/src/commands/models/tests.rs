@@ -1547,7 +1547,7 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
     assert_eq!(official_metadata["route_prefix"].as_str(), Some("官方"));
     assert_eq!(
         official_metadata["provider_id"].as_str(),
-        Some(local_router::REMOTE_COMPACTION_PROVIDER_ID)
+        Some(local_router::ROUTER_PROVIDER_ID)
     );
     assert_eq!(
         official_metadata["source_model"].as_str(),
@@ -2098,7 +2098,7 @@ fn remote_compaction_protocol_selection_hot_reloads_without_changing_provider_id
 }
 
 #[test]
-fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
+fn remote_compaction_capability_changes_hot_reload_with_one_provider() {
     let mut route = crate::config::ProviderProfile::new("Responses Route");
     route.id = "route-a".into();
     route.base_url = "https://route-a.example/v1".into();
@@ -2112,16 +2112,24 @@ fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
     let mut enabled = applied.clone();
     enabled.profiles[0].supports_remote_compaction = true;
 
-    assert!(remote_compaction_transport_requires_restart(
+    assert!(!remote_compaction_transport_requires_restart(
         &applied, &enabled
     ));
-    assert!(provider_route_requires_restart(&applied, &enabled));
-    assert!(!runtime_supports_current_routes_for_hot_reload(
+    assert!(!provider_route_requires_restart(&applied, &enabled));
+    assert!(runtime_supports_current_routes_for_hot_reload(
         &applied, &enabled
     ));
-    assert!(remote_compaction_transport_requires_restart(
+    assert!(!remote_compaction_transport_requires_restart(
         &enabled, &applied
     ));
+    assert!(
+        config_with_launch_pinned_transport(&applied, &enabled).profiles[0]
+            .supports_remote_compaction
+    );
+    assert!(
+        !config_with_launch_pinned_transport(&enabled, &applied).profiles[0]
+            .supports_remote_compaction
+    );
 
     let mut mixed = enabled.clone();
     let mut other = mixed.profiles[0].clone();
@@ -2135,7 +2143,7 @@ fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
         mixed.remote_compaction_mode(),
         swapped.remote_compaction_mode()
     );
-    assert!(remote_compaction_transport_requires_restart(
+    assert!(!remote_compaction_transport_requires_restart(
         &mixed, &swapped
     ));
 }

@@ -702,34 +702,27 @@
       source.includes("isServiceTierAllowed") &&
       source.includes("availableOptions.length")
     ) {
-      // The current model's options decide whether the speed control exists.
+      // 速度档入口不再跟随当前模型声明的档位数量，始终保留在输入区。
       patched = replaceNearestRendererGateBeforeAnchor(
         patched,
         [
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
-              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+            replacement: (_match, assignment, _resultName, _settingsName, draftName) =>
+              `${assignment}!${draftName}`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
-              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+            replacement: (_match, assignment, _resultName, _settingsName, draftName) =>
+              `${assignment}!${draftName}`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, settingsName) =>
-              `${assignment}${settingsName}.availableOptions.length>1`,
+            replacement: (_match, assignment) => `${assignment}!0`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (
-              _match,
-              preservedPrefix,
-              _resultName,
-              _draftName,
-              settingsName,
-            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+            replacement: (_match, preservedPrefix) => `${preservedPrefix}!0`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
@@ -738,8 +731,8 @@
               assignment,
               _resultName,
               draftName,
-              settingsName,
-            ) => `${assignment}!${draftName}&&${settingsName}.availableOptions.length>1`,
+              _settingsName,
+            ) => `${assignment}!${draftName}`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
@@ -747,24 +740,17 @@
               _match,
               assignment,
               _resultName,
-              settingsName,
+              _settingsName,
               draftName,
-            ) => `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+            ) => `${assignment}!${draftName}`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, settingsName) =>
-              `${assignment}${settingsName}.availableOptions.length>1`,
+            replacement: (_match, assignment) => `${assignment}!0`,
           },
           {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (
-              _match,
-              preservedPrefix,
-              _resultName,
-              _draftName,
-              settingsName,
-            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+            replacement: (_match, preservedPrefix) => `${preservedPrefix}!0`,
           },
         ],
         undefined,
@@ -919,6 +905,11 @@
         "interaction heartbeat",
       );
     }
+    if (patched.includes("globalThis.__codeyModelWhitelistPatch?.trackOutgoingMessage")
+      && patched.includes("let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage")
+      && patched.includes("globalThis.__codeyModelWhitelistPatch?.rewriteIncomingResult")) {
+      patched += "\n;globalThis.__codeyModelRequestSourceGateInstalled=true;\n";
+    }
     return patched;
   };
   const discoveredCodexRendererAssets = new Set();
@@ -945,7 +936,7 @@
   };
   const discoverCodexRendererAssets = (baseUrl, source) => {
     for (const match of source.matchAll(
-      /\bsrc\s*=\s*(["'])([^"']+\.(?:c|m)?js(?:[?#][^"']*)?)\1/gi,
+      /\b(?:src|href)\s*=\s*(["'])([^"']+\.(?:c|m)?js(?:[?#][^"']*)?)\1/gi,
     )) rememberCodexRendererAsset(baseUrl, match[2]);
   };
   const isCodexRendererBootstrapRequest = (request) => {
@@ -963,7 +954,7 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+          /\/(?:(?:app-initial|app-shared|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
           ) ||
           (
@@ -1125,29 +1116,7 @@
   const localRouterProviderIds = new Set(["codey_router", "codey_router_remote"]);
   const defaultRouterProvider = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_provider");
   const localRouterRuntimeEnabled = localRouterProviderIds.has(defaultRouterProvider);
-  const routerProviderForParams = (method, params) => {
-    const requestedModel = typeof params?.model === "string" ? params.model.trim() : "";
-    // Resume/fork inherit their model from history. A saved carrier or the
-    // launch default does not prove that history's route still supports compact.
-    if (!requestedModel && method !== "thread/start") return "codey_router";
-    const model = requestedModel || runtimeConfigValue(nativeRuntimeConfigOverrides, "model");
-    if (!model) return defaultRouterProvider;
-    const catalogPath = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_catalog_json");
-    // Built-in-catalog launches have no model metadata file. Only an all-capable
-    // launch may default to remote; a renderer-selected carrier stays explicit.
-    if (!catalogPath) return localRouterProviderIds.has(params?.modelProvider)
-      ? params.modelProvider : defaultRouterProvider;
-    try {
-      const catalog = JSON.parse(process.getBuiltinModule("fs").readFileSync(catalogPath, "utf8"));
-      const entry = catalog.models?.find((entry) => (
-        typeof entry.slug === "string" && entry.slug.trim().toLowerCase() === String(model).trim().toLowerCase()
-      ));
-      if (entry?.codey_remote_compaction === true) return "codey_router_remote";
-    } catch {
-      // An unknown model has no verified remote compaction route.
-    }
-    return "codey_router";
-  };
+  const routerProviderForParams = () => "codey_router";
   if (localRouterRuntimeEnabled) {
     // A shared daemon or external WebSocket can retain another provider and
     // never read this launch's overrides. Use Codex's own process-local mode.

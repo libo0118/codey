@@ -57,8 +57,8 @@ pub(crate) use platform::{activate_visible_windows_codex_window, windows_process
 #[cfg(windows)]
 pub(crate) use process::windows_cli_wrapper_target;
 use process::{
-    SpawnedCodex, prepare_codex_for_launch, reap_child_after_cleanup, spawn_codex,
-    spawn_codex_exit_watcher,
+    CodexLaunchOptions, SpawnedCodex, prepare_codex_for_launch, reap_child_after_cleanup,
+    spawn_codex, spawn_codex_exit_watcher,
 };
 #[cfg(test)]
 use process::{codex_runtime_arguments, gpu_launch_arguments};
@@ -317,7 +317,7 @@ fn validate_router_provider(home: &std::path::Path) -> Result<()> {
         // compatible with the live loopback table installed later.
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
-            crate::local_router::ROUTER_PROVIDER_IDS.join("、")
+            crate::local_router::OWNED_ROUTER_PROVIDER_IDS.join("、")
         );
     }
     Ok(())
@@ -724,6 +724,7 @@ async fn prepare_startup_model_catalog(
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
     let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
+    let runtime_display_names = config.runtime_catalog_display_names();
     let plugin_context = !runtime_plugin_model_contexts.is_empty();
     let custom_context = !runtime_model_contexts.is_empty();
     let refresh_official_provider =
@@ -782,6 +783,7 @@ async fn prepare_startup_model_catalog(
                     plugin_contexts: &runtime_plugin_model_contexts,
                     contexts: &runtime_model_contexts,
                     reasoning_efforts: &runtime_model_reasoning_efforts,
+                    display_names: &runtime_display_names,
                 },
                 &catalog_codex_app_path,
             );
@@ -800,6 +802,7 @@ async fn prepare_startup_model_catalog(
                                 plugin_contexts: &runtime_plugin_model_contexts,
                                 contexts: &runtime_model_contexts,
                                 reasoning_efforts: &runtime_model_reasoning_efforts,
+                                display_names: &runtime_display_names,
                             },
                         )?;
                     }
@@ -1239,6 +1242,7 @@ async fn inject_initial_renderer(
         Err(failure) => failure,
     };
     let error_message = format!("{failure:#}");
+    let failure_detail = failure.detail().map(str::to_string);
     let failure_metadata = error_log::FailureMetadata {
         stage: Some("startup.renderer_injection".to_string()),
         recoverable: Some(false),
@@ -1253,6 +1257,7 @@ async fn inject_initial_renderer(
             "appPath": app_dir,
             "debugPort": debug_port,
             "processId": spawned.process_id,
+            "lastError": failure_detail,
         }),
     );
 
@@ -1445,6 +1450,7 @@ fn spawn_injection_watchdog(
                         },
                         serde_json::json!({
                             "debugPort": debug_port,
+                            "lastError": error.detail(),
                         }),
                     )
                     .await;
@@ -1857,13 +1863,17 @@ async fn spawn_and_inject_runtime(
     runtime_config_overrides: &[String],
 ) -> Result<SpawnedRenderer> {
     let spawn_inject_started = Instant::now();
+    let launch_proxy = crate::launch_proxy::CodexLaunchProxy::resolve(&config.codex_launch_proxy)?;
     let mut spawned = match spawn_codex(
         &mut storage.app_dir,
         patch.debug_port,
         config.slim_codex_pet,
         config.subagent_optimization,
         config.misc_model_catalog_id(),
-        config.gpu_launch_mode,
+        CodexLaunchOptions {
+            gpu_launch_mode: config.gpu_launch_mode,
+            launch_proxy: launch_proxy.as_ref(),
+        },
         runtime_config_overrides,
     )
     .await
@@ -1878,6 +1888,7 @@ async fn spawn_and_inject_runtime(
             .await);
         }
     };
+    crate::launch_proxy::set_active(launch_proxy);
     let codex_spawn_ms = spawn_inject_started.elapsed().as_millis() as u64;
     let maintenance = MaintenanceStatus {
         session_status: storage.session_maintenance.status,

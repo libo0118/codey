@@ -385,7 +385,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "codey"
-version = "1.2.8-libo.1"
+version = "1.2.11-libo.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -414,6 +414,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rfd",
+ "ring",
  "rusqlite",
  "rustls",
  "semver",
@@ -425,7 +426,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml_edit",
- "unicode-normalization",
  "uuid",
  "webpki-roots 0.26.11",
  "windows 0.58.0",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "codey-codex-extensions"
-version = "1.2.8-libo.1"
+version = "1.2.11-libo.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-core"
-version = "1.2.8-libo.1"
+version = "1.2.11-libo.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-data"
-version = "1.2.8-libo.1"
+version = "1.2.11-libo.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

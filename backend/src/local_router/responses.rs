@@ -260,9 +260,8 @@ impl RouterServer {
                 };
                 write_json_response(&mut stream, 200, &value).await?;
             }
-            // 系统浏览器里的请求日志页只能经由本地路由访问后端；账号筛选、账号名
-            // 显示和按账号推算额度都依赖同一份账号目录。这里只读取账号文档，不再
-            // 同步 Codex 登录，避免浏览器的只读页面改动登录状态。
+            // 系统浏览器里的请求日志页通过本地路由获取账号目录，用于账号筛选和
+            // 账号名显示。这里只读取账号文档，避免只读页面同步 Codex 登录状态。
             ("POST", "/codey/api/list_official_accounts") => {
                 let store = crate::official_accounts::OfficialAccountStore::for_config_path(
                     &crate::config::default_config_path(),
@@ -301,50 +300,6 @@ impl RouterServer {
                     .request_log_catalog
                     .clone();
                 write_json_response(&mut stream, 200, &json!({"config": catalog})).await?;
-            }
-            ("POST", "/codey/api/query_route_request_log_quota_usage") => {
-                let query = match serde_json::from_slice::<
-                    crate::route_request_log::RouteRequestLogQuotaQuery,
-                >(&request.body)
-                {
-                    Ok(query) => query,
-                    Err(error) => {
-                        write_error_response(
-                            &mut stream,
-                            400,
-                            "invalid_request_log_query",
-                            format!("额度用量查询参数无效：{error}"),
-                            None,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                let backend = self
-                    .snapshot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .request_log_backend;
-                let root = self.request_log.root().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::route_request_log::query_route_request_log_quota_usage(
-                        &root, backend, query,
-                    )
-                })
-                .await;
-                let message = match result {
-                    Ok(Ok(usage)) => {
-                        let mut value = serde_json::to_value(usage)?;
-                        value["recordingHealth"] =
-                            serde_json::to_value(self.request_log.health().await)?;
-                        write_json_response(&mut stream, 200, &value).await?;
-                        return Ok(());
-                    }
-                    Ok(Err(error)) => format!("查询额度用量失败：{error:#}"),
-                    Err(error) => format!("额度用量查询任务异常退出：{error}"),
-                };
-                write_error_response(&mut stream, 500, "request_log_query_failed", message, None)
-                    .await?;
             }
             ("POST", "/codey/api/query_route_request_log_models") => {
                 let query = match serde_json::from_slice::<
@@ -939,38 +894,65 @@ impl RouterServer {
                 .map_err(|message| (401, "plugin_account_unavailable", message));
         }
         if route.official_account {
-            let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
-                Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
-                None => (self.official_auth_path.as_path(), true),
-            };
-            let official_auth = resolve_official_upstream_auth(
-                request,
-                &self.bearer_token,
-                auth_path,
-                &self.official_auth_cache,
-                accepts_incoming_authorization,
-            )
-            .await
-            .ok_or_else(|| {
-                (
-                    401,
-                    "openai_auth_missing",
-                    "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+            if let Some((siwc_path, account_id)) = route.official_auth.as_ref().and_then(|auth| {
+                auth.siwc_path
+                    .as_deref()
+                    .zip(Some(auth.account_id.as_str()))
+            }) {
+                // SIWC 直连平面：令牌来自账号的 SIWC 槽位，不接受下游自带的
+                // Codex 令牌；backend-api 专属头一律剥掉。
+                let siwc_auth = resolve_siwc_upstream_auth(
+                    siwc_path,
+                    account_id,
+                    &self.siwc_auth_cache,
+                    &self.client,
+                    &self.proxied_clients,
                 )
-            })?;
-            let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
-                (
-                    401,
-                    "openai_auth_invalid",
-                    "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                .await
+                .map_err(|error| (401, "siwc_auth_unavailable", format!("{error:#}")))?;
+                let value = HeaderValue::from_str(&siwc_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "siwc_auth_invalid",
+                        "官方直连凭据无效，请在账号卡片重新授权".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                strip_siwc_forbidden_headers(&mut headers);
+            } else {
+                let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
+                    Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
+                    None => (self.official_auth_path.as_path(), true),
+                };
+                let official_auth = resolve_official_upstream_auth(
+                    request,
+                    &self.bearer_token,
+                    auth_path,
+                    &self.official_auth_cache,
+                    accepts_incoming_authorization,
                 )
-            })?;
-            headers.insert(AUTHORIZATION, value);
-            headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
-            if let Some(account_id) = official_auth.account_id.as_deref()
-                && let Ok(value) = HeaderValue::from_str(account_id)
-            {
-                headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                .await
+                .ok_or_else(|| {
+                    (
+                        401,
+                        "openai_auth_missing",
+                        "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+                    )
+                })?;
+                let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "openai_auth_invalid",
+                        "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
+                if let Some(account_id) = official_auth.account_id.as_deref()
+                    && let Ok(value) = HeaderValue::from_str(account_id)
+                {
+                    headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                }
             }
         }
         Ok(headers)
@@ -1710,7 +1692,30 @@ impl RouterServer {
                 );
             body_mutated = true;
         }
+        let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
+        // 原生 Responses 上游可能为模型保留 `collaboration` 命名空间并逐字校验 schema，
+        // 先改到空闲的普通命名空间，归一化和摘标记才不会再动到保留 schema；
+        // 回包由 COLLABORATION_ALIAS 还原。
+        let collaboration_alias = (bridge == ProtocolBridge::NativeResponses)
+            .then(|| alias_reserved_collaboration_namespace(&mut body))
+            .flatten();
+        if collaboration_alias.is_some() {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        // 没能改名的请求里 `collaboration` 仍是保留名，其内部 schema 必须逐字保留。
+        let collaboration_reserved = bridge == ProtocolBridge::NativeResponses
+            && body_has_reserved_collaboration_namespace(&body);
         if !resolved.route.official_account && normalize_responses_tool_parameter_roots(&mut body) {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        // 官方上游看到协作工具的加密标记就会把任务正文换成只有它能解开的令牌，
+        // 第三方子代理线路没有该密钥。摘掉标记让正文以明文返回，跨线路派发才能送达。
+        if strip_collaboration_message_encryption(
+            &mut body,
+            resolved.route.official_account || collaboration_reserved,
+        ) {
             body_mutated = true;
             encoded_body = None;
         }
@@ -1731,7 +1736,6 @@ impl RouterServer {
                 probe.mark_fallback(reason);
             }
         }
-        let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
         if let Some(probe) = downstream.request_log_probe() {
             probe.resolve_route(
                 &resolved.provider_id,
@@ -1749,28 +1753,16 @@ impl RouterServer {
                 subagent_request,
             );
         }
-        if compacting && !resolved.route.supports_remote_compaction {
-            return downstream
-                .write_error(
-                    400,
-                    "compaction_unsupported",
-                    "当前线路未启用原生远程压缩，请使用 Codex 本地摘要".into(),
-                    Some(&resolved.route),
-                )
-                .await;
-        }
-        if bridge != ProtocolBridge::NativeResponses {
-            if compacting {
-                return downstream
-                    .write_error(
-                        400,
-                        "compaction_unsupported",
-                        "当前线路不支持原生远程压缩，请使用 Codex 本地摘要".into(),
-                        Some(&resolved.route),
-                    )
-                    .await;
+        let native_compaction = compacting
+            && resolved.route.supports_remote_compaction
+            && bridge == ProtocolBridge::NativeResponses;
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
             }
-            if let Err(error) = validate_portable_context(&body) {
+            Ok(false) => {}
+            Err(error) => {
                 return downstream
                     .write_error(
                         400,
@@ -1780,6 +1772,32 @@ impl RouterServer {
                     )
                     .await;
             }
+        }
+        if compacting && !native_compaction {
+            if let Err(error) = prepare_gateway_compaction(&mut body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_responses_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+        }
+        if bridge != ProtocolBridge::NativeResponses
+            && let Err(error) = validate_portable_context(&body)
+        {
+            return downstream
+                .write_error(
+                    400,
+                    "context_not_portable",
+                    error.to_string(),
+                    Some(&resolved.route),
+                )
+                .await;
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
@@ -1815,6 +1833,31 @@ impl RouterServer {
             // Expansion changed the input too; do not reuse its original raw
             // JSON slice, which would contain only the latest delta.
             encoded_body = None;
+            // 展开恢复的历史里仍带着 Codex 侧的 `collaboration` 调用与工具声明，
+            // 与请求初次改名后的命名空间保持一致。
+            if collaboration_alias
+                .as_ref()
+                .is_some_and(|alias| alias.alias_history(&mut body))
+            {
+                encoded_body = None;
+            }
+        }
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
         }
         if bridge == ProtocolBridge::NativeResponses
             && route_changed
@@ -1870,13 +1913,16 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let compact_endpoint_compat = compacting
+        let compact_endpoint_compat = native_compaction
             && request_kind == ResponsesRequestKind::Create
             && !resolved.route.official_account
             && resolved.route.remote_compaction_protocol
                 == crate::config::RemoteCompactionProtocol::CompactEndpoint;
         let upstream_url = match (request_kind, compact_endpoint_compat) {
-            (ResponsesRequestKind::Compact, _) | (_, true) => &resolved.route.upstream_compact_url,
+            (ResponsesRequestKind::Compact, _) if native_compaction => {
+                &resolved.route.upstream_compact_url
+            }
+            (_, true) => &resolved.route.upstream_compact_url,
             _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
@@ -2085,7 +2131,7 @@ impl RouterServer {
             && !resolved.route.official_account
             && chat_reasoning_summaries.iter().any(Option::is_some))
         .then_some(chat_reasoning_summaries);
-        let (result, stream_failure) = CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
+        let (result, stream_failure) = COLLABORATION_ALIAS.scope(collaboration_alias.clone(), CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -2114,9 +2160,10 @@ impl RouterServer {
                         discard_opaque_reasoning,
                     )
                     .await?;
-                if websocket_attempt == UpstreamWebSocketAttempt::Completed {
-                    return Ok(());
-                }
+                let fallback_reason = match websocket_attempt {
+                    UpstreamWebSocketAttempt::Completed => return Ok(()),
+                    UpstreamWebSocketAttempt::UseHttp(reason) => reason,
+                };
                 if had_previous_response && responses_previous_response_id(&upstream_body).is_none()
                 {
                     // Reconnection may have expanded history before its handshake failed.
@@ -2126,7 +2173,7 @@ impl RouterServer {
                 if resolved.route.supports_websockets
                     && let Some(probe) = downstream.request_log_probe()
                 {
-                    probe.mark_fallback("websocket_to_http_sse");
+                    probe.mark_fallback(fallback_reason);
                 }
             }
             match downstream.prepare_native_http_fallback(
@@ -2159,6 +2206,11 @@ impl RouterServer {
             // A failed/reconnected WebSocket can restore full history after the
             // first normalization pass. Validate and normalize the exact body
             // that will be sent through the HTTP fallback as well.
+            match restore_codey_compaction_summaries(&mut upstream_body) {
+                Ok(true) => { body_mutated = true; encoded_body = None; }
+                Ok(false) => {}
+                Err(error) => return downstream.write_error(400, "context_not_portable", error.to_string(), Some(&resolved.route)).await,
+            }
             if route_changed && let Err(error) = validate_cross_route_context(&upstream_body) {
                 return downstream
                     .write_error(
@@ -2174,6 +2226,14 @@ impl RouterServer {
                 encoded_body = None;
             }
             if resolved.route.official_account && sanitize_official_upstream_history(&mut upstream_body) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            // 恢复的历史沿用 Codex 侧的 `collaboration` 调用，与改名后的工具保持一致。
+            if collaboration_alias
+                .as_ref()
+                .is_some_and(|alias| alias.alias_history(&mut upstream_body))
+            {
                 body_mutated = true;
                 encoded_body = None;
             }
@@ -2238,6 +2298,15 @@ impl RouterServer {
         } else {
             None
         };
+        // SIWC 直连只接受公开 Responses 字段：续接状态、采样参数和托管工具
+        // 在这里剥掉。净化改写正文就必须整段重编码，透传字节里残留的字段
+        // 不能再发出去。
+        if resolved.route.uses_siwc()
+            && sanitize_siwc_responses_request(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -2484,6 +2553,14 @@ impl RouterServer {
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {
+            if compacting && !native_compaction {
+                return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
+            }
+            observe_siwc_upstream_rejection(
+                &resolved.route,
+                upstream_status,
+                preloaded_error_body.as_deref().unwrap_or_default(),
+            );
             return write_upstream_http_error(
                 downstream,
                 UpstreamHttpErrorResponse {
@@ -2511,6 +2588,10 @@ impl RouterServer {
                 .await
                 {
                     Ok(Ok(body)) => {
+                        if compacting && !native_compaction {
+                            return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
+                        }
+                        observe_siwc_upstream_rejection(&resolved.route, upstream_status, &body);
                         write_upstream_http_error(
                             downstream,
                             UpstreamHttpErrorResponse {
@@ -2533,6 +2614,10 @@ impl RouterServer {
                 }
             }
             _ if compacting => {
+                if !native_compaction {
+                    write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
+                        stream_requested, &resolved.route, &tool_bridge).await
+                } else {
                 write_validated_compaction(
                     downstream,
                     response,
@@ -2547,6 +2632,7 @@ impl RouterServer {
                     &resolved.route,
                 )
                 .await
+                }
             }
             ProtocolBridge::ResponsesToAnthropicMessages
             | ProtocolBridge::ResponsesToChatCompletions => {
@@ -2601,7 +2687,7 @@ impl RouterServer {
         result
         }.await;
         (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
-        }).await;
+        })).await;
         if let Some((status, code)) = stream_failure {
             observed.status = Some(status);
             observed.error = Some(code);

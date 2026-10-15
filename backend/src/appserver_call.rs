@@ -125,6 +125,7 @@ impl SharedClient {
             .env("CODEX_HOME", crate::codex_config::codex_home())
             .env_remove("CODEX_CLI_PATH")
             .env_remove("CODEX_APP_SERVER_FORCE_CLI")
+            .envs(crate::launch_proxy::shared_app_server_environment())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -251,16 +252,8 @@ fn route_key(route: &Route) -> String {
 }
 
 fn router_overrides(route: &Route) -> Vec<String> {
-    let provider = if route.supports_remote_compaction {
-        crate::local_router::REMOTE_COMPACTION_PROVIDER_ID
-    } else {
-        crate::local_router::ROUTER_PROVIDER_ID
-    };
-    let name = if route.supports_remote_compaction {
-        "OpenAI"
-    } else {
-        "Codey Local Router"
-    };
+    let provider = crate::local_router::ROUTER_PROVIDER_ID;
+    let name = "Codey Local Router";
     let mut headers = InlineTable::new();
     headers.insert(
         crate::local_router::ROUTER_AUTH_HEADER,
@@ -268,6 +261,10 @@ fn router_overrides(route: &Route) -> Vec<String> {
     );
     let mut overrides = vec![
         override_value("model_provider", TomlValue::from(provider)),
+        override_value(
+            &format!("model_providers.{provider}.capabilities.remote_compaction"),
+            TomlValue::from("v2"),
+        ),
         override_value(
             &format!("model_providers.{provider}.name"),
             TomlValue::from(name),
@@ -391,8 +388,15 @@ mod tests {
         let mut remote = route();
         remote.supports_remote_compaction = true;
         let remote_overrides = router_overrides(&remote).join("\n");
-        assert!(remote_overrides.contains("model_provider=\"codey_router_remote\""));
-        assert!(remote_overrides.contains("model_providers.codey_router_remote.name=\"OpenAI\""));
+        // 压缩能力与鉴权分离：同一 Provider 声明 V2 能力，由网关按目标线路分流。
+        assert!(remote_overrides.contains("model_provider=\"codey_router\""));
+        assert!(
+            remote_overrides.contains("model_providers.codey_router.name=\"Codey Local Router\"")
+        );
+        assert!(
+            remote_overrides
+                .contains("model_providers.codey_router.capabilities.remote_compaction=\"v2\"")
+        );
         let response = redact(
             json!({"result":{"note":"router-secret","nested":["router-secret"]}}),
             "router-secret",

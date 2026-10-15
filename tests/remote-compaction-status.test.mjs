@@ -7,17 +7,19 @@ const source = await readFile(new URL("../src/remoteCompactionStatus.ts", import
 const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
 const { remoteCompactionStatusText, getRouteCompactionStatus } = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
 
-test("saving remote compaction does not claim it is already active", () => {
+test("saving remote compaction reports gateway handling without claiming activation", () => {
   const local = remoteCompactionStatusText({ running: true, remoteCompaction: {
     configured: true, active: false, restartRequired: true, blockingRoutes: [],
   } });
-  assert.equal(local.title, "当前使用本地压缩");
-  assert.match(local.detail, /已保存配置支持远程压缩.*需重启 Codex/);
+  assert.equal(local.title, "当前由 Codey 网关生成压缩摘要");
+  assert.match(local.detail, /已保存配置声明了原生远程压缩.*压缩方式随所选线路自动生效/);
+  assert.doesNotMatch(local.detail, /重启|新建任务/);
   const remote = remoteCompactionStatusText({ running: true, remoteCompaction: {
     configured: false, active: true, restartRequired: true, blockingRoutes: [],
   } });
   assert.equal(remote.title, "当前已启用远程压缩");
-  assert.match(remote.detail, /未启用远程压缩.*需重启 Codex/);
+  assert.match(remote.detail, /已保存配置未声明原生远程压缩，由网关生成摘要.*压缩方式随所选线路自动生效/);
+  assert.doesNotMatch(remote.detail, /重启|新建任务/);
 });
 
 test("missing status, stopped Codex and unmanaged compression remain distinct", () => {
@@ -28,15 +30,16 @@ test("missing status, stopped Codex and unmanaged compression remain distinct", 
   assert.equal(remoteCompactionStatusText(undefined).title, "压缩方式待确认");
 });
 
-test("mixed routes advertise independent compaction and capability changes require restart", () => {
+test("mixed routes advertise compaction that follows the selected route automatically", () => {
   const status = { running: true, remoteCompaction: {
     configured: true, active: true, configuredMode: "mixed", activeMode: "mixed",
     restartRequired: true, blockingRoutes: [{ routeName: "Chat", reason: "上游协议不支持原生压缩" }],
   } };
   const text = remoteCompactionStatusText(status);
   assert.equal(text.title, "当前按线路选择压缩方式");
-  assert.match(text.detail, /支持的线路独立使用远程压缩/);
-  assert.match(text.detail, /需重启 Codex/);
+  assert.match(text.detail, /原生支持的线路透传上游压缩.*其余线路由网关生成摘要/);
+  assert.match(text.detail, /压缩方式随所选线路自动生效/);
+  assert.doesNotMatch(text.detail, /重启|新建任务/);
 });
 
 test("getRouteCompactionStatus correctly identifies official, remote, and local routes", () => {
@@ -80,9 +83,10 @@ test("getRouteCompactionStatus correctly identifies official, remote, and local 
     supportsRemoteCompaction: false,
   };
   const customDisabledStatus = getRouteCompactionStatus(customDisabledRoute, { running: true });
-  assert.equal(customDisabledStatus.mode, "local");
-  assert.equal(customDisabledStatus.badgeText, "本地压缩");
-  assert.equal(customDisabledStatus.badgeVariant, "secondary");
+  assert.equal(customDisabledStatus.mode, "remote");
+  assert.equal(customDisabledStatus.badgeText, "网关压缩");
+  assert.equal(customDisabledStatus.badgeVariant, "success");
+  assert.match(customDisabledStatus.tooltip, /网关生成等价摘要/);
   assert.equal(customDisabledStatus.reason, "未开启远程压缩");
 
   const chatRoute = {
@@ -93,9 +97,10 @@ test("getRouteCompactionStatus correctly identifies official, remote, and local 
     supportsRemoteCompaction: true,
   };
   const chatStatus = getRouteCompactionStatus(chatRoute, { running: true });
-  assert.equal(chatStatus.mode, "local");
-  assert.equal(chatStatus.badgeText, "本地压缩");
-  assert.equal(chatStatus.badgeVariant, "secondary");
+  assert.equal(chatStatus.mode, "remote");
+  assert.equal(chatStatus.badgeText, "网关压缩");
+  assert.equal(chatStatus.badgeVariant, "success");
+  assert.match(chatStatus.tooltip, /网关生成等价摘要/);
   assert.equal(chatStatus.reason, "上游协议不支持原生压缩");
 
   const runtimeBlockedRoute = {
@@ -115,11 +120,16 @@ test("getRouteCompactionStatus correctly identifies official, remote, and local 
     },
   };
   const waStatus = getRouteCompactionStatus(runtimeBlockedRoute, runtimeStatus);
-  assert.equal(waStatus.mode, "local");
-  assert.equal(waStatus.badgeText, "本地压缩");
+  assert.equal(waStatus.mode, "remote");
+  assert.equal(waStatus.badgeText, "网关压缩");
+  assert.match(waStatus.tooltip, /网关生成等价摘要/);
   assert.equal(waStatus.reason, "未开启远程压缩");
 
   const restartRouteStatus = getRouteCompactionStatus(customRemoteRoute, runtimeStatus);
   assert.equal(restartRouteStatus.mode, "remote");
-  assert.match(restartRouteStatus.tooltip, /需重启 Codex 生效/);
+  assert.match(restartRouteStatus.tooltip, /压缩方式随所选线路自动生效/);
+  assert.doesNotMatch(restartRouteStatus.tooltip, /重启|新建任务/);
+  const officialChangedStatus = getRouteCompactionStatus(officialRoute, runtimeStatus);
+  assert.match(officialChangedStatus.tooltip, /压缩方式随所选线路自动生效/);
+  assert.doesNotMatch(officialChangedStatus.tooltip, /重启|新建任务/);
 });
