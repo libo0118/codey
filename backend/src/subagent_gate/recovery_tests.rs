@@ -65,7 +65,11 @@ fn completed_opaque_child_cannot_reappear_as_pending_after_late_start() {
     handle_hook_for_runtime_at(&spawn, &root, runtime, 21).unwrap();
 
     let agent = "opaque-reader-thread";
-    let transcript = temp.path().join("child.jsonl");
+    let transcript = temp
+        .path()
+        .join("sessions")
+        .join(format!("rollout-probe-{agent}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
     fs::write(
         &transcript,
         format!(
@@ -115,12 +119,12 @@ fn completed_opaque_child_cannot_reappear_as_pending_after_late_start() {
     handle_hook_for_runtime_at(&interrupt, &root, runtime, 33).unwrap();
     status.tool_response = Some(json!({"agents": [
         {"agent_name": "/root/reader", "agent_status": "pending_init"},
-        {"agent_name": "/root/sibling", "agent_status": "completed"}
+        {"agent_name": "/root/sibling", "agent_status": "running"}
     ]}));
     handle_hook_for_runtime_at(&status, &root, runtime, 34).unwrap();
     assert_eq!(
         active_agent_count_for_runtime(&root, runtime, session).unwrap(),
-        0
+        1
     );
     let ledger: Value = serde_json::from_slice(
         &fs::read(session_state_dir(&root, session).join("orchestrator-ledger-v1.json")).unwrap(),
@@ -128,8 +132,17 @@ fn completed_opaque_child_cannot_reappear_as_pending_after_late_start() {
     .unwrap();
     assert_eq!(ledger["reservations"]["reader"]["outcome"], "succeeded");
     assert!(ledger["reservations"]["reader"]["fenced_at_ms"].is_number());
+    status.tool_response = Some(json!({"agents": [
+        {"agent_name": "/root/reader", "agent_status": "pending_init"},
+        {"agent_name": "/root/sibling", "agent_status": "completed"}
+    ]}));
+    handle_hook_for_runtime_at(&status, &root, runtime, 35).unwrap();
     assert_eq!(
-        handle_hook_for_runtime_at(&input("Stop", session), &root, runtime, 35).unwrap(),
+        active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+        0
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&input("Stop", session), &root, runtime, 36).unwrap(),
         json!({})
     );
 
