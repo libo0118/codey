@@ -1458,7 +1458,8 @@ pub(crate) fn observe_status_response(
         let refines_lifecycle_stop = reservation.state == ReservationState::Terminal
             && reservation.outcome == ExecutionOutcome::Unknown;
         if transitions_to_terminal || refines_lifecycle_stop {
-            if let Some(agent_id_hash) = reservation.agent_id_hash.take() {
+            // Keep the terminal identity so delayed lifecycle events cannot recreate an orphan marker.
+            if let Some(agent_id_hash) = reservation.agent_id_hash.clone() {
                 agent_id_hashes.push(agent_id_hash);
             }
             reservation.state = ReservationState::Terminal;

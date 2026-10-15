@@ -42,6 +42,119 @@ fn unavailable_wait(session: &str) -> HookInput {
 }
 
 #[test]
+fn completed_opaque_child_cannot_reappear_as_pending_after_late_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("codey-subagent-gate-v3");
+    let session = "late-completed-child";
+    let runtime = "runtime-a";
+    start_recovery_child_named(&root, session, "sibling");
+
+    let mut spawn = input("PreToolUse", session);
+    spawn.cwd = Some("/repo-reader".into());
+    spawn.turn_id = Some("root-turn-a".into());
+    spawn.tool_name = Some("agents.spawn_agent".into());
+    spawn.tool_input = Some(json!({
+        "task_name": "reader", "agent_type": "codey_quick_scan", "message": "Read the source"
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&spawn, &root, runtime, 20).unwrap(),
+        json!({})
+    );
+    spawn.hook_event_name = "PostToolUse".into();
+    spawn.tool_response = Some(json!(json!({"task_name": "/root/reader"}).to_string()));
+    handle_hook_for_runtime_at(&spawn, &root, runtime, 21).unwrap();
+
+    let agent = "opaque-reader-thread";
+    let transcript = temp
+        .path()
+        .join("sessions")
+        .join(format!("rollout-probe-{agent}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"type": "session_meta", "payload": {
+                "id": agent, "parent_thread_id": session,
+                "agent_path": "/root/reader", "agent_role": "codey_quick_scan"
+            }})
+        ),
+    )
+    .unwrap();
+    let mut start = input("SubagentStart", session);
+    start.agent_id = Some(agent.into());
+    start.agent_type = Some("codey_quick_scan".into());
+    start.transcript_path = Some(transcript.to_string_lossy().into_owned());
+    handle_hook_for_runtime_at(&start, &root, runtime, 22).unwrap();
+
+    let mut status = input("PostToolUse", session);
+    status.tool_name = Some("agents.list_agents".into());
+    status.tool_response = Some(json!({"agents": [
+        {"agent_name": "/root/reader", "agent_status": {"completed": "done"}},
+        {"agent_name": "/root/sibling", "agent_status": "running"}
+    ]}));
+    handle_hook_for_runtime_at(&status, &root, runtime, 30).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+        1
+    );
+
+    // A delayed Start must still resolve to the completed attempt's identity.
+    handle_hook_for_runtime_at(&start, &root, runtime, 31).unwrap();
+    assert!(!agent_marker_path(&session_state_dir(&root, session), runtime, agent).exists());
+    assert_eq!(
+        active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+        1
+    );
+
+    let mut interrupt = input("PreToolUse", session);
+    interrupt.turn_id = Some("root-turn-a".into());
+    interrupt.tool_name = Some("agents.interrupt_agent".into());
+    interrupt.tool_input = Some(json!({"target": "reader"}));
+    handle_hook_for_runtime_at(&interrupt, &root, runtime, 32).unwrap();
+    interrupt.hook_event_name = "PostToolUse".into();
+    interrupt.tool_response = Some(json!(
+        json!({"previous_status": "pending_init"}).to_string()
+    ));
+    handle_hook_for_runtime_at(&interrupt, &root, runtime, 33).unwrap();
+    status.tool_response = Some(json!({"agents": [
+        {"agent_name": "/root/reader", "agent_status": "pending_init"},
+        {"agent_name": "/root/sibling", "agent_status": "running"}
+    ]}));
+    handle_hook_for_runtime_at(&status, &root, runtime, 34).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+        1
+    );
+    let ledger: Value = serde_json::from_slice(
+        &fs::read(session_state_dir(&root, session).join("orchestrator-ledger-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["reservations"]["reader"]["outcome"], "succeeded");
+    assert!(ledger["reservations"]["reader"]["fenced_at_ms"].is_number());
+    status.tool_response = Some(json!({"agents": [
+        {"agent_name": "/root/reader", "agent_status": "pending_init"},
+        {"agent_name": "/root/sibling", "agent_status": "completed"}
+    ]}));
+    handle_hook_for_runtime_at(&status, &root, runtime, 35).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(&root, runtime, session).unwrap(),
+        0
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&input("Stop", session), &root, runtime, 36).unwrap(),
+        json!({})
+    );
+
+    spawn.hook_event_name = "PreToolUse".into();
+    spawn.turn_id = Some("root-turn-b".into());
+    assert_eq!(
+        handle_hook_for_runtime_at(&spawn, &root, runtime, 40).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
 fn root_entry_points_recover_after_status_tool_failure_without_stop() {
     for event in ["PreToolUse", "UserPromptSubmit", "PostToolUse"] {
         let temp = tempfile::tempdir().unwrap();

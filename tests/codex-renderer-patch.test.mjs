@@ -708,9 +708,14 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchedSharedChunk,
       /__codeyAppServerRequestClients/,
     );
+    // The current native model/speed controls live in app-primary.
+    const primaryChunkResponse = await installedHandler({
+      url: "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+    });
+    assert.match(await primaryChunkResponse.text(), /__codeyAppServerRequestClients/);
     // Assets outside the patch set must pass through untouched.
     const unrelatedChunkResponse = await installedHandler({
-      url: "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+      url: "app://-/webview/assets/unrelated-chunk-6f60e9ac4103.js",
     });
     assert.equal(await unrelatedChunkResponse.text(), appServerRequestSource);
 

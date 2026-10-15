@@ -684,6 +684,90 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
       assert.equal(modernPicker.triggerConfig(workMode, true, "fast").modelPickerTriggerConfig, undefined);
     }
 
+    // 26.1007 moved the composer to app-primary and replaced the boolean
+    // entitlement with serviceTierAccess. Keep the model/tier intersection.
+    const accessControlsSource = [
+      "function settings(auth,model,tier){",
+      "const u=auth,h={models:[model]},o={model:model.model,isLoading:auth.modelLoading===true},conversation=null,pending=auth.requirementsPending===true;",
+      "let b=BYe(u)?.authMethod??null;",
+      "let{serviceTierAccess:D}=KVi(auth),A,k,M,O,j;",
+      "let t=fVi(h?.models,o.model);",
+      "A=RZe(t,tier,D),k=A==null?null:sve(t,A);",
+      "O=o.isLoading||auth.isLoading===true||conversation==null&&pending,j=async()=>{};",
+      "M=Rwe(t).filter(e=>vne(e.value,D));",
+      "let I={availableOptions:M,isLoading:O,selectedServiceTier:k,serviceTierForRequest:A};",
+      "return{hasManagedNewThreadSettings:false,serviceTierAccess:D,serviceTierSettings:I}}",
+      "function composer(auth,model,tier,{draft:fe=false,hidden:he=false,daybreak:Ge=false}={}){",
+      "let{serviceTierSettings:rt}=settings(auth,model,tier);",
+      "let{serviceTierAccess:ot}=KVi(auth);",
+      "let St=model,Kt=rt.selectedServiceTier,Jt=rt.availableOptions.find(e=>e.value===Kt),",
+      "Zt=Jt?.iconKind??null,Qt=!Ge&&!he&&Zt!=null&&Ht(St,Kt),",
+      "$t=!he&&!fe&&ot!=null&&rt.availableOptions.length>1;",
+      "return{modelPickerTriggerConfig:{selectedServiceTierIconKind:Qt?Zt:null},show:$t,settings:rt}}",
+      "function speedCommands(auth,model,tier){const marker=`composer.speedSlashCommand.disableDescription`;let{serviceTierSettings:s}=settings(auth,model,tier);",
+      "let{serviceTierAccess:o}=KVi(auth);",
+      "return s.availableOptions.map(e=>({enabled:vne(e.value,o)&&!s.isLoading,option:e}))}",
+      "function speedSettings(auth,model,tier){let{serviceTierAccess:n}=KVi(auth),{serviceTierSettings:r}=settings(auth,model,tier);",
+      "if(n==null||r.availableOptions.length<=1)return null;return r}",
+      "function setTier(auth,model,tier,nextTier){let{serviceTierAccess:d}=settings(auth,model,tier);",
+      "if(!vne(nextTier,d))return false;return nextTier}",
+      "function BYe(auth){return auth}",
+      "function KVi(auth){return{serviceTierAccess:auth.access??null,isLoading:auth.isLoading===true}}",
+      "function fVi(models,model){return models.find(e=>e.model===model)}",
+      "function vne(tier,access){return tier==null||access?.[tier===`priority`?`fast`:`ultrafast`]===true}",
+      "function RZe(model,tier,access){return vne(tier,access)?tier:null}",
+      "function sve(model,tier){return model?.serviceTiers?.find(e=>e.id===tier)?.id??null}",
+      "function Rwe(model){return[{value:null,iconKind:null},...(model?.serviceTiers??[]).map(e=>",
+      "({value:e.id,iconKind:e.id===`priority`?`fast`:`ultrafast`}))]}",
+      "function Ht(model,tier){return sve(model,tier)!=null}",
+    ].join("");
+    const patchedAccessControls = await patchAsset(
+      accessControlsSource,
+      "app://-/assets/app-primary-19fe57fd8c00.js",
+    );
+    const accessControls = Function(
+      `${patchedAccessControls};return {composer,speedCommands,speedSettings,setTier};`,
+    )();
+    const apiAuth = { authMethod: "apikey" };
+    const fastModel = { model: "supported", serviceTiers: [fastServiceTier] };
+    const plainModel = { model: "plain", serviceTiers: [] };
+    assert.equal(accessControls.composer(apiAuth, fastModel, null).show, true);
+    assert.equal(accessControls.composer(apiAuth, fastModel, null).modelPickerTriggerConfig.selectedServiceTierIconKind, null);
+    const fastControls = accessControls.composer(apiAuth, fastModel, "priority");
+    assert.equal(fastControls.modelPickerTriggerConfig.selectedServiceTierIconKind, "fast");
+    assert.equal(fastControls.settings.serviceTierForRequest, "priority");
+    assert.equal(fastControls.settings.serviceTierAccess.ultrafast, undefined);
+    assert.equal(accessControls.speedCommands(apiAuth, fastModel, null)[1].enabled, true);
+    assert.ok(accessControls.speedSettings(apiAuth, fastModel, null));
+    assert.equal(accessControls.setTier(apiAuth, fastModel, null, "priority"), "priority");
+    assert.equal(accessControls.speedCommands({ ...apiAuth, isLoading: true }, fastModel, null)[1].enabled, false);
+    assert.equal(accessControls.speedCommands({ ...apiAuth, requirementsPending: true }, fastModel, null)[1].enabled, true);
+    assert.equal(accessControls.speedCommands({ ...apiAuth, modelLoading: true }, fastModel, null)[1].enabled, false);
+    for (const flags of [{ draft: true }, { hidden: true }]) {
+      assert.equal(accessControls.composer(apiAuth, fastModel, "priority", flags).show, false);
+    }
+    assert.equal(accessControls.composer(apiAuth, fastModel, "priority", { daybreak: true }).modelPickerTriggerConfig.selectedServiceTierIconKind, null);
+    const staleControls = accessControls.composer(apiAuth, plainModel, "priority");
+    assert.equal(staleControls.show, false);
+    assert.equal(staleControls.settings.serviceTierForRequest, null);
+    assert.equal(staleControls.modelPickerTriggerConfig.selectedServiceTierIconKind, null);
+    assert.equal(accessControls.speedSettings(apiAuth, plainModel, null), null);
+    assert.equal(accessControls.setTier(apiAuth, plainModel, null, "priority"), false);
+    for (const authMethod of ["chatgpt", "personalAccessToken", "amazonBedrock", "unknown", "APIKey", "apiKey"]) {
+      const auth = { authMethod, access: null };
+      assert.equal(accessControls.composer(auth, fastModel, "priority").show, false, authMethod);
+      assert.equal(accessControls.composer(auth, fastModel, "priority").settings.serviceTierForRequest, null, authMethod);
+      assert.equal(accessControls.speedSettings(auth, fastModel, null), null, authMethod);
+      assert.equal(accessControls.setTier(auth, fastModel, null, "priority"), false, authMethod);
+    }
+    const nativeAuth = { authMethod: "chatgpt", access: { fast: true } };
+    assert.equal(accessControls.composer(nativeAuth, fastModel, "priority").show, true);
+    assert.equal(accessControls.composer(nativeAuth, fastModel, "priority").modelPickerTriggerConfig.selectedServiceTierIconKind, "fast");
+    assert.equal(accessControls.speedCommands({ ...nativeAuth, requirementsPending: true }, fastModel, null)[1].enabled, false);
+    const ultraModel = { model: "ultra", serviceTiers: [{ id: "rapid", name: "Ultrafast" }] };
+    assert.deepEqual(accessControls.composer(apiAuth, ultraModel, "rapid").settings.serviceTierAccess, { ultrafast: true });
+    assert.equal(accessControls.composer(apiAuth, ultraModel, "priority").settings.serviceTierForRequest, null);
+
     for (const url of [
       "app://-/assets/app-initial.js",
       "app://-/assets/app-initial-windows.js",
