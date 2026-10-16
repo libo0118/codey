@@ -227,6 +227,9 @@ pub(super) fn identity_task_candidates(
     identifier: &str,
 ) -> BTreeSet<String> {
     let identifier_hash = hash_component(identifier);
+    if ledger.settled_agent_id_hashes.contains(&identifier_hash) {
+        return BTreeSet::new();
+    }
     ledger
         .reservations
         .iter()
@@ -256,6 +259,12 @@ pub(super) fn task_id_from_subagent_transcript(
     transcript_path: Option<&str>,
     ledger: &SessionLedger,
 ) -> Option<String> {
+    if ledger
+        .settled_agent_id_hashes
+        .contains(&hash_component(agent_id))
+    {
+        return None;
+    }
     let transcript_path = Path::new(transcript_path?);
     if !transcript_path.is_absolute()
         || transcript_path.extension().and_then(|value| value.to_str()) != Some("jsonl")

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+#[path = "failed_spawn_recovery_tests.rs"]
+mod failed_spawn_recovery_tests;
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
 
@@ -14,6 +16,7 @@ fn input(event: &str, session: &str) -> HookInput {
         tool_name: None,
         tool_input: None,
         tool_response: None,
+        tool_use_id: None,
         turn_id: None,
         transcript_path: None,
         agent_transcript_path: None,

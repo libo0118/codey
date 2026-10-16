@@ -1,5 +1,78 @@
 use super::*;
 
+fn settle_opaque_child_round(root: &Path, session: &str) {
+    write_test_runtime_policy(root);
+    let mut spawn = input("PreToolUse", session);
+    spawn.turn_id = Some("root-turn-a".into());
+    spawn.tool_name = Some("agents.spawn_agent".into());
+    spawn.tool_input = Some(json!({
+        "task_name": "reader", "agent_type": "codey_quick_scan", "message": "Read the source"
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&spawn, root, "runtime-a", 10).unwrap(),
+        json!({})
+    );
+    spawn.hook_event_name = "PostToolUse".into();
+    spawn.tool_response = Some(json!({"agent_id": "old-opaque"}));
+    handle_hook_for_runtime_at(&spawn, root, "runtime-a", 11).unwrap();
+    let mut stopped = input("SubagentStop", session);
+    stopped.agent_id = Some("old-opaque".into());
+    handle_hook_for_runtime_at(&stopped, root, "runtime-a", 12).unwrap();
+    assert_eq!(
+        handle_hook_for_runtime_at(&input("Stop", session), root, "runtime-a", 13).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn settled_only_ledger_does_not_count_a_terminal_marker_as_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "settled-history-marker";
+    settle_opaque_child_round(root, session);
+    create_active_marker(root, "runtime-a", session, "old-opaque").unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        0
+    );
+    let mut start = input("SubagentStart", session);
+    start.agent_id = Some("old-opaque".into());
+    handle_hook_for_runtime_at(&start, root, "runtime-a", 14).unwrap();
+    assert_eq!(
+        handle_hook_for_runtime_at(&input("Stop", session), root, "runtime-a", 15).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn settled_only_ledger_preserves_legacy_pending_init_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "settled-history-legacy";
+    settle_opaque_child_round(root, session);
+    create_active_marker(root, "runtime-a", session, "legacy-unknown").unwrap();
+    let mut status = input("PostToolUse", session);
+    status.tool_name = Some("agents.list_agents".into());
+    status.tool_response = Some(json!({"agents": [
+        {"agent_name": "/root/legacy-unknown", "agent_status": "pending_init"}
+    ]}));
+    handle_hook_for_runtime_at(&status, root, "runtime-a", 20).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        1
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &input("Stop", session),
+            root,
+            "runtime-a",
+            20 + PENDING_INIT_GRACE_MILLIS
+        )
+        .unwrap(),
+        json!({})
+    );
+}
+
 fn start_recovery_child(root: &Path, session: &str) {
     start_recovery_child_named(root, session, "reader");
 }

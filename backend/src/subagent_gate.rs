@@ -15,6 +15,7 @@ use crate::subagent::{
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
 };
 
+mod failed_spawn_recovery;
 mod runtime_policy;
 mod state;
 #[cfg(test)]
@@ -93,6 +94,8 @@ struct HookInput {
     tool_input: Option<Value>,
     #[serde(default, alias = "toolResponse")]
     tool_response: Option<Value>,
+    #[serde(default, alias = "toolUseId")]
+    tool_use_id: Option<String>,
     #[serde(default, alias = "turnId")]
     turn_id: Option<String>,
     #[serde(default, alias = "transcriptPath")]
@@ -1082,6 +1085,7 @@ fn pre_tool_use_output(
         )? {
             return Ok(pre_tool_reason_denial(&reason));
         }
+        failed_spawn_recovery::note_spawn_call(input, state_root, runtime_id, now_ms)?;
         if active == 0
             && let Some(turn_id) = nonempty(input.turn_id.as_deref())
         {
@@ -1494,6 +1498,11 @@ fn recover_root_active_state(
     else {
         return Ok(0);
     };
+    if active == 0 {
+        return Ok(0);
+    }
+    failed_spawn_recovery::recover(input, state_root, runtime_id, now_ms)?;
+    active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
         return Ok(0);
     }
