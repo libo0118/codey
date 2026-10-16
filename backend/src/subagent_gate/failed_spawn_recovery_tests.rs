@@ -101,6 +101,7 @@ fn failed_spawn_without_post_releases_on_next_root_hook() {
                 assert!(ledger["reservations"].as_object().unwrap().is_empty());
             } else {
                 assert_eq!(ledger["reservations"][TASK]["outcome"], "failed");
+                assert_eq!(ledger["updated_at_ms"], 200);
             }
         }
     }

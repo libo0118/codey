@@ -273,11 +273,11 @@ pub(super) fn recover(input: &HookInput, root: &Path, runtime: &str, now_ms: u64
         let Some(created) = pending.get(&call.task) else {
             continue;
         };
-        let Some(returned) = call.returned_at_ms.filter(|returned| {
-            *returned >= *created && *returned >= call.called_at_ms && *returned <= now_ms
-        }) else {
+        if !call.returned_at_ms.is_some_and(|returned| {
+            returned >= *created && returned >= call.called_at_ms && returned <= now_ms
+        }) {
             continue;
-        };
+        }
         let Some(response) = call.failure.as_ref() else {
             continue;
         };
@@ -301,7 +301,7 @@ pub(super) fn recover(input: &HookInput, root: &Path, runtime: &str, now_ms: u64
                 &input.session_id,
                 Some(&json!({"task_name": call.task})),
                 Some(response),
-                returned,
+                now_ms,
             )?;
         }
     }
