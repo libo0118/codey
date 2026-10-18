@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Tabs } from "@heroui/react";
 import {
   IconCheck,
@@ -21,6 +21,7 @@ import {
   Tooltip,
 } from "./components/ui";
 import { invoke } from "./api";
+import { errorText } from "./appUtils";
 import type { Config } from "./App.types";
 
 export type SystemSettingsDialogProps = {
@@ -55,33 +56,54 @@ function SystemSettingsDialogComponent({
   const [copied, setCopied] = useState(false);
   const [machineNo, setMachineNo] = useState<string | null>(null);
   const [machineNoLoading, setMachineNoLoading] = useState(true);
-  const [machineNoFailed, setMachineNoFailed] = useState(false);
+  const [machineNoError, setMachineNoError] = useState<string | null>(null);
   const [machineNoAttempt, setMachineNoAttempt] = useState(0);
   const [machineNoCopyState, setMachineNoCopyState] = useState<
     "idle" | "copied" | "error"
   >("idle");
+  const machineNoCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pathCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (machineNoCopyTimer.current !== null) clearTimeout(machineNoCopyTimer.current);
+    if (pathCopyTimer.current !== null) clearTimeout(pathCopyTimer.current);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setMachineNo(null);
     setMachineNoLoading(true);
-    setMachineNoFailed(false);
+    setMachineNoError(null);
     setMachineNoCopyState("idle");
+    const timer = setTimeout(() => {
+      cancelled = true;
+      setMachineNoError("读取超时，请检查网络连接后重试。");
+      setMachineNoLoading(false);
+    }, 20000);
+    const finish = () => {
+      if (cancelled) return false;
+      cancelled = true;
+      clearTimeout(timer);
+      setMachineNoLoading(false);
+      return true;
+    };
     void invoke<string | null>("get_device_machine_no")
       .then(
         (value) => {
-          if (!cancelled) setMachineNo(value);
+          if (finish()) setMachineNo(value);
         },
-        () => {
-          if (!cancelled) setMachineNoFailed(true);
+        (error: unknown) => {
+          if (!finish()) return;
+          const reason = error instanceof Error || typeof error === "string"
+            ? errorText(error).trim()
+            : "";
+          setMachineNoError(reason || "暂时无法读取设备号，请稍后重试。");
         },
-      )
-      .finally(() => {
-        if (!cancelled) setMachineNoLoading(false);
-      });
+      );
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [open, machineNoAttempt]);
 
@@ -93,7 +115,11 @@ function SystemSettingsDialogComponent({
     } catch {
       setMachineNoCopyState("error");
     }
-    setTimeout(() => setMachineNoCopyState("idle"), 2000);
+    if (machineNoCopyTimer.current !== null) clearTimeout(machineNoCopyTimer.current);
+    machineNoCopyTimer.current = setTimeout(() => {
+      machineNoCopyTimer.current = null;
+      setMachineNoCopyState("idle");
+    }, 2000);
   };
 
   const resolvedCodexPath = codexAppPath || "/Applications/ChatGPT.app";
@@ -105,7 +131,11 @@ function SystemSettingsDialogComponent({
     try {
       await navigator.clipboard.writeText(resolvedCodexPath);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      if (pathCopyTimer.current !== null) clearTimeout(pathCopyTimer.current);
+      pathCopyTimer.current = setTimeout(() => {
+        pathCopyTimer.current = null;
+        setCopied(false);
+      }, 2000);
     } catch {
       // 忽略写入剪贴板异常
     }
@@ -152,14 +182,20 @@ function SystemSettingsDialogComponent({
 
             <div className="flex items-center gap-3 border-b border-[var(--codey-border-subtle)] py-2.5">
               <span className="shrink-0 text-xs font-medium text-[var(--codey-muted)]">当前设备号</span>
-              <code
-                className="min-w-0 flex-1 break-all select-all text-xs text-[var(--codey-text)]"
-                title={machineNo || undefined}
-                aria-live="polite"
-              >
-                {machineNoLoading ? "读取中…" : machineNoFailed ? "读取失败" : machineNo || "尚未登记"}
-              </code>
-              {machineNoFailed ? (
+              <div className="min-w-0 flex-1" aria-live="polite">
+                <code
+                  className="break-all select-all text-xs text-[var(--codey-text)]"
+                  title={machineNo || undefined}
+                >
+                  {machineNoLoading ? "读取中…" : machineNoError ? "读取失败" : machineNo || "尚未登记"}
+                </code>
+                {machineNoError && (
+                  <p className="mt-1 break-words text-xs leading-relaxed text-danger">
+                    {machineNoError}
+                  </p>
+                )}
+              </div>
+              {machineNoError ? (
                 <Button
                   variant="ghost"
                   size="sm"

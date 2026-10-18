@@ -197,13 +197,14 @@ enum DialogResult {
     Secondary,
 }
 
-// 原生消息框没有滚动区，更新说明完整拼入正文，仅去掉分类标题的强调标记便于阅读。
+// 原生消息框没有滚动区，更新说明完整拼入正文，去掉标题标记便于阅读。
 fn format_update_notes(notes: &str) -> String {
     let lines: Vec<&str> = notes
         .trim()
         .lines()
         .map(|line| {
             let line = line.trim();
+            let line = plain_atx_heading(line).unwrap_or(line);
             line.strip_prefix("**")
                 .and_then(|title| title.strip_suffix("**"))
                 .filter(|title| matches!(*title, "新增功能" | "体验优化" | "问题修复"))
@@ -214,6 +215,24 @@ fn format_update_notes(notes: &str) -> String {
         String::new()
     } else {
         format!("\n\n更新说明：\n{}", lines.join("\n"))
+    }
+}
+
+fn plain_atx_heading(line: &str) -> Option<&str> {
+    let level = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &line[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let title = rest.trim_matches([' ', '\t']);
+    let without_closing_hashes = title.trim_end_matches('#');
+    if without_closing_hashes.is_empty() || without_closing_hashes.ends_with([' ', '\t']) {
+        Some(without_closing_hashes.trim_end_matches([' ', '\t']))
+    } else {
+        Some(title)
     }
 }
 
@@ -264,6 +283,36 @@ mod update_note_tests {
             assert!(rendered.contains(expected));
         }
         assert!(format_update_notes("**保留其他文字**").contains("**保留其他文字**"));
+    }
+
+    #[test]
+    fn atx_headings_preserve_the_full_title_and_following_content() {
+        for level in 1..=6 {
+            for separator in [" ", "\t"] {
+                let marker = "#".repeat(level);
+                let rendered = format_update_notes(&format!(
+                    "{marker}{separator}完整标题 C# 和 #标签 ##\t\r\n- 第一项\r\n\r\n第二段"
+                ));
+                assert_eq!(
+                    rendered,
+                    "\n\n更新说明：\n完整标题 C# 和 #标签\n- 第一项\n\n第二段"
+                );
+            }
+        }
+        assert_eq!(
+            format_update_notes("## **新增功能**\n### 普通标题\n######\n## ###"),
+            "\n\n更新说明：\n新增功能\n普通标题\n\n"
+        );
+    }
+
+    #[test]
+    fn non_heading_hashes_and_attached_closing_hashes_are_preserved() {
+        let notes =
+            "#tag\n##没有分隔空白\n####### 超过六级\n正文 # 井号\n## 标题###\n## C#\n## 标题 #标签";
+        assert_eq!(
+            format_update_notes(notes),
+            "\n\n更新说明：\n#tag\n##没有分隔空白\n####### 超过六级\n正文 # 井号\n标题###\nC#\n标题 #标签"
+        );
     }
 
     #[test]

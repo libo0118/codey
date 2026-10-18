@@ -1,25 +1,18 @@
 use super::*;
 
 impl RouterServer {
-    pub(crate) async fn handle_connection(
-        &self,
-        mut stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
+    pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         // 协议探测和读取请求头共用这一次超时。慢客户端不能先占满探测窗口，
         // 再单独占满读头窗口。
         let header_started = Instant::now();
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
-                return self
-                    .handle_responses_websocket(stream, connection_permit)
-                    .await;
+                return self.handle_responses_websocket(stream).await;
             }
             ResponsesWebSocketProbe::Http => {}
             ResponsesWebSocketProbe::Silent => {
                 // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
                 // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
-                let _connection_permit = connection_permit;
                 let _ = write_error_response(
                     &mut stream,
                     408,
@@ -31,7 +24,6 @@ impl RouterServer {
                 return Ok(());
             }
         }
-        let _connection_permit = connection_permit;
         let header_budget = REQUEST_READ_TIMEOUT.saturating_sub(header_started.elapsed());
         let pending =
             match tokio::time::timeout(header_budget, read_http_request_head(&mut stream)).await {
@@ -141,6 +133,10 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
+        if pending.request.method == "GET" && pending.request.path == REQUEST_LOG_ICON_PATH {
+            write_static_response(&mut stream, "image/png", REQUEST_LOG_ICON).await?;
+            return Ok(());
+        }
         if !self.authorized(&pending.request) {
             self.record_rejected_request(
                 &pending.request,
@@ -166,6 +162,9 @@ impl RouterServer {
         };
         let route_path = request.path.as_str();
         match (request.method.as_str(), route_path) {
+            ("GET", "/codey/concurrency") => {
+                write_json_response(&mut stream, 200, &self.official_concurrency.status()).await?;
+            }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 let snapshot = Arc::clone(
                     &self
@@ -668,6 +667,18 @@ impl RouterServer {
         if editing {
             upstream_url = format!("{}/edits", upstream_url.trim_end_matches("/generations"));
         }
+        let mut admission_downstream = HttpResponsesDownstream::new(stream);
+        let admission = {
+            let mut observed =
+                ObservedResponsesDownstream::new(&mut admission_downstream, probe.clone());
+            self.admit_official(&route, &mut observed).await
+        };
+        stream = admission_downstream.stream;
+        let _official_permit = match admission {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let headers = match self
             .prepare_upstream_request_headers(&request, &route)
             .await
@@ -894,6 +905,11 @@ impl RouterServer {
                 .map_err(|message| (401, "plugin_account_unavailable", message));
         }
         if route.official_account {
+            if let Some(auth) = route.official_auth.as_ref() {
+                validate_managed_official_account(auth)
+                    .await
+                    .map_err(|error| (401, "official_account_unavailable", format!("{error:#}")))?;
+            }
             if let Some((siwc_path, account_id)) = route.official_auth.as_ref().and_then(|auth| {
                 auth.siwc_path
                     .as_deref()
@@ -920,19 +936,28 @@ impl RouterServer {
                 headers.insert(AUTHORIZATION, value);
                 strip_siwc_forbidden_headers(&mut headers);
             } else {
-                let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
-                    Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
-                    None => (self.official_auth_path.as_path(), true),
+                let official_auth = match &route.official_auth {
+                    Some(auth) => {
+                        resolve_managed_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            auth,
+                            &self.official_auth_cache,
+                        )
+                        .await
+                    }
+                    None => {
+                        resolve_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            &self.official_auth_path,
+                            &self.official_auth_cache,
+                            true,
+                        )
+                        .await
+                    }
                 };
-                let official_auth = resolve_official_upstream_auth(
-                    request,
-                    &self.bearer_token,
-                    auth_path,
-                    &self.official_auth_cache,
-                    accepts_incoming_authorization,
-                )
-                .await
-                .ok_or_else(|| {
+                let official_auth = official_auth.ok_or_else(|| {
                     (
                         401,
                         "openai_auth_missing",
@@ -970,30 +995,18 @@ impl RouterServer {
     // Tungstenite's handshake callback fixes the error type to an HTTP
     // response value; its size is imposed by the external Callback contract.
     #[allow(clippy::result_large_err)]
-    pub(crate) async fn handle_responses_websocket(
-        &self,
-        stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
-        // 握手完成前一直占着并发名额。空闲等待在循环里释放，避免预连接和
-        // 已结束的回合把名额占满；下一条需要转发的消息会重新获取。
-        let mut connection_permit = Some(connection_permit);
+    pub(crate) async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+        // 连接总预算覆盖握手与空闲阶段，生成执行预算在每轮选路后获取。
         let handshake_context = Arc::new(Mutex::new(None));
         let captured_context = Arc::clone(&handshake_context);
         let token = self.token.clone();
         let bearer_token = self.bearer_token.clone();
         let request_id = current_router_request_id();
-        let websocket_config = WebSocketConfig::default()
-            // Responses events are latency-sensitive and already framed. Do
-            // not wait for tungstenite's default 128 KiB write threshold.
-            .write_buffer_size(0)
-            .max_write_buffer_size(MAX_UPSTREAM_RESPONSE_BYTES)
-            .max_message_size(Some(MAX_REQUEST_BYTES))
-            .max_frame_size(Some(MAX_REQUEST_BYTES));
+        let websocket_config = downstream_websocket_config();
         let socket = tokio::time::timeout(
             REQUEST_READ_TIMEOUT,
             accept_hdr_async_with_config(
-                stream,
+                WebSocketIngress::new(stream, Arc::clone(&self.request_body_budget)),
                 move |request: &WebSocketRequest, mut response: WebSocketResponse| {
                     if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path()) {
                         return Err(websocket_handshake_error(
@@ -1036,7 +1049,7 @@ impl RouterServer {
             .take()
             .context("Codey Responses WebSocket 缺少握手上下文")?;
         let mut downstream = WebSocketResponsesDownstream::with_shared_backoffs(
-            socket,
+            BudgetedWebSocket::new(socket),
             Arc::clone(&self.websocket_backoffs),
             Arc::clone(&self.request_body_budget),
             Arc::clone(&self.idle_downstreams),
@@ -1047,7 +1060,6 @@ impl RouterServer {
         );
 
         loop {
-            drop(connection_permit.take());
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
@@ -1058,59 +1070,16 @@ impl RouterServer {
             if downstream.handle_idle_response_interrupt(&message)? {
                 continue;
             }
-            if matches!(message, WebSocketMessage::Text(_)) {
-                match acquire_connection_permit_within(
-                    &self.connection_limit,
-                    REQUEST_BODY_BUDGET_WAIT,
-                )
-                .await
-                {
-                    Ok(permit) => connection_permit = Some(permit),
-                    Err(ConnectionPermitError::Busy) => {
-                        downstream
-                            .write_error(
-                                503,
-                                "router_busy",
-                                "Codey 本地路由当前请求过多，请稍后重试".to_string(),
-                                None,
-                            )
-                            .await?;
-                        continue;
-                    }
-                    Err(ConnectionPermitError::Closed) => {
-                        anyhow::bail!("等待本地路由连接名额失败");
-                    }
-                }
-            }
+            let BudgetedWebSocketMessage {
+                message,
+                parsed_body,
+                permit: body_budget_permit,
+            } = message;
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
-                    let body_budget_permit = match acquire_request_body_budget_within(
-                        &self.request_body_budget,
-                        text.len(),
-                        REQUEST_BODY_BUDGET_WAIT,
-                    )
-                    .await
+                    let mut body = match parsed_body.expect("admitted text must have a JSON result")
                     {
-                        Ok(permit) => permit,
-                        Err(error)
-                            if error
-                                .downcast_ref::<RequestBodyBudgetUnavailable>()
-                                .is_some() =>
-                        {
-                            downstream
-                                .write_error(
-                                    503,
-                                    "router_memory_busy",
-                                    "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
-                                    None,
-                                )
-                                .await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let mut body = match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(Value::Object(body)) => Value::Object(body),
                         Ok(_) => {
                             downstream
@@ -1137,12 +1106,6 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    if body["type"] == "response.steer" {
-                        let event = downstream.steering.accept(&body, &self.request_body_budget);
-                        downstream.write_steering_event(&event).await?;
-                        downstream.write_steering_notifications().await?;
-                        continue;
-                    }
                     let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
                     if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
                         // 仅显示有界的协议标识，不把任意字段内容写入错误信息。
@@ -1619,6 +1582,20 @@ impl RouterServer {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let mut portable_attempt =
+            match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            409,
+                            "portable_compaction_unavailable",
+                            error.to_string(),
+                            None,
+                        )
+                        .await;
+                }
+            };
         let model_was_defaulted = requested_model.is_empty();
         let model = if model_was_defaulted {
             snapshot.default_model.trim().to_string()
@@ -1667,8 +1644,18 @@ impl RouterServer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bound_route = bindings.route_for_keys(&binding_keys);
-            let resolved =
-                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
+            let resolved = if let Some(attempt) = &portable_attempt {
+                Ok(RouteSelection {
+                    provider_id: attempt.source.provider_id.clone(),
+                    protocol: attempt.source.protocol,
+                    requested_model: model.clone(),
+                    route: Arc::clone(&attempt.source),
+                    upstream_model: attempt.model.clone(),
+                    fallback_reason: None,
+                })
+            } else {
+                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref())
+            };
             (resolved, bound_route)
         };
         let resolved = match resolved {
@@ -1682,7 +1669,17 @@ impl RouterServer {
         };
         let route_changed = previous_route
             .as_deref()
-            .is_some_and(|provider_id| provider_id != resolved.provider_id);
+            .is_some_and(|provider_id| provider_id != resolved.provider_id)
+            || self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .routes
+                .get(binding_keys.first().map(String::as_str).unwrap_or_default())
+                .is_some_and(|binding| {
+                    !binding.upstream_model.is_empty()
+                        && binding.context_config != Some(resolved.route.context_config)
+                });
         if model != resolved.upstream_model {
             body.as_object_mut()
                 .expect("validated Responses body must remain an object")
@@ -1754,6 +1751,7 @@ impl RouterServer {
             );
         }
         let native_compaction = compacting
+            && portable_attempt.is_none()
             && resolved.route.supports_remote_compaction
             && bridge == ProtocolBridge::NativeResponses;
         match restore_codey_compaction_summaries(&mut body) {
@@ -1774,7 +1772,16 @@ impl RouterServer {
             }
         }
         if compacting && !native_compaction {
-            if let Err(error) = prepare_gateway_compaction(&mut body) {
+            let metadata =
+                crate::model_catalog::runtime_context_metadata(crate::codex_config::codex_home());
+            let model_metadata = gateway_compaction_model_metadata(
+                &metadata,
+                &resolved.provider_id,
+                &resolved.upstream_model,
+            );
+            if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
+                .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
+            {
                 return downstream
                     .write_error(
                         400,
@@ -1872,6 +1879,9 @@ impl RouterServer {
                 )
                 .await;
         }
+        // Only a full, restored request can establish portability. An unresolved
+        // previous_response_id carries history that is absent from this input.
+        let history_portable = portable_compaction::resolved_history_portability(&body);
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
         if bridge == ProtocolBridge::NativeResponses {
             if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {
@@ -2051,6 +2061,11 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        let _official_permit = match self.admit_official(&resolved.route, downstream).await {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut headers = match self
             .prepare_upstream_request_headers(&request, &resolved.route)
             .await
@@ -2080,15 +2095,19 @@ impl RouterServer {
         let auto_review_request =
             model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
                 || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
-        if !auto_review_request {
-            let refresh_session_binding = route_hint.is_some() && !subagent_request;
+        if !auto_review_request && portable_attempt.is_none() {
+            let refresh_session_binding = !subagent_request
+                && incoming_header(&request, "x-codex-parent-thread-id").is_none()
+                && (route_hint.is_some() || incoming_header(&request, "thread-id").is_none());
             self.bindings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remember(
+                .remember_resolved(
                     &binding_keys,
-                    &resolved.provider_id,
+                    &resolved,
                     refresh_session_binding,
+                    native_compaction,
+                    history_portable,
                 );
         }
         let cache_key_deleted = resolved
@@ -2202,6 +2221,38 @@ impl RouterServer {
                         )
                         .await;
                 }
+            }
+            // `generate` 是 Responses WebSocket 的传输层字段:false 表示预热
+            // 请求,只暂存上下文换取续接用的 response_id,不要求产出内容。
+            // HTTP Responses 不认识该参数,剥掉再发又会把预热变成一次真实
+            // 生成,所以回退 HTTP 时由本地应答空响应;其他取值只剥除字段。
+            // 应答的 response_id 沿用上游形态:已暂存的历史记在这个 id 下,
+            // 客户端续接时由原生历史展开;resp_codey_ 前缀会误触发旧线路
+            // 历史恢复,不能用。
+            match upstream_body
+                .as_object_mut()
+                .and_then(|object| object.remove("generate"))
+            {
+                Some(Value::Bool(false)) => {
+                    let model = upstream_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or(resolved.upstream_model.as_str());
+                    let response = json!({
+                        "id": format!("resp_{}", Uuid::new_v4().simple()),
+                        "object": "response",
+                        "status": "completed",
+                        "model": model,
+                        "output": [],
+                        "usage": {"input_tokens":0,"output_tokens":0,"total_tokens":0},
+                    });
+                    return downstream.write_json(200, &response).await;
+                }
+                Some(_) => {
+                    body_mutated = true;
+                    encoded_body = None;
+                }
+                None => {}
             }
             // A failed/reconnected WebSocket can restore full history after the
             // first normalization pass. Validate and normalize the exact body
@@ -2616,7 +2667,7 @@ impl RouterServer {
             _ if compacting => {
                 if !native_compaction {
                     write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
-                        stream_requested, &resolved.route, &tool_bridge).await
+                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut()).await
                 } else {
                 write_validated_compaction(
                     downstream,

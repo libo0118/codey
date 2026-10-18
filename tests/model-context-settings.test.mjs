@@ -16,6 +16,7 @@ const modelState = {
 
 function officialPicker(localRouterEnabled = true) {
   const calls = [];
+  const notices = [];
   const config = {
     activeProfileId: "official",
     localRouterEnabled,
@@ -35,14 +36,14 @@ function officialPicker(localRouterEnabled = true) {
   const options = {
     config, currentProvider: null, officialAccountAvailable: true,
     runOperation: async (_name, action) => action(),
-    setPersistedConfig: () => {}, setStatus: () => {}, setNotice: () => {},
+    applyConfigResult: () => true, setNotice: notice => notices.push(notice),
   };
   const render = () => {
     graph.restart();
     return graph.exports.useModelSelection(options);
   };
   render().openModelPicker(modelState, "", "official");
-  return { render, calls, config };
+  return { render, calls, config, options, notices };
 }
 
 test("官方模型选择器提交预算，并过滤不属于该线路的模型", async () => {
@@ -68,6 +69,18 @@ test("官方模型恢复默认提交空预算，原生模式省略预算变更",
   await native.render().saveModelSelection();
   assert.equal(Object.hasOwn(native.calls[0].args, "modelContexts"), false);
   assert.equal(Object.hasOwn(native.calls[0].args, "reasoningEfforts"), false);
+});
+
+test("模型保存结果过期时保留当前编辑器，不更新模型或提示", async () => {
+  const { render, options, notices } = officialPicker();
+  const accepted = [];
+  options.applyConfigResult = result => { accepted.push(result); return false; };
+  const before = render().modelState;
+  await render().saveModelSelection();
+  assert.equal(accepted.length, 1);
+  assert.equal(render().modelState, before);
+  assert.equal(render().modelPickerVisible, true);
+  assert.deepEqual(notices, []);
 });
 
 test("上下文输入以 K 为单位，非法输入不能改变预算", () => {

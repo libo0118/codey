@@ -66,9 +66,7 @@ export function getRouteCompactionStatus(
     (b) => b.routeId === profile.id
   );
 
-  const hasPluginTransport = Boolean(
-    profile.pluginRouteSpec && (profile.pluginRouteSpec as any).transport
-  );
+  const hasPluginTransport = Boolean(profile.pluginRouteSpec?.transport);
   if (hasPluginTransport) {
     return {
       mode: "remote",

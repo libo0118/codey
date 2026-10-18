@@ -53,8 +53,9 @@ pub(super) struct CodexAppVersionCache {
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
     version: String,
-    lookup_started_at: Instant,
-    checked_at: Instant,
+    checked_at: Option<Instant>,
+    generation: u64,
+    refreshing: bool,
 }
 
 fn runtime_feature_status_value(
@@ -158,6 +159,7 @@ pub(super) async fn runtime_status_with_options(
         0
     };
     let mut status = json!({
+        "configApply": super::config_apply::status(state),
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "codeyUpdatePolicy": codey_update_policy,
@@ -231,61 +233,96 @@ pub(super) async fn runtime_status_with_options(
 }
 
 async fn codex_app_version_for_status(
-    state: &AppState,
+    state: &Arc<AppState>,
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
 ) -> String {
-    let lookup_started_at = Instant::now();
+    cached_codex_app_version(
+        state,
+        runtime_app_path,
+        configured_app_path,
+        Arc::new(|runtime_path: Option<PathBuf>, configured_path: String| {
+            error_log::refresh_codex_app_version(runtime_path.as_deref(), Some(&configured_path))
+                .unwrap_or_default()
+        }),
+    )
+    .await
+}
+
+type VersionLookup = dyn Fn(Option<PathBuf>, String) -> String + Send + Sync;
+
+async fn cached_codex_app_version(
+    state: &Arc<AppState>,
+    runtime_app_path: Option<PathBuf>,
+    configured_app_path: String,
+    lookup: Arc<VersionLookup>,
+) -> String {
+    let mut cache = state.codex_app_version_cache.lock().await;
+    let cached = cache.get_or_insert_with(|| CodexAppVersionCache {
+        runtime_app_path: runtime_app_path.clone(),
+        configured_app_path: configured_app_path.clone(),
+        version: String::new(),
+        checked_at: None,
+        generation: 0,
+        refreshing: false,
+    });
+    if cached.runtime_app_path != runtime_app_path
+        || cached.configured_app_path != configured_app_path
     {
-        let cache = state.codex_app_version_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.runtime_app_path == runtime_app_path
-            && cached.configured_app_path == configured_app_path
-            && lookup_started_at.saturating_duration_since(cached.checked_at)
-                < CODEX_APP_VERSION_CACHE_TTL
-        {
-            return cached.version.clone();
+        cached.runtime_app_path = runtime_app_path;
+        cached.configured_app_path = configured_app_path;
+        cached.version.clear();
+        cached.checked_at = None;
+        cached.generation = cached.generation.wrapping_add(1);
+    }
+    if !cached.refreshing
+        && cached
+            .checked_at
+            .is_none_or(|checked| checked.elapsed() >= CODEX_APP_VERSION_CACHE_TTL)
+        && !state.is_shutting_down()
+    {
+        cached.refreshing = true;
+        tokio::spawn(refresh_codex_app_version_cache(Arc::clone(state), lookup));
+    }
+    cached.version.clone()
+}
+
+async fn refresh_codex_app_version_cache(state: Arc<AppState>, lookup: Arc<VersionLookup>) {
+    // 一个后台任务串行探测；路径连续变化时只保留最新请求，避免慢卷扫描堆积。
+    loop {
+        let (runtime_path, configured_path, generation) = {
+            let mut cache = state.codex_app_version_cache.lock().await;
+            let Some(cached) = cache.as_mut() else { return };
+            if state.is_shutting_down() {
+                cached.refreshing = false;
+                return;
+            }
+            (
+                cached.runtime_app_path.clone(),
+                cached.configured_app_path.clone(),
+                cached.generation,
+            )
+        };
+        let lookup = Arc::clone(&lookup);
+        let shutdown_state = Arc::clone(&state);
+        let version = tokio::task::spawn_blocking(move || {
+            if shutdown_state.is_shutting_down() {
+                return String::new();
+            }
+            lookup(runtime_path, configured_path)
+        })
+        .await
+        .unwrap_or_default();
+        let mut cache = state.codex_app_version_cache.lock().await;
+        let Some(cached) = cache.as_mut() else { return };
+        if cached.generation == generation {
+            cached.version = version;
+            // 未找到版本或任务失败也缓存，避免状态轮询反复扫描磁盘。
+            cached.checked_at = Some(Instant::now());
+            cached.refreshing = false;
+            return;
         }
     }
-
-    // App bundle discovery performs blocking filesystem work. Do not keep the
-    // async cache mutex locked while it runs: concurrent status requests should
-    // remain independent even when the application lives on a slow volume.
-    let checked_runtime_app_path = runtime_app_path.clone();
-    let checked_configured_app_path = configured_app_path.clone();
-    let version = tokio::task::spawn_blocking(move || {
-        error_log::refresh_codex_app_version(
-            checked_runtime_app_path.as_deref(),
-            Some(&checked_configured_app_path),
-        )
-        .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-
-    let mut cache = state.codex_app_version_cache.lock().await;
-    if let Some(cached) = cache.as_ref()
-        && cached.runtime_app_path == runtime_app_path
-        && cached.configured_app_path == configured_app_path
-        && cached.lookup_started_at >= lookup_started_at
-    {
-        // Another request completed the same lookup while this one was doing
-        // filesystem work. Reuse the newer result instead of replacing it.
-        return cached.version.clone();
-    }
-    if cache
-        .as_ref()
-        .is_none_or(|cached| cached.lookup_started_at < lookup_started_at)
-    {
-        *cache = Some(CodexAppVersionCache {
-            runtime_app_path,
-            configured_app_path,
-            version: version.clone(),
-            lookup_started_at,
-            checked_at: Instant::now(),
-        });
-    }
-    version
 }
 
 fn ensure_runtime_can_start(state: &AppState) -> Result<(), String> {
@@ -397,6 +434,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> anyhow::Result<Valu
         &config,
         handler,
         &state.trace_log_write_protection_active,
+        state.trace_log_guard_state.clone(),
         state.crashpad_pending_stats.clone(),
         Arc::clone(&state.account_usage_cache),
     )
@@ -428,6 +466,8 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> anyhow::Result<Valu
         codex_exit,
         runtime_generation,
     ));
+    *state.startup_error.write().await = None;
+    super::config_apply::confirm_launch(state, &config).await;
     Ok(json!({"status":"running"}))
 }
 
@@ -665,6 +705,9 @@ pub async fn begin_shutdown(state: &Arc<AppState>) {
     }
     state.restart_in_progress.store(false, Ordering::Release);
 }
+
+#[cfg(test)]
+mod version_cache_tests;
 
 #[cfg(test)]
 mod tests {

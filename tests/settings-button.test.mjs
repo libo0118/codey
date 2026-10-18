@@ -705,7 +705,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 重置/);
   assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 重置/);
   const summaryHtml = usage.innerHTML.split('class="codey-usage-details"')[0];
-  assert.match(summaryHtml, /class="codey-usage-plan-tag">Pro 20x<\/span>[\s\S]*?周额度[\s\S]*?60%/);
+  assert.match(summaryHtml, /class="codey-usage-plan-tag" data-pro-tier="200">Pro 200<\/span>[\s\S]*?周额度[\s\S]*?60%/);
   assert.doesNotMatch(summaryHtml, /余额|42/);
   assert.match(usage.innerHTML, /class="codey-usage-details" role="tooltip"/);
   assert.match(usage.innerHTML, /5 小时额度[\s\S]*?剩余 85%[\s\S]*?已用 15%/);
@@ -783,6 +783,47 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   const remountedSummaryHtml = remountedUsage.innerHTML.split('class="codey-usage-details"')[0];
   assert.doesNotMatch(remountedSummaryHtml, /data-window="five-hour"/);
   assert.match(remountedSummaryHtml, /class="codey-usage-plan-tag">Plus<\/span>/);
+
+  for (const [planType, expectedLabel, expectedTier] of [
+    ["prolite", "Pro 100", "100"],
+    ["pro", "Pro 200", "200"],
+    ["promax", "Pro 500", "500"],
+    ["  ProLite  ", "Pro 100", "100"],
+    ["pro100", "Pro 100", "100"],
+    ["pro200", "Pro 200", "200"],
+    ["pro500", "Pro 500", "500"],
+    ["pro 100", "Pro 100", "100"],
+    ["pro_200", "Pro 200", "200"],
+    ["pro-500", "Pro 500", "500"],
+    ["Pro $100", "Pro 100", "100"],
+    ["5x", "Pro 5x"],
+    ["pro5x", "Pro 5x"],
+    ["pro20x", "Pro 20x"],
+    ["plus", "Plus"],
+    ["free", "Free"],
+    ["business_prolite", "business_prolite"],
+    ["business_pro100", "business_pro100"],
+    ["pro500_trial", "pro500_trial"],
+    ["pro_lite", "pro_lite"],
+    ["business_plus", "business_plus"],
+    ["  future_plan  ", "future_plan"],
+    ["__proto__", "__proto__"],
+    ['pro500" data-pro-tier="500', 'pro500" data-pro-tier="500'],
+  ]) {
+    accountUsageResult = { ...accountUsageResult, planType };
+    await window.__codeyRefreshAccountUsage();
+    assert.equal(
+      remountedUsage.innerHTML.match(/class="codey-usage-plan-tag"(?: data-pro-tier="(?:100|200|500)")?>([^<]*)<\/span>/)?.[1],
+      expectedLabel.replaceAll('"', "&quot;"),
+      `rendered plan label for ${planType}`,
+    );
+    assert.equal(
+      remountedUsage.innerHTML.match(/class="codey-usage-plan-tag" data-pro-tier="([^"]*)"/)?.[1],
+      expectedTier,
+      `rendered Pro tier for ${planType}`,
+    );
+    assert.equal(findById("codey-account-usage"), remountedUsage);
+  }
 
   accountUsageResult = { status: "disabled" };
   await window.__codeyRefreshAccountUsage();

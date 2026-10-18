@@ -39,6 +39,7 @@ pub(crate) fn reconcile_for_current_provider(
         config.manual_third_party_models(),
         reasoning_efforts.as_ref(),
         Some(&config.subagent_model),
+        &config.codex_app_path,
     )
     .map(|state| {
         let upstream = config

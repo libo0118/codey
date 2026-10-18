@@ -1,16 +1,16 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck as Check,
   IconAdjustmentsHorizontal,
   IconArchive,
   IconBolt,
   IconChartDonut,
+  IconClipboard,
   IconCpu,
   IconEdit as Edit,
   IconEye,
   IconEyeOff,
   IconFileText,
-  IconGitCommit,
   IconGripVertical,
   IconHelpCircle,
   IconInfoCircle,
@@ -46,6 +46,7 @@ import {
   PasswordInput,
   Select,
   Switch,
+  TextArea,
   Tooltip,
 } from "./components/ui";
 import { modelIdsEqual, modelKey, moveModelId, uniqueModelIds } from "./modelIds";
@@ -64,6 +65,11 @@ import {
   validateThirdPartyRouteShortName,
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
+import {
+  parseNewApiConnectionInfo,
+  suggestRouteNamesFromUrl,
+  type NewApiConnectionInfo,
+} from "./routeConnectionImport";
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
@@ -107,6 +113,7 @@ type ModelSectionProps = {
       routeName: string;
       routeShortName: string;
       baseUrl: string;
+      maxConcurrency: number;
     },
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
@@ -155,7 +162,7 @@ type RouteDraftErrors = {
   upstreamProxy: string;
 };
 
-// 官方线路的编辑入口只改线路名、短名称、网关和代理，模型列举交给同步入口。
+// 官方线路的编辑入口调整连接与并发设置，模型列举交给同步入口。
 type OfficialRouteDialogScope = "settings" | "models";
 
 const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
@@ -272,7 +279,23 @@ function ModelSectionComponent({
     useState<OfficialRouteSettingsDraft | null>(null);
   const [officialDialogScope, setOfficialDialogScope] =
     useState<OfficialRouteDialogScope | null>(null);
+  // 「快速导入」粘贴面板与一次性状态；新建第三方线路时可用。
+  const [routeImportOpen, setRouteImportOpen] = useState(false);
+  const [routeImportText, setRouteImportText] = useState("");
+  const [routeImportError, setRouteImportError] = useState("");
+  const [routeImportApplied, setRouteImportApplied] = useState(false);
+  const routeImportGeneration = useRef(0);
   const routeConfigReadOnly = !config.localRouterEnabled;
+
+  const resetRouteImport = useCallback(() => {
+    routeImportGeneration.current += 1;
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(false);
+  }, []);
+
+  useEffect(() => () => { routeImportGeneration.current += 1; }, []);
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -281,7 +304,8 @@ function ModelSectionComponent({
     setOfficialRouteDraft(null);
     setOfficialDialogScope(null);
     setRouteApiKeyVisible(false);
-  }, [routeConfigReadOnly]);
+    resetRouteImport();
+  }, [resetRouteImport, routeConfigReadOnly]);
 
   // 官方线路的线路名、短名称、网关和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
@@ -493,6 +517,7 @@ function ModelSectionComponent({
     setHeaderError("");
     setOfficialModelDraft([]);
     setOfficialDialogScope(null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const openRouteDialog = (
@@ -513,6 +538,7 @@ function ModelSectionComponent({
             routeShortName: routeAccount?.routeShortName || profile.shortName || fallbackRouteShortName(profile.name),
             baseUrl: routeAccount?.baseUrl ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
+            maxConcurrency: String(profile.maxConcurrency ?? routeAccount?.maxConcurrency ?? 0),
           }
         : null,
     );
@@ -532,6 +558,7 @@ function ModelSectionComponent({
       setOfficialModelContextDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const updateRouteDraft = (patch: Partial<Profile>) => {
@@ -539,6 +566,74 @@ function ModelSectionComponent({
   };
   const updateOfficialRouteDraft = (patch: Partial<OfficialRouteSettingsDraft>) => {
     setOfficialRouteDraft((current) => current ? { ...current, ...patch } : current);
+  };
+  // 解析成功即写入草稿；空缺的线路名和短名称按连接地址补建议值。
+  const applyRouteConnectionInfo = (info: NewApiConnectionInfo) => {
+    const suggestions = suggestRouteNamesFromUrl(
+      info.url,
+      MAX_ROUTE_NAME_CHARACTERS,
+      MAX_ROUTE_SHORT_NAME_CHARACTERS,
+    );
+    setRouteDraft((current) => {
+      if (!current) return current;
+      const suggestedShortName =
+        suggestions.shortName &&
+        !validateThirdPartyRouteShortName(
+          suggestions.shortName,
+          config.profiles,
+          current.id,
+        )
+          ? suggestions.shortName
+          : "";
+      return {
+        ...current,
+        baseUrl: info.url,
+        apiKey: info.key,
+        name: current.name || suggestions.name,
+        shortName: current.shortName || suggestedShortName,
+      };
+    });
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(true);
+  };
+  // 优先读剪贴板，命中连接信息直接填入；读不到或不匹配时展开手动粘贴面板。
+  const handleRouteQuickImport = async () => {
+    const generation = ++routeImportGeneration.current;
+    if (routeImportOpen) {
+      setRouteImportOpen(false);
+      return;
+    }
+    setRouteImportApplied(false);
+    let clipboardText: string | null = null;
+    try {
+      clipboardText = await navigator.clipboard.readText();
+    } catch {
+      clipboardText = null;
+    }
+    if (generation !== routeImportGeneration.current) return;
+    const info = parseNewApiConnectionInfo(clipboardText);
+    if (info) {
+      applyRouteConnectionInfo(info);
+      return;
+    }
+    setRouteImportError(
+      clipboardText?.trim()
+        ? "剪贴板内容不是有效的 New API 连接信息，请手动粘贴"
+        : "",
+    );
+    setRouteImportOpen(true);
+  };
+  const handleRouteImportTextChange = (value: string) => {
+    routeImportGeneration.current += 1;
+    setRouteImportText(value);
+    const info = parseNewApiConnectionInfo(value);
+    if (info) {
+      applyRouteConnectionInfo(info);
+    } else {
+      setRouteImportError(value.trim() ? "不是有效的 New API 连接信息" : "");
+    }
   };
   const openHeadersDialog = (profile: Profile) => {
     setHeaderDialogProfile(profile);
@@ -621,6 +716,7 @@ function ModelSectionComponent({
                     routeName: officialRouteDraft.routeName.trim(),
                     routeShortName: officialRouteDraft.routeShortName.trim(),
                     baseUrl: officialRouteDraft.baseUrl.trim(),
+                    maxConcurrency: Number(officialRouteDraft.maxConcurrency.trim()),
                   }
                 : undefined,
             )
@@ -628,6 +724,7 @@ function ModelSectionComponent({
       : await onSaveRoute({ ...routeDraft, modelRequestHeaders });
     if (saved) {
       if (routeDraft.authMode === "officialAccount") void refreshOfficialAccounts();
+      resetRouteImport();
       setRouteDialogOpen(false);
       setRouteDraft(null);
       setOfficialRouteDraft(null);
@@ -652,6 +749,11 @@ function ModelSectionComponent({
     : undefined;
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
+  const isNewRouteDraft = Boolean(
+    routeDraft &&
+    routeDraft.authMode !== "officialAccount" &&
+    !config.profiles.some((profile) => profile.id === routeDraft.id),
+  );
 
   const preferredProfile =
     config.profiles.find((profile) => profile.id === config.activeProfileId) ??
@@ -683,22 +785,6 @@ function ModelSectionComponent({
       {!config.localRouterEnabled && (
         <div className="text-muted italic">
           本地路由已关闭，自动复核回退不会生效。
-        </div>
-      )}
-    </div>
-  );
-
-  const conversationGitTooltip = (
-    <div className="flex flex-col gap-1 text-xs leading-relaxed max-w-[360px]">
-      <div className="font-semibold text-foreground">
-        指定分析本对话文件改动并生成 Git 提交信息的模型
-      </div>
-      <div className="text-muted">
-        在对话工具栏中点击 Git 提交时，使用此模型分析限定文件的完整 diff 并生成提交说明。保存后生效；推荐使用具备良好推理能力的代码模型。
-      </div>
-      {!config.localRouterEnabled && (
-        <div className="text-muted italic">
-          本地路由已关闭，无法通过本地路由分发模型请求。
         </div>
       )}
     </div>
@@ -1200,55 +1286,6 @@ function ModelSectionComponent({
           </div>
         </div>
 
-        <div className="route-auxiliary-bar">
-          <div className="route-auxiliary-header">
-            <div className="route-auxiliary-title-row">
-              <IconGitCommit size={15} className="route-auxiliary-icon" aria-hidden="true" />
-              <span className="route-auxiliary-title">对话 Git 提交增强</span>
-            </div>
-            <div className="route-auxiliary-action">
-              <Switch
-                aria-label="对话 Git 提交增强"
-                checked={config.conversationGit?.enabled === true}
-                disabled={isBusy || !onConfigChange || (!config.localRouterEnabled && !config.conversationGit?.enabled)}
-                onCheckedChange={(enabled) => onConfigChange?.({
-                  ...config,
-                  conversationGit: { model: config.conversationGit?.model || config.defaultModel, enabled },
-                })}
-              />
-            </div>
-          </div>
-
-          {config.conversationGit?.enabled && (
-            <div className="route-auxiliary-grid">
-              <div className="route-auxiliary-misc">
-                <Tooltip content={conversationGitTooltip} position="top">
-                  <span className="route-auxiliary-label cursor-help">
-                    <IconCpu size={14} className="route-auxiliary-icon" aria-hidden="true" />
-                    <strong>提交分析模型</strong>
-                    <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
-                  </span>
-                </Tooltip>
-                <div className="route-auxiliary-combobox">
-                  <ModelCombobox
-                    aria-label="Git 提交分析模型"
-                    value={config.conversationGit.model}
-                    placeholder={
-                      subagentModelOptions.length === 0
-                        ? "所有线路均暂无模型"
-                        : "请选择提交分析模型"
-                    }
-                    disabled={isBusy || !config.localRouterEnabled}
-                    options={subagentModelOptions}
-                    preferredProviderId={preferredProviderId}
-                    onChange={(model) => onConfigChange?.({ ...config, conversationGit: { enabled: true, model } })}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
         <div className="readonly-note">
           <IconInfoCircle size={14} className="readonly-note-icon" aria-hidden="true" />
           <span className="readonly-note-text">
@@ -1275,6 +1312,7 @@ function ModelSectionComponent({
               setOfficialRouteDraft(null);
               setOfficialDialogScope(null);
               setRouteApiKeyVisible(false);
+              resetRouteImport();
             }
           }
         }}
@@ -1301,6 +1339,20 @@ function ModelSectionComponent({
                       ? "编辑线路"
                       : "新增线路"}
                 </DialogTitle>
+                {isNewRouteDraft && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-auto shrink-0"
+                    disabled={isBusy}
+                    title="粘贴 New API「复制连接串」内容，自动填入 URL 与 Key"
+                    aria-expanded={routeImportOpen}
+                    onClick={() => void handleRouteQuickImport()}
+                  >
+                    <IconClipboard size={13} aria-hidden="true" />
+                    <span>快速导入</span>
+                  </Button>
+                )}
               </div>
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
@@ -1309,8 +1361,8 @@ function ModelSectionComponent({
                       ? `当前官方账号：${draftOfficialAccountLabel}。未勾选的模型不会在模型目录和选择器中显示。`
                       : "未勾选的模型不会在模型目录和选择器中显示。"
                     : draftOfficialAccount
-                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。`
-                      : "此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。"
+                      ? `当前官方账号：${draftOfficialAccountLabel}。调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。`
+                      : "调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
@@ -1400,6 +1452,31 @@ function ModelSectionComponent({
                       </label>
                     </div>
 
+                    <label className="route-field">
+                      <span>最高并发数</span>
+                      <Input
+                        id="official-route-max-concurrency-input"
+                        aria-label="最高并发数"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        value={officialRouteDraft?.maxConcurrency ?? "0"}
+                        disabled={isBusy || !draftOfficialAccount}
+                        aria-invalid={Boolean(officialRouteDraftErrors?.maxConcurrency)}
+                        aria-describedby={officialRouteDraftErrors?.maxConcurrency
+                          ? "official-route-max-concurrency-error official-route-max-concurrency-hint"
+                          : "official-route-max-concurrency-hint"}
+                        onChange={(event) => updateOfficialRouteDraft({ maxConcurrency: event.target.value })}
+                      />
+                      {officialRouteDraftErrors?.maxConcurrency ? (
+                        <small id="official-route-max-concurrency-error" className="text-[var(--codey-red,#d70015)]" role="alert">
+                          {officialRouteDraftErrors.maxConcurrency}
+                        </small>
+                      ) : null}
+                      <small id="official-route-max-concurrency-hint" className="route-field-hint">
+                        0 表示不限制；达到上限后等待。降低上限不影响正在执行的请求。
+                      </small>
+                    </label>
                     <label className="route-field">
                       <span>网关地址（可选）</span>
                       <Input
@@ -1539,6 +1616,46 @@ function ModelSectionComponent({
               </div>
             ) : (
               <div className="route-editor-form">
+                {isNewRouteDraft && routeImportOpen && (
+                  <div className="route-import-panel">
+                    <label className="route-field">
+                      <span>New API 连接信息</span>
+                      <TextArea
+                        aria-label="New API 连接信息"
+                        aria-invalid={Boolean(routeImportError)}
+                        aria-describedby={
+                          routeImportError ? "route-import-error" : "route-import-hint"
+                        }
+                        value={routeImportText}
+                        disabled={isBusy}
+                        rows={2}
+                        autoFocus
+                        className="route-import-input font-mono text-xs"
+                        placeholder='{"_type":"newapi_channel_conn","key":"sk-…","url":"https://api.example.com"}'
+                        onChange={(event) => handleRouteImportTextChange(event.target.value)}
+                      />
+                      {routeImportError ? (
+                        <small
+                          id="route-import-error"
+                          className="text-[var(--codey-red,#d70015)]"
+                          role="alert"
+                        >
+                          {routeImportError}
+                        </small>
+                      ) : (
+                        <small id="route-import-hint" className="route-field-hint">
+                          粘贴 New API 令牌的「复制连接串」内容，识别后自动填入 URL 与 Key
+                        </small>
+                      )}
+                    </label>
+                  </div>
+                )}
+                {isNewRouteDraft && routeImportApplied && (
+                  <div className="route-import-status" role="status">
+                    <Check size={13} aria-hidden="true" />
+                    <span>已从连接信息填入 URL 与 Key，确认短名称后保存</span>
+                  </div>
+                )}
                 <div className="route-editor-row route-editor-row-names">
                   <label className="route-field">
                     <span>短名称 {REQUIRED_FIELD_MARKER}</span>
@@ -1905,6 +2022,7 @@ function ModelSectionComponent({
                   setOfficialDialogScope(null);
                   setRouteValidationAttempted(false);
                   setRouteApiKeyVisible(false);
+                  resetRouteImport();
                 }}
               >
                 取消

@@ -80,7 +80,64 @@ pub(crate) fn restore_codey_compaction_summaries(body: &mut Value) -> Result<boo
     Ok(changed)
 }
 
-pub(crate) fn prepare_gateway_compaction(body: &mut Value) -> Result<()> {
+pub(crate) fn gateway_compaction_model_metadata<'a>(
+    metadata: &'a BTreeMap<String, serde_json::Map<String, Value>>,
+    provider: &str,
+    upstream: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    // 以实际解析出的线路为准，避免原始模型名命中同名官方模型的预算。
+    let canonical = crate::model_id::model_alias(provider, upstream);
+    metadata
+        .iter()
+        .find(|(slug, _)| crate::model_id::equal(slug, &canonical))
+        .map(|(_, value)| value)
+}
+
+/// 摘要只占后续窗口的一小部分；另一半输出预算留给模型推理。
+/// 没有目录声明时使用有限的回退预算，不推测模型的上下文容量。
+pub(crate) fn gateway_compaction_output_budget(
+    body: &Value,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> Result<u64> {
+    let mut budget = 16_384;
+    if let Some(metadata) = metadata {
+        if let Some(window) = metadata
+            .get("context_window")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            let percent = metadata
+                .get("effective_context_window_percent")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(100);
+            budget = budget.min(window.saturating_mul(percent) / 100 / 8);
+        }
+        if let Some(limit) = metadata
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            budget = budget.min(limit / 4);
+        }
+    }
+    for field in ["max_output_tokens", "max_tokens"] {
+        if let Some(value) = body.get(field) {
+            if value.is_null() {
+                continue;
+            }
+            let limit = value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .with_context(|| format!("{field} 必须为正整数"))?;
+            budget = budget.min(limit);
+        }
+    }
+    anyhow::ensure!(budget > 0, "模型上下文预算不足以生成压缩摘要");
+    Ok(budget)
+}
+
+pub(crate) fn prepare_gateway_compaction(body: &mut Value, output_budget: u64) -> Result<()> {
     let input = body.get_mut("input").context("压缩请求缺少 input")?;
     if let Some(text) = input.as_str() {
         *input = json!({"role":"user","content":[{"type":"input_text","text":text}]});
@@ -102,12 +159,14 @@ pub(crate) fn prepare_gateway_compaction(body: &mut Value) -> Result<()> {
         "压缩触发项必须位于历史末尾"
     );
     // 用 user 角色追加总结指令，三种协议都能转换，也不会被当成助手历史。
-    items.push(json!({"role":"user","content":[{"type":"input_text","text":"请只输出供下一轮助手继续工作的结构化交接摘要。保留用户目标与约束、已完成工作与验证结果、关键事实和文件位置、未完成任务与下一步、需要保留的工具结果。清楚区分已确认事实和假设，不调用工具，不执行新任务。"}]}));
+    items.push(json!({"role":"user","content":[{"type":"input_text","text":format!("请只输出供下一轮助手继续工作的结构化交接摘要。保留系统指令、用户目标与约束、已完成工作与验证结果、关键事实和文件位置、未完成任务与下一步、需要保留的工具结果。清楚区分已确认事实和假设，不调用工具，不执行新任务。精简重复叙述，摘要目标不超过 {} token，在预算内完整交接，优先保留约束与未完成事项。", (output_budget / 2).max(1))}]}));
     let object = body.as_object_mut().context("压缩请求必须为对象")?;
     for field in ["tools", "tool_choice", "parallel_tool_calls"] {
         object.remove(field);
     }
     object.insert("stream".into(), json!(true));
+    object.remove("max_tokens");
+    object.insert("max_output_tokens".into(), json!(output_budget));
     Ok(())
 }
 
@@ -188,13 +247,25 @@ pub(crate) enum CompactionResponseFormat {
 }
 
 pub(crate) fn validate_portable_context(body: &Value) -> Result<()> {
+    validate_portable_context_items(input_items(body), false)
+}
+
+fn validate_portable_context_items(items: &[Value], allow_trigger: bool) -> Result<()> {
     let is_compaction = |item: &Value| {
         matches!(
             item.get("type").and_then(Value::as_str),
             Some("compaction" | "compaction_trigger")
         )
     };
-    for item in input_items(body) {
+    for (index, item) in items.iter().enumerate() {
+        // 末尾的无参数触发项是当前压缩操作，不携带旧线路的加密历史。
+        if allow_trigger
+            && index + 1 == items.len()
+            && item["type"] == "compaction_trigger"
+            && item.as_object().is_some_and(|object| object.len() == 1)
+        {
+            continue;
+        }
         if codey_summary_message(item)?.is_some() {
             continue;
         }
@@ -216,7 +287,7 @@ pub(crate) fn validate_portable_context(body: &Value) -> Result<()> {
 }
 
 pub(crate) fn validate_cross_route_context(body: &Value) -> Result<()> {
-    validate_portable_context(body)?;
+    validate_portable_context_items(input_items(body), true)?;
     fn contains_item_reference(value: &Value) -> bool {
         if value.get("type").and_then(Value::as_str) == Some("item_reference") {
             return true;
@@ -1865,6 +1936,7 @@ impl SseFrameAccumulator for CompactionAccumulator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
     response: reqwest::Response,
@@ -1873,6 +1945,7 @@ pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     stream: bool,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
+    portable_attempt: Option<&mut PortableAttempt>,
 ) -> Result<()> {
     let probe = downstream.request_log_probe().cloned();
     let result = await_upstream(downstream, async {
@@ -1907,8 +1980,17 @@ pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
         Ok(value)
     }).await?;
     match result {
-        Ok(value) if stream => write_responses_response_as_events(downstream, &value).await,
-        Ok(value) => downstream.write_json(200, &value).await,
+        Ok(value) => {
+            if stream {
+                write_responses_response_as_events(downstream, &value).await?;
+            } else {
+                downstream.write_json(200, &value).await?;
+            }
+            if let Some(attempt) = portable_attempt {
+                attempt.complete();
+            }
+            Ok(())
+        }
         Err(error) => {
             let (status, code) = if error.is::<ContextLengthExceeded>() {
                 (400, CONTEXT_LENGTH_EXCEEDED)

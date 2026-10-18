@@ -18,9 +18,9 @@ pub async fn set_route_enabled(
     // 启停只保存线路及其模型依赖，不重新配置通知、日志保护等无关功能。
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
+    let hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
         hot_reload.add_to_response(json!({
@@ -79,8 +79,8 @@ pub async fn reorder_route_models(
     // 只改模型顺序，成员、默认模型和子代理绑定都不变，直接落盘并推送目录。
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
+    let hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(hot_reload.add_to_response(json!({
         "status": "ok",
@@ -159,9 +159,9 @@ pub async fn delete_route(
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     let model_state = current_model_state_async(&config).await?;
+    let hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
         hot_reload.add_to_response(json!({
@@ -505,7 +505,7 @@ pub async fn fetch_route_models(
         None
     };
     if let Some(entries) = fetched_account_entries.as_deref() {
-        model_catalog::merge_account_runtime_models(codex_home(), entries)
+        model_catalog::merge_account_runtime_models(codex_home(), entries, &config.codex_app_path)
             .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
     }
     let fetched_catalog = if let Some(entries) = fetched_account_entries.as_ref() {

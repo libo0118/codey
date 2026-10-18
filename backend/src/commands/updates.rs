@@ -20,6 +20,27 @@ const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
 static DEVICE_IDENTITY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn device_http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            // 注册请求体和检查、上报请求头都包含密钥，禁止转发到重定向目标。
+            let builder = reqwest::Client::builder()
+                .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    attempt.error("设备身份请求不允许重定向")
+                }));
+            #[cfg(test)]
+            let builder = builder.no_proxy();
+            builder
+                .build()
+                .map_err(|error| format!("创建设备更新客户端失败：{error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 #[derive(Clone, Copy)]
 enum UpdateRequestMode {
     Automatic,
@@ -109,7 +130,10 @@ pub(crate) struct UpdateDownload {
 #[serde(rename_all = "camelCase")]
 struct DeviceIdentity {
     install_key: String,
+    #[serde(default)]
     machine_no: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,7 +237,9 @@ pub async fn check_for_updates(
 async fn get_device_machine_no(state: &AppState) -> Result<Value, String> {
     {
         let _guard = DEVICE_IDENTITY_LOCK.lock().await;
-        if let Some(identity) = read_device_identity(&state.store).await? {
+        if let Some(identity) = read_device_identity(&state.store).await?
+            && !identity.pending
+        {
             return Ok(json!(identity.machine_no));
         }
     }
@@ -386,10 +412,9 @@ async fn configured_release_admin_url(state: &AppState) -> Result<Option<String>
 }
 
 async fn device_identity_path(store: &ConfigStore) -> Result<PathBuf, String> {
-    let parent = store
-        .path()
-        .parent()
-        .ok_or_else(|| "Codey 配置路径无父目录，无法保存设备身份".to_string())?;
+    let parent = store.path().parent().ok_or_else(|| {
+        device_identity_failure("path", "Codey 配置路径无父目录，无法保存设备身份")
+    })?;
     Ok(parent.join("release-device.json"))
 }
 
@@ -441,14 +466,70 @@ async fn retry_pending_device_event(state: &AppState) {
 
 async fn read_device_identity(store: &ConfigStore) -> Result<Option<DeviceIdentity>, String> {
     let path = device_identity_path(store).await?;
-    if let Ok(bytes) = tokio::fs::read(&path).await
-        && let Ok(identity) = serde_json::from_slice::<DeviceIdentity>(&bytes)
-        && !identity.install_key.trim().is_empty()
-        && !identity.machine_no.trim().is_empty()
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(device_identity_failure(
+                "read",
+                format!("读取设备身份失败：{error}"),
+            ));
+        }
+    };
+    let identity: DeviceIdentity = serde_json::from_slice(&bytes).map_err(|error| {
+        // 解析错误可能包含文件内容，只记录位置，避免把密钥带入日志或前端。
+        device_identity_failure(
+            "parse",
+            format!(
+                "设备身份文件格式无效（第 {} 行，第 {} 列），原文件已保留",
+                error.line(),
+                error.column()
+            ),
+        )
+    })?;
+    if identity.install_key.trim().is_empty()
+        || (identity.pending && !identity.machine_no.is_empty())
+        || (!identity.pending && identity.machine_no.trim().is_empty())
     {
-        return Ok(Some(identity));
+        return Err(device_identity_failure(
+            "validate",
+            "设备身份文件字段不完整或状态无效，原文件已保留",
+        ));
     }
-    Ok(None)
+    Ok(Some(identity))
+}
+
+fn device_identity_failure(stage: &'static str, error: impl Into<String>) -> String {
+    let error = error.into();
+    crate::error_log::record_failure(
+        "device_identity_failed",
+        stage,
+        &error,
+        json!({ "stage": stage }),
+    );
+    error
+}
+
+async fn write_device_identity(path: &Path, identity: &DeviceIdentity) -> Result<(), String> {
+    let stage = if identity.pending {
+        "save_pending"
+    } else {
+        "save_registered"
+    };
+    let bytes = serde_json::to_vec(identity)
+        .map_err(|_| device_identity_failure(stage, "设备身份序列化失败"))?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::fs_util::atomic_write_private_with_parent(&path, &bytes)
+    })
+    .await
+    .map_err(|error| device_identity_failure(stage, format!("保存设备身份任务失败：{error}")))?
+    .map_err(|error| {
+        device_identity_failure(
+            stage,
+            format!("保存设备身份失败，请检查配置目录的写入权限和磁盘空间：{error}"),
+        )
+    })
 }
 
 async fn load_or_register_device(
@@ -457,14 +538,23 @@ async fn load_or_register_device(
 ) -> Result<DeviceIdentity, String> {
     // 设置弹窗和自动更新可能同时首次登记，必须共用同一份设备身份。
     let _guard = DEVICE_IDENTITY_LOCK.lock().await;
-    if let Some(identity) = read_device_identity(&state.store).await? {
-        return Ok(identity);
-    }
     let path = device_identity_path(&state.store).await?;
-
-    let install_key = format!("{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut identity = match read_device_identity(&state.store).await? {
+        Some(identity) if !identity.pending => return Ok(identity),
+        Some(identity) => identity,
+        None => {
+            let identity = DeviceIdentity {
+                install_key: format!("{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+                machine_no: String::new(),
+                pending: true,
+            };
+            // 先保存密钥；请求响应丢失或最终保存失败后，重试仍使用同一份身份。
+            write_device_identity(&path, &identity).await?;
+            identity
+        }
+    };
     let body = json!({
-        "installKey": install_key,
+        "installKey": identity.install_key,
         "rollbackProtocol": 1,
         "platform": current_update_platform(),
         "arch": current_update_arch(),
@@ -474,49 +564,38 @@ async fn load_or_register_device(
         "osName": current_os_name(),
         "osVersion": current_os_version(),
     });
-    let response = state
-        .http_client
+    let response = device_http_client()
+        .map_err(|error| device_identity_failure("client", error))?
         .post(format!("{base_url}/api/devices/register"))
         .json(&body)
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|error| format!("注册设备失败：{error}"))?
+        .map_err(|error| {
+            device_identity_failure("register", format!("注册设备失败：{}", error.without_url()))
+        })?
         .error_for_status()
-        .map_err(|error| format!("注册设备失败：{error}"))?;
+        .map_err(|error| {
+            device_identity_failure("register", format!("注册设备失败：{}", error.without_url()))
+        })?;
     let registered = response
         .json::<DeviceIdentityResponse>()
         .await
-        .map_err(|error| format!("设备注册响应无效：{error}"))?;
+        .map_err(|error| {
+            device_identity_failure(
+                "response",
+                format!("设备注册响应无效：{}", error.without_url()),
+            )
+        })?;
     if registered.machine_no.trim().is_empty() {
-        return Err("设备注册响应缺少机器号".to_string());
+        return Err(device_identity_failure(
+            "response",
+            "设备注册响应缺少机器号",
+        ));
     }
-    let identity = DeviceIdentity {
-        install_key,
-        machine_no: registered.machine_no,
-    };
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("创建设备身份目录失败：{error}"))?;
-    }
-    let bytes = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-    tokio::fs::write(path, bytes)
-        .await
-        .map_err(|error| format!("保存设备身份失败：{error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = device_identity_path(&state.store).await?;
-        let mut permissions = tokio::fs::metadata(&path)
-            .await
-            .map_err(|error| format!("读取设备身份权限失败：{error}"))?
-            .permissions();
-        permissions.set_mode(0o600);
-        tokio::fs::set_permissions(path, permissions)
-            .await
-            .map_err(|error| format!("设置设备身份权限失败：{error}"))?;
-    }
+    identity.machine_no = registered.machine_no;
+    identity.pending = false;
+    write_device_identity(&path, &identity).await?;
     Ok(identity)
 }
 
@@ -550,7 +629,12 @@ async fn fetch_release_admin_update(
     if let Some(os_version) = current_os_version() {
         query.push(("osVersion", os_version));
     }
-    let mut request = state.http_client.get(endpoint).query(&query);
+    let client = if identity.is_some() {
+        device_http_client()?
+    } else {
+        &state.http_client
+    };
+    let mut request = client.get(endpoint).query(&query);
     if let Some(identity) = &identity {
         request = request
             .header("x-machine-no", &identity.machine_no)
@@ -754,9 +838,9 @@ async fn report_publish_event(
         "errorMessage": error_message,
     });
     let mut last_error = String::from("上报更新状态失败");
+    let client = device_http_client()?;
     for attempt in 0..3 {
-        match state
-            .http_client
+        match client
             .post(format!("{base_url}/api/publishes/{publish_id}/report"))
             .header("x-machine-no", &identity.machine_no)
             .header("x-device-key", &identity.install_key)
@@ -1058,20 +1142,16 @@ fn platform_os_version() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn platform_os_version() -> Option<String> {
-    // `ver` 输出中的版本号与系统语言无关，只解析其中的数字部分。
-    let output = std::process::Command::new("cmd")
-        .args(["/c", "ver"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let raw = text.split_whitespace().find(|part| {
-        part.chars().filter(|character| *character == '.').count() >= 2
-            && part
-                .chars()
-                .all(|character| character.is_ascii_digit() || character == '.' || character == ']')
-    })?;
-    let version = raw.trim_matches(|character: char| !character.is_ascii_digit());
-    let build = version.split('.').nth(2)?.parse::<u64>().ok()?;
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // 直接读取系统版本，避免外部命令受自动启动配置或安全软件影响而阻塞。
+    unsafe { RtlGetVersion(&mut version) }.ok().ok()?;
+    let build = version.dwBuildNumber;
     // 系统名称已由 osName 上报，这里只补世代与 build，渲染成「Windows 11 26100」。
     let generation = if build >= 22000 { "11" } else { "10" };
     Some(format!("{generation} {build}"))
@@ -1098,19 +1178,13 @@ fn platform_os_version() -> Option<String> {
     None
 }
 
-/// Codex 版本在启动阶段已被探测并缓存；缓存缺失时补一次探测。
+/// 只读取启动阶段缓存，展示用的版本信息缺失时不阻塞设备登记。
 async fn current_codex_version() -> Option<String> {
     #[cfg(test)]
     if let Ok(version) = TEST_DEVICE_VERSIONS.try_with(|versions| versions.codex.clone()) {
         return version;
     }
-    if let Some(version) = crate::error_log::cached_codex_version() {
-        return Some(version);
-    }
-    tokio::task::spawn_blocking(|| crate::error_log::refresh_codex_app_version(None, None))
-        .await
-        .ok()
-        .flatten()
+    crate::error_log::cached_codex_version()
 }
 
 fn installable_package_priority(asset: &UpdateManifestAsset) -> Option<u8> {
@@ -1521,6 +1595,114 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn device_requests_reject_redirects_but_public_requests_still_follow_them() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_url = format!("http://{}/target", destination.local_addr().unwrap());
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let destination_server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = destination.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                captured
+                    .lock()
+                    .await
+                    .push(String::from_utf8_lossy(&buffer[..count]).into_owned());
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}", source.local_addr().unwrap());
+        let source_server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = source.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {destination_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                let error = device_http_client()
+                    .unwrap()
+                    .request(method, &source_url)
+                    .header("x-device-key", "test-install-key")
+                    .send()
+                    .await
+                    .unwrap_err();
+                assert!(error.is_redirect());
+            }
+            // Registration carries the same secret in its body and must also stop.
+            let directory = tempfile::tempdir().unwrap();
+            let state = AppState {
+                store: ConfigStore::new(directory.path().join("config.json")),
+                http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                ..AppState::default()
+            };
+            TEST_DEVICE_VERSIONS
+                .scope(
+                    TestDeviceVersions {
+                        codex: None,
+                        os: None,
+                    },
+                    async {
+                        assert!(load_or_register_device(&state, &source_url).await.is_err());
+                        let identity = DeviceIdentity {
+                            install_key: "test-install-key".into(),
+                            machine_no: "test-machine".into(),
+                            pending: false,
+                        };
+                        tokio::fs::write(
+                            device_identity_path(&state.store).await.unwrap(),
+                            serde_json::to_vec(&identity).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                        state.config.write().await.codey_update_policy =
+                            crate::config::CodeyUpdatePolicy::Stable;
+                        assert!(
+                            fetch_release_admin_update(
+                                &state,
+                                &source_url,
+                                UpdateRequestMode::Manual
+                            )
+                            .await
+                            .is_err()
+                        );
+                    },
+                )
+                .await;
+            assert!(received.lock().await.is_empty());
+            // Manifest/download requests continue to use the ordinary shared client.
+            assert!(
+                state
+                    .http_client
+                    .get(&source_url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .is_success()
+            );
+            let requests = received.lock().await;
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0].contains("test-install-key"));
+            assert!(!requests[0].to_ascii_lowercase().contains("x-device-key"));
+        })
+        .await;
+        source_server.abort();
+        destination_server.abort();
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn device_machine_no_reads_registered_identity_without_exposing_key() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
@@ -1553,6 +1735,292 @@ mod tests {
         state.config.write().await.release_admin_url.clear();
         assert_eq!(get_device_machine_no(&state).await.unwrap(), Value::Null);
         assert!(!device_identity_path(&state.store).await.unwrap().exists());
+    }
+
+    async fn read_registration_request(stream: &mut tokio::net::TcpStream) -> Value {
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "request ended before headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST /api/devices/register "));
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .unwrap()
+            .1
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "request ended before body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap()
+    }
+
+    async fn respond_to_registration(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_registration_reuses_persisted_key_after_restart_without_metadata() {
+        for first_response in [
+            None,
+            Some(("200 OK", "invalid-json")),
+            Some(("200 OK", r#"{"machineNo":" "}"#)),
+            Some(("503 Service Unavailable", "{}")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = AppState {
+                store: ConfigStore::new(directory.path().join("config.json")),
+                ..AppState::default()
+            };
+            let identity_path = device_identity_path(&state.store).await.unwrap();
+            let server_path = identity_path.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut install_key = None;
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = read_registration_request(&mut stream).await;
+                    assert_eq!(request["codexVersion"], Value::Null);
+                    assert_eq!(request["osVersion"], Value::Null);
+                    let pending: DeviceIdentity =
+                        serde_json::from_slice(&tokio::fs::read(&server_path).await.unwrap())
+                            .unwrap();
+                    assert!(pending.pending);
+                    assert_eq!(request["installKey"], pending.install_key);
+                    if let Some(key) = &install_key {
+                        assert_eq!(&request["installKey"], key);
+                    } else {
+                        // 模拟服务端已接受首个请求，但客户端未取得有效响应。
+                        install_key = Some(request["installKey"].clone());
+                    }
+                    if attempt == 0 {
+                        if let Some((status, body)) = first_response {
+                            respond_to_registration(&mut stream, status, body).await;
+                        }
+                    } else {
+                        respond_to_registration(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"machineNo":"m_retried"}"#,
+                        )
+                        .await;
+                    }
+                }
+                install_key.unwrap()
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                TEST_DEVICE_VERSIONS.scope(
+                    TestDeviceVersions {
+                        codex: None,
+                        os: None,
+                    },
+                    async {
+                        assert!(load_or_register_device(&state, &base_url).await.is_err());
+                        let pending = read_device_identity(&state.store).await.unwrap().unwrap();
+                        assert!(pending.pending);
+                        assert!(pending.machine_no.is_empty());
+                        // 新建状态模拟重启，确保恢复不依赖进程内缓存。
+                        let restarted = AppState {
+                            store: ConfigStore::new(state.store.path().to_path_buf()),
+                            ..AppState::default()
+                        };
+                        restarted.config.write().await.release_admin_url.clear();
+                        assert_eq!(
+                            get_device_machine_no(&restarted).await.unwrap(),
+                            Value::Null
+                        );
+                        let registered = load_or_register_device(&restarted, &base_url)
+                            .await
+                            .unwrap();
+                        assert_eq!(registered.install_key, pending.install_key);
+                        assert_eq!(registered.machine_no, "m_retried");
+                        assert!(!registered.pending);
+                        let saved = read_device_identity(&restarted.store)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(saved.install_key, registered.install_key);
+                        assert_eq!(saved.machine_no, registered.machine_no);
+                        assert!(!saved.pending);
+                        registered
+                    },
+                ),
+            )
+            .await;
+            if result.is_err() {
+                server.abort();
+            }
+            let registered = result.unwrap();
+            assert_eq!(server.await.unwrap(), registered.install_key);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(identity_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_unreadable_identity_is_preserved_without_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            ..AppState::default()
+        };
+        let path = device_identity_path(&state.store).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        for contents in [
+            r#"{"installKey":"private-key","machineNo": "#,
+            r#"{"installKey":"private-key"}"#,
+            r#"{"machineNo":"existing"}"#,
+            r#"{"installKey":"private-key","machineNo":" "}"#,
+            r#"{"installKey":" ","pending":true}"#,
+            r#"{"installKey":"private-key","machineNo":"existing","pending":true}"#,
+            r#"{"installKey":"private-key","pending":"private-key"}"#,
+        ] {
+            tokio::fs::write(&path, contents).await.unwrap();
+            let error = load_or_register_device(&state, &base_url)
+                .await
+                .unwrap_err();
+            assert!(error.contains("设备身份文件"));
+            assert!(!error.contains("private-key"));
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), contents);
+            assert!(get_device_machine_no(&state).await.is_err());
+        }
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
+        let error = load_or_register_device(&state, &base_url)
+            .await
+            .unwrap_err();
+        assert!(error.contains("读取设备身份失败"));
+        assert!(path.is_dir());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    struct RestoreDirectoryPermissions(PathBuf, std::fs::Permissions);
+
+    #[cfg(unix)]
+    impl RestoreDirectoryPermissions {
+        fn make_read_only(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let original = std::fs::metadata(path).unwrap().permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            Self(path.to_path_buf(), original)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreDirectoryPermissions {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_is_not_sent_when_pending_identity_cannot_be_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            ..AppState::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let permissions = RestoreDirectoryPermissions::make_read_only(directory.path());
+        let result = load_or_register_device(&state, &base_url).await;
+        drop(permissions);
+        assert!(result.unwrap_err().contains("保存设备身份失败"));
+        assert!(!device_identity_path(&state.store).await.unwrap().exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_final_save_preserves_pending_identity_and_retries_with_same_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            ..AppState::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server_directory = directory.path().to_path_buf();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let first = read_registration_request(&mut stream).await;
+            let permissions = RestoreDirectoryPermissions::make_read_only(&server_directory);
+            blocked_tx.send(permissions).ok().unwrap();
+            respond_to_registration(&mut stream, "200 OK", r#"{"machineNo":"m_saved"}"#).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let second = read_registration_request(&mut stream).await;
+            assert_eq!(first["installKey"], second["installKey"]);
+            respond_to_registration(&mut stream, "200 OK", r#"{"machineNo":"m_saved"}"#).await;
+            first["installKey"].clone()
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            TEST_DEVICE_VERSIONS.scope(
+                TestDeviceVersions {
+                    codex: None,
+                    os: None,
+                },
+                async {
+                    let error = load_or_register_device(&state, &base_url)
+                        .await
+                        .unwrap_err();
+                    drop(blocked_rx.await.unwrap());
+                    assert!(error.contains("保存设备身份失败"));
+                    let pending = read_device_identity(&state.store).await.unwrap().unwrap();
+                    assert!(pending.pending);
+                    assert!(pending.machine_no.is_empty());
+                    let registered = load_or_register_device(&state, &base_url).await.unwrap();
+                    assert_eq!(registered.install_key, pending.install_key);
+                    assert_eq!(registered.machine_no, "m_saved");
+                    registered
+                },
+            ),
+        )
+        .await;
+        if result.is_err() {
+            server.abort();
+        }
+        assert_eq!(server.await.unwrap(), result.unwrap().install_key);
     }
 
     #[tokio::test]

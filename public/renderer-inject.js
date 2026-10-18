@@ -136,6 +136,9 @@
       #${accountUsageId} .codey-usage-overview { display: flex; min-width: 0; align-items: baseline; gap: 6px; }
       #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
       #${accountUsageId} .codey-usage-plan-tag { flex: 0 0 auto; overflow: hidden; max-width: 44%; border: 1px solid color-mix(in srgb, #0a84ff 32%, transparent); border-radius: 4px; padding: 0 4px; background: color-mix(in srgb, #0a84ff 13%, transparent); color: color-mix(in srgb, #0a84ff 82%, CanvasText); font-size: 8px; font-weight: 700; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="100"] { border-color: light-dark(#cbd5e1, #64748b); background: linear-gradient(135deg, light-dark(#f8fafc, #394452), light-dark(#e2e8f0, #262e39)); color: light-dark(#475569, #dbe4ef); box-shadow: inset 0 1px 0 rgb(255 255 255 / .18); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="200"] { border-color: light-dark(#d6b86b, #8f7035); background: linear-gradient(135deg, light-dark(#fff8e7, #4b3b1f), light-dark(#f2dfb0, #302719)); color: light-dark(#78530e, #f2d58d); box-shadow: inset 0 1px 0 rgb(255 255 255 / .24); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="500"] { border-color: light-dark(#b89654, #c6a663); background: linear-gradient(135deg, light-dark(#49305f, #59406e), light-dark(#25182f, #302039)); color: light-dark(#f8e5af, #ffe9b0); box-shadow: inset 0 1px 0 rgb(255 234 184 / .24), 0 1px 3px rgb(37 28 54 / .15); }
       #${accountUsageId} .codey-usage-value { margin-inline-start: auto; font-size: 12px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
       #${accountUsageId} .codey-usage-meter { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 8%, transparent); contain: size; line-height: 0; }
       #${accountUsageId} .codey-usage-meter > span { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
@@ -500,18 +503,19 @@
   const accountUsagePlanLabel = (planType) => {
     const raw = String(planType || "").trim();
     if (!raw) return "";
-    const compact = raw.toLowerCase().replace(/[\s_$-]+/g, "");
-    if (compact === "5x" || compact.includes("pro5x") || compact.includes("pro100")) {
-      return "Pro 5x";
-    }
-    if (compact === "pro" || compact.includes("pro20x") || compact.includes("pro200")) {
-      return "Pro 20x";
-    }
-    if (compact.includes("plus")) return "Plus";
-    if (compact.includes("free")) return "Free";
-    return raw
-      .replace(/[_-]+/g, " ")
-      .replace(/\b\w/g, (character) => character.toUpperCase());
+    const normalized = raw.toLowerCase();
+    if (normalized === "prolite") return "Pro 100";
+    if (normalized === "pro") return "Pro 200";
+    if (normalized === "promax") return "Pro 500";
+    const compact = normalized.replace(/[\s_$-]+/g, "");
+    if (compact === "pro100") return "Pro 100";
+    if (compact === "pro200") return "Pro 200";
+    if (compact === "pro500") return "Pro 500";
+    if (compact === "5x" || compact === "pro5x") return "Pro 5x";
+    if (compact === "pro20x") return "Pro 20x";
+    if (normalized === "plus") return "Plus";
+    if (normalized === "free") return "Free";
+    return raw;
   };
 
   const accountUsageResetLabel = (resetsAt) => {
@@ -608,6 +612,7 @@
 
   const accountUsageWindowSegment = (window, kind, plan = "") => {
     if (!window || accountUsageWindowKind(window) !== kind) return null;
+    const proTier = /^Pro (100|200|500)$/.exec(plan)?.[1];
     const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
     const roundedRemaining = Math.round(remaining);
     const label = kind === "weekly" ? "周额度" : "5 小时";
@@ -626,7 +631,7 @@
       html: `
         <span class="codey-usage-segment" data-window="${kind}" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
           <span class="codey-usage-overview">
-            ${plan ? `<span class="codey-usage-plan-tag">${escapeAccountUsageText(plan)}</span>` : ""}
+            ${plan ? `<span class="codey-usage-plan-tag"${proTier ? ` data-pro-tier="${proTier}"` : ""}>${escapeAccountUsageText(plan)}</span>` : ""}
             <span class="codey-usage-window-label">${label}</span>
             <span class="codey-usage-value">${roundedRemaining}%</span>
           </span>

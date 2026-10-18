@@ -1168,57 +1168,6 @@ async fn bridge_read_routes_bypass_a_slow_serial_handler() {
     pump.close().await;
 }
 
-#[tokio::test]
-async fn git_work_does_not_block_status_cancellation_or_serial_settings() {
-    let release = Arc::new(tokio::sync::Notify::new());
-    let server_release = Arc::clone(&release);
-    let (url, request_rx) = spawn_cdp_server(move |mut socket| async move {
-        for expected_id in 1..=5 {
-            let command = recv_json(&mut socket).await;
-            assert_eq!(command["id"], expected_id);
-            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
-        }
-        for (id, path) in [
-            ("preview", "/api/conversation_git_preview"),
-            ("status", "/api/conversation_git_status"),
-            ("cancel", "/api/conversation_git_cancel"),
-            ("settings", "/settings/set"),
-        ] {
-            send_json(&mut socket, json!({"method":"Runtime.bindingCalled", "params":{
-                "payload":serde_json::to_string(&json!({"id":id,"path":path,"payload":{}})).unwrap()
-            }})).await;
-        }
-        let mut completed = Vec::new();
-        for _ in 0..3 {
-            let response = tokio::time::timeout(Duration::from_secs(2), recv_json(&mut socket))
-                .await
-                .expect("Git preview must not block unrelated handlers");
-            completed.push(response.to_string());
-        }
-        for id in ["status", "cancel", "settings"] {
-            assert!(completed.iter().any(|response| response.contains(id)));
-        }
-        server_release.notify_one();
-        assert_expression_contains_request(&recv_json(&mut socket).await, "preview");
-        close_socket(&mut socket).await;
-    })
-    .await;
-    let handler = Arc::new(move |path: String, _: serde_json::Value| {
-        let release = Arc::clone(&release);
-        Box::pin(async move {
-            if path == "/api/conversation_git_preview" {
-                release.notified().await;
-            }
-            Ok(json!({"status":"ok"}))
-        }) as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
-    });
-    let pump = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[])
-        .await
-        .unwrap();
-    request_rx.await.unwrap();
-    pump.close().await;
-}
-
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
 async fn accept_installed_bridge(listener: &TcpListener) -> (TestSocket, String) {

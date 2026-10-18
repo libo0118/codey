@@ -42,6 +42,7 @@ fn refresh_model_catalog_or_fallback_at(
         &native_web_search_models,
         &image_detail_original_models,
         &config.runtime_remote_compaction_model_aliases(),
+        &config.codex_app_path,
     );
     match result {
         Ok(fallback) => {
@@ -275,6 +276,7 @@ pub(crate) fn model_catalog_fallback(
     native_web_search_models: &[String],
     image_detail_original_models: &[String],
     remote_compaction_models: &[String],
+    codex_app_path: &str,
 ) -> Result<bool, String> {
     match result {
         Ok(()) => Ok(false),
@@ -284,6 +286,7 @@ pub(crate) fn model_catalog_fallback(
                 native_web_search_models,
                 image_detail_original_models,
                 remote_compaction_models,
+                codex_app_path,
             )
             .map(|available| !available)
             .map_err(|fallback_error| fallback_error.to_string())

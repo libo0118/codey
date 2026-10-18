@@ -90,7 +90,17 @@ async function deviceDialog(invoke, overrides = {}) {
     return module.exports.SystemSettingsDialog(props);
   };
   const tree = render();
-  return { tree, render, runEffect: () => effect() };
+  let cleanup;
+  return {
+    tree,
+    props,
+    render,
+    runEffect: () => {
+      cleanup?.();
+      cleanup = effect();
+      return cleanup;
+    },
+  };
 }
 
 test("设备号按接口原值显示和复制，反馈与目录复制独立", async (t) => {
@@ -141,16 +151,88 @@ test("设备号读取失败可重试，未登记时不可复制占位文字", as
   assert.deepEqual(clipboardWrites, []);
 });
 
-test("关闭的弹窗不请求设备号，关闭后忽略迟到结果", async () => {
+test("设备号显示具体错误原因，空错误使用可理解的提示", async () => {
+  for (const [error, expected] of [
+    [new Error("无法读取设备信息，请检查文件访问权限。"), "无法读取设备信息，请检查文件访问权限。"],
+    ["设备登记失败，请检查网络连接后重试。", "设备登记失败，请检查网络连接后重试。"],
+    [new Error("  "), "暂时无法读取设备号，请稍后重试。"],
+    [null, "暂时无法读取设备号，请稍后重试。"],
+  ]) {
+    const fixture = await deviceDialog(async () => { throw error; });
+    fixture.runEffect();
+    await new Promise(setImmediate);
+    const tree = fixture.render();
+    const status = collectElements(tree, element => elementProps(element)["aria-live"] === "polite")[0];
+    assert.ok(textContent(status).includes("读取失败"));
+    assert.ok(textContent(status).includes(expected));
+    assert.equal(byLabel(tree, "重新读取设备号").length, 1);
+    assert.equal(byLabel(tree, "复制设备号").length, 0);
+  }
+});
+
+for (const lateOutcome of ["成功", "失败"]) {
+  test(`设备号超时后可重试，忽略旧请求的迟到${lateOutcome}`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pending = [];
+    const fixture = await deviceDialog(() => new Promise((resolve, reject) => {
+      pending.push({ resolve, reject });
+    }));
+    fixture.runEffect();
+    t.mock.timers.tick(19999);
+    assert.match(textContent(fixture.render()), /读取中/);
+    t.mock.timers.tick(1);
+    const timedOut = fixture.render();
+    assert.match(textContent(timedOut), /读取失败/);
+    assert.match(textContent(timedOut), /读取超时，请检查网络连接后重试/);
+    elementProps(byLabel(timedOut, "重新读取设备号")[0]).onClick();
+    fixture.render();
+    fixture.runEffect();
+    if (lateOutcome === "成功") pending[0].resolve("m_old_response");
+    else pending[0].reject(new Error("旧请求失败"));
+    await new Promise(setImmediate);
+    const retrying = fixture.render();
+    assert.equal(pending.length, 2);
+    assert.match(textContent(retrying), /读取中/);
+    assert.doesNotMatch(textContent(retrying), /m_old_response|旧请求失败|读取超时|读取失败/);
+    pending[1].resolve("m_retry_success");
+    await new Promise(setImmediate);
+    t.mock.timers.tick(20000);
+    const completed = fixture.render();
+    assert.match(textContent(completed), /m_retry_success/);
+    assert.doesNotMatch(textContent(completed), /读取失败|读取超时/);
+    assert.equal(elementProps(byLabel(completed, "复制设备号")[0]).disabled, false);
+  });
+}
+
+test("设备号超时后，原请求迟到成功也不会替换超时提示", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let resolve;
+  const fixture = await deviceDialog(() => new Promise(done => { resolve = done; }));
+  fixture.runEffect();
+  t.mock.timers.tick(20000);
+  resolve("m_timed_out_response");
+  await new Promise(setImmediate);
+  const tree = fixture.render();
+  assert.match(textContent(tree), /读取超时/);
+  assert.doesNotMatch(textContent(tree), /m_timed_out_response/);
+});
+
+test("关闭的弹窗不请求设备号，关闭后清理等待并忽略迟到结果", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const clearTimer = t.mock.method(globalThis, "clearTimeout");
   const closed = await deviceDialog(() => { throw new Error("不应请求"); }, { open: false });
   closed.runEffect();
   let resolve;
   const fixture = await deviceDialog(() => new Promise(done => { resolve = done; }));
-  const cleanup = fixture.runEffect();
-  cleanup();
+  fixture.runEffect();
+  fixture.props.open = false;
+  fixture.render();
+  fixture.runEffect();
+  assert.equal(clearTimer.mock.callCount(), 1);
+  t.mock.timers.tick(20000);
   resolve("m_late_response");
   await new Promise(setImmediate);
-  assert.doesNotMatch(textContent(fixture.render()), /m_late_response/);
+  assert.doesNotMatch(textContent(fixture.render()), /m_late_response|读取失败|读取超时/);
 });
 
 test("设备号复制失败不显示成功反馈", async (t) => {

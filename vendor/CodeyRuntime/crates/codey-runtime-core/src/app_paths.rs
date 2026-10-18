@@ -280,12 +280,9 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        // A failed registration query must not turn into a standalone guess.
-        let mut paths = registered_codex_app_dirs()?;
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            paths.extend(standalone_codex_app_dirs_from(Path::new(&local)));
-        }
-        unique_installation(paths)
+        resolve_codex_app_dir_with_saved_checked(None, None)
+            .ok()
+            .flatten()
     }
     #[cfg(not(windows))]
     {
@@ -329,59 +326,413 @@ pub fn resolve_codex_app_dir_with_saved(
     app_dir: Option<&Path>,
     saved_app_path: Option<&str>,
 ) -> Option<PathBuf> {
+    resolve_codex_app_dir_with_saved_checked(app_dir, saved_app_path)
+        .ok()
+        .flatten()
+}
+
+pub fn resolve_codex_app_dir_with_saved_checked(
+    app_dir: Option<&Path>,
+    saved_app_path: Option<&str>,
+) -> anyhow::Result<Option<PathBuf>> {
     if let Some(app_dir) = app_dir {
-        return normalize_codex_app_path(app_dir);
+        return normalize_codex_app_path_checked(app_dir).map(Some);
     }
     if let Some(saved) = saved_app_path
         .map(str::trim)
         .filter(|saved| !saved.is_empty())
-        && let Some(path) = normalize_codex_app_path(Path::new(saved))
     {
-        return Some(path);
+        return normalize_codex_app_path_checked(Path::new(saved)).map(Some);
     }
-    resolve_codex_app_dir(None)
+    #[cfg(windows)]
+    {
+        let mut paths = registered_codex_app_dirs().ok_or_else(|| {
+            anyhow::anyhow!("无法查询或解析 Windows Codex 包注册信息，请明确选择应用路径")
+        })?;
+        let (mut roots, mut diagnostics) = standalone_registry_roots();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            roots.extend([
+                local.join("Programs/Codex"),
+                local.join("OpenAI/Codex/bin"),
+                local.join("OpenAI/Codex"),
+                local.join("Programs/OpenAI/Codex"),
+            ]);
+        }
+        paths.extend(collect_automatic_app_roots(roots)?);
+        add_optional_discovery_source(
+            &mut paths,
+            &mut diagnostics,
+            "当前会话进程",
+            running_codex_app_dirs(),
+        );
+        for path in &paths {
+            validate_codex_app_dir(path)?;
+        }
+        finish_automatic_discovery(paths, diagnostics)
+    }
+    #[cfg(not(windows))]
+    Ok(resolve_codex_app_dir(None))
+}
+
+// Automatic roots can be data-only directories. Keep absence separate from
+// unreadable directories, incomplete installations and ambiguous candidates.
+#[cfg(any(windows, test))]
+fn collect_automatic_app_roots(mut roots: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    use anyhow::Context;
+    roots.sort();
+    roots.dedup();
+    let mut paths = Vec::new();
+    for root in roots {
+        let metadata = match std::fs::metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法访问 Codex 安装目录：{}", root.display()));
+            }
+        };
+        let app = if metadata.is_dir() {
+            let Some(app) = app_candidate_from_directory(&root)? else {
+                continue;
+            };
+            app
+        } else {
+            normalize_codex_app_path_checked(&root)?
+        };
+        validate_codex_app_dir(&app)?;
+        paths.push(app);
+    }
+    Ok(paths)
+}
+
+#[cfg(any(windows, test))]
+fn add_optional_discovery_source(
+    paths: &mut Vec<PathBuf>,
+    diagnostics: &mut Vec<String>,
+    source: &str,
+    result: anyhow::Result<Vec<PathBuf>>,
+) {
+    match result {
+        Ok(found) => paths.extend(found),
+        Err(error) => diagnostics.push(format!("{source}：{error:#}")),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn finish_automatic_discovery(
+    paths: Vec<PathBuf>,
+    diagnostics: Vec<String>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !diagnostics.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "codex_app_discovery_source_failed",
+            serde_json::json!({"diagnostics": diagnostics}),
+        );
+    }
+    if paths.is_empty() {
+        anyhow::ensure!(
+            diagnostics.is_empty(),
+            "未找到可用的 Codex 安装，部分来源查询失败：{}",
+            diagnostics.join("；")
+        );
+        return Ok(None);
+    }
+    let display = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("；");
+    unique_installation(paths)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("发现多个 Codex 安装，请明确选择应用路径：{display}"))
+}
+
+#[cfg(windows)]
+fn running_codex_app_dirs() -> anyhow::Result<Vec<PathBuf>> {
+    use crate::windows_integration::{enumerate_processes, process_session_id};
+    let session = process_session_id(std::process::id())
+        .ok_or_else(|| anyhow::anyhow!("无法确定当前 Windows 会话"))?;
+    let mut paths = Vec::new();
+    for process in enumerate_processes()? {
+        if process.session_id != Some(session)
+            || !is_supported_app_executable_name(&process.exe_file)
+        {
+            continue;
+        }
+        // Process names are only a cheap filter. Resolve the OS-reported image
+        // path and require a complete supported application before accepting it.
+        if let Some(image) = process.executable_path
+            && let Ok(app) = normalize_codex_app_path_checked(&image)
+            && validate_codex_app_dir(&app).is_ok()
+        {
+            paths.push(app);
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(windows)]
+fn standalone_registry_roots() -> (Vec<PathBuf>, Vec<String>) {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    use windows::core::PCWSTR;
+    let mut paths = Vec::new();
+    let mut diagnostics = Vec::new();
+    // Read fixed application registrations, never execute registry command lines.
+    // Metadata validation below decides whether a registration is actually Codex.
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        for key in [
+            r"Software\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe",
+            r"Software\Microsoft\Windows\CurrentVersion\App Paths\ChatGPT.exe",
+            r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe",
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex",
+        ] {
+            let key_wide = key.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let value = if key.ends_with(r"Uninstall\Codex") {
+                "InstallLocation"
+            } else {
+                ""
+            };
+            let value_wide = value.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let mut buffer = vec![0u16; 32768];
+            let mut size = (buffer.len() * 2) as u32;
+            let status = unsafe {
+                RegGetValueW(
+                    hive,
+                    PCWSTR(key_wide.as_ptr()),
+                    PCWSTR(value_wide.as_ptr()),
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buffer.as_mut_ptr().cast()),
+                    Some(&mut size),
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                diagnostics.push(format!(
+                    "无法读取 Codex 安装注册信息：{key}，错误码 {}",
+                    status.0
+                ));
+                continue;
+            }
+            let end = buffer
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(buffer.len());
+            let value = match String::from_utf16(&buffer[..end]) {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(format!("Codex 安装注册信息编码无效：{key}，{error}"));
+                    continue;
+                }
+            };
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    diagnostics.push(format!(
+                        "Codex 安装注册路径不是绝对路径：{}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                // ChatGPT has its own desktop product. Only Codex-identified
+                // locations should be a discovery source for that generic name.
+                if key.ends_with("ChatGPT.exe")
+                    && !path
+                        .components()
+                        .any(|part| part.as_os_str().eq_ignore_ascii_case("Codex"))
+                {
+                    continue;
+                }
+                paths.push(path);
+            }
+        }
+    }
+    (paths, diagnostics)
 }
 
 pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
-    if path.as_os_str().is_empty() {
-        return None;
-    }
+    normalize_codex_app_path_checked(path).ok()
+}
 
-    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    if is_supported_app_executable_name(file_name) {
-        let parent = path.parent()?;
-        return executable_in_dir(parent).map(|_| parent.to_path_buf());
+/// Resolves only known installer layouts, preserving filesystem and ambiguity errors.
+/// Identity validation is deliberately separate so damaged applications stay visible.
+pub fn normalize_codex_app_path_checked(path: &Path) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    anyhow::ensure!(!path.as_os_str().is_empty(), "Codex 安装路径为空");
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Codex 路径不存在或无法访问：{}", path.display()))?;
+    if path.extension() == Some(OsStr::new("app")) && metadata.is_dir() {
+        return Ok(path.to_path_buf());
     }
-
-    if path.extension() == Some(OsStr::new("app")) {
-        return path.is_dir().then(|| path.to_path_buf());
+    if metadata.is_file() {
+        let parent = path.parent().context("Codex 程序没有父目录")?;
+        let supported = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_supported_app_executable_name);
+        anyhow::ensure!(
+            supported
+                || !SELECTED_FILE_REQUIRES_SIBLING_EXECUTABLE
+                || executable_in_dir(parent).is_some(),
+            "所选文件不是 Codex 桌面启动程序：{}",
+            path.display()
+        );
+        // A selected executable names its own app, even when another complete
+        // install exists below it. Never replace a damaged explicit selection.
+        if supported && resources_present(parent)? {
+            return Ok(parent.to_path_buf());
+        }
+        return normalize_codex_app_path_checked(parent);
     }
-
-    if path.is_file() {
-        return install_dir_from_selected_file(path, SELECTED_FILE_REQUIRES_SIBLING_EXECUTABLE);
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "Codex 安装路径不是目录：{}",
+        path.display()
+    );
+    if let Some(candidate) = app_candidate_from_directory(path)? {
+        return Ok(candidate);
     }
-
-    if executable_in_dir(path).is_some() {
-        return Some(path.to_path_buf());
-    }
-
-    let nested = CODEX_APP_ENTRY_DIRS
-        .iter()
-        .map(|entry| path.join(entry))
-        .filter(|nested| executable_in_dir(nested).is_some())
-        .collect::<Vec<_>>();
-    if let Some(first) = nested.first().cloned() {
-        // Preserve the selected layout, but refuse different installations
-        // underneath it. Canonicalization allows aliases of the same install.
-        return unique_installation(nested).map(|_| first);
-    }
-
     #[cfg(not(windows))]
-    if path.is_dir() {
-        return Some(path.to_path_buf());
-    }
+    return Ok(path.to_path_buf());
+    #[cfg(windows)]
+    anyhow::bail!("目录内没有 Codex 桌面启动程序：{}", path.display());
+}
 
-    None
+fn app_candidate_from_directory(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::Context;
+    let mut candidates = Vec::new();
+    let root_launcher = executable_in_dir_checked(path)?.is_some();
+    let root_resources = resources_present(path)?;
+    if root_launcher && root_resources {
+        candidates.push(path.to_path_buf());
+    }
+    for entry in bounded_app_entry_dirs(path)? {
+        if executable_in_dir_checked(&entry)?.is_some() {
+            candidates.push(entry);
+        }
+    }
+    if candidates.is_empty() && root_launcher {
+        candidates.push(path.to_path_buf());
+    }
+    // A resource-free root launcher is the only excluded candidate. Nested
+    // executables lacking resources remain candidates and cannot disappear.
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut unique = Vec::<(PathBuf, PathBuf)>::new();
+    for candidate in candidates {
+        let canonical = std::fs::canonicalize(&candidate)
+            .with_context(|| format!("无法访问 Codex 候选目录：{}", candidate.display()))?;
+        let root = std::fs::canonicalize(path)?;
+        anyhow::ensure!(
+            canonical.starts_with(&root),
+            "Codex 候选目录超出所选安装目录：{}",
+            candidate.display()
+        );
+        if !unique.iter().any(|(known, _)| known == &canonical) {
+            unique.push((canonical, candidate));
+        }
+    }
+    anyhow::ensure!(
+        unique.len() == 1,
+        "发现多个 Codex 候选目录，请明确选择程序文件；缺少资源的候选也需检查：{}",
+        unique
+            .iter()
+            .map(|(_, path)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("；")
+    );
+    Ok(Some(unique.remove(0).1))
+}
+
+fn resources_present(path: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let resources = path.join("resources");
+    // The directory itself counts: removing metadata must not silently redirect
+    // an explicitly selected damaged installation to another version.
+    resources
+        .try_exists()
+        .with_context(|| format!("无法检查 Codex 应用资源：{}", resources.display()))
+}
+
+fn executable_in_dir_checked(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::Context;
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let mut executable = None;
+            for entry in std::fs::read_dir(path)
+                .with_context(|| format!("无法读取 Codex 候选目录：{}", path.display()))?
+            {
+                let entry = entry
+                    .with_context(|| format!("无法读取 Codex 候选目录条目：{}", path.display()))?;
+                if STANDALONE_CODEX_EXECUTABLES
+                    .iter()
+                    .any(|name| executable_name_matches(&entry.file_name(), name))
+                {
+                    let metadata = std::fs::metadata(entry.path()).with_context(|| {
+                        format!("无法读取 Codex 启动程序：{}", entry.path().display())
+                    })?;
+                    if metadata.is_file() && executable.is_none() {
+                        executable = Some(entry.path());
+                    }
+                }
+            }
+            Ok(executable)
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("无法访问 Codex 候选目录：{}", path.display()))
+        }
+    }
+}
+
+fn bounded_app_entry_dirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use anyhow::Context;
+    let mut paths = CODEX_APP_ENTRY_DIRS
+        .iter()
+        .map(|entry| root.join(entry))
+        .collect::<Vec<_>>();
+    // Only inspect version-shaped children of the install root and versions/.
+    // No recursive walk and no version sorting to choose an arbitrary install.
+    for parent in [root.to_path_buf(), root.join("versions")] {
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法扫描 Codex 安装目录：{}", parent.display()));
+            }
+        };
+        for (index, entry) in entries.enumerate() {
+            anyhow::ensure!(
+                index < 256,
+                "Codex 安装目录条目过多，请直接选择程序文件：{}",
+                parent.display()
+            );
+            let entry = entry
+                .with_context(|| format!("无法读取 Codex 安装目录条目：{}", parent.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let version = name.strip_prefix("app-").unwrap_or(&name);
+            if version.split('.').count() >= 2
+                && version
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                paths.push(entry.path());
+                paths.push(entry.path().join("app"));
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// Names the install directory a user-selected file belongs to.
@@ -390,13 +741,14 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
 /// Guessing the parent of an unrelated binary (a CLI build or a third-party
 /// Codex launcher such as `codex-x.exe`) would hand the launcher a path it can
 /// never start, and the failure would only surface as a spawn error.
+#[cfg(test)]
 fn install_dir_from_selected_file(
     path: &Path,
     require_sibling_executable: bool,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
     if !require_sibling_executable || executable_in_dir(parent).is_some() {
-        return Some(parent.to_path_buf());
+        return normalize_codex_app_path(parent);
     }
     None
 }
@@ -1283,6 +1635,94 @@ mod tests {
     }
 
     #[test]
+    fn installer_launcher_resolves_to_the_electron_app_for_all_path_sources() {
+        for entry in CODEX_APP_ENTRY_DIRS {
+            for launcher in STANDALONE_CODEX_EXECUTABLES {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("Programs/Codex");
+                let app = root.join(entry);
+                write_windows_client(&app);
+                std::fs::rename(app.join("Codex.exe"), app.join("ChatGPT.exe")).unwrap();
+                let selected_exe = root.join(launcher);
+                std::fs::write(&selected_exe, b"installer launcher").unwrap();
+                let cli = app.join("resources/codex.exe");
+                std::fs::write(&cli, b"CLI fixture").unwrap();
+
+                for selected in [&root, &selected_exe, &app, &app.join("ChatGPT.exe")] {
+                    let resolved = resolve_codex_app_dir(Some(selected)).unwrap();
+                    assert_eq!(resolved, app);
+                    validate_codex_app_dir(&resolved).unwrap();
+                    assert_eq!(build_codex_executable(&resolved), app.join("ChatGPT.exe"));
+                    assert_eq!(codex_runtime_executable(&resolved), Some(cli.clone()));
+                    assert_eq!(
+                        resolve_codex_app_dir_with_saved(None, selected.to_str()),
+                        Some(app.clone())
+                    );
+                }
+                assert_eq!(
+                    find_standalone_codex_app_dir_from(temp.path()),
+                    Some(std::fs::canonicalize(&app).unwrap())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installer_layout_supports_unpacked_metadata_and_preserves_flat_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_windows_client(root);
+        assert_eq!(normalize_codex_app_path(root), Some(root.to_path_buf()));
+        let nested = root.join("app");
+        std::fs::create_dir_all(nested.join("resources/app")).unwrap();
+        std::fs::write(nested.join("ChatGPT.exe"), b"desktop fixture").unwrap();
+        std::fs::write(
+            nested.join("resources/app/package.json"),
+            serde_json::to_vec(&codex_client_package()).unwrap(),
+        )
+        .unwrap();
+        // A directory is ambiguous, but an explicit executable selects its app.
+        assert!(normalize_codex_app_path(root).is_none());
+        assert_eq!(
+            normalize_codex_app_path(&root.join("Codex.exe")),
+            Some(root.to_path_buf())
+        );
+        // Startup forwards the exact executable to model discovery, preserving
+        // selection even though an already resolved directory has nested apps.
+        let resolved = normalize_codex_app_path_checked(&root.join("Codex.exe")).unwrap();
+        let catalog_selection = build_codex_executable(&resolved);
+        assert_eq!(
+            normalize_codex_app_path_checked(&catalog_selection).unwrap(),
+            resolved
+        );
+        std::fs::remove_dir_all(root.join("resources")).unwrap();
+        assert_eq!(normalize_codex_app_path(root), Some(nested.clone()));
+        validate_codex_app_dir(&nested).unwrap();
+    }
+
+    #[test]
+    fn nested_layout_does_not_skip_invalid_application_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("Codex.exe"), b"installer launcher").unwrap();
+        let app = root.join("app");
+        write_windows_client(&app);
+        write_app_asar_metadata(
+            &app.join("resources"),
+            serde_json::json!({"name": "unrelated-client", "version": "1.0.0"}),
+        );
+        let resolved = normalize_codex_app_path(root).unwrap();
+        assert_eq!(resolved, app);
+        assert!(validate_codex_app_dir(&resolved).is_err());
+        // A damaged root archive still counts as a separate layout. It must
+        // not be hidden by the valid app below it.
+        write_windows_client(&app);
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/app.asar"), b"invalid archive").unwrap();
+        assert!(normalize_codex_app_path(root).is_none());
+    }
+
+    #[test]
     fn windows_discovery_refuses_multiple_installations() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("Programs/Codex");
@@ -1305,14 +1745,136 @@ mod tests {
     }
 
     #[test]
+    fn automatic_roots_skip_data_directories_and_missing_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Programs/Codex/app");
+        write_windows_client(&app);
+        let data = temp.path().join("OpenAI/Codex");
+        std::fs::create_dir_all(data.join("logs")).unwrap();
+        let paths = collect_automatic_app_roots(vec![
+            data,
+            temp.path().join("Programs/Codex"),
+            temp.path().join("missing"),
+        ])
+        .unwrap();
+        assert_eq!(paths, vec![app]);
+    }
+
+    #[test]
+    fn automatic_roots_support_versioned_bin_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("OpenAI/Codex");
+        let bin = root.join("bin");
+        let app = bin.join("versions/1.2.3/app");
+        write_windows_client(&app);
+        let paths = collect_automatic_app_roots(vec![root, bin]).unwrap();
+        assert_eq!(paths, vec![app]);
+    }
+
+    #[test]
+    fn automatic_roots_do_not_hide_incomplete_or_ambiguous_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = temp.path().join("healthy");
+        let broken = temp.path().join("broken");
+        write_windows_client(&healthy);
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("Codex.exe"), b"incomplete install").unwrap();
+        assert!(collect_automatic_app_roots(vec![healthy.clone(), broken.clone()]).is_err());
+        write_windows_client(&broken);
+        write_windows_client(&broken.join("app"));
+        assert!(collect_automatic_app_roots(vec![healthy, broken]).is_err());
+    }
+
+    #[test]
+    fn optional_source_failures_preserve_verified_installations_and_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write_windows_client(&app);
+        let mut paths = vec![app.clone()];
+        let mut diagnostics = Vec::new();
+        add_optional_discovery_source(
+            &mut paths,
+            &mut diagnostics,
+            "当前会话进程",
+            Err(anyhow::anyhow!("session unavailable")),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("session unavailable"));
+        assert_eq!(
+            finish_automatic_discovery(paths, diagnostics.clone()).unwrap(),
+            Some(std::fs::canonicalize(&app).unwrap())
+        );
+        assert!(finish_automatic_discovery(Vec::new(), diagnostics.clone()).is_err());
+        let other = temp.path().join("other");
+        write_windows_client(&other);
+        assert!(finish_automatic_discovery(vec![app, other], diagnostics).is_err());
+    }
+
+    #[test]
     fn selected_parent_refuses_multiple_nested_installations() {
         let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Codex.exe"), b"installer launcher").unwrap();
         let app = temp.path().join("app");
         write_windows_client(&app);
         assert_eq!(normalize_codex_app_path(temp.path()), Some(app.clone()));
         write_windows_client(&temp.path().join("current"));
         assert!(normalize_codex_app_path(temp.path()).is_none());
         assert_eq!(normalize_codex_app_path(&app), Some(app));
+    }
+
+    #[test]
+    fn incomplete_nested_candidate_is_reported_instead_of_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write_windows_client(&app);
+        let broken = temp.path().join("current");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("Codex.exe"), b"incomplete install").unwrap();
+        let error = normalize_codex_app_path_checked(temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("多个 Codex 候选"), "{error}");
+        assert!(error.contains(&app.display().to_string()), "{error}");
+        assert!(error.contains(&broken.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn explicit_damaged_install_does_not_switch_to_nested_app() {
+        let temp = tempfile::tempdir().unwrap();
+        write_windows_client(temp.path());
+        write_windows_client(&temp.path().join("app"));
+        std::fs::remove_file(temp.path().join("resources/app.asar")).unwrap();
+        let selected = temp.path().join("Codex.exe");
+        let app = normalize_codex_app_path_checked(&selected).unwrap();
+        assert_eq!(app, temp.path());
+        assert!(validate_codex_app_dir(&app).is_err());
+        assert!(
+            resolve_codex_app_dir_with_saved_checked(
+                None,
+                temp.path().join("missing.exe").to_str()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn version_directory_scan_is_bounded_and_does_not_choose_latest() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("versions/1.2.3/app");
+        write_windows_client(&first);
+        assert_eq!(normalize_codex_app_path(temp.path()), Some(first));
+        let second = temp.path().join("app-9.8.7");
+        write_windows_client(&second);
+        assert!(
+            normalize_codex_app_path_checked(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("多个 Codex 候选")
+        );
+        assert_eq!(
+            normalize_codex_app_path(&second.join("Codex.exe")),
+            Some(second)
+        );
     }
 
     #[cfg(unix)]
@@ -2013,9 +2575,17 @@ mod tests {
 
         // A third-party launcher must not turn its own directory into the Codex app.
         assert_eq!(install_dir_from_selected_file(&third_party, true), None);
+        // Windows keeps rejecting the directory on its own: even when the
+        // selected-file sibling check is relaxed, the directory candidate
+        // still has no Codex launcher to start.
+        let expected = if cfg!(windows) {
+            None
+        } else {
+            Some(app_dir.as_path())
+        };
         assert_eq!(
             install_dir_from_selected_file(&third_party, false).as_deref(),
-            Some(app_dir.as_path())
+            expected
         );
 
         std::fs::write(app_dir.join("Codex.exe"), []).unwrap();

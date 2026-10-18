@@ -18,15 +18,15 @@ test("codex launch proxy validator matches the launch-time constraints", async (
     "socks5://127.0.0.1:1080",
     "socks5h://proxy.example.com:1080",
     "http://[::1]:7890",
+    // 凭据交给本地认证中继，不交给 Chromium 命令行。
+    "http://user:pass@proxy.example.com:8080",
+    "socks5://user@127.0.0.1:1080",
   ]) {
     assert.equal(validateCodexLaunchProxy(accepted), "", accepted);
   }
 
   for (const rejected of [
-    // Chromium 命令行代理不支持认证。
-    "http://user:pass@proxy.example.com:8080",
-    "socks5://user@127.0.0.1:1080",
-    // 只允许协议、地址和端口。
+    // 只允许协议、地址、端口和认证信息。
     "http://127.0.0.1:7890/v1",
     "socks5://127.0.0.1:1080/v1",
     "http://127.0.0.1:7890?x=1",
@@ -34,6 +34,8 @@ test("codex launch proxy validator matches the launch-time constraints", async (
     // SOCKS 必须显式端口。
     "socks5://127.0.0.1",
     "socks5h://proxy.example.com",
+    // RFC 1929 的用户名和密码各限 255 字节。
+    `socks5://${"u".repeat(256)}@127.0.0.1:1080`,
     // 协议与格式。
     "ftp://proxy.example.com:21",
     "127.0.0.1:7890",
@@ -66,7 +68,10 @@ test("launch proxy input lives in the Codex feature policy card", async () => {
 test("launch proxy reaches Chromium arguments, spawn environment and restart detection", async () => {
   const [configSource, commandsSource, processSource, proxySource, appServerSource] =
     await Promise.all([
-      readFile(new URL("backend/src/config.rs", root), "utf8"),
+      Promise.all([
+        readFile(new URL("backend/src/config/types.rs", root), "utf8"),
+        readFile(new URL("backend/src/config/normalize.rs", root), "utf8"),
+      ]).then((parts) => parts.join("\n")),
       readFile(new URL("backend/src/commands.rs", root), "utf8"),
       readFile(new URL("backend/src/launcher/process.rs", root), "utf8"),
       readFile(new URL("backend/src/launch_proxy.rs", root), "utf8"),
@@ -93,4 +98,23 @@ test("launch proxy reaches Chromium arguments, spawn environment and restart det
     appServerSource,
     /shared_app_server_environment\(\)/,
   );
+});
+
+test("credentialed launch proxy goes through the local auth relay", async () => {
+  const [proxySource, relaySource, launcherSource] = await Promise.all([
+    readFile(new URL("backend/src/launch_proxy.rs", root), "utf8"),
+    readFile(new URL("backend/src/launch_proxy_relay.rs", root), "utf8"),
+    readFile(new URL("backend/src/launcher.rs", root), "utf8"),
+  ]);
+
+  // 带凭据的上游解析为中继计划，启动时落成回环地址，客户端与子进程都
+  // 拿不到凭据。
+  assert.match(proxySource, /LaunchProxyPlan::Relayed/);
+  assert.match(proxySource, /fn relayed\(port: u16\)/);
+  assert.match(proxySource, /http:\/\/127\.0\.0\.1:\{port\}/);
+  assert.match(launcherSource, /plan\.start\(\)\.await/);
+  // 中继向上游注入认证：http(s) 走 Proxy-Authorization，socks5 走 RFC 1929。
+  assert.match(relaySource, /Proxy-Authorization/);
+  assert.match(relaySource, /0x02|method.*auth|socks5_negotiate/);
+  assert.match(relaySource, /pub\(crate\) async fn ensure_running/);
 });

@@ -20,9 +20,9 @@ test("subagent settings expose the five supported role controls", async () => {
   for (const [id, name] of [
     ["codey_quick_scan", "快速定位"],
     ["codey_deep_research", "深度检索"],
-    ["codey_visual_analysis", "视觉分析"],
-    ["codey_worker", "代码实施"],
-    ["codey_visual_worker", "视觉实施"],
+    ["codey_visual_analysis", "界面核验"],
+    ["codey_worker", "逻辑开发"],
+    ["codey_visual_worker", "前端开发"],
   ]) {
     assert.match(featurePolicySource, new RegExp(`id: "${id}"`));
     assert.match(featurePolicySource, new RegExp(`name: "${name}"`));

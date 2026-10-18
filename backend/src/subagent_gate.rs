@@ -127,18 +127,12 @@ struct ObservedRuntimeSubagentSelection {
 enum HookMode {
     SubagentOnly,
     WithFastctx,
-    ConversationGit,
 }
 
 pub fn run_hook_if_requested() -> Result<bool> {
     let mode = match std::env::args_os().nth(1).as_deref() {
         Some(argument) if argument == OsStr::new(HOOK_ARGUMENT) => HookMode::SubagentOnly,
         Some(argument) if argument == OsStr::new(COMBINED_HOOK_ARGUMENT) => HookMode::WithFastctx,
-        Some(argument)
-            if argument == OsStr::new(crate::conversation_git::tracking::HOOK_ARGUMENT) =>
-        {
-            HookMode::ConversationGit
-        }
         _ => return Ok(false),
     };
     let gate_active = runtime_gate_is_active(std::env::var_os(RUNTIME_ACTIVE_ENV).as_deref());
@@ -151,27 +145,6 @@ pub fn run_hook_if_requested() -> Result<bool> {
         MAX_HOOK_INPUT_BYTES,
         "读取 Codex 子代理门禁 Hook 输入失败",
     )?;
-    if mode == HookMode::ConversationGit {
-        if crate::config::ConfigStore::default()
-            .load()?
-            .conversation_git
-            .enabled
-        {
-            let result = serde_json::from_slice::<Value>(&raw)
-                .map_err(anyhow::Error::from)
-                .and_then(|input| {
-                    crate::conversation_git::tracking::observe(
-                        crate::codex_config::codex_home(),
-                        &input,
-                    )
-                });
-            if let Err(error) = result {
-                eprintln!("Codey 文件基线记录失败：{error:#}");
-            }
-        }
-        write_hook_output(&json!({}))?;
-        return Ok(true);
-    }
     let input = match parse_hook_input(&raw) {
         Ok(input) => input,
         Err(output) => {
@@ -186,7 +159,6 @@ pub fn run_hook_if_requested() -> Result<bool> {
         HookMode::WithFastctx => {
             combined_hook_output_for_runtime(&input, &state_root, &runtime_id, gate_active)
         }
-        HookMode::ConversationGit => unreachable!(),
     }
     .unwrap_or_else(|error| {
         eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");

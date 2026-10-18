@@ -29,6 +29,6 @@ test("官方额度只在菜单打开时获取，关闭后停止", () => {
   assert.ok(effect, "额度查询应在菜单未打开时直接返回");
   assert.match(panel, /\}, \[active, accountListKey, refreshUsage\]\);/);
   // 账号失效等其它入口仍保留原行为。
-  assert.match(panel, /await refreshUsage\(account\.id, false\)/);
+  assert.match(panel, /await refreshUsage\(account\.id, false, \(\) => cancelled\)/);
   assert.match(panel, /onClick=\{\(\) => void refreshUsage\(account\.id, true\)\}/);
 });

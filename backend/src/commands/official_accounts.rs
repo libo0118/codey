@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 
 use super::{
     AppState, LaunchOfficialAccountStatus, argument, current_model_state_async, error_log,
-    hot_reload_runtime_models, official_account_available_for_usage, open_system_browser,
-    optional_argument, prepare_routes_for_current_launch, query_official_account_usage,
-    redacted_config, runtime_config_requires_restart, save_config_to_store, string_argument,
+    official_account_available_for_usage, open_system_browser, optional_argument,
+    prepare_routes_for_current_launch, query_official_account_usage, redacted_config,
+    runtime_config_requires_restart, save_config_to_store, string_argument,
 };
 use crate::codex_config::codex_home;
 use crate::config::{
@@ -109,6 +109,7 @@ pub(super) async fn invoke(
             optional_argument::<String>(args, "routeShortName"),
             optional_argument::<String>(args, "upstreamProxy"),
             optional_argument::<String>(args, "baseUrl"),
+            optional_argument::<u32>(args, "maxConcurrency"),
         ) {
             (
                 Ok(account_id),
@@ -116,6 +117,7 @@ pub(super) async fn invoke(
                 Ok(route_short_name),
                 Ok(upstream_proxy),
                 Ok(base_url),
+                Ok(max_concurrency),
             ) => {
                 save_official_account_route_settings(
                     state,
@@ -124,14 +126,16 @@ pub(super) async fn invoke(
                     route_short_name.unwrap_or_default(),
                     upstream_proxy.unwrap_or_default(),
                     base_url.unwrap_or_default(),
+                    max_concurrency,
                 )
                 .await
             }
-            (Err(error), _, _, _, _)
-            | (_, Err(error), _, _, _)
-            | (_, _, Err(error), _, _)
-            | (_, _, _, Err(error), _)
-            | (_, _, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _, _)
+            | (_, Err(error), _, _, _, _)
+            | (_, _, Err(error), _, _, _)
+            | (_, _, _, Err(error), _, _)
+            | (_, _, _, _, Err(error), _)
+            | (_, _, _, _, _, Err(error)) => Err(error),
         },
         _ => Err(format!("未知 Codey API 命令：{command}")),
     }
@@ -677,8 +681,16 @@ pub(super) async fn set_default_official_account(
         ));
     }
 
-    // 页头额度跟随默认账号，切换后确保额度显示处于开启状态。
-    {
+    let home = codex_home().to_path_buf();
+    let activate_store = store.clone();
+    let activate_id = account_id.clone();
+    let record = tokio::task::spawn_blocking(move || activate_store.activate(&activate_id, &home))
+        .await
+        .map_err(|error| format!("切换默认官方账号任务异常退出：{error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+
+    // 页头额度跟随默认账号；激活失败时不修改显示设置。
+    let usage_setting = async {
         let _guard = state.config_write_lock.lock().await;
         let mut config = state.config.read().await.clone();
         if !config.show_account_usage_in_header {
@@ -687,24 +699,24 @@ pub(super) async fn set_default_official_account(
             let config = save_config_to_store(state, config).await?;
             *state.config.write().await = config;
         }
+        Ok::<(), String>(())
     }
-
-    let home = codex_home().to_path_buf();
-    let activate_store = store.clone();
-    let activate_record = record.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        OfficialAccountStore::write_codex_login(&home, &activate_record)?;
-        activate_store.set_default_account_id(Some(&activate_record.id))?;
-        Ok(())
-    })
-    .await
-    .map_err(|error| format!("切换默认官方账号任务异常退出：{error}"))?
-    .map_err(|error| format!("{error:#}"))?;
+    .await;
 
     // Usage is cached per auth file fingerprint; the file just changed, so the
     // next read reflects the new account. Route availability is recomputed
     // from the store like at launch.
-    let payload = refresh_official_route_after_account_change(state).await?;
+    let mut payload = refresh_official_route_after_account_change(state)
+        .await
+        .map_err(|error| format!("默认官方账号已切换，但刷新官方线路失败：{error}"))?;
+    if let Err(error) = usage_setting {
+        let warning = format!("默认官方账号已切换，但开启页头额度显示失败：{error}");
+        let warning = match payload.get("warning").and_then(Value::as_str) {
+            Some(previous) => format!("{previous}；{warning}"),
+            None => warning,
+        };
+        payload = merge(payload, json!({ "warning": warning }));
+    }
     Ok(merge(payload, json!({ "accountId": record.id })))
 }
 
@@ -716,8 +728,7 @@ pub(super) async fn remove_official_account(
     if account_id.is_empty() {
         return Err("缺少要移除的官方账号".to_string());
     }
-    // 删除账号前尽力撤销 SIWC 授权；远端不可达不阻塞本地清理，凭据文件
-    // 会随账号记录一起删除。
+    // 先保留撤销需要的凭据，本地删除成功后再尽力撤销远端 SIWC 授权。
     let lookup_store = state.official_accounts();
     let lookup_id = account_id.clone();
     let siwc_credential = tokio::task::spawn_blocking(move || {
@@ -728,26 +739,12 @@ pub(super) async fn remove_official_account(
     .await
     .ok()
     .and_then(|result| result.ok().flatten());
-    if let Some(credential) = siwc_credential
-        && let Err(error) = revoke_siwc_session(&state.http_client, &credential).await
-    {
-        error_log::record_failure(
-            "official_siwc_revoke_failed",
-            "remove_official_account",
-            format!("{error:#}"),
-            json!({ "accountId": account_id }),
-        );
-    }
     let store = state.official_accounts();
     let home = codex_home().to_path_buf();
+    let removal_id = account_id.clone();
     let (removed_default, promoted, accounts_left) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, Option<String>, bool)> {
-            let was_default = store.default_account_id()?.as_deref() == Some(account_id.as_str());
-            if was_default && let Some(record) = store.get(&account_id)? {
-                OfficialAccountStore::clear_codex_login_if_matches(&home, &record)?;
-            }
-            store.remove(&account_id)?;
-            let mut remaining = store.list()?;
+            let (was_default, mut remaining) = store.remove_with_codex_login(&removal_id, &home)?;
             // 默认账号被移除后把剩下最早的可用账号补上，Codex 仍然有可用的登录
             // 身份；失效账号必须跳过，否则补位会因凭据被拒绝而整个失败。
             let promoted = if was_default {
@@ -768,8 +765,35 @@ pub(super) async fn remove_official_account(
         .await
         .map_err(|error| format!("移除官方账号任务异常退出：{error}"))?
         .map_err(|error| format!("{error:#}"))?;
+    if let Some(credential) = siwc_credential
+        && let Err(error) = revoke_siwc_session(&state.http_client, &credential).await
+    {
+        error_log::record_failure(
+            "official_siwc_revoke_failed",
+            "remove_official_account",
+            format!("{error:#}"),
+            json!({ "accountId": account_id }),
+        );
+    }
     if let Some(promoted) = promoted {
-        let payload = set_default_official_account(state, promoted).await?;
+        let payload = match set_default_official_account(state, promoted).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                // 删除已经提交，补位失败也必须同步路由并明确告知实际结果。
+                let refresh_error = match refresh_official_route_after_account_change(state).await {
+                    Ok(payload) => payload
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    Err(error) => Some(error),
+                };
+                let mut message = format!("账号已移除，但切换默认官方账号失败：{error}");
+                if let Some(error) = refresh_error {
+                    message.push_str(&format!("；刷新官方线路未完成：{error}"));
+                }
+                return Err(message);
+            }
+        };
         return Ok(merge(payload, json!({ "status": "ok" })));
     }
     if removed_default && !accounts_left {
@@ -815,7 +839,10 @@ pub(super) async fn save_official_account_route_settings(
     route_short_name: String,
     upstream_proxy: String,
     base_url: String,
+    max_concurrency: Option<u32>,
 ) -> Result<Value, String> {
+    // 与模型设置共用提交锁；账号文件锁只在同步写入期间持有。
+    let config_write_guard = state.config_write_lock.lock().await;
     let account_id = write_official_account_route_settings(
         state,
         account_id,
@@ -823,8 +850,10 @@ pub(super) async fn save_official_account_route_settings(
         route_short_name,
         upstream_proxy,
         base_url,
+        max_concurrency,
     )
     .await?;
+    drop(config_write_guard);
     let payload = refresh_official_route_after_account_change(state).await?;
     Ok(merge(
         payload,
@@ -841,6 +870,7 @@ pub(crate) async fn write_official_account_route_settings(
     route_short_name: String,
     upstream_proxy: String,
     base_url: String,
+    max_concurrency: Option<u32>,
 ) -> Result<String, String> {
     let account_id = account_id.trim().to_string();
     if account_id.is_empty() {
@@ -901,12 +931,13 @@ pub(crate) async fn write_official_account_route_settings(
             let label = other.email.as_deref().unwrap_or(other.id.as_str());
             anyhow::bail!("短名称「{short_name}」已被官方账号 {label} 使用");
         }
-        store.update_route_settings(
+        store.update_route_settings_with_concurrency(
             &saved_id,
             saved_name,
             saved_short_name,
             saved_proxy,
             base_url,
+            max_concurrency,
         )?;
         Ok(())
     })
@@ -922,9 +953,14 @@ pub(crate) async fn refresh_official_route_after_account_change(
     state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let prepare_error = prepare_routes_for_current_launch(state).await.err();
-    let config = state.config.read().await.clone();
+    let (config, hot_reload) = {
+        let _commit = state.config_write_lock.lock().await;
+        (
+            state.config.read().await.clone(),
+            super::models::ModelHotReloadOutcome::queued(state, true),
+        )
+    };
     let model_state = current_model_state_async(&config).await?;
-    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let store = state.official_accounts();
     let accounts = tokio::task::spawn_blocking(move || accounts_payload(&store))

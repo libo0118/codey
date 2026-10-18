@@ -155,6 +155,9 @@ pub struct OfficialAccountRecord {
     pub route_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_short_name: Option<String>,
+    /// 官方账号线路的最高并发数；旧记录默认不限制。
+    #[serde(default)]
+    pub max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
     /// Custom OpenAI gateway for this account. `None` keeps the official
@@ -194,6 +197,7 @@ pub struct OfficialAccountSummary {
     pub route_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_short_name: Option<String>,
+    pub max_concurrency: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,6 +278,7 @@ impl OfficialAccountRecord {
             // `OfficialAccountStore::upsert` keeps the saved route settings.
             route_name: None,
             route_short_name: None,
+            max_concurrency: 0,
             upstream_proxy: None,
             base_url: None,
             invalid_reason: None,
@@ -317,6 +322,7 @@ impl OfficialAccountRecord {
             last_refresh: self.last_refresh(),
             route_name: self.route_name.clone(),
             route_short_name: self.route_short_name.clone(),
+            max_concurrency: self.max_concurrency,
             upstream_proxy: self.upstream_proxy.clone(),
             base_url: self.base_url.clone(),
             invalid: self.invalid(),
@@ -604,6 +610,49 @@ pub struct OfficialAccountStore {
     dir: PathBuf,
 }
 
+/// 删除提交前保留原文件；恢复时不替换其他进程写入的新文件。
+struct PendingAccountRemoval {
+    original: PathBuf,
+    staged: tempfile::TempPath,
+}
+
+impl PendingAccountRemoval {
+    fn stage(original: PathBuf) -> Result<Option<Self>> {
+        let metadata = match fs::symlink_metadata(&original) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.is_dir(),
+            "待删除的凭据路径是目录：{}",
+            original.display()
+        );
+        let staged = tempfile::Builder::new()
+            .prefix(".removed-account-")
+            .tempfile_in(original.parent().context("凭据路径缺少父目录")?)?
+            .into_temp_path();
+        match fs::rename(&original, &staged) {
+            Ok(()) => Ok(Some(Self { original, staged })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn restore(self) -> Result<()> {
+        if let Err(error) = self.staged.persist_noclobber(&self.original) {
+            let cause = error.error;
+            let path = error.path.keep().context("无法保留待恢复的凭据文件")?;
+            bail!(
+                "恢复 {} 失败，原文件保留在 {}：{cause}",
+                self.original.display(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DefaultAccountFile {
@@ -691,6 +740,12 @@ impl OfficialAccountStore {
         Ok(records)
     }
 
+    /// 线路派生使用同一批账号与默认账号记录；不让账号导入、删除或更新穿插在读取之间。
+    pub(crate) fn route_snapshot(&self) -> Result<(Vec<OfficialAccountRecord>, Option<String>)> {
+        let _guard = self.lock_writes()?;
+        Ok((self.list()?, self.default_account_id()?))
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<OfficialAccountRecord>> {
         Ok(
             read_account_record(&self.account_path(id), "official_accounts.get")?
@@ -770,6 +825,7 @@ impl OfficialAccountStore {
         self.get(&id)
     }
 
+    #[cfg(test)]
     pub fn set_default_account_id(&self, id: Option<&str>) -> Result<()> {
         let _guard = self.lock_writes()?;
         self.set_default_account_id_unlocked(id)
@@ -784,6 +840,94 @@ impl OfficialAccountStore {
             .context("保存默认官方账号记录失败")
     }
 
+    /// 切换与删除共用存储锁；网络刷新后的旧副本不能重新激活已删除的账号。
+    pub(crate) fn activate(&self, id: &str, codex_home: &Path) -> Result<OfficialAccountRecord> {
+        let _guard = self.lock_writes()?;
+        self.activate_unlocked(id, codex_home, || {
+            self.set_default_account_id_unlocked(Some(id))
+        })
+    }
+
+    fn activate_unlocked(
+        &self,
+        id: &str,
+        codex_home: &Path,
+        commit_default: impl FnOnce() -> Result<()>,
+    ) -> Result<OfficialAccountRecord> {
+        let record = self
+            .get(id)?
+            .with_context(|| format!("找不到官方账号：{id}"))?;
+        anyhow::ensure!(!record.invalid(), "官方账号已失效，无法设为默认：{id}");
+        // 默认记录不可读时直接失败，保留现有登录文件。
+        self.default_account_id()?;
+        let path = codex_home.join(CODEX_AUTH_FILE_NAME);
+        let bytes = serde_json::to_vec_pretty(&record.auth)?;
+        if fs::read(&path).is_ok_and(|current| current == bytes) {
+            commit_default()?;
+            return Ok(record);
+        }
+        fs::create_dir_all(codex_home)?;
+        let mut replacement = tempfile::Builder::new()
+            .prefix(".activate-account-")
+            .tempfile_in(codex_home)?;
+        std::io::Write::write_all(&mut replacement, &bytes)?;
+        replacement.as_file().sync_all()?;
+        let previous =
+            PendingAccountRemoval::stage(path.clone()).context("保留原 Codex 登录信息失败")?;
+        // 原登录移走后出现的新文件属于外部写者，不能直接覆盖。
+        if let Err(error) = replacement.persist_noclobber(&path) {
+            let error = anyhow!(error.error);
+            if let Some(previous) = previous
+                && let Err(restore_error) = previous.restore()
+            {
+                return Err(error.context(format!(
+                    "切换默认账号失败，原登录恢复失败：{restore_error:#}"
+                )));
+            }
+            return Err(error.context("写入 Codex 登录信息失败"));
+        }
+        if let Err(error) = commit_default() {
+            // 先移走再检查，避免在检查与删除之间误删 Codex 刚刷新的登录文件。
+            let rollback = (|| -> Result<()> {
+                let current = PendingAccountRemoval::stage(path.clone())?
+                    .context("Codex 登录文件已被外部移除")?;
+                let current_bytes = fs::read(&current.staged);
+                if current_bytes
+                    .as_ref()
+                    .is_ok_and(|current| *current == bytes)
+                {
+                    drop(current);
+                    Ok(())
+                } else {
+                    current.restore()?;
+                    bail!("Codex 登录文件已被外部修改，保留当前文件");
+                }
+            })();
+            // 恢复失败也必须保留原凭据供恢复，不能让 TempPath 自动清理。
+            let restore = match (previous, rollback.is_ok()) {
+                (Some(previous), true) => previous.restore(),
+                (Some(previous), false) => {
+                    let backup = previous.staged.keep().context("保留原登录备份失败")?;
+                    Err(anyhow!("原登录保留在 {}", backup.display()))
+                }
+                (None, _) => Ok(()),
+            };
+            let failures = [rollback.err(), restore.err()]
+                .into_iter()
+                .flatten()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>();
+            if !failures.is_empty() {
+                return Err(error.context(format!(
+                    "切换默认账号失败，登录恢复未完成：{}",
+                    failures.join("；")
+                )));
+            }
+            return Err(error);
+        }
+        Ok(record)
+    }
+
     /// Stores the credentials of an account. Route settings belong to Codey
     /// rather than to the credential document, so the saved ones survive a
     /// re-login or a token refresh, which both arrive without them.
@@ -793,6 +937,7 @@ impl OfficialAccountStore {
         if let Some(saved) = self.get(&record.id)? {
             record.route_name = saved.route_name;
             record.route_short_name = saved.route_short_name;
+            record.max_concurrency = saved.max_concurrency;
             record.upstream_proxy = saved.upstream_proxy;
             record.base_url = saved.base_url;
             // 重新登录只替换 Codex 凭据，SIWC 槽位按账号保留。
@@ -846,6 +991,7 @@ impl OfficialAccountStore {
 
     /// Replaces the route overrides of one account; `None` restores the value
     /// derived from the Codex configuration.
+    #[cfg(test)]
     pub fn update_route_settings(
         &self,
         id: &str,
@@ -853,6 +999,26 @@ impl OfficialAccountStore {
         route_short_name: Option<String>,
         upstream_proxy: Option<String>,
         base_url: Option<String>,
+    ) -> Result<()> {
+        self.update_route_settings_with_concurrency(
+            id,
+            route_name,
+            route_short_name,
+            upstream_proxy,
+            base_url,
+            None,
+        )
+    }
+
+    /// 未提供并发值时保留当前设置，显式传入 0 才解除限制。
+    pub fn update_route_settings_with_concurrency(
+        &self,
+        id: &str,
+        route_name: Option<String>,
+        route_short_name: Option<String>,
+        upstream_proxy: Option<String>,
+        base_url: Option<String>,
+        max_concurrency: Option<u32>,
     ) -> Result<()> {
         let _guard = self.lock_writes()?;
         let mut record = self
@@ -862,6 +1028,33 @@ impl OfficialAccountStore {
         record.route_short_name = route_setting(route_short_name);
         record.upstream_proxy = route_setting(upstream_proxy);
         record.base_url = route_setting(base_url);
+        if let Some(max_concurrency) = max_concurrency {
+            record.max_concurrency = max_concurrency;
+        }
+        self.write(&record)
+    }
+
+    /// 模型同步只改明确提供的运行设置，避免覆盖同时更新的账号元数据。
+    pub fn update_route_runtime_settings(
+        &self,
+        id: &str,
+        upstream_proxy: Option<String>,
+        base_url: Option<Option<String>>,
+        max_concurrency: Option<u32>,
+    ) -> Result<()> {
+        let _guard = self.lock_writes()?;
+        let mut record = self
+            .get(id)?
+            .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
+        if let Some(upstream_proxy) = upstream_proxy {
+            record.upstream_proxy = route_setting(Some(upstream_proxy));
+        }
+        if let Some(base_url) = base_url {
+            record.base_url = route_setting(base_url);
+        }
+        if let Some(max_concurrency) = max_concurrency {
+            record.max_concurrency = max_concurrency;
+        }
         self.write(&record)
     }
 
@@ -933,14 +1126,97 @@ impl OfficialAccountStore {
             .with_context(|| format!("保存官方账号失败：{}", record.id))
     }
 
-    pub fn remove(&self, id: &str) -> Result<()> {
+    #[cfg(test)]
+    fn remove(&self, id: &str) -> Result<()> {
         let _guard = self.lock_writes()?;
-        crate::fs_util::remove_file_if_exists(&self.account_path(id))
-            .with_context(|| format!("删除官方账号失败：{id}"))?;
-        crate::fs_util::remove_file_if_exists(&self.siwc_path(id))
-            .with_context(|| format!("删除官方直连凭据失败：{id}"))?;
-        if self.default_account_id()?.as_deref() == Some(id) {
-            self.set_default_account_id_unlocked(None)?;
+        let was_default = self.default_account_id()?.as_deref() == Some(id);
+        self.remove_unlocked(id, was_default, None, || {
+            self.set_default_account_id_unlocked(None)
+        })
+    }
+
+    /// 登录文件和账号库一起删除；后续补位需要的读取也在修改前完成。
+    pub(crate) fn remove_with_codex_login(
+        &self,
+        id: &str,
+        codex_home: &Path,
+    ) -> Result<(bool, Vec<OfficialAccountRecord>)> {
+        let _guard = self.lock_writes()?;
+        let was_default = self.default_account_id()?.as_deref() == Some(id);
+        let remaining = self
+            .list()?
+            .into_iter()
+            .filter(|record| record.id != id)
+            .collect();
+        self.remove_unlocked(id, was_default, Some(codex_home), || {
+            self.set_default_account_id_unlocked(None)
+        })?;
+        Ok((was_default, remaining))
+    }
+
+    fn remove_unlocked(
+        &self,
+        id: &str,
+        was_default: bool,
+        codex_home: Option<&Path>,
+        commit_default: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let record = if was_default && codex_home.is_some() {
+            self.get(id)?
+        } else {
+            None
+        };
+        let mut pending = Vec::new();
+        let result = (|| -> Result<()> {
+            if let (Some(home), Some(record)) = (codex_home, record) {
+                let path = home.join(CODEX_AUTH_FILE_NAME);
+                let matches = |path: &Path| {
+                    fs::read(path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|auth| record.matches_auth(&auth))
+                };
+                if matches(&path) {
+                    let staged = PendingAccountRemoval::stage(path.clone())
+                        .with_context(|| format!("移除 Codex 登录信息失败：{}", path.display()))?;
+                    if let Some(staged) = staged {
+                        // 重新检查移动后的内容，外部刚切换的登录不能随旧账号删除。
+                        if matches(&staged.staged) {
+                            pending.push(staged);
+                        } else {
+                            staged.restore()?;
+                        }
+                    }
+                }
+            }
+            for (path, context) in [
+                (self.account_path(id), format!("删除官方账号失败：{id}")),
+                (self.siwc_path(id), format!("删除官方直连凭据失败：{id}")),
+            ] {
+                if let Some(staged) = PendingAccountRemoval::stage(path).with_context(|| context)? {
+                    pending.push(staged);
+                }
+            }
+            // 原子写是最后一步：失败时默认记录保持原样，其他文件仍可恢复。
+            if was_default {
+                commit_default()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut failures = Vec::new();
+            for staged in pending.into_iter().rev() {
+                if let Err(error) = staged.restore() {
+                    failures.push(format!("{error:#}"));
+                }
+            }
+            if !failures.is_empty() {
+                return Err(error.context(format!(
+                    "账号删除未完成，部分文件恢复失败：{}",
+                    failures.join("；")
+                )));
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -1051,6 +1327,9 @@ impl OfficialAccountStore {
     /// first (default) account so upgrades keep working without a re-login.
     pub fn resolve_launch_login(&self, codex_home: &Path) -> Result<LaunchLoginResolution> {
         self.sync_default_from_codex_home(codex_home)?;
+        // 线路重建与账号操作可以并行；读取默认记录和恢复登录文件必须
+        // 与切换、删除串行，避免用删除前的副本重新写出登录文件。
+        let _guard = self.lock_writes()?;
         if let Some(record) = self.default_account()? {
             Self::write_codex_login(codex_home, &record)?;
             return Ok(LaunchLoginResolution::Available {
@@ -1060,8 +1339,8 @@ impl OfficialAccountStore {
         if self.list()?.is_empty()
             && let Some(record) = Self::read_codex_login(codex_home)?
         {
-            self.upsert(&record)?;
-            self.set_default_account_id(Some(&record.id))?;
+            self.write(&record)?;
+            self.set_default_account_id_unlocked(Some(&record.id))?;
             return Ok(LaunchLoginResolution::Available {
                 account_id: record.id,
             });
@@ -1070,26 +1349,6 @@ impl OfficialAccountStore {
             reason: "Codey 中没有设为默认的官方账号；请在线路设置中添加官方账号并设为默认"
                 .to_string(),
         })
-    }
-
-    /// Removes the Codex home login when it belongs to the given account.
-    pub fn clear_codex_login_if_matches(
-        codex_home: &Path,
-        record: &OfficialAccountRecord,
-    ) -> Result<bool> {
-        let path = codex_home.join(CODEX_AUTH_FILE_NAME);
-        let Ok(bytes) = fs::read(&path) else {
-            return Ok(false);
-        };
-        let Ok(auth) = serde_json::from_slice::<Value>(&bytes) else {
-            return Ok(false);
-        };
-        if !record.matches_auth(&auth) {
-            return Ok(false);
-        }
-        crate::fs_util::remove_file_if_exists(&path)
-            .with_context(|| format!("移除 Codex 登录信息失败：{}", path.display()))?;
-        Ok(true)
     }
 
     // -----------------------------------------------------------------------
@@ -3096,6 +3355,360 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn activation_restores_login_when_default_commit_fails() {
+        for existing_login in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let store = OfficialAccountStore::new(directory.path());
+            let record = OfficialAccountRecord::from_auth(
+                chatgpt_auth("next", "next@example.com", "2026-01-01T00:00:00Z"),
+                1,
+            )
+            .unwrap();
+            store.upsert(&record).unwrap();
+            store.set_default_account_id(Some("previous")).unwrap();
+            let auth_path = home.path().join(CODEX_AUTH_FILE_NAME);
+            let before = existing_login.then_some(b"previous login".to_vec());
+            if let Some(bytes) = &before {
+                fs::write(&auth_path, bytes).unwrap();
+            }
+            let _guard = store.lock_writes().unwrap();
+            let error = store
+                .activate_unlocked(&record.id, home.path(), || {
+                    assert_eq!(
+                        OfficialAccountStore::read_codex_login(home.path())?
+                            .unwrap()
+                            .id,
+                        record.id
+                    );
+                    bail!("default commit failed");
+                })
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("default commit failed"));
+            assert_eq!(fs::read(auth_path).ok(), before);
+            assert_eq!(
+                store.default_account_id().unwrap().as_deref(),
+                Some("previous")
+            );
+            assert_eq!(
+                fs::read_dir(home.path()).unwrap().count(),
+                usize::from(existing_login)
+            );
+        }
+    }
+
+    #[test]
+    fn activation_restores_login_after_real_default_write_error() {
+        let directory = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("next", "next@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        let path = home.path().join(CODEX_AUTH_FILE_NAME);
+        fs::write(&path, b"previous login").unwrap();
+        let _guard = store.lock_writes().unwrap();
+        let error = store
+            .activate_unlocked(&record.id, home.path(), || {
+                fs::create_dir(store.default_path())?;
+                store.set_default_account_id_unlocked(Some(&record.id))
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("保存默认官方账号记录失败"));
+        assert_eq!(fs::read(path).unwrap(), b"previous login");
+    }
+
+    #[test]
+    fn activation_preserves_external_login_and_recoverable_backup_on_rollback_conflict() {
+        let directory = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("next", "next@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        let path = home.path().join(CODEX_AUTH_FILE_NAME);
+        fs::write(&path, b"previous login").unwrap();
+        let _guard = store.lock_writes().unwrap();
+        let error = store
+            .activate_unlocked(&record.id, home.path(), || {
+                fs::write(&path, b"external login")?;
+                bail!("default commit failed");
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("外部修改"));
+        assert!(format!("{error:#}").contains("原登录保留在"));
+        assert_eq!(fs::read(&path).unwrap(), b"external login");
+        let backup = fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| *entry != path)
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), b"previous login");
+        assert_eq!(store.default_account_id().unwrap(), None);
+    }
+
+    #[test]
+    fn activation_and_removal_are_serialized_without_recreating_credentials() {
+        let directory = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("account", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let activate = scope.spawn(|| {
+                barrier.wait();
+                store.activate(&record.id, home.path())
+            });
+            barrier.wait();
+            store
+                .remove_with_codex_login(&record.id, home.path())
+                .unwrap();
+            // 两种合法顺序：先激活再删除，或删除后激活因记录缺失而失败。
+            let _ = activate.join().unwrap();
+        });
+        assert!(store.get(&record.id).unwrap().is_none());
+        assert_eq!(store.default_account_id().unwrap(), None);
+        assert!(!home.path().join(CODEX_AUTH_FILE_NAME).exists());
+        assert!(store.activate(&record.id, home.path()).is_err());
+    }
+
+    #[test]
+    fn concurrent_activations_keep_default_record_and_login_together() {
+        let directory = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        for id in ["first", "second"] {
+            store
+                .upsert(
+                    &OfficialAccountRecord::from_auth(
+                        chatgpt_auth(id, "a@example.com", "2026-01-01T00:00:00Z"),
+                        1,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                store.activate("first", home.path()).unwrap();
+            });
+            barrier.wait();
+            store.activate("second", home.path()).unwrap();
+            first.join().unwrap();
+        });
+        assert_eq!(
+            store.default_account_id().unwrap(),
+            Some(
+                OfficialAccountStore::read_codex_login(home.path())
+                    .unwrap()
+                    .unwrap()
+                    .id
+            )
+        );
+    }
+
+    #[test]
+    fn remove_rolls_back_account_when_siwc_removal_fails() {
+        let directory = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        store.set_default_account_id(Some(&record.id)).unwrap();
+        fs::create_dir(store.siwc_path(&record.id)).unwrap();
+
+        let error = store.remove(&record.id).unwrap_err();
+
+        assert!(error.to_string().contains("删除官方直连凭据失败"));
+        assert_eq!(store.get(&record.id).unwrap(), Some(record.clone()));
+        assert_eq!(
+            store.default_account_id().unwrap().as_deref(),
+            Some(record.id.as_str())
+        );
+        assert!(store.siwc_path(&record.id).is_dir());
+    }
+
+    #[test]
+    fn remove_preserves_account_when_default_record_cannot_be_read() {
+        let directory = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        fs::write(store.siwc_path(&record.id), b"siwc").unwrap();
+        fs::create_dir(store.default_path()).unwrap();
+
+        assert!(store.remove(&record.id).is_err());
+        assert_eq!(store.get(&record.id).unwrap(), Some(record));
+        assert_eq!(fs::read(store.siwc_path("acct")).unwrap(), b"siwc");
+    }
+
+    #[test]
+    fn remove_with_codex_login_restores_login_on_midway_file_failure() {
+        let directory = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        store.set_default_account_id(Some(&record.id)).unwrap();
+        OfficialAccountStore::write_codex_login(home.path(), &record).unwrap();
+        let auth_path = home.path().join(CODEX_AUTH_FILE_NAME);
+        let before_auth = fs::read(&auth_path).unwrap();
+        let before_default = fs::read(store.default_path()).unwrap();
+        fs::create_dir(store.siwc_path(&record.id)).unwrap();
+
+        let error = store
+            .remove_with_codex_login(&record.id, home.path())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("删除官方直连凭据失败"));
+        assert_eq!(store.get(&record.id).unwrap(), Some(record));
+        assert_eq!(fs::read(auth_path).unwrap(), before_auth);
+        assert_eq!(fs::read(store.default_path()).unwrap(), before_default);
+    }
+
+    #[test]
+    fn remove_with_codex_login_preserves_default_and_other_login_when_not_matching() {
+        for removing_default in [false, true] {
+            for matching_login in [false, true] {
+                let directory = TempDir::new().unwrap();
+                let home = TempDir::new().unwrap();
+                let store = OfficialAccountStore::new(directory.path());
+                let record = OfficialAccountRecord::from_auth(
+                    chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+                    1,
+                )
+                .unwrap();
+                let other = OfficialAccountRecord::from_auth(
+                    chatgpt_auth("other", "b@example.com", "2026-01-01T00:00:00Z"),
+                    2,
+                )
+                .unwrap();
+                store.upsert(&record).unwrap();
+                store.upsert(&other).unwrap();
+                let default_id = if removing_default {
+                    &record.id
+                } else {
+                    &other.id
+                };
+                store.set_default_account_id(Some(default_id)).unwrap();
+                fs::write(store.siwc_path(&record.id), b"siwc").unwrap();
+                let login = if matching_login { &record } else { &other };
+                OfficialAccountStore::write_codex_login(home.path(), login).unwrap();
+                let auth_path = home.path().join(CODEX_AUTH_FILE_NAME);
+                let before_auth = fs::read(&auth_path).unwrap();
+
+                let (was_default, remaining) = store
+                    .remove_with_codex_login(&record.id, home.path())
+                    .unwrap();
+
+                assert_eq!(was_default, removing_default);
+                assert_eq!(remaining, vec![other.clone()]);
+                assert!(store.get(&record.id).unwrap().is_none());
+                assert!(!store.siwc_path(&record.id).exists());
+                assert_eq!(
+                    store.default_account_id().unwrap(),
+                    (!removing_default).then_some(other.id)
+                );
+                if removing_default && matching_login {
+                    assert!(!auth_path.exists());
+                } else {
+                    assert_eq!(fs::read(auth_path).unwrap(), before_auth);
+                }
+                assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".removed-account-")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn remove_restores_staged_files_when_default_commit_fails_without_overwriting_external_login() {
+        for external_login in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let store = OfficialAccountStore::new(directory.path());
+            let record = OfficialAccountRecord::from_auth(
+                chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+                1,
+            )
+            .unwrap();
+            store.upsert(&record).unwrap();
+            store.set_default_account_id(Some(&record.id)).unwrap();
+            fs::write(store.siwc_path(&record.id), b"siwc").unwrap();
+            OfficialAccountStore::write_codex_login(home.path(), &record).unwrap();
+            let auth_path = home.path().join(CODEX_AUTH_FILE_NAME);
+            let before_auth = fs::read(&auth_path).unwrap();
+            let _guard = store.lock_writes().unwrap();
+
+            let error = store
+                .remove_unlocked(&record.id, true, Some(home.path()), || {
+                    assert!(!store.account_path(&record.id).exists());
+                    assert!(!store.siwc_path(&record.id).exists());
+                    assert!(!auth_path.exists());
+                    if external_login {
+                        fs::write(&auth_path, b"external login")?;
+                    }
+                    // 模拟外部把默认记录替换成目录，使最后的真实原子写失败。
+                    fs::rename(store.default_path(), directory.path().join("saved-default"))?;
+                    fs::create_dir(store.default_path())?;
+                    store.set_default_account_id_unlocked(None)
+                })
+                .unwrap_err();
+
+            assert!(format!("{error:#}").contains("保存默认官方账号记录失败"));
+            assert_eq!(store.get(&record.id).unwrap(), Some(record));
+            assert_eq!(fs::read(store.siwc_path("acct")).unwrap(), b"siwc");
+            assert!(store.default_path().is_dir());
+            if external_login {
+                assert_eq!(fs::read(auth_path).unwrap(), b"external login");
+                assert!(error.to_string().contains("恢复失败"));
+                let backup = fs::read_dir(home.path())
+                    .unwrap()
+                    .find_map(|entry| {
+                        let entry = entry.unwrap();
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".removed-account-")
+                            .then_some(entry.path())
+                    })
+                    .unwrap();
+                assert_eq!(fs::read(backup).unwrap(), before_auth);
+            } else {
+                assert_eq!(fs::read(auth_path).unwrap(), before_auth);
+            }
+        }
+    }
+
+    #[test]
     fn plugin_credentials_recheck_identity_uniqueness_and_token_expiry() {
         let directory = TempDir::new().unwrap();
         let store = OfficialAccountStore::new(directory.path());
@@ -3486,6 +4099,123 @@ mod tests {
             .update_route_settings("acct_missing", None, None, None, None)
             .unwrap_err();
         assert!(error.to_string().contains("acct_missing"));
+    }
+
+    #[test]
+    fn official_concurrency_defaults_persists_and_preserves_omitted_updates() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join("accounts"));
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct-limit", "limit@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("maxConcurrency");
+        let legacy: OfficialAccountRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.max_concurrency, 0);
+        store.upsert(&legacy).unwrap();
+
+        store
+            .update_route_settings_with_concurrency(
+                &record.id,
+                Some("主账号".into()),
+                Some("主".into()),
+                None,
+                None,
+                Some(3),
+            )
+            .unwrap();
+        let reloaded = OfficialAccountStore::new(dir.path().join("accounts"));
+        assert_eq!(
+            reloaded.get(&record.id).unwrap().unwrap().max_concurrency,
+            3
+        );
+        let summary = serde_json::to_value(reloaded.summaries().unwrap()).unwrap();
+        assert_eq!(summary[0]["maxConcurrency"], json!(3));
+
+        // 只同步模型或代理时不清除并发配置和其他账号元数据。
+        store
+            .update_route_runtime_settings(
+                &record.id,
+                Some("http://localhost:8080".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        store.ensure_generated_route_settings().unwrap();
+        store.update_route_short_name(&record.id, "新").unwrap();
+        store.update_plan_type(&record.id, Some("pro")).unwrap();
+        let saved = store.get(&record.id).unwrap().unwrap();
+        assert_eq!(saved.max_concurrency, 3);
+        assert_eq!(saved.route_name.as_deref(), Some("主账号"));
+        assert_eq!(saved.route_short_name.as_deref(), Some("新"));
+
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(0))
+            .unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 0);
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(u32::MAX))
+            .unwrap();
+        assert_eq!(
+            store.get(&record.id).unwrap().unwrap().max_concurrency,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn official_concurrency_survives_relogin_stale_refresh_and_default_sync() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join("accounts"));
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct-limit", "limit@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        let stale = store.get(&record.id).unwrap().unwrap();
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(7))
+            .unwrap();
+        let mut refreshed = stale.clone();
+        refreshed.auth["tokens"]["access_token"] = json!("refreshed-token");
+        let saved = store
+            .update_credentials_if_current(&stale, &refreshed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.max_concurrency, 7);
+        assert_eq!(
+            saved.auth["tokens"]["access_token"],
+            json!("refreshed-token")
+        );
+
+        // 重新导入或重新登录得到的记录默认是 0，不能覆盖账号已有设置。
+        store.upsert(&record).unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 7);
+        store.activate(&record.id, &home).unwrap();
+        let mut auth = record.auth.clone();
+        auth["tokens"]["access_token"] = json!("codex-refreshed-token");
+        auth["last_refresh"] = json!("2026-01-02T00:00:00Z");
+        fs::write(home.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
+        store.sync_default_from_codex_home(&home).unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 7);
+
+        store.remove(&record.id).unwrap();
+        assert!(
+            store
+                .update_credentials_if_current(&stale, &refreshed)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .update_route_runtime_settings(&record.id, None, None, Some(2))
+                .is_err()
+        );
+        assert!(store.get(&record.id).unwrap().is_none());
     }
 
     #[test]

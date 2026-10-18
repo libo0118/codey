@@ -11,7 +11,7 @@ struct NativeHistoryEntry {
     owner: [u8; 32],
     expires_at: Instant,
     history: Arc<AdaptedResponsesHistory>,
-    force_http: bool,
+    continuation_rejected: bool,
 }
 
 #[derive(Default)]
@@ -58,7 +58,7 @@ impl NativeHistoryCache {
                         .as_ref()
                         .is_some_and(|(response_id, _)| response_id == id)
             })
-            .map(|entry| (Arc::clone(&entry.history), entry.force_http))
+            .map(|entry| (Arc::clone(&entry.history), entry.continuation_rejected))
     }
 
     fn mark_requires_http(&mut self, scope: [u8; 32], owner: [u8; 32], id: [u8; 32]) {
@@ -70,12 +70,18 @@ impl NativeHistoryCache {
                     <[u8; 32]>::from(Sha256::digest(response_id.as_bytes())) == id
                 })
             {
-                entry.force_http = true;
+                entry.continuation_rejected = true;
             }
         }
     }
 
-    fn insert(&mut self, scope: [u8; 32], owner: [u8; 32], history: Arc<AdaptedResponsesHistory>) {
+    fn insert(
+        &mut self,
+        scope: [u8; 32],
+        owner: [u8; 32],
+        history: Arc<AdaptedResponsesHistory>,
+        continuation_rejected: bool,
+    ) {
         let now = Instant::now();
         self.prune(now);
         let bytes = history.retained_bytes();
@@ -92,7 +98,7 @@ impl NativeHistoryCache {
             scope,
             owner,
             expires_at: now + NATIVE_HISTORY_CACHE_TTL,
-            force_http: history.requires_native_http,
+            continuation_rejected,
             history,
         });
     }
@@ -102,12 +108,12 @@ impl NativeHistoryCache {
 pub(crate) struct NativeResponsesHistory {
     owner: Option<[u8; 32]>,
     refresh_scope: Option<[u8; 32]>,
-    force_http: bool,
+    continuation_rejected: bool,
     pending_previous_response: Option<[u8; 32]>,
     scope: Option<[u8; 32]>,
     cache: Arc<Mutex<NativeHistoryCache>>,
     latest: Option<Arc<AdaptedResponsesHistory>>,
-    latest_requires_http: bool,
+    latest_continuation_rejected: bool,
     history: AdaptedResponsesHistory,
     unavailable: Option<String>,
 }
@@ -175,7 +181,24 @@ impl NativeResponsesHistory {
     }
 
     pub(crate) fn requires_http(&self) -> bool {
-        self.force_http || self.history.requires_native_http
+        self.continuation_rejected || self.history.requires_native_http
+    }
+
+    pub(crate) fn requires_http_for_websocket(
+        &self,
+        body: &Value,
+        continues_on_current_socket: bool,
+    ) -> bool {
+        if !continues_on_current_socket || self.pending_previous_response.is_none() {
+            return self.requires_http();
+        }
+        // 同一连接已保存旧历史，仅检查新增输入；上游明确拒绝的续接仍需 HTTP。
+        self.continuation_rejected
+            || match body.get("input") {
+                Some(Value::Array(input)) => input.iter().any(native_item_requires_http),
+                Some(item @ Value::Object(_)) => native_item_requires_http(item),
+                _ => false,
+            }
     }
 
     pub(crate) fn with_cache(
@@ -209,10 +232,10 @@ impl NativeResponsesHistory {
         if self.owner != Some(owner) {
             self.history = AdaptedResponsesHistory::default();
             self.latest = None;
-            self.latest_requires_http = false;
+            self.latest_continuation_rejected = false;
             self.owner = Some(owner);
             self.refresh_scope = None;
-            self.force_http = false;
+            self.continuation_rejected = false;
         }
         self.pending_previous_response =
             responses_previous_response_id(body).map(|id| Sha256::digest(id.as_bytes()).into());
@@ -234,14 +257,18 @@ impl NativeResponsesHistory {
                 .map(|history| {
                     (
                         Arc::clone(history),
-                        self.latest_requires_http
-                            || cached.as_ref().is_some_and(|(_, force_http)| *force_http),
+                        self.latest_continuation_rejected
+                            || cached
+                                .as_ref()
+                                .is_some_and(|(_, continuation_rejected)| *continuation_rejected),
                     )
                 })
                 .or(cached)
         });
-        self.force_http = previous.as_ref().is_some_and(|(_, force_http)| *force_http);
-        self.history.requires_native_http = self.force_http;
+        self.continuation_rejected = previous
+            .as_ref()
+            .is_some_and(|(_, continuation_rejected)| *continuation_rejected);
+        self.history.requires_native_http = false;
         // A cache miss must not prevent a healthy native WS continuation.
         // Require complete history when reopening WS or falling back to HTTP.
         self.unavailable = self
@@ -249,7 +276,6 @@ impl NativeResponsesHistory {
             .stage_native(body, previous.as_ref().map(|(history, _)| history.as_ref()))
             .err()
             .map(|error| error.to_string());
-        self.history.requires_native_http |= self.force_http;
         if self.unavailable.is_some() {
             self.history.clear_pending();
         }
@@ -304,14 +330,13 @@ impl NativeResponsesHistory {
         .any(|code| code.as_str() == Some("unsupported_persisted_item_context"))
             && let Some(id) = self.pending_previous_response
         {
-            self.force_http = true;
-            self.history.requires_native_http = true;
+            self.continuation_rejected = true;
             if self.latest.as_ref().is_some_and(|history| {
                 history.last.as_ref().is_some_and(|(response_id, _)| {
                     <[u8; 32]>::from(Sha256::digest(response_id.as_bytes())) == id
                 })
             }) {
-                self.latest_requires_http = true;
+                self.latest_continuation_rejected = true;
             }
             if let (Some(scope), Some(owner)) = (self.scope, self.owner) {
                 self.cache
@@ -369,9 +394,14 @@ impl NativeResponsesHistory {
                 self.cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(scope, owner, Arc::clone(&history));
+                    .insert(
+                        scope,
+                        owner,
+                        Arc::clone(&history),
+                        self.continuation_rejected,
+                    );
             }
-            self.latest_requires_http = history.requires_native_http;
+            self.latest_continuation_rejected = self.continuation_rejected;
             self.latest = Some(history);
         }
     }
@@ -1792,11 +1822,50 @@ mod tests {
                     item["type"] != "reasoning",
                     "{item}"
                 );
+                assert!(!restored.requires_http_for_websocket(&next, true));
+                assert_eq!(
+                    restored.requires_http_for_websocket(&next, false),
+                    item["type"] != "reasoning"
+                );
                 assert!(restored.restore_for_http(owner, &mut next, true).unwrap());
                 assert_eq!(next["input"][1], item);
                 assert!(next.get("previous_response_id").is_none());
             }
         }
+    }
+
+    #[test]
+    fn native_websocket_continuation_checks_new_input_and_upstream_rejection() {
+        let owner = [1; 32];
+        let mut history = NativeResponsesHistory::default();
+        let hosted = json!({"type":"web_search_call","id":"search","status":"completed"});
+        history.prepare(owner, &mut json!({"input":"task"}));
+        history.observe(&completed("resp-hosted", vec![hosted.clone()]));
+        let mut next = json!({"previous_response_id":"resp-hosted","input":"next"});
+        history.prepare(owner, &mut next);
+        assert!(!history.requires_http_for_websocket(&next, true));
+        assert!(history.requires_http_for_websocket(&next, false));
+        for input in [
+            json!([hosted]),
+            json!([{"type":"compaction","encrypted_content":"opaque"}]),
+            json!([{"type":"reasoning","summary":[]}]),
+        ] {
+            let mut unsafe_input = json!({"previous_response_id":"resp-hosted","input":input});
+            history.prepare(owner, &mut unsafe_input);
+            assert!(history.requires_http_for_websocket(&unsafe_input, true));
+            let mut full = json!({"input":input});
+            history.prepare(owner, &mut full);
+            assert!(history.requires_http_for_websocket(&full, true));
+        }
+        history.prepare(owner, &mut next);
+        history.observe(
+            &json!({"type":"error","error":{"code":"unsupported_persisted_item_context"}}),
+        );
+        history.prepare(owner, &mut next);
+        assert!(history.requires_http_for_websocket(&next, true));
+        assert!(history.requires_http_for_websocket(&next, false));
+        history.prepare(owner, &mut json!({"input":"independent task"}));
+        assert!(!history.requires_http());
     }
 
     #[test]
@@ -1821,6 +1890,25 @@ mod tests {
                 "{item}"
             );
             assert_eq!(next, original);
+        }
+    }
+
+    #[test]
+    fn failed_compaction_keeps_the_last_successful_history() {
+        for status in ["failed", "incomplete"] {
+            let owner = [1; 32];
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(owner, &mut json!({"input":"original task"}));
+            history.observe(&completed("resp-before", vec![]));
+            history.prepare(owner, &mut json!({"previous_response_id":"resp-before","input":[{"type":"compaction_trigger"}]}));
+            history.observe(&json!({"type":format!("response.{status}"),"response":{"id":"resp-failed","status":status,"output":[{"type":"compaction","encrypted_content":"partial"}]}}));
+            let mut next = json!({"previous_response_id":"resp-before","input":"continue"});
+            history.prepare(owner, &mut next);
+            assert!(history.restore_for_http(owner, &mut next, true).unwrap());
+            assert_eq!(
+                next["input"],
+                json!([{"role":"user","content":"original task"},{"role":"user","content":"continue"}])
+            );
         }
     }
 
@@ -1882,6 +1970,10 @@ mod tests {
             let mut next = json!({"previous_response_id":response_id,"input":"next"});
             history.prepare(owner, &mut next);
             assert_eq!(history.requires_http(), requires_http);
+            assert_eq!(
+                history.requires_http_for_websocket(&next, true),
+                requires_http
+            );
             assert!(history.restore_for_http(owner, &mut next, true).unwrap());
             assert_eq!(next["input"].as_array().unwrap().len(), 2);
             if requires_http {
@@ -1892,6 +1984,7 @@ mod tests {
         let mut next = json!({"previous_response_id":"resp-http-success","input":"later"});
         inherited.prepare([1; 32], &mut next);
         assert!(inherited.requires_http());
+        assert!(inherited.requires_http_for_websocket(&next, true));
         assert!(
             inherited
                 .restore_for_http([1; 32], &mut next, true)

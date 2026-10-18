@@ -1,5 +1,54 @@
 use super::*;
 
+// 预算耗尽时仍允许小型中断事件；每条连接最多保留一条，并立即转发或丢弃。
+// 该固定上限也限制了紧急路径上的 JSON 解析和分配。
+const MAX_EMERGENCY_INTERRUPT_BYTES: usize = 4 * 1024;
+const MAX_PENDING_WEBSOCKET_MESSAGES: usize = 8;
+
+#[derive(Debug)]
+pub(crate) struct BudgetedWebSocketMessage {
+    pub(crate) message: WebSocketMessage,
+    pub(crate) parsed_body: Option<serde_json::Result<Value>>,
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+}
+
+impl BudgetedWebSocketMessage {
+    fn body(&self) -> Option<&Value> {
+        self.parsed_body.as_ref()?.as_ref().ok()
+    }
+
+    fn is_interrupt(&self) -> bool {
+        self.body()
+            .is_some_and(|body| body["type"] == "response.interrupt")
+    }
+}
+
+async fn parse_websocket_message(
+    message: WebSocketMessage,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<BudgetedWebSocketMessage> {
+    let offload = matches!(&message, WebSocketMessage::Text(text) if text.len() >= REQUEST_JSON_OFFLOAD_BYTES);
+    let parse = move || {
+        let parsed_body = match &message {
+            WebSocketMessage::Text(text) => Some(serde_json::from_str(text.as_str())),
+            _ => None,
+        };
+        BudgetedWebSocketMessage {
+            message,
+            parsed_body,
+            permit,
+        }
+    };
+    if offload {
+        // 任务取消后，正文和许可仍由 blocking 任务持有，直到解析结果被释放。
+        tokio::task::spawn_blocking(parse)
+            .await
+            .context("等待大型 Responses WebSocket JSON 解析任务失败")
+    } else {
+        Ok(parse())
+    }
+}
+
 pub(crate) enum IdleDownstreamWait {
     Evicted,
     Message(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
@@ -79,7 +128,7 @@ impl IdleDownstreamRegistry {
 
 impl WebSocketResponsesDownstream {
     #[cfg(test)]
-    pub(crate) fn new(socket: WebSocketStream<TcpStream>) -> Self {
+    pub(crate) fn new(socket: BudgetedWebSocket) -> Self {
         Self::with_shared_backoffs(
             socket,
             Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
@@ -89,11 +138,12 @@ impl WebSocketResponsesDownstream {
     }
 
     pub(crate) fn with_shared_backoffs(
-        socket: WebSocketStream<TcpStream>,
+        mut socket: BudgetedWebSocket,
         websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
         request_body_budget: Arc<Semaphore>,
         idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
     ) -> Self {
+        socket.set_budget(Arc::clone(&request_body_budget));
         let config_changes = websocket_backoffs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -111,7 +161,6 @@ impl WebSocketResponsesDownstream {
             interrupt_forwarding: false,
             terminal_started: false,
             pending_messages: VecDeque::new(),
-            pending_budget_blocked: false,
             request_body_budget,
             config_changes,
             idle_registry,
@@ -142,61 +191,99 @@ impl WebSocketResponsesDownstream {
 
     pub(crate) async fn handle_steering_message(
         &mut self,
-        message: &WebSocketMessage,
+        message: &BudgetedWebSocketMessage,
     ) -> Result<bool> {
-        let WebSocketMessage::Text(text) = message else {
+        let Some(body) = message.body() else {
             return Ok(false);
         };
-        #[derive(serde::Deserialize)]
-        struct MessageType {
-            #[serde(rename = "type")]
-            kind: String,
-        }
-        if !serde_json::from_str::<MessageType>(text.as_str())
-            .is_ok_and(|message| message.kind == "response.steer")
-        {
+        if body["type"] != "response.steer" {
             return Ok(false);
         }
-        // 预算不足时沿用普通帧的有界排队，外层取得预算后再处理。
-        let Ok(_permit) = acquire_request_body_budget(&self.request_body_budget, text.len()) else {
-            return Ok(false);
-        };
-        let body: Value = serde_json::from_str(text.as_str())?;
-        let event = self.steering.accept(&body, &self.request_body_budget);
+        let event = self.steering.accept(body, &self.request_body_budget);
         self.write_steering_event(&event).await?;
         Ok(true)
     }
 
-    fn response_interrupt_from_message(message: &WebSocketMessage) -> Result<Option<Value>> {
-        let WebSocketMessage::Text(text) = message else {
-            return Ok(None);
-        };
-        let Ok(Value::Object(body)) = serde_json::from_str::<Value>(text.as_str()) else {
-            return Ok(None);
-        };
-        if body.get("type").and_then(Value::as_str) != Some("response.interrupt") {
-            return Ok(None);
-        }
-        Ok(Some(Value::Object(body)))
-    }
-
-    fn take_response_interrupt(&mut self) -> Option<Value> {
+    fn take_response_interrupt(&mut self) -> Option<BudgetedWebSocketMessage> {
         self.pending_interrupt.take()
     }
 
     pub(crate) fn handle_idle_response_interrupt(
         &mut self,
-        message: &WebSocketMessage,
+        message: &BudgetedWebSocketMessage,
     ) -> Result<bool> {
-        Ok(Self::response_interrupt_from_message(message)?.is_some())
+        Ok(message.is_interrupt())
     }
 
-    pub(crate) async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
+    async fn reject_message(&mut self, code: &str, message: &str, waiting: bool) -> Result<()> {
+        let failure = ResponsesFailure::new(503, code, message.into(), None);
+        if waiting {
+            // 拒绝的是后续请求，不得结束当前响应或清除其续接状态。
+            self.write_steering_event(&failure.normalized_event()).await
+        } else {
+            self.clear_stream_id();
+            self.write_response_failure(&failure).await
+        }
+    }
+
+    async fn admit_message(
+        &mut self,
+        message: WebSocketMessage,
+        waiting: bool,
+    ) -> Result<Option<BudgetedWebSocketMessage>> {
+        if !matches!(
+            message,
+            WebSocketMessage::Text(_) | WebSocketMessage::Binary(_)
+        ) {
+            return parse_websocket_message(message, None).await.map(Some);
+        }
+        let reservation = match self.socket.take_message_permit() {
+            Some(permit) => Ok(Some(permit)),
+            None => acquire_request_body_budget(&self.request_body_budget, message.len()),
+        };
+        let permit = match reservation {
+            Ok(permit) => permit,
+            Err(error)
+                if error
+                    .downcast_ref::<RequestBodyBudgetUnavailable>()
+                    .is_some() =>
+            {
+                if let WebSocketMessage::Text(text) = &message
+                    && text.len() <= MAX_EMERGENCY_INTERRUPT_BYTES
+                    && let Ok(body) = serde_json::from_str::<Value>(text.as_str())
+                    && matches!(
+                        body["type"].as_str(),
+                        Some("response.interrupt" | "response.cancel")
+                    )
+                {
+                    return Ok(Some(BudgetedWebSocketMessage {
+                        message,
+                        parsed_body: Some(Ok(body)),
+                        permit: None,
+                    }));
+                }
+                drop(message);
+                self.reject_message(
+                    "router_memory_busy",
+                    "Codey 本地路由请求缓冲区已满，请稍后重试",
+                    waiting,
+                )
+                .await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        parse_websocket_message(message, permit).await.map(Some)
+    }
+
+    pub(crate) async fn next_message(&mut self) -> Result<Option<BudgetedWebSocketMessage>> {
         self.write_steering_notifications().await?;
         if let Some(body) = self.steering.take_continuation() {
-            return Ok(Some(WebSocketMessage::Text(
-                serde_json::to_string(&body)?.into(),
-            )));
+            let message = WebSocketMessage::Text(serde_json::to_string(&body)?.into());
+            if let Some(message) = self.admit_message(message, false).await? {
+                return Ok(Some(message));
+            }
+            self.write_steering_notifications().await?;
         }
         let idle_deadline = tokio::time::Instant::now() + DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT;
         let mut idle_slot = None;
@@ -216,18 +303,21 @@ impl WebSocketResponsesDownstream {
                         && upstream.liveness.maintenance_deadline() > Instant::now()
                 })
             {
-                let (message, _permit) = self.pending_messages.pop_front().unwrap();
-                if self.pending_messages.is_empty() {
-                    self.pending_budget_blocked = false;
-                }
-                return Ok(Some(message));
+                return Ok(self.pending_messages.pop_front());
             }
             if idle_slot.is_none() {
                 idle_slot = Some(IdleDownstreamRegistry::register(&self.idle_registry));
             }
             let evict = &mut idle_slot.as_mut().unwrap().1;
             let Some(upstream) = self.upstream.as_ref() else {
-                return self.wait_for_idle_downstream(evict, idle_deadline).await;
+                let Some(message) = self.wait_for_idle_downstream(evict, idle_deadline).await?
+                else {
+                    return Ok(None);
+                };
+                if let Some(message) = self.admit_message(message, false).await? {
+                    return Ok(Some(message));
+                }
+                continue;
             };
             let maintenance_deadline = upstream.liveness.maintenance_deadline();
             let event = {
@@ -275,7 +365,12 @@ impl WebSocketResponsesDownstream {
                         // that fresh handshake fails.
                         self.upstream.take();
                     }
-                    return Ok(message);
+                    let Some(message) = message else {
+                        return Ok(None);
+                    };
+                    if let Some(message) = self.admit_message(message, false).await? {
+                        return Ok(Some(message));
+                    }
                 }
                 IdleWebSocketEvent::Upstream(Some(Ok(WebSocketMessage::Ping(payload)))) => {
                     let pong = self
@@ -358,15 +453,17 @@ impl WebSocketResponsesDownstream {
         // 合成 previous_response_id 只存在这条 socket 的历史里，空闲超时不能
         // 关掉它，否则 Codex 复用连接时会丢掉续接。连接数超出上限时另有回收。
         let stateful = self.adapted_history.last.is_some() || self.native_history.has_history();
-        let read = self.socket.next();
-        tokio::pin!(read);
-        let idle = tokio::time::sleep_until(idle_deadline);
-        tokio::pin!(idle);
-        let outcome = tokio::select! {
-            biased;
-            _ = &mut *evict => IdleDownstreamWait::Evicted,
-            message = &mut read => IdleDownstreamWait::Message(message),
-            _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+        let outcome = {
+            let read = self.socket.next();
+            tokio::pin!(read);
+            let idle = tokio::time::sleep_until(idle_deadline);
+            tokio::pin!(idle);
+            tokio::select! {
+                biased;
+                _ = &mut *evict => IdleDownstreamWait::Evicted,
+                message = &mut read => IdleDownstreamWait::Message(message),
+                _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+            }
         };
         match outcome {
             IdleDownstreamWait::Evicted => Ok(None),
@@ -471,7 +568,12 @@ impl WebSocketResponsesDownstream {
         let history_key = self
             .native_history
             .prepare_for_route(route, effective_auth, body);
-        if route.official_account && self.native_history.requires_http() {
+        if route.official_account
+            && self.native_history.requires_http_for_websocket(
+                body,
+                cached_matches && previous_response_key.is_some(),
+            )
+        {
             return Ok(UpstreamWebSocketAttempt::UseHttp(
                 "websocket_history_requires_http",
             ));
@@ -664,8 +766,12 @@ impl WebSocketResponsesDownstream {
                         let interrupt = self
                             .take_response_interrupt()
                             .context("Responses WebSocket 缺少待发送的中断事件")?;
-                        let message = serde_json::to_string(&interrupt)
-                            .context("序列化 Responses WebSocket 中断事件失败")?;
+                        let message = serde_json::to_string(
+                            interrupt
+                                .body()
+                                .expect("admitted interrupt must contain JSON"),
+                        )
+                        .context("序列化 Responses WebSocket 中断事件失败")?;
                         match tokio::time::timeout(
                             DOWNSTREAM_WRITE_TIMEOUT,
                             upstream.socket.send(WebSocketMessage::Text(message.into())),
@@ -1103,19 +1209,20 @@ pub(crate) fn upstream_websocket_endpoint_is_unsupported(error: &anyhow::Error) 
     })
 }
 
-#[async_trait]
-impl ResponsesDownstream for WebSocketResponsesDownstream {
-    async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
+impl WebSocketResponsesDownstream {
+    async fn wait_response_future<T, F>(&mut self, future: F, admission: bool) -> Result<T>
     where
         T: Send,
         F: std::future::Future<Output = T> + Send,
     {
         tokio::pin!(future);
+        let mut control_messages = 0_u8;
         loop {
             tokio::select! {
+                biased;
                 // Keep the same pinned deadline when Ping or queued requests arrive.
-                result = &mut future => return Ok(result),
-                message = self.socket.next(), if self.pending_messages.len() < 8 && !self.pending_budget_blocked => {
+                message = self.socket.next(), if control_messages < 16 => {
+                    control_messages += 1;
                     match message {
                         Some(Ok(WebSocketMessage::Ping(payload))) => {
                             self.write_pong(payload).await.map_err(|error| error.context(DownstreamClosed))?;
@@ -1128,27 +1235,63 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                         }
                         Some(Err(error)) => return Err(anyhow::Error::new(error).context(DownstreamClosed)),
                         Some(Ok(message)) => {
+                            let Some(message) = self.admit_message(message, true).await? else {
+                                continue;
+                            };
                             if self.handle_steering_message(&message).await? {
                                 continue;
                             }
-                            if let Some(interrupt) = Self::response_interrupt_from_message(&message)?
-                                && self.interrupt_forwarding {
-                                self.pending_interrupt = Some(interrupt);
-                                return Err(DownstreamResponseInterrupt.into());
+                            if message.is_interrupt() || (admission && message.body().is_some_and(|body| body["type"] == "response.cancel")) {
+                                if admission {
+                                    if message.body().and_then(|body| body.get("stream_id")).and_then(Value::as_str)
+                                        .is_some_and(|id| Some(id) != self.stream_id.as_deref()) {
+                                        continue;
+                                    }
+                                    return Err(DownstreamResponseInterrupt.into());
+                                }
+                                if self.interrupt_forwarding {
+                                    self.pending_interrupt = Some(message);
+                                    return Err(DownstreamResponseInterrupt.into());
+                                }
+                                continue;
                             }
-                            // ponytail: full queues delay control frames; use an explicit
-                            // cancellation channel if cancellation must bypass queued requests.
-                            // At most one bounded frame may wait for the shared body budget.
-                            let permit = match acquire_request_body_budget(&self.request_body_budget, message.len()) {
-                                Ok(permit) => permit,
-                                Err(_) => { self.pending_budget_blocked = true; None }
-                            };
-                            self.pending_messages.push_back((message, permit));
+                            if self.pending_messages.len() >= MAX_PENDING_WEBSOCKET_MESSAGES {
+                                drop(message);
+                                self.reject_message(
+                                    "router_busy",
+                                    "Codey 本地路由当前请求过多，请稍后重试",
+                                    true,
+                                ).await?;
+                                continue;
+                            }
+                            self.pending_messages.push_back(message);
                         }
                     }
                 }
+                result = &mut future => return Ok(result),
+                _ = tokio::task::yield_now(), if control_messages >= 16 => {
+                    control_messages = 0;
+                }
             }
         }
+    }
+}
+
+#[async_trait]
+impl ResponsesDownstream for WebSocketResponsesDownstream {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.wait_response_future(future, true).await
+    }
+    async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.wait_response_future(future, false).await
     }
     fn is_websocket(&self) -> bool {
         true
@@ -1745,5 +1888,266 @@ mod encode_stream_id_tests {
             encode_responses_websocket_event(&event, None).unwrap(),
             serde_json::to_string(&event).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::super::tests::local_websocket_pair;
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_websocket_budget_rejects_small_messages_without_ending_response() {
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        downstream.request_body_budget = Arc::new(Semaphore::new(0));
+        downstream
+            .socket
+            .set_budget(Arc::clone(&downstream.request_body_budget));
+        let (release, released) = oneshot::channel::<()>();
+        let waiting = tokio::spawn(async move {
+            downstream
+                .wait_for_upstream(released)
+                .await
+                .unwrap()
+                .unwrap();
+            downstream
+        });
+        peer.send(WebSocketMessage::Text(
+            json!({"type":"response.create","input":"x".repeat(1024)})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .expect("an exhausted budget must reject the frame promptly")
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(event) = event else {
+            panic!("expected failure event")
+        };
+        let event: Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["error"]["code"], "router_memory_busy");
+        release.send(()).unwrap();
+        let downstream = waiting.await.unwrap();
+        assert!(downstream.pending_messages.is_empty());
+        assert!(!downstream.terminal_started);
+    }
+
+    async fn receive_failure(peer: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Value {
+        let message = tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected failure event")
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn queued_websocket_budget_is_shared_and_survives_message_handoff() {
+        let budget = Arc::new(Semaphore::new(1));
+        let mut downstreams = Vec::new();
+        for connection in 0..3 {
+            let (socket, mut peer) = local_websocket_pair().await;
+            let mut downstream = WebSocketResponsesDownstream::new(socket);
+            downstream.request_body_budget = Arc::clone(&budget);
+            downstream.socket.set_budget(Arc::clone(&budget));
+            let (release, released) = oneshot::channel::<()>();
+            let waiting = tokio::spawn(async move {
+                downstream
+                    .wait_for_upstream(released)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                downstream
+            });
+            peer.feed(WebSocketMessage::Text(
+                json!({"type":"response.create","input":"queued"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            peer.feed(WebSocketMessage::Ping(Default::default()))
+                .await
+                .unwrap();
+            peer.flush().await.unwrap();
+            if connection > 0 {
+                assert_eq!(
+                    receive_failure(&mut peer).await["response"]["error"]["code"],
+                    "router_memory_busy"
+                );
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), peer.next())
+                    .await
+                    .unwrap(),
+                Some(Ok(WebSocketMessage::Pong(_)))
+            ));
+            release.send(()).unwrap();
+            let downstream = waiting.await.unwrap();
+            assert_eq!(
+                downstream.pending_messages.len(),
+                usize::from(connection == 0)
+            );
+            assert_eq!(budget.available_permits(), 0);
+            downstreams.push((downstream, peer));
+        }
+        let message = downstreams[0].0.next_message().await.unwrap().unwrap();
+        assert_eq!(message.body().unwrap()["input"], "queued");
+        assert!(downstreams[0].0.pending_messages.is_empty());
+        assert_eq!(budget.available_permits(), 0);
+        drop(message);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_websocket_queue_and_exhausted_budget_still_accept_interrupts() {
+        for permits in [
+            MAX_PENDING_WEBSOCKET_MESSAGES,
+            MAX_PENDING_WEBSOCKET_MESSAGES * 2,
+        ] {
+            let (socket, mut peer) = local_websocket_pair().await;
+            let budget = Arc::new(Semaphore::new(permits));
+            let mut downstream = WebSocketResponsesDownstream::new(socket);
+            downstream.request_body_budget = Arc::clone(&budget);
+            downstream.socket.set_budget(Arc::clone(&budget));
+            downstream.interrupt_forwarding = true;
+            for _ in 0..=MAX_PENDING_WEBSOCKET_MESSAGES {
+                peer.feed(WebSocketMessage::Text(
+                    json!({"type":"response.create","input":"queued"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+            peer.feed(WebSocketMessage::Text(
+                json!({"type":"response.interrupt","response_id":"active","mode":"discard_partial_items"})
+                    .to_string().into(),
+            )).await.unwrap();
+            peer.flush().await.unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                downstream.wait_for_upstream(std::future::pending::<()>()),
+            )
+            .await
+            .expect("interrupt must bypass a full queue")
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<DownstreamResponseInterrupt>()
+                    .is_some()
+            );
+            assert_eq!(
+                downstream.pending_messages.len(),
+                MAX_PENDING_WEBSOCKET_MESSAGES
+            );
+            assert_eq!(
+                receive_failure(&mut peer).await["response"]["error"]["code"],
+                if permits == MAX_PENDING_WEBSOCKET_MESSAGES {
+                    "router_memory_busy"
+                } else {
+                    "router_busy"
+                }
+            );
+            let interrupt = downstream.take_response_interrupt().unwrap();
+            assert_eq!(interrupt.body().unwrap()["response_id"], "active");
+            assert_eq!(
+                interrupt.permit.is_none(),
+                permits == MAX_PENDING_WEBSOCKET_MESSAGES
+            );
+            assert!(!downstream.terminal_started);
+            drop((interrupt, downstream));
+            assert_eq!(budget.available_permits(), permits);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_emergency_interrupt_stops_at_header_when_budget_is_exhausted() {
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        downstream.request_body_budget = Arc::new(Semaphore::new(0));
+        downstream
+            .socket
+            .set_budget(Arc::clone(&downstream.request_body_budget));
+        downstream.interrupt_forwarding = true;
+        peer.send(WebSocketMessage::Text(
+            json!({"type":"response.interrupt","padding":"x".repeat(MAX_EMERGENCY_INTERRUPT_BYTES)})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            downstream.wait_for_upstream(std::future::pending::<()>()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.downcast_ref::<DownstreamClosed>().is_some());
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<WebSocketError>(),
+            Some(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::OutOfMemory
+        )));
+        assert!(downstream.take_response_interrupt().is_none());
+        assert!(downstream.pending_messages.is_empty());
+    }
+
+    #[test]
+    fn cancelled_large_websocket_parse_holds_budget_until_blocking_work_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, started_rx) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                release_rx.blocking_recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let budget = Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS));
+            let message = WebSocketMessage::Text(
+                json!({"type":"response.create",
+                "input":"x".repeat(REQUEST_JSON_OFFLOAD_BYTES)})
+                .to_string()
+                .into(),
+            );
+            let permit = acquire_request_body_budget(&budget, message.len()).unwrap();
+            let held = permit.as_ref().unwrap().num_permits();
+            let parsing = tokio::spawn(parse_websocket_message(message, permit));
+            tokio::task::yield_now().await;
+            let was_pending = !parsing.is_finished();
+            parsing.abort();
+            let result = parsing.await;
+            let was_cancelled = result.as_ref().is_err_and(|error| error.is_cancelled());
+            drop(result);
+            let available_after_cancellation = budget.available_permits();
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while budget.available_permits() != REQUEST_BODY_BUDGET_PERMITS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(was_pending, "large JSON must use the blocking pool");
+            assert!(was_cancelled);
+            assert_eq!(
+                available_after_cancellation,
+                REQUEST_BODY_BUDGET_PERMITS - held
+            );
+        });
     }
 }

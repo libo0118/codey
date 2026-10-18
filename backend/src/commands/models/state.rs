@@ -414,6 +414,7 @@ pub(crate) fn renderer_route_model_catalog(
                 manual_models,
                 Some(&reasoning_efforts),
                 default_model.as_deref(),
+                &config.codex_app_path,
             )
             .map(|state| {
                 state.with_upstream_reasoning(Some(

@@ -735,7 +735,6 @@ mod tests {
             &home,
             RouterApplyOptions {
                 remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
-                conversation_git: false,
                 model_contexts: None,
                 stream_max_retries: 5,
                 local_router,

@@ -121,11 +121,12 @@ impl SharedClient {
         for config in router_overrides(route) {
             command.arg("-c").arg(config);
         }
+        let proxy_environment = crate::launch_proxy::shared_app_server_environment().await;
         command
             .env("CODEX_HOME", crate::codex_config::codex_home())
             .env_remove("CODEX_CLI_PATH")
             .env_remove("CODEX_APP_SERVER_FORCE_CLI")
-            .envs(crate::launch_proxy::shared_app_server_environment())
+            .envs(proxy_environment)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

@@ -633,6 +633,29 @@
   margin-top: -2px;
 }
 
+/* 新增线路的 New API 连接信息快速导入 */
+.route-import-panel {
+  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
+  border-radius: 10px;
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.018);
+  padding: 9px 12px;
+  animation: route-subpanel-in 0.18s ease-out;
+}
+
+.route-import-input {
+  min-height: 56px;
+  resize: vertical;
+}
+
+.route-import-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--success, #34c759);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
 .route-protocol-section-header {
   display: flex;
   align-items: center;
@@ -1354,26 +1377,49 @@
 }
 
 .official-account-plan-badge.is-pro {
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, rgba(217, 119, 6, 0.06) 100%);
-  color: #b45309;
-  border-color: rgba(217, 119, 6, 0.28);
-  box-shadow: 0 1px 2px rgba(217, 119, 6, 0.06);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
-.official-account-plan-badge.is-pro:hover {
-  border-color: rgba(217, 119, 6, 0.42);
+.official-account-plan-badge.is-pro-100 {
+  background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+  color: #475569;
+  border-color: #cbd5e1;
 }
 
 [data-theme="dark"] .official-account-plan-badge.is-pro {
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.18) 0%, rgba(217, 119, 6, 0.10) 100%);
-  color: #fbbf24;
-  border-color: rgba(245, 158, 11, 0.38);
-  box-shadow: 0 0 10px rgba(245, 158, 11, 0.16), inset 0 1px 0 rgba(254, 240, 138, 0.16);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
-[data-theme="dark"] .official-account-plan-badge.is-pro:hover {
-  border-color: rgba(245, 158, 11, 0.55);
-  box-shadow: 0 0 12px rgba(245, 158, 11, 0.26), inset 0 1px 0 rgba(254, 240, 138, 0.25);
+[data-theme="dark"] .official-account-plan-badge.is-pro-100 {
+  background: linear-gradient(135deg, #394452 0%, #262e39 100%);
+  color: #dbe4ef;
+  border-color: #64748b;
+}
+
+.official-account-plan-badge.is-pro-200 {
+  background: linear-gradient(135deg, #fff8e7 0%, #f2dfb0 100%);
+  color: #78530e;
+  border-color: #d6b86b;
+}
+
+[data-theme="dark"] .official-account-plan-badge.is-pro-200 {
+  background: linear-gradient(135deg, #4b3b1f 0%, #302719 100%);
+  color: #f2d58d;
+  border-color: #8f7035;
+}
+
+.official-account-plan-badge.is-pro-500 {
+  background: linear-gradient(135deg, #49305f 0%, #25182f 100%);
+  color: #f8e5af;
+  border-color: #b89654;
+  box-shadow: inset 0 1px 0 rgba(255, 233, 176, 0.2), 0 1px 4px rgba(49, 30, 65, 0.16);
+}
+
+[data-theme="dark"] .official-account-plan-badge.is-pro-500 {
+  background: linear-gradient(135deg, #59406e 0%, #302039 100%);
+  color: #ffe9b0;
+  border-color: #c6a663;
+  box-shadow: inset 0 1px 0 rgba(255, 233, 176, 0.22), 0 1px 6px rgba(160, 117, 203, 0.14);
 }
 
 .official-account-plan-badge.is-team {

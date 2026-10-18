@@ -99,28 +99,22 @@ impl RequestLogCatalog {
     }
 }
 
-/// 本地路由优先尝试的高位端口区间，用于避开常见开发服务的低位端口。
-/// 连续候选均不可用时由内核分配，实际端口可能在区间之外。
-pub(crate) const ROUTER_PORT_RANGE_START: u16 = 45_000;
-pub(crate) const ROUTER_PORT_RANGE_END: u16 = 55_000;
-/// 从随机起点最多连续探测多少个候选端口，全都不可用时回退由内核分配。
+/// 本地路由固定优先占用的端口，被占用才顺序向上探测。
+/// 连续候选均不可用时由内核分配，实际端口可能在该端口之后。
+pub(crate) const ROUTER_PORT_START: u16 = 26_958;
+/// 从起始端口最多连续探测多少个候选端口，全都不可用时回退由内核分配。
 pub(crate) const ROUTER_PORT_PROBES: u16 = 64;
 
-/// 在区间内从 `offset` 指定的端口开始顺序探测可用端口，候选被占用就换下一个。
+/// 从 `ROUTER_PORT_START` 开始顺序探测可用端口，候选被占用就换下一个。
 /// `bind` 成功即独占该端口，所以并发启动的多个实例不会拿到同一个端口。
-pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener> {
-    bind_router_listener_with(offset, TcpListener::bind).await
-}
-
-pub(super) async fn bind_router_listener_with<T, F, Fut>(offset: u32, mut bind: F) -> Result<T>
+pub(super) async fn bind_router_listener_with<T, F, Fut>(mut bind: F) -> Result<T>
 where
     F: FnMut(std::net::SocketAddrV4) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<T>>,
 {
-    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
     let mut occupied = Vec::new();
-    for step in 0..u32::from(ROUTER_PORT_PROBES) {
-        let port = ROUTER_PORT_RANGE_START + ((offset + step) % span) as u16;
+    for step in 0..ROUTER_PORT_PROBES {
+        let port = ROUTER_PORT_START + step;
         match bind(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
             port,
@@ -131,12 +125,12 @@ where
             Err(error) => occupied.push((port, error)),
         }
     }
-    // 区间内连续候选都被占用时不能让路由起不来，退回到内核分配并留下诊断。
+    // 连续候选都被占用时不能让路由起不来，退回到内核分配并留下诊断。
     record_router_failure_nonblocking(
         "local_router_port_candidates_unavailable",
         "bind_local_router",
         format!(
-            "高位端口区间 {ROUTER_PORT_RANGE_START}-{ROUTER_PORT_RANGE_END} 内连续 {ROUTER_PORT_PROBES} 个候选端口均不可用，回退由内核分配端口"
+            "固定端口 {ROUTER_PORT_START} 起连续 {ROUTER_PORT_PROBES} 个候选端口均不可用，回退由内核分配端口"
         ),
         serde_json::json!({
             "probes": occupied
@@ -157,18 +151,46 @@ where
     .context("启动 Codey 本地路由失败")
 }
 
-/// 随机起点避免同一台机器上并发启动的实例都从同一个端口开始竞争。
 pub(crate) async fn bind_router_listener() -> Result<TcpListener> {
-    let seed = Uuid::new_v4();
-    let bytes = seed.as_bytes();
-    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
-    let offset = u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) % span;
-    bind_router_listener_from(offset).await
+    bind_router_listener_with(TcpListener::bind).await
+}
+
+/// 路由访问令牌持久化在应用状态目录下，重启后沿用同一个令牌，
+/// 已打开的日志页面刷新后仍能通过鉴权。
+fn router_token_path() -> PathBuf {
+    codey_runtime_core::paths::default_app_state_dir().join("router-token")
+}
+
+/// 读取或生成路由令牌：已有持久化令牌沿用，文件缺失或内容损坏时生成新令牌
+/// 并尽量写回；写盘失败退回本次启动的临时令牌，不阻塞路由启动。
+fn load_or_create_router_token() -> String {
+    load_or_create_router_token_at(&router_token_path())
+}
+
+pub(super) fn load_or_create_router_token_at(path: &Path) -> String {
+    if let Ok(bytes) = crate::fs_util::read_bounded(path, 256) {
+        let token = String::from_utf8_lossy(&bytes).trim().to_string();
+        if token.starts_with("codey-router-") {
+            return token;
+        }
+    }
+    let token = format!("codey-router-{}", Uuid::new_v4());
+    if let Err(error) = crate::fs_util::atomic_write_private_with_parent(path, token.as_bytes()) {
+        record_router_failure_nonblocking(
+            "router_token_persist_failed",
+            "persist_router_token",
+            format!("{error:#}"),
+            serde_json::json!({ "path": path.display().to_string() }),
+        );
+    }
+    token
 }
 
 pub(crate) struct LocalRouter {
     pub(crate) endpoint: RuntimeRouterEndpoint,
+    pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
+    pub(crate) official_concurrency: Arc<OfficialConcurrency>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) shutdown: Mutex<Option<oneshot::Sender<()>>>,
     pub(crate) task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -211,7 +233,7 @@ impl LocalRouter {
             .local_addr()
             .context("读取 Codey 本地路由监听地址失败")?
             .port();
-        let token = format!("codey-router-{}", Uuid::new_v4());
+        let token = load_or_create_router_token();
         let endpoint = RuntimeRouterEndpoint {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
@@ -220,6 +242,8 @@ impl LocalRouter {
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
+        let official_concurrency = Arc::new(OfficialConcurrency::default());
+        official_concurrency.update(&snapshot.read().unwrap());
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let official_auth_path = crate::codex_config::codex_home().join("auth.json");
         let websocket_backoffs = Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default()));
@@ -235,15 +259,18 @@ impl LocalRouter {
                 serde_json::json!({}),
             );
         }
+        let bindings = Arc::new(Mutex::new(RouteBindings::default()));
         let server = RouterServer {
             endpoint: endpoint.clone(),
             token: endpoint.token.clone(),
             bearer_token: format!("Bearer {}", endpoint.token),
             snapshot: Arc::clone(&snapshot),
+            official_concurrency: Arc::clone(&official_concurrency),
+            admitted_connections: Arc::new(Semaphore::new(MAX_ADMITTED_CONNECTIONS)),
             connection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
             request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
-            bindings: Arc::new(Mutex::new(RouteBindings::default())),
+            bindings: Arc::clone(&bindings),
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
@@ -293,7 +320,7 @@ impl LocalRouter {
                                 // 连接会退出，不再一直占着任务。
                                 enable_downstream_keepalive(&stream);
                                 let server = Arc::clone(&server);
-                                let permit = match Arc::clone(&server.connection_limit)
+                                let admitted = match Arc::clone(&server.admitted_connections)
                                     .try_acquire_owned()
                                 {
                                     Ok(permit) => permit,
@@ -329,7 +356,8 @@ impl LocalRouter {
                                 connections.spawn(ROUTER_REQUEST_ID.scope(
                                     request_id.clone(),
                                     ROUTER_REQUEST_STARTED_AT.scope(Instant::now(), async move {
-                                        if let Err(error) = server.handle_connection(stream, permit).await {
+                                        let _admitted = admitted;
+                                        if let Err(error) = server.handle_connection(stream).await {
                                             record_router_failure_nonblocking(
                                                 "local_router_request_failed",
                                                 "handle_local_router_connection",
@@ -386,7 +414,9 @@ impl LocalRouter {
         });
         Ok(Self {
             endpoint,
+            bindings,
             snapshot,
+            official_concurrency,
             websocket_backoffs,
             shutdown: Mutex::new(Some(shutdown_tx)),
             task: Mutex::new(Some(task)),
@@ -400,13 +430,13 @@ impl LocalRouter {
 
     pub(crate) fn update_config(&self, config: &CodeyConfig) -> RouterSnapshotSwap {
         let installed = Arc::new(RouterSnapshot::from_config(config));
-        let previous = std::mem::replace(
-            &mut *self
-                .snapshot
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Arc::clone(&installed),
-        );
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::replace(&mut *current, Arc::clone(&installed));
+        self.official_concurrency.update(&installed);
+        drop(current);
         self.websocket_backoffs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -428,6 +458,7 @@ impl LocalRouter {
             return false;
         }
         *current = Arc::clone(&swap.previous);
+        self.official_concurrency.update(&swap.previous);
         drop(current);
         self.websocket_backoffs
             .lock()
@@ -573,6 +604,7 @@ pub(crate) struct RouterSnapshotSwap {
     installed: Arc<RouterSnapshot>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum ConnectionPermitError {
     Busy,
@@ -581,6 +613,7 @@ pub(crate) enum ConnectionPermitError {
 
 /// HTTP 连接在名额用尽时立刻返回 503。已建立的 WebSocket 再等一小段时间，
 /// 仍然没有名额就同样返回 503，而不是一直占着这条连接。
+#[cfg(test)]
 pub(crate) async fn acquire_connection_permit_within(
     limit: &Arc<Semaphore>,
     wait: Duration,
@@ -612,6 +645,8 @@ pub(crate) struct RouterServer {
     pub(crate) token: String,
     pub(crate) bearer_token: String,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
+    pub(crate) official_concurrency: Arc<OfficialConcurrency>,
+    pub(crate) admitted_connections: Arc<Semaphore>,
     pub(crate) connection_limit: Arc<Semaphore>,
     pub(crate) rejection_limit: Arc<Semaphore>,
     pub(crate) request_body_budget: Arc<Semaphore>,
@@ -692,6 +727,7 @@ impl ResponsesRequestKind {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouteBindings {
+    pub(crate) portable_tickets: HashMap<String, PortableTicket>,
     pub(crate) compacting: HashSet<String>,
     pub(crate) routes: HashMap<String, RouteBinding>,
     pub(crate) order: VecDeque<(String, u64)>,
@@ -702,6 +738,9 @@ pub(crate) struct RouteBindings {
 pub(crate) struct RouteBinding {
     pub(crate) provider_id: String,
     pub(crate) generation: u64,
+    pub(crate) upstream_model: String,
+    pub(crate) context_config: Option<[u8; 32]>,
+    pub(crate) portable: bool,
 }
 
 impl RouteBindings {
@@ -736,6 +775,9 @@ impl RouteBindings {
                 RouteBinding {
                     provider_id: provider_id.to_string(),
                     generation,
+                    upstream_model: String::new(),
+                    context_config: None,
+                    portable: false,
                 },
             );
             self.order.push_back((key.clone(), generation));
@@ -841,6 +883,15 @@ impl RouterSnapshot {
                     .filter(|proxy| !proxy.is_empty()),
                 protocol,
                 official_account: profile.official_account,
+                concurrency_key: profile.official_account.then(|| {
+                    profile
+                        .official_account_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                        .map(|id| format!("account:{id}"))
+                        .unwrap_or_else(|| format!("provider:{provider_id}"))
+                }),
+                max_concurrency: profile.max_concurrency,
                 // Each stored account reads its own credential document, so
                 // several official routes never share one login.
                 official_auth,
@@ -1184,6 +1235,8 @@ pub(crate) struct RouteTarget {
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) protocol: UpstreamProtocol,
     pub(crate) official_account: bool,
+    pub(crate) concurrency_key: Option<String>,
+    pub(crate) max_concurrency: u32,
     pub(crate) official_auth: Option<OfficialRouteAuth>,
     pub(crate) plugin_transport: Option<plugin_transport::Target>,
     pub(crate) supports_websockets: bool,
@@ -1201,6 +1254,8 @@ pub(crate) struct OfficialRouteAuth {
     pub(crate) account_id: String,
     pub(crate) email: Option<String>,
     pub(crate) path: PathBuf,
+    /// 受管账号记录独立于路由快照和凭据缓存；删除后立即拒绝新的授权准备。
+    pub(crate) record_path: PathBuf,
     /// SIWC 直连凭据的物化文件；有值时该线路的对话流量走官方公开 API，
     /// `path` 里的 Codex 凭据只留给 backend-api 专属能力。
     pub(crate) siwc_path: Option<PathBuf>,
@@ -1232,6 +1287,7 @@ fn official_route_auth(profile: &crate::config::ProviderProfile) -> Option<Offic
     let accepts_incoming_authorization =
         siwc_path.is_none() && path == codex_home.join("auth.json");
     Some(OfficialRouteAuth {
+        record_path: store.account_path(&account_id),
         account_id,
         email,
         path,

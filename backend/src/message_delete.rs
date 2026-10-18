@@ -664,7 +664,14 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
     Ok(find_rollout_file_by_session_id(home, session_id))
 }
 
-fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+pub(crate) fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+    find_rollout_files_by_session_id(home, session_id)
+        .into_iter()
+        .next()
+}
+
+pub(crate) fn find_rollout_files_by_session_id(home: &Path, session_id: &str) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
     for dirname in ROLLOUT_SEARCH_DIRS {
         let root = home.join(dirname);
         if !root.exists() {
@@ -679,26 +686,28 @@ fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<Path
         // 目录顺序即优先级：活跃会话目录命中后才看归档目录，同一目录内按
         // 路径排序保证确定性（日期分片下最早文件优先）。
         files.sort();
-        let matched = files.into_iter().find(|path| {
+        matches.extend(files.into_iter().filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
                     rollout_thread_id_from_filename(name)
                         .is_some_and(|thread_id| thread_id.eq_ignore_ascii_case(session_id))
                 })
-        });
-        if matched.is_some() {
-            return matched;
-        }
+        }));
     }
-    None
+    matches
 }
 
 fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in
         fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
     {
-        let path = entry?.path();
+        let entry = entry?;
+        // 不跟随目录链接，避免跨目录扫描或循环。
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
         if path.is_dir() {
             collect_rollout_files(&path, files)?;
         } else if path

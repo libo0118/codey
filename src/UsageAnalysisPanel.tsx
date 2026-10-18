@@ -1,20 +1,25 @@
 import { useEffect, useRef, useState } from "react";
-import { IconArrowLeft, IconChartDonut, IconRefresh } from "@tabler/icons-react";
+import { IconArrowLeft, IconChartDonut, IconInfoCircle, IconRefresh } from "@tabler/icons-react";
 import { Spinner } from "@heroui/react";
-import { Button, Select, Badge } from "./components/ui";
+import { Button } from "./components/ui";
 import { invoke } from "./api";
 import { withTimeout } from "./appUtils";
-import { formatUsageNumber, observeUsageRequest, usageCoverage, usageQuery, usageSlices, usageTrend, type LogAnalytics, type UsageLoadState, type UsageRange } from "./usageAnalysis";
+import { formatUsageNumber, observeUsageRequest, usageCoverage, usageQuery, usageSlices, type LogAnalytics, type UsageLoadState, type UsageRange } from "./usageAnalysis";
 import styles from "./styles.usage-analysis.css?inline";
 import { UsageHeatmap } from "./UsageHeatmap";
+import { UsageTimeline } from "./UsageTimeline";
 
-const colors = ["#007aff", "#635bdb", "#1a9c86", "#d98916", "#e06785", "#699ad4", "#8b71ba", "#71a54d", "#b77757", "#c883c7", "#428394", "#afb13d", "#93969e"];
+const ranges: { label: string; value: UsageRange }[] = [
+  { label: "近 7 天", value: "7d" },
+  { label: "近 30 天", value: "30d" },
+  { label: "全部历史", value: "all" },
+];
 const utc = (timestamp: number) => new Date(timestamp).toLocaleString("zh-CN", { timeZone: "UTC", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 
 export function UsageAnalysisPanel({ onBack }: { onBack: () => void }) {
   const [range, setRange] = useState<UsageRange>("7d");
   const [revision, setRevision] = useState(0);
-  const [chart, setChart] = useState<"heatmap" | "bars">("heatmap");
+  const [chart, setChart] = useState<"heatmap" | "bars">("bars");
   const [state, setState] = useState<UsageLoadState>({ loading: true, data: null, error: "" });
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => { heading.current?.focus(); }, []);
@@ -29,34 +34,29 @@ export function UsageAnalysisPanel({ onBack }: { onBack: () => void }) {
   const partial = health && (health.sampleRatePerMillion < 1_000_000 || health.sampledOut > 0 || dropped > 0 || health.writeFailures > 0 || health.observerPanics > 0 || health.writerPanics > 0 || health.shutdownTimeouts > 0);
   const slices = stats?.queryable ? usageSlices(stats) : [];
   const totalTokens = stats?.totalTokensSum;
-  let angle = 0;
-  const gradient = totalTokens != null && totalTokens > 0 ? slices.map((slice, index) => {
-    const start = angle;
-    angle += (slice.tokens ?? 0) / totalTokens * 360;
-    return `${colors[index]} ${start}deg ${angle}deg`;
-  }).join(", ") : "";
-  const trend = stats?.queryable ? usageTrend(stats) : { peak: null, bars: [] };
-  // 未上报用量的分桶画成低矮虚线柱，避免与零用量一样显示为空白。
-  const unknownBarHeight = 3;
+  // 各字段独立汇总，仅用同一刻度比较输入、输出，不推算总量或缓存占比。
+  const tokenComparisonMax = Math.max(stats?.inputTokensSum ?? 0, stats?.outputTokensSum ?? 0);
   const percent = (tokens: number | null) => tokens != null && totalTokens != null && totalTokens > 0 ? tokens / totalTokens * 100 : null;
 
   return <section className="usage-analysis" aria-labelledby="usage-analysis-title">
     <style>{styles}</style>
-    <Button variant="link" className="usage-back" onClick={onBack}><IconArrowLeft size={15} aria-hidden="true" />返回线路与模型</Button>
+    <header className="usage-header">
+    <div className="usage-navigation"><Button variant="ghost" size="xs" className="usage-back" onClick={onBack}><IconArrowLeft size={15} aria-hidden="true" />线路与模型</Button></div>
     <div className="usage-heading">
-      <div className="section-heading"><span className="section-icon" aria-hidden="true"><IconChartDonut size={18} /></span><div>
+      <div className="usage-title">
         <h1 ref={heading} tabIndex={-1} id="usage-analysis-title">用量分析</h1>
-        <p>了解模型消耗分布与用量变化</p>
-      </div></div>
-      <Button variant="outline" size="sm" loading={state.loading} onClick={reload}><IconRefresh size={14} aria-hidden="true" />刷新</Button>
-    </div>
-    <div className="usage-toolbar">
-      <div className="usage-controls">
-        <Select aria-label="用量时间范围" value={range} optionList={[{ label: "近 7 天", value: "7d" }, { label: "近 30 天", value: "30d" }, { label: "全部历史", value: "all" }]} onChange={(value) => { if (value !== range) { setState({ loading: true, data: null, error: "" }); setRange(value as UsageRange); } }} />
+        <p>模型消耗与使用趋势</p>
       </div>
-      <Badge variant="secondary">仅保留的日志</Badge>
+    <div className="usage-toolbar">
+      <div className="usage-range-control usage-segmented" role="group" aria-label="用量时间范围">
+        {ranges.map(({ label, value }) => <Button key={value} size="xs" variant="ghost" aria-pressed={range === value} onPress={() => {
+          if (value !== range) { setState({ loading: true, data: null, error: "" }); setRange(value); }
+        }}>{label}</Button>)}
+      </div>
+      <Button variant="outline" size="sm" className="usage-refresh" loading={state.loading} onClick={reload}><IconRefresh size={14} aria-hidden="true" />刷新</Button>
     </div>
-    <p className="usage-scope">仅统计经过 Codey 路由且仍保留的请求日志，不包含官方直连。清理日志会影响历史统计。</p>
+    </div>
+    </header>
     <div aria-live="polite" aria-busy={state.loading}>
       {state.loading ? <div className="usage-state" role="status"><Spinner size="sm" /><strong>正在统计用量…</strong><span>正在读取所选范围的请求日志</span></div>
         : state.error ? <div className="usage-state usage-error" role="alert"><strong>用量分析加载失败</strong><p>{state.error}</p><Button variant="outline" size="sm" onClick={reload}>重试</Button></div>
@@ -66,49 +66,53 @@ export function UsageAnalysisPanel({ onBack }: { onBack: () => void }) {
           {partial && <p className="usage-notice">当前记录周期存在采样、丢弃或写入异常，统计仅反映已保存记录，不能代表全部请求。</p>}
           {health && health.pendingEntries > 0 && <p className="usage-scope">有 {formatUsageNumber(health.pendingEntries)} 条日志等待写入，可稍后刷新。</p>}
           {stats.total === 0 ? <div className="usage-state"><IconChartDonut size={32} aria-hidden="true" /><strong>所选范围暂无请求日志</strong><span>可切换到全部历史，或开启日志记录后发起请求。</span></div> : <>
-            <div className="usage-overview">
-              <div className="usage-total"><span>总 Token</span><strong>{formatUsageNumber(totalTokens)}</strong><small>所选范围 · 已知总量合计</small>
-                <div className="usage-quality"><span>用量已知覆盖率 <b>{usageCoverage(stats.total, stats.totalTokensKnownCount)}</b></span><span>{formatUsageNumber(stats.totalTokensKnownCount)} / {formatUsageNumber(stats.total)} 条总量已知</span></div>
+            <div className="usage-overview" role="group" aria-label="用量概览">
+              <div className="usage-metric usage-metric-total"><span>总 Token <small>{ranges.find((item) => item.value === range)?.label}</small></span><strong>{formatUsageNumber(totalTokens)}</strong><small>已知总量合计</small></div>
+              <div className="usage-token-comparison">
+                {([
+                  { key: "input", label: "输入 Token", value: stats.inputTokensSum, detail: "包含缓存输入" },
+                  { key: "output", label: "输出 Token", value: stats.outputTokensSum, detail: "上游已上报用量" },
+                ] as const).map(({ key, label, value, detail }) => <div className={`usage-token-row usage-token-${key}`} key={key}>
+                  <div className="usage-token-row-heading"><span>{label}<small>{detail}</small></span><strong>{formatUsageNumber(value)}</strong></div>
+                  <div className={`usage-token-track${value == null ? " usage-token-track-unknown" : ""}`} aria-hidden="true">
+                    {value != null && value > 0 && <span style={{ width: `${value / tokenComparisonMax * 100}%` }} />}
+                  </div>
+                </div>)}
+                <div className="usage-token-scale"><span>0</span><span>同一刻度，分别汇总</span><span>{formatUsageNumber(tokenComparisonMax > 0 ? tokenComparisonMax : stats.inputTokensSum === 0 || stats.outputTokensSum === 0 ? 0 : null)}</span></div>
+                <div className="usage-cache-detail"><span>缓存 Token <strong>{formatUsageNumber(stats.cachedTokensSum)}</strong></span><small>已计入输入，不重复相加</small></div>
               </div>
-              <div className="usage-metrics">
-              {[
-                ["输入 Token", formatUsageNumber(stats.inputTokensSum), "包含缓存输入"],
-                ["输出 Token", formatUsageNumber(stats.outputTokensSum), "上游已上报用量"],
-                ["缓存 Token", formatUsageNumber(stats.cachedTokensSum), "已包含于输入，不重复相加"],
-                ["请求数", formatUsageNumber(stats.total), "所选范围内保留的记录"],
-              ].map(([title, value, detail]) => <div className="usage-metric" key={title}><span>{title}</span><strong>{value}</strong><small>{detail}</small></div>)}
+              <div className="usage-request-summary">
+                <div className="usage-metric"><span>请求数</span><strong>{formatUsageNumber(stats.total)}</strong><small>所选范围内保留的记录</small></div>
+                <div className="usage-quality"><span>用量已知覆盖率 <strong>{usageCoverage(stats.total, stats.totalTokensKnownCount)}</strong></span><span>{formatUsageNumber(stats.totalTokensKnownCount)} / {formatUsageNumber(stats.total)} 条总量已知</span></div>
               </div>
             </div>
-            {stats.totalTokensKnownCount < stats.total && <p className="usage-notice">部分请求未上报总 Token，用量与占比仅基于已知数据；“—”表示未上报。</p>}
-            <div className="usage-card">
-              <div className="usage-card-heading"><div><h2>模型用量占比</h2><p>按已知 Token 排序，快速定位主要消耗</p></div><Badge variant="secondary">前 12 项</Badge></div>
-              <div className="usage-distribution">
-                <div className="usage-donut-wrap"><div className="usage-donut" role="img" aria-label={totalTokens == null ? "尚无已知 Token 用量，占比不可计算" : `已知总 Token ${formatUsageNumber(totalTokens)}，详细占比见图例`} style={{ background: gradient ? `conic-gradient(${gradient})` : "var(--codey-surface-sunken, #e9eaee)" }}><div><span>已知 Token</span><strong>{formatUsageNumber(totalTokens)}</strong></div></div><p>模型消耗分布</p></div>
-                <ul className="usage-legend">
-                  {slices.map((slice, index) => <li key={`${slice.other ? "other" : "group"}:${slice.key}`}><span className="usage-rank" aria-hidden="true">{slice.other ? "·" : String(index + 1).padStart(2, "0")}</span><div className="usage-model"><strong><i style={{ background: colors[index] }} aria-hidden="true" />{slice.other ? "其他" : slice.key || "未知模型"}</strong><small>{formatUsageNumber(slice.requests)} 次请求</small><span className="usage-share-track" aria-hidden="true"><span style={{ width: `${percent(slice.tokens) ?? 0}%`, background: colors[index] }} /></span></div><div className="usage-legend-value"><strong>{formatUsageNumber(slice.tokens)}</strong><small>{percent(slice.tokens)?.toFixed(1) ?? "—"}{percent(slice.tokens) == null ? "" : "%"}</small></div></li>)}
-                </ul>
-              </div>
-              {(stats.groups.length > 12 || stats.groupsTruncated) && <p className="usage-scope">“其他”包含前 12 项以外的所有分组{stats.groupsTruncated ? "，包括未单独返回的分组" : ""}。</p>}
-            </div>
-            <div className="usage-card">
-              <div className="usage-card-heading"><div><h2>Token 时间趋势</h2><p>观察所选范围内的消耗节奏</p></div><div className="usage-chart-switch" role="group" aria-label="趋势图类型"><Button size="xs" variant={chart === "heatmap" ? "light" : "ghost"} aria-pressed={chart === "heatmap"} onPress={() => setChart("heatmap")}>热力图</Button><Button size="xs" variant={chart === "bars" ? "light" : "ghost"} aria-pressed={chart === "bars"} onPress={() => setChart("bars")}>直方图</Button></div></div>
-              <p className="usage-scope">{utc(stats.fromUnixMs)} — {utc(stats.toUnixMs)} UTC（不含结束时间）</p>
+            <div className="usage-overview-notes"><p>各项按已上报数据分别汇总，上报范围可能不同，输入与输出之和不一定等于总 Token。</p>{stats.totalTokensKnownCount < stats.total && <p>部分请求未上报总 Token，用量与占比仅基于已知数据；— 表示未上报。</p>}</div>
+            <div className="usage-workspace">
+            <section className="usage-card usage-trend-card" aria-labelledby="usage-trend-title">
+              <div className="usage-card-heading"><div><h2 id="usage-trend-title">Token 时间趋势</h2><p>{utc(stats.fromUnixMs)} 至 {utc(stats.toUnixMs)} UTC（不含结束时间）</p></div><div className="usage-chart-switch usage-segmented" role="group" aria-label="趋势图类型"><Button size="xs" variant="ghost" aria-pressed={chart === "bars"} onPress={() => setChart("bars")}>直方图</Button><Button size="xs" variant="ghost" aria-pressed={chart === "heatmap"} onPress={() => setChart("heatmap")}>热力图</Button></div></div>
               {chart === "heatmap" && <UsageHeatmap key={range} stats={stats} />}
               {stats.trend.length ? <>
-                {chart === "bars" && <><div className="usage-trend-unit">Token · UTC · 每 {formatUsageNumber(stats.bucketMs / 3_600_000)} 小时一组</div>
-                <div className="usage-trend-chart"><div className="usage-trend-scale"><span>{formatUsageNumber(trend.peak)}</span><span>{formatUsageNumber(trend.peak == null ? null : trend.peak / 2)}</span><span>0</span></div><div className="usage-trend-plot">
-                  <svg className="usage-trend" viewBox="0 0 800 140" preserveAspectRatio="none" role="img" aria-label="UTC 时间分桶的已知 Token 趋势，展开下方明细可读取每组数据">
-                    {[11, 75, 139].map((y) => <line className="usage-gridline" key={y} x1="0" y1={y} x2="800" y2={y} strokeDasharray={y === 139 ? undefined : "4 5"} />)}
-                    {trend.bars.map((bucket) => <rect className="usage-trend-bar" key={bucket.timestampUnixMs} x={bucket.x} y={139 - (bucket.tokensUnknown ? unknownBarHeight : bucket.height)} width={bucket.width} height={bucket.tokensUnknown ? unknownBarHeight : bucket.height} rx="2" style={bucket.tokensUnknown ? { fill: "none", stroke: "var(--codey-blue, #007aff)", strokeDasharray: "2 2", strokeWidth: 1.5, opacity: .75, vectorEffect: "non-scaling-stroke" } : undefined}><title>{utc(bucket.timestampUnixMs)} UTC：{bucket.tokensUnknown ? "用量未上报" : `${formatUsageNumber(bucket.totalTokensSum)} Token`}，{formatUsageNumber(bucket.total)} 次请求</title></rect>)}
-                  </svg>
-                  <div className="usage-trend-labels"><span>{utc(stats.fromUnixMs)}</span><span className="usage-trend-midpoint">{utc(stats.fromUnixMs + (stats.toUnixMs - stats.fromUnixMs) / 2)}</span><span>{utc(stats.toUnixMs)}</span></div>
-                </div></div>
-                <p className="usage-scope">虚线柱表示该时段有请求但用量未上报；空白表示没有请求，以明细为准。</p></>}
+                {chart === "bars" && <UsageTimeline key={`${range}:${revision}:${stats.fromUnixMs}:${stats.toUnixMs}`} stats={stats} />}
                 <details className="usage-trend-details"><summary>查看趋势明细</summary><div className="usage-table-scroll"><table><thead><tr><th>分桶起点（UTC）</th><th>请求数</th><th>Token</th></tr></thead><tbody>{stats.trend.map((bucket) => <tr key={bucket.timestampUnixMs}><td>{utc(bucket.timestampUnixMs)}</td><td>{formatUsageNumber(bucket.total)}</td><td>{formatUsageNumber(bucket.totalTokensSum)}</td></tr>)}</tbody></table></div></details>
               </> : <p className="usage-scope">暂无趋势数据</p>}
+            </section>
+            <section className="usage-card usage-model-card" aria-labelledby="usage-distribution-title">
+              <div className="usage-card-heading"><div><h2 id="usage-distribution-title">模型用量占比</h2><p>按已知 Token 从高到低排列，展示前 12 项</p></div></div>
+              <table className="usage-model-table" aria-labelledby="usage-distribution-title">
+                <thead><tr><th scope="col">模型</th><th scope="col">请求数</th><th scope="col">Token</th><th scope="col">占比</th></tr></thead>
+                <tbody>{slices.map((slice, index) => <tr key={`${slice.other ? "other" : "group"}:${slice.key}`}>
+                  <th scope="row"><span className="usage-model-name"><span className="usage-rank" aria-hidden="true">{slice.other ? "·" : String(index + 1).padStart(2, "0")}</span><span>{slice.other ? "其他" : slice.key || "未知模型"}</span></span></th>
+                  <td><span className="usage-mobile-label">请求数</span>{formatUsageNumber(slice.requests)}</td>
+                  <td className="usage-model-tokens"><span className="usage-mobile-label">Token</span>{formatUsageNumber(slice.tokens)}</td>
+                  <td><span className="usage-mobile-label">占比</span><span className="usage-model-share"><span className="usage-share-track" aria-hidden="true"><span style={{ width: `${percent(slice.tokens) ?? 0}%` }} /></span><span>{percent(slice.tokens)?.toFixed(1) ?? "—"}{percent(slice.tokens) == null ? "" : "%"}</span></span></td>
+                </tr>)}</tbody>
+              </table>
+              {(stats.groups.length > 12 || stats.groupsTruncated) && <p className="usage-scope">其他包含前 12 项以外的所有分组{stats.groupsTruncated ? "，包括未单独返回的分组" : ""}。</p>}
+            </section>
             </div>
           </>}
         </> : null}
     </div>
+    <footer className="usage-context"><IconInfoCircle size={15} aria-hidden="true" /><p><strong>统计口径</strong>数据来自已保留的请求日志，仅统计经过 Codey 路由的请求，不包含官方直连。清理日志会影响历史统计。</p></footer>
   </section>;
 }

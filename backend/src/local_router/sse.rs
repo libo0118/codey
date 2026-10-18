@@ -229,8 +229,9 @@ impl<'a> ResponsesSseRewriter<'a> {
         self.buffer.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some(frame) = take_next_sse_frame(&self.buffer, &mut self.cursor) {
-            output.extend(
-                self.rewrite_frame(frame, &self.buffer[self.forwarded..self.cursor.consumed]),
+            // 正常事件直接复制到本次输出，避免为每帧创建临时 Vec。
+            output.extend_from_slice(
+                &self.rewrite_frame(frame, &self.buffer[self.forwarded..self.cursor.consumed]),
             );
             self.forwarded = self.cursor.consumed;
         }
@@ -244,19 +245,21 @@ impl<'a> ResponsesSseRewriter<'a> {
 
     pub(crate) fn finish(&mut self) -> Vec<u8> {
         let buffer = std::mem::take(&mut self.buffer);
-        let output = self.rewrite_frame(&buffer[self.cursor.consumed..], &buffer[self.forwarded..]);
+        let output = self
+            .rewrite_frame(&buffer[self.cursor.consumed..], &buffer[self.forwarded..])
+            .into_owned();
         self.cursor = SseCursor::default();
         self.forwarded = 0;
         output
     }
 
-    fn rewrite_frame(&self, frame: &[u8], original: &[u8]) -> Vec<u8> {
+    fn rewrite_frame<'b>(&self, frame: &[u8], original: &'b [u8]) -> Cow<'b, [u8]> {
         #[derive(serde::Deserialize)]
         struct EventKind<'a> {
             #[serde(rename = "type", borrow)]
             kind: Cow<'a, str>,
         }
-        let passthrough = || original.to_vec();
+        let passthrough = || Cow::Borrowed(original);
         let Ok(Some(data)) = sse_frame_data(frame) else {
             return passthrough();
         };
@@ -328,7 +331,7 @@ impl<'a> ResponsesSseRewriter<'a> {
             }
         }
         output.extend_from_slice(newline);
-        output
+        Cow::Owned(output)
     }
 }
 
@@ -430,6 +433,10 @@ pub(crate) fn sse_frame_data(frame: &[u8]) -> Result<Option<Cow<'_, str>>> {
 pub(crate) fn current_unix_timestamp() -> i64 {
     crate::fs_util::timestamp_secs() as i64
 }
+
+#[cfg(test)]
+#[path = "sse_perf_tests.rs"]
+mod perf_tests;
 
 #[cfg(test)]
 mod tests {

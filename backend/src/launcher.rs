@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
+use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved_checked;
 use codey_runtime_core::config_manager::ConfigManager;
 use codey_runtime_core::launcher::build_codex_command;
 use serde::Serialize;
@@ -75,6 +75,9 @@ const CDP_WATCHDOG_INCONCLUSIVE_LIMIT: u8 = 6;
 // A completely unresponsive endpoint is a stronger signal than a busy page,
 // so it must rebuild sooner.
 const _: () = assert!(CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD < CDP_WATCHDOG_INCONCLUSIVE_LIMIT);
+// 每轮重装内部已自带整段发现阶段重试预算：连续这么多轮仍摸不到可注入
+// 页面时，调试端口就是随旧进程消失了，再重试只是在刷同样的超时。
+const CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionHealth {
@@ -294,8 +297,6 @@ pub struct CodeyRuntime {
     process_id: Option<u32>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
-    #[cfg(target_os = "macos")]
-    inspector_argument: Option<String>,
     watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     watchdog_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     exit_watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -525,7 +526,18 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
         let configured_app_path = configured_app_path
             .map(|path| refresh_windows_packaged_app_dir(&path))
             .transpose()?;
-        let app_dir = resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None);
+        let app_dir =
+            resolve_codex_app_dir_with_saved_checked(configured_app_path.as_deref(), None)
+                .map_err(|error| {
+                    // Surface the configured-path failure in the same wording the
+                    // settings page shows, while keeping the underlying diagnostic as
+                    // context for logs and stderr.
+                    if configured_app_path_is_empty {
+                        error
+                    } else {
+                        error.context(CODEX_APP_PATH_INVALID_ERROR)
+                    }
+                })?;
         if let Some(app_dir) = app_dir.as_deref() {
             error_log::refresh_codex_app_version(Some(app_dir), None);
         }
@@ -710,6 +722,12 @@ async fn prepare_startup_model_catalog(
     let catalog_home = home.to_path_buf();
     // The snapshot has to come from the install this launch uses, so the
     // resolved app directory is forwarded instead of re-probing the default.
+    #[cfg(windows)]
+    let catalog_codex_app_path =
+        codey_runtime_core::app_paths::build_codex_executable(codex_app_dir)
+            .to_string_lossy()
+            .into_owned();
+    #[cfg(not(windows))]
     let catalog_codex_app_path = codex_app_dir.to_string_lossy().into_owned();
     let use_builtin_official_catalog =
         current_profile.enabled && config.uses_builtin_official_model_catalog();
@@ -793,6 +811,7 @@ async fn prepare_startup_model_catalog(
                     &runtime_native_web_search_models,
                     &runtime_image_detail_original_models,
                     &runtime_remote_compaction_models,
+                    &catalog_codex_app_path,
                 )
                 .and_then(|available| {
                     if available {
@@ -819,6 +838,7 @@ async fn prepare_startup_model_catalog(
                 &manual_models,
                 Some(&runtime_model_reasoning_efforts),
                 requested_default_model.as_deref(),
+                &catalog_codex_app_path,
             );
             (refresh, cached_catalog, selection)
         })
@@ -946,7 +966,6 @@ async fn prepare_codex_startup_state(
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
-    let conversation_git = config.conversation_git.enabled;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
@@ -969,7 +988,6 @@ async fn prepare_codex_startup_state(
                 model_contexts: Some(&runtime_model_contexts),
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
-                conversation_git,
                 subagent_optimization,
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
@@ -1168,14 +1186,9 @@ async fn stop_codex_processes(
     app_dir: &std::path::Path,
     process_id: Option<u32>,
     #[cfg(unix)] process_group_id: Option<u32>,
-    #[cfg(target_os = "macos")] inspector_argument: Option<&str>,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(inspector_argument) = inspector_argument {
-            return stop_macos_codex(inspector_argument, app_dir, process_id, process_group_id)
-                .await;
-        }
         terminate_unix_codex_processes(app_dir, process_id, process_group_id, None)
             .await
             .map(|_| ())
@@ -1221,6 +1234,7 @@ struct RuntimeConfigRestoreContext<'a> {
     local_router_enabled: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn inject_initial_renderer(
     debug_port: u16,
     handler: codey_runtime_core::bridge::BridgeHandler,
@@ -1229,12 +1243,14 @@ async fn inject_initial_renderer(
     spawned: &SpawnedCodex,
     child: &Arc<Mutex<Option<Child>>>,
     restore_context: RuntimeConfigRestoreContext<'_>,
+    prefetched_target: Option<tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>>>,
 ) -> Result<cdp::InjectedTarget> {
     let failure = match cdp::retry_inject_with_scripts(
         debug_port,
         handler,
         injection_scripts,
         cdp::InjectionRetrySource::Startup,
+        prefetched_target,
     )
     .await
     {
@@ -1266,8 +1282,6 @@ async fn inject_initial_renderer(
         spawned.process_id,
         #[cfg(unix)]
         spawned.process_group_id,
-        #[cfg(target_os = "macos")]
-        spawned.inspector_argument.as_deref(),
     )
     .await
     {
@@ -1334,6 +1348,10 @@ fn spawn_injection_watchdog(
         let mut target = injected_target;
         let mut failure_counters = InjectionFailureCounters::default();
         let mut reported_health: Option<InjectionHealth> = None;
+        // 连续停在目标枚举/选择阶段的重装轮数：Codex 在托管外重启（自更新、
+        // 单实例交接等）会带走调试端口，此后任何页面侧重试都不可能恢复，
+        // 到达阈值后把集成标记为停用并退出看门狗，不再无限烧重试。
+        let mut endpoint_losses: u8 = 0;
         'watchdog: loop {
             tokio::select! {
                 biased;
@@ -1407,6 +1425,9 @@ fn spawn_injection_watchdog(
                 );
                 reported_health = Some(health);
             }
+            if health == InjectionHealth::Healthy {
+                endpoint_losses = 0;
+            }
             if !watchdog_should_reinject(&mut failure_counters, health) {
                 continue;
             }
@@ -1418,6 +1439,7 @@ fn spawn_injection_watchdog(
                     handler.clone(),
                     &watchdog_scripts,
                     cdp::InjectionRetrySource::Watchdog,
+                    None,
                 ) => result,
             };
             match reinjection {
@@ -1437,8 +1459,10 @@ fn spawn_injection_watchdog(
                     *watchdog_websocket_url.write().await = next_websocket_url;
                     previous.close().await;
                     failure_counters = InjectionFailureCounters::default();
+                    endpoint_losses = 0;
                 }
                 Err(error) => {
+                    let endpoint_unreachable = error.debug_endpoint_unreachable();
                     let error_message = format!("{error:#}");
                     error_log::record_failure_with_metadata_async(
                         "injection_failed",
@@ -1451,6 +1475,7 @@ fn spawn_injection_watchdog(
                         serde_json::json!({
                             "debugPort": debug_port,
                             "lastError": error.detail(),
+                            "debugEndpointUnreachable": endpoint_unreachable,
                         }),
                     )
                     .await;
@@ -1458,6 +1483,26 @@ fn spawn_injection_watchdog(
                         .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
                     eprintln!("Codey CDP bridge 恢复失败：{error_message}");
                     failure_counters = InjectionFailureCounters::after_failed_reinjection();
+                    endpoint_losses = if endpoint_unreachable {
+                        endpoint_losses.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if endpoint_losses >= CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
+                        // 调试端口随旧进程消失后不会回来：继续探测只是反复
+                        // 制造同样的超时。把状态固定为停用说明；用户经 Codey
+                        // 重新拉起 Codex 时会走全新的注入与看门狗。
+                        *watchdog_statuses.write().await = watchdog_scripts
+                            .statuses_with_error("Codex 已在 Codey 之外重启，集成已停用；通过 Codey 重新启动 Codex 后恢复");
+                        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                            "bridge.injection_disabled",
+                            serde_json::json!({
+                                "debugPort": debug_port,
+                                "consecutiveEndpointLosses": endpoint_losses,
+                            }),
+                        );
+                        break 'watchdog;
+                    }
                 }
             }
         }
@@ -1556,11 +1601,12 @@ impl StartupStageTimings {
 fn spawn_initial_storage_guards(
     home: &std::path::Path,
     config: &CodeyConfig,
+    trace_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
 ) -> InitialStorageGuards {
     let trace_guard_home = home.to_path_buf();
     let disable_trace_log_writes = config.disable_trace_log_writes;
     let trace = tokio::task::spawn_blocking(move || {
-        trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
+        trace_guard_state.configure(&trace_guard_home, disable_trace_log_writes)
     });
     let protect_crashpad_pending = config.protect_crashpad_pending;
     let crashpad = tokio::task::spawn_blocking(move || {
@@ -1750,7 +1796,6 @@ async fn prepare_native_runtime_state(
 ) -> Result<PreparedProviderState> {
     let runtime_config_home = home.to_path_buf();
     let fast_context_tools = config.fast_context_tools;
-    let conversation_git = config.conversation_git.enabled;
     let subagent_optimization = config.subagent_optimization;
     let stream_max_retries = config.stream_max_retries;
     let native_subagent_config = config.clone();
@@ -1768,7 +1813,6 @@ async fn prepare_native_runtime_state(
                 model_contexts: None,
                 default_model: None,
                 fast_context_tools,
-                conversation_git,
                 subagent_optimization,
                 subagent_model: &native_subagent_config.subagent_model,
                 subagent_reasoning_effort: &native_subagent_config.subagent_reasoning_effort,
@@ -1863,7 +1907,16 @@ async fn spawn_and_inject_runtime(
     runtime_config_overrides: &[String],
 ) -> Result<SpawnedRenderer> {
     let spawn_inject_started = Instant::now();
-    let launch_proxy = crate::launch_proxy::CodexLaunchProxy::resolve(&config.codex_launch_proxy)?;
+    let launch_proxy =
+        match crate::launch_proxy::CodexLaunchProxy::resolve(&config.codex_launch_proxy)? {
+            Some(plan) => Some(plan.start().await?),
+            None => None,
+        };
+    // 调试端口在 Chromium 主进程就绪后先于 CLI 包装器握手可用：与其并行预取
+    // 页面目标——除 /json 枚举外还尝试浏览器端点自动挂载，页面在首个导航前被
+    // 暂停时 Fetch 拦截能赶在任何资产请求之前落位。任务自带暂停态清理
+    // （EarlyAttachHold 的 Drop 保证放行），spawn 失败时直接放弃即可。
+    let target_prefetch = cdp::spawn_injectable_target_prefetch(patch.debug_port);
     let mut spawned = match spawn_codex(
         &mut storage.app_dir,
         patch.debug_port,
@@ -1880,6 +1933,7 @@ async fn spawn_and_inject_runtime(
     {
         Ok(spawned) => spawned,
         Err(error) => {
+            target_prefetch.abort();
             return Err(restore_runtime_config_after_error(
                 home,
                 config.local_router_enabled,
@@ -1911,6 +1965,7 @@ async fn spawn_and_inject_runtime(
             home,
             local_router_enabled: config.local_router_enabled,
         },
+        Some(target_prefetch),
     )
     .await?;
     let inject_renderer_ms = spawn_inject_started.elapsed().as_millis() as u64 - codex_spawn_ms;
@@ -2024,6 +2079,17 @@ impl CodeyRuntime {
             .map(|local_router| local_router.update_config(config)))
     }
 
+    pub(crate) fn portable_compaction(
+        &self,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.local_router
+            .as_ref()
+            .context("本地路由尚未启动")?
+            .portable_compaction(operation, payload)
+    }
+
     pub(crate) fn revert_local_router_routes(&self, swap: local_router::RouterSnapshotSwap) {
         if let Some(local_router) = self.local_router.as_ref() {
             local_router.revert_config(swap);
@@ -2053,6 +2119,18 @@ impl CodeyRuntime {
 
     pub(crate) fn local_router_endpoint(&self) -> Option<RuntimeRouterEndpoint> {
         self.local_router.as_ref().map(LocalRouter::endpoint)
+    }
+
+    /// 页面状态条按当前可见会话 id 查询的实时统计；本地路由未启动时返回 None。
+    pub(crate) fn conversation_stats_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::conversation_stats::ConversationStatsSnapshot> {
+        self.local_router
+            .as_ref()?
+            .request_log
+            .session_stats()
+            .snapshot(session_id)
     }
 
     pub async fn applied_subagent_config(&self) -> Arc<RuntimeSubagentConfig> {
@@ -2121,6 +2199,7 @@ impl CodeyRuntime {
         config: &CodeyConfig,
         handler: codey_runtime_core::bridge::BridgeHandler,
         trace_log_write_protection_active: &AtomicBool,
+        trace_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
@@ -2151,7 +2230,7 @@ impl CodeyRuntime {
             validate_startup_router_provider(home).await?;
         }
         stage_timings.mark("validateRouterProviderMs");
-        let initial_storage_guards = spawn_initial_storage_guards(home, config);
+        let initial_storage_guards = spawn_initial_storage_guards(home, config, trace_guard_state);
         let (storage, startup_catalog) = prepare_startup_storage(
             home,
             config,
@@ -2247,8 +2326,6 @@ impl CodeyRuntime {
         };
         stage_timings.mark("spawnAndInjectMs");
         stage_timings.report();
-        #[cfg(target_os = "macos")]
-        let inspector_argument = spawned.inspector_argument.clone();
         let process_id = spawned.process_id;
         let RuntimeWatchers {
             injection_statuses,
@@ -2290,8 +2367,6 @@ impl CodeyRuntime {
                 process_id,
                 #[cfg(unix)]
                 process_group_id: spawned.process_group_id,
-                #[cfg(target_os = "macos")]
-                inspector_argument,
                 watchdog_shutdown: Mutex::new(Some(watchdog_shutdown)),
                 watchdog_task: Mutex::new(Some(watchdog_task)),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
@@ -2312,8 +2387,6 @@ impl CodeyRuntime {
                 self.process_id,
                 #[cfg(unix)]
                 self.process_group_id,
-                #[cfg(target_os = "macos")]
-                self.inspector_argument.as_deref(),
             ),
             restore_runtime_config_for_router_mode(
                 codex_home(),

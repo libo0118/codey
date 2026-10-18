@@ -3,7 +3,8 @@ import { IconAlertCircle, IconBrandOpenai, IconClipboard, IconClock, IconLogin2 
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
-import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
+import { useOfficialAccounts } from "./useOfficialAccounts";
+import { useOfficialAccountLoginPoll } from "./useOfficialAccountLoginPoll";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, TextArea, Tooltip } from "./components/ui";
 import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
@@ -17,22 +18,36 @@ type AccountUsageSnapshot = {
 };
 
 type LoginStart = { loginId: string; authUrl: string; browserOpened?: boolean };
-type LoginPoll = OfficialAccountsResult & { status: "wait" | "ok" | "failed" | "expired"; message?: string };
 
-const LOGIN_POLL_INTERVAL_MS = 1500;
 // 账号较多时连续额度查询容易触发官方风控，逐条读取之间留出间隔。
 const USAGE_QUERY_STAGGER_MS = 200;
 
+function normalizePlan(plan?: string) {
+  const value = plan?.trim().toLowerCase() || "";
+  const compact = value.replace(/[\s_$-]/g, "");
+  if (compact === "pro100") return "prolite";
+  if (compact === "pro200") return "pro";
+  if (compact === "pro500") return "promax";
+  return value;
+}
+
+function isProPlan(plan?: string) {
+  const p = normalizePlan(plan);
+  return p === "prolite" || p === "pro" || p === "promax";
+}
+
 function formatPlan(plan?: string) {
-  if (!plan) return "";
-  const known: Record<string, string> = { free: "Free", plus: "Plus", pro: "Pro", team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu" };
-  return known[plan.toLowerCase()] || plan;
+  const known: Record<string, string> = { free: "Free", plus: "Plus", prolite: "Pro 100", pro: "Pro 200", promax: "Pro 500", team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu" };
+  const label = known[normalizePlan(plan)];
+  return typeof label === "string" ? label : plan?.trim() || "";
 }
 
 function planTagClass(plan?: string) {
-  const p = plan?.toLowerCase();
+  const p = normalizePlan(plan);
   if (p === "plus") return "official-account-plan-badge is-plus";
-  if (p === "pro") return "official-account-plan-badge is-pro";
+  if (p === "prolite") return "official-account-plan-badge is-pro is-pro-100";
+  if (p === "pro") return "official-account-plan-badge is-pro is-pro-200";
+  if (p === "promax") return "official-account-plan-badge is-pro is-pro-500";
   if (p === "team" || p === "business" || p === "enterprise") return "official-account-plan-badge is-team";
   return "official-account-plan-badge is-default";
 }
@@ -219,8 +234,10 @@ export function OfficialAccountsPanel({
   onNotice,
   onRequestConfirmation,
 }: OfficialAccountsPanelProps) {
-  const [accounts, setAccounts] = useState<OfficialAccount[] | null>(null);
-  const [loadError, setLoadError] = useState("");
+  const { accounts, loadError, applyResult, refresh, refreshRoutes } = useOfficialAccounts({
+    onAccountsLoaded,
+    onAccountsChanged,
+  });
   const [pending, setPending] = useState<string | null>(null);
   const [confirmAccount, setConfirmAccount] = useState<OfficialAccount | null>(null);
   const [usages, setUsages] = useState<Record<string, AccountUsageSnapshot | null>>({});
@@ -242,51 +259,11 @@ export function OfficialAccountsPanel({
   const siwcLoginRef = useRef<(LoginStart & { accountId: string }) | null>(null);
   siwcLoginRef.current = siwcLogin;
 
-  const applyResult = useCallback(
-    (result: OfficialAccountsResult) => {
-      if (Array.isArray(result.accounts)) {
-        rememberOfficialAccounts(result);
-        setAccounts(result.accounts);
-      }
-      onAccountsChanged(result);
-    },
-    [onAccountsChanged],
-  );
-
-  const refresh = useCallback(async (force = false) => {
-    try {
-      const result = await listOfficialAccounts({ force });
-      const loaded = result.accounts ?? [];
-      if (!Array.isArray(loaded)) throw new Error("官方账号列表格式无效，请重新加载");
-      setAccounts(loaded);
-      onAccountsLoaded?.(loaded);
-      setLoadError("");
-    } catch (error) {
-      setLoadError(errorText(error));
-      onAccountsLoaded?.(null);
-    }
-  }, [onAccountsLoaded]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  // 官方线路随账号库派生：账号失效后线路从配置里移除，账号恢复后重新出现。
-  // 这里一次取回最新的账号列表、配置和模型状态。
-  const refreshRoutes = useCallback(async () => {
-    try {
-      const result = await invoke<OfficialAccountsResult>("refresh_official_account_routes");
-      applyResult(result);
-      setLoadError("");
-    } catch (error) {
-      setLoadError(errorText(error));
-    }
-  }, [applyResult]);
-
   const accountsRef = useRef<OfficialAccount[]>([]);
   accountsRef.current = accounts ?? [];
 
-  const refreshUsage = useCallback(async (accountId: string, force: boolean) => {
+  const refreshUsage = useCallback(async (accountId: string, force: boolean, isCancelled: () => boolean = () => false) => {
+    if (isCancelled()) return;
     setUsagePending((current) => ({ ...current, [accountId]: (current[accountId] ?? 0) + 1 }));
     setUsages((current) => ({ ...current, [accountId]: current[accountId] ?? null }));
     try {
@@ -294,6 +271,7 @@ export function OfficialAccountsPanel({
         accountId,
         forceRefresh: force,
       });
+      if (isCancelled()) return;
       setUsages((current) => ({ ...current, [accountId]: snapshot }));
       // 后端确认账号失效后重算线路：卡片随即标红、隐藏切换默认入口，失效
       // 账号的线路同时从列表里移除。只在状态发生变化时重算一次，已标记失效的
@@ -306,9 +284,12 @@ export function OfficialAccountsPanel({
         void refreshRoutes();
       }
     } catch (error) {
+      if (isCancelled()) return;
       setUsages((current) => ({ ...current, [accountId]: { status: "error", message: errorText(error) } }));
     } finally {
-      setUsagePending((current) => ({ ...current, [accountId]: Math.max(0, (current[accountId] ?? 0) - 1) }));
+      if (!isCancelled()) {
+        setUsagePending((current) => ({ ...current, [accountId]: Math.max(0, (current[accountId] ?? 0) - 1) }));
+      }
     }
   }, [refreshRoutes]);
 
@@ -338,82 +319,42 @@ export function OfficialAccountsPanel({
           if (cancelled) return;
         }
         queried += 1;
-        await refreshUsage(account.id, false);
+        await refreshUsage(account.id, false, () => cancelled);
       }
     })();
     return () => {
       cancelled = true;
+      setUsagePending({});
     };
   }, [active, accountListKey, refreshUsage]);
 
-  // Poll a pending login until the callback completes or the user closes it.
-  useEffect(() => {
-    if (!login) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      if (!active) return;
-      try {
-        const result = await invoke<LoginPoll>("poll_official_account_login", { loginId: login.loginId });
-        if (!active) return;
-        if (result.status === "wait") {
-          timer = setTimeout(() => void poll(), LOGIN_POLL_INTERVAL_MS);
-          return;
-        }
-        if (result.status === "ok") {
-          applyResult(result);
-          setLogin(null);
-          onNotice({ tone: "success", text: result.warning ? `账号已添加；${result.warning}` : "官方账号已添加" });
-          return;
-        }
-        setLoginError(result.message || (result.status === "expired" ? "登录已过期，请重新开始" : "登录失败"));
-      } catch (error) {
-        if (!active) return;
-        setLoginError(errorText(error));
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
-    };
-  }, [login, applyResult, onNotice]);
-
-  // Poll a pending SIWC authorization the same way as the add-account login.
-  useEffect(() => {
-    if (!siwcLogin) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      if (!active) return;
-      try {
-        const result = await invoke<LoginPoll>("poll_official_account_siwc", { loginId: siwcLogin.loginId });
-        if (!active) return;
-        if (result.status === "wait") {
-          timer = setTimeout(() => void poll(), LOGIN_POLL_INTERVAL_MS);
-          return;
-        }
-        if (result.status === "ok") {
-          applyResult(result);
-          setSiwcLogin(null);
-          onNotice({
-            tone: result.warning ? "info" : "success",
-            text: result.warning ? `已启用官方直连；${result.warning}` : "已启用官方直连，对话将通过 OpenAI 官方通道调用订阅",
-          });
-          return;
-        }
-        setSiwcError(result.message || (result.status === "expired" ? "授权已过期，请重新开始" : "授权失败"));
-      } catch (error) {
-        if (!active) return;
-        setSiwcError(errorText(error));
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
-    };
-  }, [siwcLogin, applyResult, onNotice]);
+  useOfficialAccountLoginPoll({
+    loginId: login?.loginId,
+    command: "poll_official_account_login",
+    onSuccess: (result) => {
+      applyResult(result);
+      setLogin(null);
+      onNotice({ tone: "success", text: result.warning ? `账号已添加；${result.warning}` : "官方账号已添加" });
+    },
+    onError: setLoginError,
+    expiredMessage: "登录已过期，请重新开始",
+    failedMessage: "登录失败",
+  });
+  useOfficialAccountLoginPoll({
+    loginId: siwcLogin?.loginId,
+    command: "poll_official_account_siwc",
+    onSuccess: (result) => {
+      applyResult(result);
+      setSiwcLogin(null);
+      onNotice({
+        tone: result.warning ? "info" : "success",
+        text: result.warning ? `已启用官方直连；${result.warning}` : "已启用官方直连，对话将通过 OpenAI 官方通道调用订阅",
+      });
+    },
+    onError: setSiwcError,
+    expiredMessage: "授权已过期，请重新开始",
+    failedMessage: "授权失败",
+  });
 
   async function startSiwc(account: OfficialAccount) {
     setPending(`siwc:${account.id}`);
@@ -778,7 +719,7 @@ export function OfficialAccountsPanel({
                         <strong title={label}>{label}</strong>
                         {plan && (
                           <span className={planTagClass(planType)}>
-                            {planType?.toLowerCase() === "pro" ? (
+                            {isProPlan(planType) ? (
                               <IconSparkles size={11} stroke={2.2} className="official-account-plan-icon" aria-hidden="true" />
                             ) : null}
                             <span>{plan}</span>

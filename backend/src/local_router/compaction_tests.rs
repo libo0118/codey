@@ -2,6 +2,90 @@ use super::tests::router_config;
 use super::*;
 use crate::config::RemoteCompactionProtocol;
 
+#[test]
+fn gateway_summary_budget_uses_route_alias_without_cross_route_fallback() {
+    let metadata = BTreeMap::from([
+        (
+            "model".into(),
+            json!({"context_window":1000000})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+        (
+            "route-a/model".into(),
+            json!({"context_window":32768}).as_object().unwrap().clone(),
+        ),
+        (
+            "route-b/model".into(),
+            json!({"context_window":8192}).as_object().unwrap().clone(),
+        ),
+    ]);
+    for provider in ["route-a", " ROUTE-A "] {
+        let selected = gateway_compaction_model_metadata(&metadata, provider, "model").unwrap();
+        assert_eq!(selected["context_window"], 32768);
+    }
+    assert!(gateway_compaction_model_metadata(&metadata, "route-c", "model").is_none());
+}
+
+#[test]
+fn gateway_summary_budget_respects_window_threshold_and_explicit_limits() {
+    let metadata = json!({"context_window": 32768, "effective_context_window_percent": 75, "auto_compact_token_limit": 24000});
+    assert_eq!(
+        gateway_compaction_output_budget(&json!({}), metadata.as_object()).unwrap(),
+        3072
+    );
+    let threshold = json!({"auto_compact_token_limit": 4096});
+    assert_eq!(
+        gateway_compaction_output_budget(&json!({}), threshold.as_object()).unwrap(),
+        1024
+    );
+    assert_eq!(
+        gateway_compaction_output_budget(&json!({"max_output_tokens":64000}), None).unwrap(),
+        16384
+    );
+    assert_eq!(
+        gateway_compaction_output_budget(&json!({"max_output_tokens":null}), None).unwrap(),
+        16384
+    );
+    assert_eq!(
+        gateway_compaction_output_budget(&json!({"max_output_tokens":1}), None).unwrap(),
+        1
+    );
+    for invalid in [json!(0), json!(-1), json!("100")] {
+        assert!(
+            gateway_compaction_output_budget(&json!({"max_output_tokens":invalid}), None).is_err()
+        );
+    }
+    let tiny = json!({"auto_compact_token_limit": 1});
+    assert!(gateway_compaction_output_budget(&json!({}), tiny.as_object()).is_err());
+}
+
+#[test]
+fn gateway_summary_budget_preserves_instructions_and_history() {
+    let history = json!([{"role":"system","content":"retain system constraints"}, {"role":"user","content":"task"}]);
+    let mut body =
+        json!({"instructions":"retain instructions", "input":history, "max_tokens":64000});
+    body["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"compaction_trigger"}));
+    prepare_gateway_compaction(&mut body, 4096).unwrap();
+    assert_eq!(body["instructions"], "retain instructions");
+    assert_eq!(
+        &body["input"].as_array().unwrap()[..2],
+        history.as_array().unwrap()
+    );
+    assert_eq!(body["max_output_tokens"], 4096);
+    assert!(body.get("max_tokens").is_none());
+    assert!(
+        body["input"][2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("2048 token")
+    );
+}
+
 fn compact_result() -> Value {
     json!({
         "id":"cmp_window", "object":"response.compaction", "created_at":123,
@@ -24,6 +108,8 @@ fn gateway_compaction_summary_round_trip_preserves_text_and_rejects_invalid_enco
     assert!(restore_codey_compaction_summaries(&mut body).unwrap());
     assert_eq!(body["input"][0]["role"], "user");
     assert_eq!(body["input"][0]["content"][0]["text"], text);
+    assert!(!restore_codey_compaction_summaries(&mut body).unwrap());
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
     assert!(responses_to_chat_completions_body(&body).is_ok());
     assert!(responses_to_anthropic_messages_body(&body).is_ok());
     for content in [
@@ -458,6 +544,8 @@ async fn gateway_compaction_returns_portable_summary_on_all_protocols() {
             response.json::<Value>().await.unwrap()
         };
         validate_compaction_result(&value, true).unwrap();
+        // 压缩前输入的使用量不能成为新摘要窗口的 token 计数。
+        assert!(value.get("usage").is_none());
         let item = value["output"][0].clone();
         assert!(
             item["encrypted_content"]
@@ -475,6 +563,56 @@ async fn gateway_compaction_returns_portable_summary_on_all_protocols() {
             200,
             "{}",
             response.text().await.unwrap()
+        );
+        mock.await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn gateway_compaction_rejects_truncated_summaries_on_all_protocols() {
+    for (protocol, truncated) in [
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            json!({"id":"chat","choices":[{"index":0,"message":{"role":"assistant","content":"partial summary"},"finish_reason":"length"}]}),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"partial summary"}],"stop_reason":"max_tokens","usage":{"input_tokens":100000,"output_tokens":1}}),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            json!({"id":"resp","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial summary"}]}]}),
+        ),
+    ] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (mut config, provider, model) =
+            router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].supports_remote_compaction = false;
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await.unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let limit = body
+                .get("max_output_tokens")
+                .or_else(|| body.get("max_tokens"))
+                .or_else(|| body.get("max_completion_tokens"))
+                .unwrap();
+            assert_eq!(limit, 128);
+            write_json_response(&mut socket, 200, &truncated)
+                .await
+                .unwrap();
+        });
+        let response = reqwest::Client::new().post(format!("{}/responses", endpoint.base_url)).bearer_auth(&endpoint.token)
+            .json(&json!({"model":model_alias(&provider, &model),"max_output_tokens":128,"input":[{"role":"user","content":"preserve this"},{"type":"compaction_trigger"}]})).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 502, "{protocol}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_compaction_response"
         );
         mock.await.unwrap();
         router.stop().await.unwrap();

@@ -209,6 +209,11 @@ pub(super) fn refresh_windows_packaged_app_dir(app_dir: &Path) -> Result<std::pa
         "无法唯一确定当前用户的 Windows Store Codex 注册包"
     );
     let current = &packages[0];
+    // Keep an explicit executable selection within the same registered package.
+    // Re-resolving its package root can lose that selection when layouts coexist.
+    if previous == *current && app_dir.try_exists()? {
+        return Ok(app_dir.to_path_buf());
+    }
     let name = current.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut length = 0;
     let status =
@@ -232,8 +237,8 @@ pub(super) fn refresh_windows_packaged_app_dir(app_dir: &Path) -> Result<std::pa
     let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(
         &buffer[..length as usize - 1],
     ));
-    let path = codey_runtime_core::app_paths::normalize_codex_app_path(&path)
-        .context("当前 Windows Store Codex 包中未找到启动程序")?;
+    let path = codey_runtime_core::app_paths::normalize_codex_app_path_checked(&path)
+        .context("无法确定当前 Windows Store Codex 包的启动程序")?;
     if previous != *current {
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "launcher.windows_package_refreshed",
@@ -612,23 +617,6 @@ pub(super) fn build_fresh_macos_open_command(
         command.insert(1, "-n".to_string());
     }
     command
-}
-
-#[cfg(target_os = "macos")]
-pub(super) async fn stop_macos_codex(
-    inspector_argument: &str,
-    app_dir: &std::path::Path,
-    process_id: Option<u32>,
-    process_group_id: Option<u32>,
-) -> Result<()> {
-    terminate_unix_codex_processes(
-        app_dir,
-        process_id,
-        process_group_id,
-        Some(inspector_argument),
-    )
-    .await
-    .map(|_| ())
 }
 
 #[cfg(unix)]

@@ -194,11 +194,21 @@ test("official accounts derive missing route settings and keep explicit blank lo
 
 test("official settings allow an empty long name and reject an empty short name", () => {
   const { exports } = createModuleGraph(new URL("../src/officialRouteSettings.ts", import.meta.url));
-  const draft = { routeName: "", routeShortName: "主", baseUrl: "", upstreamProxy: "" };
+  const draft = { routeName: "", routeShortName: "主", baseUrl: "", upstreamProxy: "", maxConcurrency: "0" };
   assert.deepEqual(exports.validateOfficialRouteSettings(draft, [], [], "account"), {
-    routeName: "", shortName: "", baseUrl: "", upstreamProxy: "",
+    routeName: "", shortName: "", baseUrl: "", upstreamProxy: "", maxConcurrency: "",
   });
   assert.equal(exports.validateOfficialRouteSettings({ ...draft, routeShortName: " " }, [], [], "account").shortName, "请输入短名称");
+});
+
+test("official concurrency accepts zero and unsigned integers without coercing invalid drafts", () => {
+  const { exports } = createModuleGraph(new URL("../src/officialRouteSettings.ts", import.meta.url));
+  for (const value of ["0", "1", "16", "4294967295", " 4 "]) {
+    assert.equal(exports.validateOfficialRouteConcurrency(value), "", value);
+  }
+  for (const value of ["", " ", "-1", "1.5", "1e3", "0x10", "NaN", "Infinity", "4294967296", "99999999999999999999999"]) {
+    assert.notEqual(exports.validateOfficialRouteConcurrency(value), "", value);
+  }
 });
 
 test("subagent route options preserve a blank long name without changing model IDs", () => {
@@ -257,6 +267,26 @@ test("preview saving blank official long names survives derivation and missing s
     assert.equal(saved.status, "ok");
     assert.equal(saved.accounts.find((account) => account.id === "acct_preview_1").routeName, "");
     assert.equal(saved.config.profiles.find((profile) => profile.officialAccountId === "acct_preview_1").name, "");
+    const route = saved.config.profiles.find((profile) => profile.officialAccountId === "acct_preview_1");
+    const model = saved.modelState.officialModelIds[0];
+    const concurrentSaved = await invoke("save_official_route_models", {
+      routeId: route.id, models: [model], accountId: "acct_preview_1",
+      routeName: "", routeShortName: "主官", baseUrl: "", upstreamProxy: "", maxConcurrency: 3,
+    });
+    assert.equal(concurrentSaved.status, "ok");
+    assert.equal(concurrentSaved.accounts.find((account) => account.id === "acct_preview_1").maxConcurrency, 3);
+    assert.equal(concurrentSaved.config.profiles.find((profile) => profile.id === route.id).maxConcurrency, 3);
+    const modelSynced = await invoke("save_official_route_models", { routeId: route.id, models: [model] });
+    assert.equal(modelSynced.config.profiles.find((profile) => profile.id === route.id).maxConcurrency, 3);
+    for (const maxConcurrency of [-1, 1.5, 4294967296]) {
+      const invalid = await invoke("save_official_route_models", {
+        routeId: route.id, models: [model], accountId: "acct_preview_1",
+        routeName: "不应保存", routeShortName: "主官", maxConcurrency,
+      });
+      assert.equal(invalid.status, "failed");
+      assert.equal(concurrentSaved.accounts.find((account) => account.id === "acct_preview_1").maxConcurrency, 3);
+      assert.equal(concurrentSaved.accounts.find((account) => account.id === "acct_preview_1").routeName, "");
+    }
     const rejected = await invoke("save_official_account_route_settings", {
       accountId: "acct_preview_1", routeName: "不应保存", routeShortName: " ", baseUrl: "", upstreamProxy: "",
     });
@@ -278,7 +308,7 @@ test("preview saving blank official long names survives derivation and missing s
 test("the route-name limit is shared by the renderer and the official account command", async () => {
   const [settings, backendConfig, officialAccounts] = await Promise.all([
     readFile(new URL("../src/officialRouteSettings.ts", import.meta.url), "utf8"),
-    readFile(new URL("../backend/src/config.rs", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/config/types.rs", import.meta.url), "utf8"),
     readFile(
       new URL("../backend/src/commands/official_accounts.rs", import.meta.url),
       "utf8",

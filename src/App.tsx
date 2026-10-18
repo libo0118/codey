@@ -24,8 +24,6 @@ import { UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
-import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
-import { repairOperationResult } from "./injectionRepair";
 import {
   getNotificationChannelDefinition,
 } from "./notifications";
@@ -43,6 +41,8 @@ import { SettingsPageHeader } from "./SettingsPageHeader";
 import { SettingsLayout } from "./SettingsLayout";
 import { useModelSelection } from "./useModelSelection";
 import { useRuntimeStatus } from "./useRuntimeStatus";
+import { configApplyNotice } from "./configApply";
+import { applyConfigCommandResult, type ConfigCommandResult } from "./configCommandResult";
 import { useAppUpdates } from "./useAppUpdates";
 import {
   NoticeLoadingText,
@@ -132,10 +132,11 @@ export function App({
     editConfig,
     isOnlyNativeRouterToggle,
     adoptRouteConfig,
+    adoptSavedConfig,
     discardDraft,
   } = useDraftConfig();
   const { status, setStatus, markRestartInProgress, refreshStatus, refreshStatusForLoad,
-    restartStatusError, setRestartStatusError } =
+    restartStatusError, setRestartStatusError, acceptConfigApply, configApplyError, retryConfigApply } =
     useRuntimeStatus({
       active: !embedded || modalVisible,
       embedded,
@@ -169,7 +170,6 @@ export function App({
   const [busy, setBusy] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
-  const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
   const [systemSettingsOpen, setSystemSettingsOpen] = useState(false);
   const popupContainer = modalContainer ?? null;
   const noticeController = useAppNoticeController();
@@ -183,18 +183,7 @@ export function App({
   }, [restartStatusError, setNotice]);
 
   const provider = providerStatus?.provider;
-  const isBusy = busy !== null || (injectionRepairRequested && !restartStatusError);
-  useEffect(() => {
-    if (!injectionRepairRequested || status.restartInProgress) return;
-    setInjectionRepairRequested(false);
-    const confirmed = isMainProcessInjectionConfirmed(status);
-    setNotice({
-      tone: status.startupError || !confirmed ? "error" : "success",
-      text: status.startupError || (confirmed
-        ? "主进程注入已修复，Codex 已自动重启"
-        : "尚未确认主进程注入修复成功，请查看运行状态或失败提示"),
-    });
-  }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
+  const isBusy = busy !== null;
   const configLoaded = config !== null;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
@@ -286,8 +275,7 @@ export function App({
     currentProvider: provider ?? null,
     officialAccountAvailable: status.officialAccountAvailable === true,
     runOperation,
-    setPersistedConfig,
-    setStatus,
+    applyConfigResult: (result) => applyCommandResult(result, adoptRouteConfig),
     setNotice,
   });
   const {
@@ -330,7 +318,10 @@ export function App({
         if (result.providerStatus) setProviderStatus(result.providerStatus);
         if (result.modelState) setModelState(result.modelState);
       })
-      .catch(() => undefined);
+      .catch((error) => setNotice({
+        tone: "error",
+        text: `未能刷新插件线路：${errorText(error)}。请重新加载设置页面；已完成的插件操作无需重复。`,
+      }));
   };
   useEffect(() => {
     const refresh = () => refreshPluginRoutesRef.current();
@@ -439,10 +430,12 @@ export function App({
   }
 
   async function persist(next: Config) {
+    const submittedDraft = config;
     const result = await invoke<{
       config: Config;
       providerStatus?: ProviderStatus;
       modelState?: ModelState;
+      configApply?: import("./App.types").ConfigApplyStatus | null;
       restartRequired?: boolean;
       modelHotReloaded?: boolean;
       modelHotReloadError?: string;
@@ -462,7 +455,7 @@ export function App({
       subagentConfigHotReloadError?: string;
       fastContextToolsStatus?: FastContextToolsStatus;
     }>("save_codey_config", { config: next });
-    setPersistedConfig(result.config);
+    if (!applyCommandResult(result, (incoming) => adoptSavedConfig(incoming, submittedDraft))) return result;
     setFastContextToolsStatus(
       result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
     );
@@ -471,15 +464,6 @@ export function App({
         detail: { config: result.config },
       }),
     );
-    if (result.providerStatus) setProviderStatus(result.providerStatus);
-    if (result.modelState) setModelState(result.modelState);
-    if (typeof result.restartRequired === "boolean") {
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired,
-      }));
-    }
-    setDirty(false);
     // 保存结果已包含配置、模型和重启状态；其余运行状态在后台补充。
     void refreshStatus().catch(() => undefined);
     return result;
@@ -493,14 +477,14 @@ export function App({
     if (isBusy) return false;
     setBusy("save-notification-channel");
     try {
-      await persist({
+      const result = await persist({
         ...current,
         webhook: {
           ...current.webhook,
           channels,
         },
       });
-      setNotice({ tone: "success", text: successText });
+      setNotice(result.configApply ? configApplyNotice(result.configApply) : { tone: "success", text: successText });
       return true;
     } catch (error) {
       setNotice({ tone: "error", text: errorText(error) });
@@ -570,15 +554,10 @@ export function App({
           config: Config;
           providerStatus: ProviderStatus;
           modelState: ModelState;
+          configApply?: import("./App.types").ConfigApplyStatus | null;
           restartRequired?: boolean;
         }>("sync_current_provider");
-        setPersistedConfig(result.config);
-        setProviderStatus(result.providerStatus);
-        setModelState(result.modelState);
-        setStatus((current) => ({
-          ...current,
-          restartRequired: result.restartRequired ?? current.restartRequired,
-        }));
+        applyRouteResult(result);
         if (nativeMode) {
           completeModelPickerLoad(
             session,
@@ -611,28 +590,23 @@ export function App({
     });
   }
 
-  function applyRouteResult(result: {
-    config: Config;
-    providerStatus?: ProviderStatus;
-    modelState?: ModelState;
-    restartRequired?: boolean;
-  }) {
-    const merged = adoptRouteConfig(result.config);
-    if (!merged) return;
-    if (result.providerStatus) setProviderStatus(result.providerStatus);
-    if (result.modelState) setModelState(result.modelState);
-    if (typeof result.restartRequired === "boolean") {
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired,
-      }));
-    }
-    setDirty(merged.dirty);
+  function applyCommandResult(
+    result: ConfigCommandResult,
+    adoptConfig: (incoming: Config) => { dirty: boolean } | null,
+  ) {
+    return applyConfigCommandResult(result, {
+      adoptConfig, acceptConfigApply, setDirty, setProviderStatus, setModelState, setStatus,
+    });
+  }
+
+  function applyRouteResult(result: ConfigCommandResult) {
+    if (!applyCommandResult(result, adoptRouteConfig)) return false;
     window.dispatchEvent(
       new CustomEvent("codey:config-changed", {
         detail: { config: result.config },
       }),
     );
+    return true;
   }
 
   async function saveRoute(route: Profile) {
@@ -652,6 +626,10 @@ export function App({
       };
       const result = await persist(nextConfig);
       saved = true;
+      if (result.configApply) {
+        setNotice(configApplyNotice(result.configApply));
+        return;
+      }
       setNotice({
         tone: result.restartRequired ? "info" : "success",
         text: result.restartRequired
@@ -672,6 +650,7 @@ export function App({
         config: Config;
         providerStatus?: ProviderStatus;
         modelState: ModelState;
+        configApply?: import("./App.types").ConfigApplyStatus | null;
         restartRequired?: boolean;
         modelHotReloadError?: string;
         subagentConfigHotReloadError?: string;
@@ -682,6 +661,10 @@ export function App({
       });
       applyRouteResult(result);
       saved = true;
+      if (result.configApply) {
+        setNotice(configApplyNotice(result.configApply));
+        return;
+      }
       const reloadError = result.modelHotReloadError || result.subagentConfigHotReloadError;
       setNotice({
         tone: reloadError || result.restartRequired ? "info" : "success",
@@ -702,8 +685,8 @@ export function App({
     if ((profiles[sourceIndex].enabled === false) !== (profiles[targetIndex].enabled === false)) return;
     profiles.splice(targetIndex, 0, profiles.splice(sourceIndex, 1)[0]);
     await runOperation("reorder-routes", async () => {
-      await persist({ ...config, profiles });
-      setNotice({ tone: "success", text: "线路顺序已保存" });
+      const result = await persist({ ...config, profiles });
+      setNotice(result.configApply ? configApplyNotice(result.configApply) : { tone: "success", text: "线路顺序已保存" });
     });
   }
 
@@ -715,6 +698,7 @@ export function App({
       const result = await invoke<{
         config: Config;
         modelState: ModelState;
+        configApply?: import("./App.types").ConfigApplyStatus | null;
         restartRequired?: boolean;
       } & ModelRuntimeUpdate>("reorder_route_models", {
         routeId,
@@ -724,7 +708,7 @@ export function App({
       applyRouteResult(result);
       // 顺序调整即时生效，不按重启状态提示；只有推送到选择器失败时才提醒。
       setNotice(
-        result.modelHotReloadError
+        result.configApply ? configApplyNotice(result.configApply) : result.modelHotReloadError
           ? {
               tone: "info",
               text: `模型顺序已保存，但模型列表未刷新：${result.modelHotReloadError}`,
@@ -741,6 +725,7 @@ export function App({
         config: Config;
         providerStatus: ProviderStatus;
         modelState: ModelState;
+        configApply?: import("./App.types").ConfigApplyStatus | null;
         restartRequired?: boolean;
         modelHotReloaded?: boolean;
       }>("delete_route", {
@@ -748,6 +733,10 @@ export function App({
         expectedRevision: config.settingsRevision,
       });
       applyRouteResult(result);
+      if (result.configApply) {
+        setNotice(configApplyNotice(result.configApply));
+        return;
+      }
       setNotice({
         tone: result.modelHotReloaded === false ? "info" : "success",
         text: "线路已删除，相关模型已从选择器移除",
@@ -816,6 +805,7 @@ export function App({
           modelState: ModelState;
           routeModelState: ModelState;
           models: string[];
+          configApply?: import("./App.types").ConfigApplyStatus | null;
           restartRequired?: boolean;
           modelHotReloaded?: boolean;
         }>("fetch_route_models", {
@@ -866,6 +856,7 @@ export function App({
       routeName: string;
       routeShortName: string;
       baseUrl: string;
+      maxConcurrency: number;
     },
   ) {
     if (!config) return false;
@@ -880,6 +871,7 @@ export function App({
       const modelResult = await invoke<{
         config: Config;
         modelState: ModelState;
+        configApply?: import("./App.types").ConfigApplyStatus | null;
         restartRequired?: boolean;
         modelHotReloaded?: boolean;
         customContextsRestored?: boolean;
@@ -891,19 +883,25 @@ export function App({
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
-        // 线路名、短名称、网关和代理写入同一账号记录，避免再打一次派生/热更新。
+        // 连接与并发设置写入同一账号记录，避免重复派生和热更新。
         ...(routeSettings
           ? {
               accountId: routeSettings.accountId,
               routeName: routeSettings.routeName,
               routeShortName: routeSettings.routeShortName,
               baseUrl: routeSettings.baseUrl,
+              maxConcurrency: routeSettings.maxConcurrency,
             }
           : {}),
       });
-      applyRouteResult(modelResult);
+      // 旧响应已被配置版本检查拒绝时，也不能回写账号缓存或关闭当前草稿。
+      if (!applyRouteResult(modelResult)) return;
       if (routeSettings) handleOfficialAccountsChanged(modelResult);
       saved = true;
+      if (modelResult.configApply) {
+        setNotice({ ...configApplyNotice(modelResult.configApply), text: configApplyNotice(modelResult.configApply).text + customContextRestoredNote(modelResult) });
+        return;
+      }
       const restartNote = modelResult.restartRequired
         ? "，重启 Codex 后完全生效"
         : "，模型与额度展示已更新";
@@ -940,12 +938,17 @@ export function App({
       const result = await invoke<{
         config: Config;
         modelState: ModelState;
+        configApply?: import("./App.types").ConfigApplyStatus | null;
         restartRequired?: boolean;
       }>("save_default_model", {
         routeId,
         model,
       });
       applyRouteResult(result);
+      if (result.configApply) {
+        setNotice(configApplyNotice(result.configApply));
+        return;
+      }
       setNotice({
         tone: result.restartRequired ? "info" : "success",
         text: `已将全局默认模型设为「${profile.name} / ${model}」`,
@@ -959,6 +962,10 @@ export function App({
       const retryCountChanged =
         persistedConfigRef.current?.streamMaxRetries !== config.streamMaxRetries;
       const result = await persist(config);
+      if (result.configApply) {
+        setNotice(configApplyNotice(result.configApply));
+        return;
+      }
       const subagentHotReloaded = Boolean(result.subagentConfigHotReloaded);
       const subagentHotReloadFailed = Boolean(result.subagentConfigHotReloadError);
       const subagentNote = subagentUpdateNote(result);
@@ -1126,25 +1133,6 @@ export function App({
     });
   }
 
-  async function repairMainProcessInjection() {
-    if (!config || restartStatusError || !canRepairMainProcessInjection(status)) return;
-    await runOperation("repair-main-process-injection", async () => {
-      if (dirty) await persist(config);
-      setNotice({ tone: "info", text: "正在退出 Codex 并修复主进程注入，成功后将自动重启…" });
-      try {
-        await withTimeout(invoke("repair_main_process_injection"), 10_000,
-          "修复请求暂未确认，请稍后重新查询状态");
-        setInjectionRepairRequested(true);
-      } catch (error) {
-        const result = repairOperationResult(error);
-        setNotice({ tone: result.tone, text: result.text });
-        // 退出客户端会断开内嵌页面连接；后端明确拒绝才不会开始修复。
-        if (!result.unconfirmed) return;
-      }
-      markRestartInProgress();
-    });
-  }
-
   function askRepairCodexConfig() {
     if (isBusy) return;
     setConfirmation({
@@ -1225,9 +1213,6 @@ export function App({
     () => void prepareComputerUse(),
   );
   const handleRestartCodex = useStableEvent(askRestartCodex);
-  const handleRepairMainProcessInjection = useStableEvent(
-    () => void repairMainProcessInjection(),
-  );
   const handleFooterUpdateClick = useStableEvent(() => void checkForUpdates());
   const handleConfigChange = useStableEvent(editConfig);
   const handleAddNotificationChannel = useStableEvent(addNotificationChannel);
@@ -1286,6 +1271,7 @@ export function App({
           config: result.config,
           modelState: result.modelState,
           restartRequired: result.restartRequired,
+          configApply: result.configApply,
         });
       }
       if (typeof result.officialAccountAvailable === "boolean") {
@@ -1524,6 +1510,15 @@ export function App({
         </header>
       )}
 
+      {status.configApply && (
+        <div role={status.configApply.state === "failed" || configApplyError ? "alert" : "status"}
+          className="flex flex-wrap items-center gap-2 border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 px-5 py-2 text-xs">
+          {status.configApply.state === "pending" && !configApplyError && <LoaderCircle size={14} className="animate-spin" aria-hidden="true" />}
+          <span>{configApplyError || configApplyNotice(status.configApply).text}</span>
+          {configApplyError && <Button size="sm" variant="outline" onClick={() => void retryConfigApply()}>重新查询状态</Button>}
+        </div>
+      )}
+
       {usageAnalysisOpen ? (
         <div className="page-scroll">
           <UsageAnalysisPanel onBack={() => setUsageAnalysisOpen(false)} />
@@ -1606,13 +1601,7 @@ export function App({
                 onRepairPluginMarketplace={handleRepairPluginMarketplace}
                 onPrepareComputerUse={handlePrepareComputerUse}
                 computerUseNotice={computerUseNotice}
-                onRepairMainProcessInjection={handleRepairMainProcessInjection}
-                onRepairCodexConfig={askRepairCodexConfig}
                 configRepairNotice={configRepairNotice}
-                injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
-                onRestart={handleRestartCodex}
-                restartStatusUnknown={Boolean(restartStatusError)}
-                showRestartAction={!embedded}
               />
               <FeaturePolicyCard
                 config={config}

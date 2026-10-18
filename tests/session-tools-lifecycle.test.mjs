@@ -228,6 +228,33 @@ test("retained action buttons use the current tooltip installation after reload"
   assert.equal(runtime.document.getElementById("codey-runtime-toast").textContent, "operation finished");
 });
 
+test("retained delete button opens native confirmation once per click after repeated reloads", async () => {
+  const runtime = fixture();
+  const { row } = thread(runtime.document, "thread-1");
+  row.appendChild(new FakeElement("button", { "aria-label": "归档任务" }));
+  let confirmations = 0;
+  row.__reactFiber$test = { memoizedProps: { getItems: async () => [
+    { id: "delete-thread", onSelect: () => { confirmations += 1; } },
+  ] } };
+  runtime.load();
+  runtime.window.__codeyInstallSessionDeleteButtons(row);
+  const button = row.querySelector("[data-codey-session-delete]");
+  for (let index = 0; index < 3; index += 1) {
+    runtime.window.__codeySessionToolsInstall.dispose();
+    runtime.load();
+    runtime.window.__codeyInstallSessionDeleteButtons(row);
+    assert.equal(row.querySelectorAll("[data-codey-session-delete]").length, 1);
+    assert.equal(row.querySelector("[data-codey-session-delete]"), button);
+    const click = () => button.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} });
+    click();
+    click();
+    await settle();
+    assert.equal(confirmations, index + 1);
+    assert.equal(button.disabled, false);
+  }
+  assert.equal(runtime.calls.length, 0, "only the native confirmation is opened");
+});
+
 test("a listener registration failure releases the listeners already installed", () => {
   const runtime = fixture();
   const register = runtime.document.addEventListener.bind(runtime.document);

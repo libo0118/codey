@@ -133,7 +133,8 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 派发
 
-- 按当前客户端提供的工具接口调用 `agents.spawn_agent`；原生接口直接调用，客户端明确提供工具目录和专用转发入口时，使用该入口及目录中的准确名称和参数。不要通过 JavaScript 聚合执行器调用协作工具。按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
+- 按当前客户端提供的工具接口调用 `agents.spawn_agent`；原生接口直接调用，客户端明确提供工具目录和专用转发入口时，使用该入口及目录中的准确名称和参数。不要通过 JavaScript 聚合执行器调用协作工具。`task_name` 只含小写字母、数字和下划线。
+- 按任务性质选择角色：`codey_quick_scan` 用于小范围只读定位与事实检索；`codey_deep_research` 用于跨文件、跨目录的检索与架构归纳；`codey_visual_analysis` 用于视觉证据观察和前端改动的独立核验；`codey_visual_worker` 用于界面、布局、样式与交互实现；`codey_worker` 用于后端、数据、算法、命令行和脚本逻辑；`default` 仅兼容旧配置。改动用户可见界面的任务属于 `codey_visual_worker`，改派给 `codey_worker` 会丢失渲染验证。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景。独立审查明确要求只读取和回报，写入任务明确文件归属；任务正文不构成资源隔离或权限证明。各角色均获得 `command.execute`、`files.read`、`workspace.write` 和 `visual.inspect`，实际权限仍由 Codex 原生权限决定。
 - 派发并行写入任务前确认文件归属不重叠；同一文件可能互相覆盖时，改派到其他文件或等前一个 attempt 结算。确实需要同时修改同一片代码时，改为串行执行或为每个写入者准备独立 worktree。任务正文与自报文件范围不构成额外权限，实际权限始终由 Codex 原生权限决定。
 
@@ -152,6 +153,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    legacy::LEGACY_SUBAGENT_GUIDANCE_PRE_ROLE_TAXONOMY,
     COMMAND_WORKSPACE_CLAIM_SUBAGENT_GUIDANCE,
     WORKSPACE_WRITE_SUBAGENT_GUIDANCE,
     WRITE_AT_SPAWN_SUBAGENT_GUIDANCE,
@@ -375,8 +377,10 @@ Do not finish the same broad investigation in the root before delegating it. Kee
 sequential work with the root; file counts and tool-call estimates are not delegation cutoffs. When delegating, strongly \
 prefer an enabled Codey role that fits the task and explicitly set `agent_type`: `codey_quick_scan` for \
 focused lookups; `codey_deep_research` for broad code, log, and document research; \
-`codey_visual_analysis` for visual inspection; `codey_worker` for bounded non-visual \
-implementation; and `codey_visual_worker` for implementation requiring visual verification. Prefer these \
+`codey_visual_analysis` for visual evidence review and independent verification of frontend changes; \
+`codey_visual_worker` for frontend and UI implementation; and `codey_worker` for backend, data, \
+algorithm, CLI and script logic. A change that alters what a user can see belongs to \
+`codey_visual_worker`, not `codey_worker`; routing it to the logic role drops render verification. Prefer these \
 over generic `default`, `explorer`, or `worker` when both fit; avoid omitting `agent_type` out of habit. \
 This is a preference, not a restriction: an explicit user choice, unavailable or unsuitable Codey roles, \
 or a clear task-specific advantage can justify another available role. Roles select task specialization \
@@ -433,54 +437,6 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-const READ_ONLY_QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
-
-description = "Read-only fast lookup for exact locations, repetitive checks, and low-risk factual retrieval."
-sandbox_mode = "read-only"
-
-developer_instructions = """
-你是快速定位子代理。只做只读、范围明确、低风险的定位与事实检索，不修改任何文件，不做方案取舍，也不派生其他子代理。
-优先返回最短可核验证据：确切路径、`file:line`、符号名、匹配数量和必要的关键原文。任务超出小范围快速检索时，明确说明应改派深度检索或视觉分析角色。
-你的回复直接供主代理使用：密而不水，区分事实与推断，不寒暄、不复述过程。
-首行写 `status: completed | partial | blocked`；最多保留 5 条会影响决策的关键证据，并明确未覆盖范围。
-"""
-
-[features]
-image_generation = false
-"#####;
-
-const READ_ONLY_DEEP_RESEARCH_AGENT_CONFIG: &str = r#####"name = "codey_deep_research"
-
-description = "Read-only broad research across code, logs, and documents for synthesis and architecture exploration."
-sandbox_mode = "read-only"
-
-developer_instructions = """
-你是深度检索子代理。负责跨文件、跨目录的代码、日志和文档检索、归纳与架构探索；不修改任何文件，不做最终方案取舍，也不派生其他子代理。
-覆盖任务给定范围，返回符号关系、关键路径、`file:line` 和必要原文。把已确认事实、推断、缺口与矛盾分开，保留足够证据供主代理低成本抽查。
-你的输出直接喂给主代理：结构紧凑、信息密集，不写面向最终用户的包装文字。
-首行写 `status: completed | partial | blocked`；只返回会影响决策的结论、最多 5 条关键证据和明确 gaps。
-"""
-
-[features]
-image_generation = false
-"#####;
-
-const READ_ONLY_VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
-
-description = "Read-only visual analysis for screenshots, pages, GUI states, PDFs, and independent evidence review."
-sandbox_mode = "read-only"
-
-developer_instructions = """
-你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的只读观察，也可承担需要视觉证据的复杂探索与独立核验；不修改文件，不做最终方案取舍，也不派生其他子代理。
-先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
-你的输出直接供主代理决策，保持精炼、具体、可核验。
-首行写 `status: completed | partial | blocked`；只返回会影响决策的可见事实、最多 5 条关键证据和明确 gaps。
-"""
-
-[features]
-image_generation = false
-"#####;
-
 pub(crate) const QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
 
 description = "Fast lookup for exact locations, repetitive checks, and low-risk factual retrieval."
@@ -515,12 +471,12 @@ image_generation = false
 
 pub(crate) const VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
 
-description = "Visual analysis for screenshots, pages, GUI states, PDFs, and independent evidence review."
+description = "Read-only visual and UI evidence review for screenshots, pages, GUI states and PDFs, plus independent verification of frontend changes."
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的观察，以及需要视觉证据的探索与独立核验，不做最终方案取舍，也不派生其他子代理。按本次任务授权使用所需工具，包括命令、读写和视觉工具；实际操作受 Codex 原生权限约束。
-先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
+你是界面核验子代理。负责截图、页面、GUI、PDF 和渲染结果的观察，以及前端改动的独立核验；不做最终方案取舍，也不派生其他子代理。按本次任务授权使用所需工具，包括命令、读写和视觉工具；实际操作受 Codex 原生权限约束。
+先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。核验前端改动时，说明所依据的代码版本或内容、实际观察到的呈现，以及尚未覆盖的状态或断点。
 你的输出直接供主代理决策，保持精炼、具体、可核验。
 首行写 `status: completed | partial | blocked`；只返回会影响决策的可见事实、最多 5 条关键证据和明确 gaps。
 """
@@ -531,11 +487,11 @@ image_generation = false
 
 pub(crate) const WORKER_AGENT_CONFIG: &str = r#####"name = "codey_worker"
 
-description = "Writable implementation for bounded, reversible, testable, low-to-medium complexity non-visual tasks."
+description = "Implementation for backend, data, algorithm, CLI, scripting and build-tooling logic that does not change user-visible UI."
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-你是代码实施子代理。只处理主代理明确授权、边界清晰、可回滚且可测试的低到中等复杂度非视觉实现；不要扩大范围，不做跨模块架构取舍，也不派生其他子代理。
+你是逻辑开发子代理。负责主代理明确授权、边界清晰、可回滚且可测试的实现：后端服务、数据处理、算法、命令行、脚本和构建工具等不改变用户可见界面的逻辑；不承担界面与交互实现，不扩大范围，不做跨模块架构取舍，也不派生其他子代理。
 修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。仅当契约显式授予 `command.execute` 时运行命令验证；实际文件与命令访问继续受继承的 Codex 原生权限约束。否则列出需要主代理执行的检查。返回修改文件、关键位置、已取得的验证证据和仍存风险。
 遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
 首行写 `status: completed | partial | blocked`；紧凑列出改动、确定性验证结果和未完成项，不回传冗长日志。
@@ -547,36 +503,25 @@ image_generation = false
 
 pub(crate) const VISUAL_WORKER_AGENT_CONFIG: &str = r#####"name = "codey_visual_worker"
 
-description = "Writable implementation for pages, GUI, PDFs, and tasks that require visual evidence or render verification."
+description = "Frontend implementation for UI, layout, style, component and interaction changes, with render or screenshot evidence when the client can capture it."
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-你是视觉实施子代理。只处理主代理明确授权、边界清晰且需要截图、页面、GUI、PDF 或渲染证据的低到中等复杂度实现；不要扩大范围，不做架构取舍，也不派生其他子代理。
-修改前读取确切代码与视觉基线，修改后通过已授权的渲染/截图工具核验；仅当契约显式授予 `command.execute` 时运行通用命令，实际文件与命令访问继续受继承的 Codex 原生权限约束。报告修改文件、关键位置、视觉证据、验证结果和仍存风险。
-保留并适配其他人的并行改动；遇到需要产品选择、破坏性操作或范围不明确时停止并交回主代理。
-首行写 `status: completed | partial | blocked`；紧凑列出改动、视觉与确定性验证结果和未完成项，不回传冗长日志。
+你是前端开发子代理。负责主代理明确授权、边界清晰的界面与交互实现：页面结构、样式布局、组件、状态呈现和用户可见的交互行为；不承担后端、数据、算法和构建工具层面的逻辑实现，不扩大范围，不做跨模块架构取舍，也不派生其他子代理。
+修改前读取将要编辑的确切代码与现有界面基线，保留并适配其他人的并行改动。修改后优先用客户端已授权的渲染或截图工具核验实际呈现并报告可见结果；客户端不具备视觉捕获能力时，明确说明本次只有代码层验证，不要声称已核验渲染效果。仅当契约显式授予 `command.execute` 时运行构建或测试类命令；实际文件与命令访问继续受继承的 Codex 原生权限约束。否则列出需要主代理执行的检查。
+返回修改文件、关键位置、界面证据或明确的验证缺口和仍存风险。遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
+首行写 `status: completed | partial | blocked`；紧凑列出改动、渲染或确定性验证结果和未完成项，不回传冗长日志。
 """
 
 [features]
 image_generation = false
 "#####;
 
-pub(crate) const READ_ONLY_AGENT_WRITE_GUARD: &str = "\
-当前任务类型是只读子代理，只能检查、搜索、分析和回报。不要调用 `replace`、`apply_patch`、\
-文件写入命令或任何会创建、修改、删除、移动文件及改变外部状态的工具。即使任务正文要求写入，\
-也不要尝试或重试；请停止实施，把需要修改的内容和证据交回主代理，由主代理完成写入。";
-
 pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 执行前确认本次任务正文完整可读。正文为空、缺失或无法解密时，只向主代理报告阻塞，等待明确重述；\
 不得凭继承对话或旧任务猜测目标，也不要扫描工作区或尝试写入。按本次任务指定的路径、工具和清理分工执行；\
 任务未要求时不要做全仓库哈希。中止后即使收到排队任务，也不能恢复已撤销的工具权限。\
 返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
-
-pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
-本次运行没有启用 `codey_worker`、`codey_visual_worker` 或 `default`，因此没有可写子代理。所有创建、修改、\
-删除、移动文件或其他会改变状态的工作都由主代理直接完成；只读子代理只能承担检索、分析和证据\
-收集。不得把写入任务改派给只读角色，也不得要求它们尝试 `replace`、\
-`apply_patch` 或其他写入工具。";
 
 pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
     match role {
@@ -590,17 +535,10 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn subagent_source_config_versions(role: &str) -> Option<[&'static str; 2]> {
-    let current = subagent_source_config(role)?;
-    let previous = match role {
-        "codey_quick_scan" => READ_ONLY_QUICK_SCAN_AGENT_CONFIG,
-        "codey_deep_research" => READ_ONLY_DEEP_RESEARCH_AGENT_CONFIG,
-        "codey_visual_analysis" => READ_ONLY_VISUAL_ANALYSIS_AGENT_CONFIG,
-        _ => current,
-    };
-    Some([current, previous])
-}
-
+/// Codey owns `codex-constraints/` outright: every file there is regenerated
+/// from these definitions on each launch, so no historical text has to be
+/// recognized or matched. Only text injected into Codex's own `config.toml`
+/// needs migration lists, because that file belongs to the user.
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
 tools in native clients. Prefer FastCtx for supported local file operations. Use `mcp__codey_fastctx__inspect_local_file` for focused inspection, \
 `mcp__codey_fastctx__grep` for search, `mcp__codey_fastctx__glob` for discovery, and \

@@ -6,6 +6,24 @@ export type UpstreamProtocol =
   | "openaiChatCompletions"
   | "anthropicMessages";
 
+export type TransportOptions = {
+  accountEmail: string;
+  models?: Record<string, { contextWindow: number; autoCompactTokenLimit: number }>;
+  imageGeneration?: boolean;
+  imageEdit?: boolean;
+};
+
+export type PluginRouteSpec = {
+  name: string;
+  baseUrl: string;
+  upstreamProtocol: string;
+  models: string[];
+  modelReasoningEfforts?: Record<string, string[]>;
+  headers: Record<string, string>;
+  shortName: string;
+  transport?: TransportOptions;
+};
+
 export type Profile = {
   enabled?: boolean;
   id: string;
@@ -19,10 +37,12 @@ export type Profile = {
   clearApiKey?: boolean;
   modelRequestHeaders?: Record<string, string>;
   upstreamProxy?: string;
+  /** 官方账号线路的最高并发数；0 或缺省表示不限制。 */
+  maxConcurrency?: number;
   sourceProviderId?: string;
   pluginOwnerId?: string;
   /** 宿主已返回的插件声明；这里只使用独立于用户设置的模型能力。 */
-  pluginRouteSpec?: { modelReasoningEfforts?: Record<string, string[]> };
+  pluginRouteSpec?: PluginRouteSpec;
   officialAccount: boolean;
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
@@ -97,7 +117,6 @@ export type Config = {
   initialRouteImportCompleted: boolean;
   webhook: { channels: NotificationChannel[] };
   promptOptimization: PromptOptimizationConfig;
-  conversationGit: { enabled: boolean; model: string };
   codexAppPath: string;
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
@@ -187,6 +206,7 @@ export type OfficialAccount = {
   lastRefresh?: string;
   routeName?: string;
   routeShortName?: string;
+  maxConcurrency?: number;
   upstreamProxy?: string;
   /** 自定义 OpenAI 网关。留空时使用官方默认地址。 */
   baseUrl?: string;
@@ -199,6 +219,7 @@ export type OfficialAccount = {
 };
 
 export type OfficialAccountsResult = {
+  configApply?: ConfigApplyStatus | null;
   accounts?: OfficialAccount[];
   accountId?: string;
   defaultAccountId?: string | null;
@@ -211,7 +232,14 @@ export type OfficialAccountsResult = {
   warning?: string;
 };
 
+export type ConfigApplyStatus = {
+  revision: number;
+  state: "pending" | "applied" | "restart_required" | "failed" | "saved";
+  error?: string | null;
+};
+
 export type RuntimeStatus = {
+  configApply?: ConfigApplyStatus | null;
   running: boolean;
   remoteCompaction?: {
     configured: boolean;

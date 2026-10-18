@@ -10,11 +10,11 @@ mod codey_plugins;
 mod commands;
 mod computer_use;
 mod config;
-mod conversation_git;
+mod conversation_stats;
 mod crashpad_pending_guard;
 #[cfg(windows)]
 mod desktop_instance;
-mod electron_fuses;
+mod early_attach;
 mod error_log;
 pub mod fastctx;
 mod fastctx_route_gate;
@@ -22,6 +22,7 @@ mod fs_util;
 mod hook_io;
 mod http_response;
 mod launch_proxy;
+mod launch_proxy_relay;
 mod launcher;
 mod local_router;
 mod maintenance_lock;
@@ -41,9 +42,11 @@ mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
 mod provider_models;
+mod renderer_asset_patch;
 mod route_request_log;
 mod session_index_cleanup;
 mod session_metadata;
+mod session_model;
 mod session_transfer;
 mod sqlite_util;
 mod startup_update;
@@ -84,21 +87,6 @@ pub fn run_plugin_log_terminal_if_requested() -> Result<bool> {
 
 pub fn run_codex_cli_wrapper_if_requested() -> Result<bool> {
     codex_startup_patch::run_cli_wrapper_if_requested()
-}
-
-pub fn run_node_options_repair_if_requested() -> Result<bool> {
-    electron_fuses::run_node_options_repair_if_requested()
-}
-
-pub fn run_elevated_node_options_helper_if_requested() -> Option<i32> {
-    #[cfg(windows)]
-    {
-        electron_fuses::windows_repair::run_if_requested()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
 }
 
 pub fn install_crash_log_hook(component: &'static str, stage: &'static str) {

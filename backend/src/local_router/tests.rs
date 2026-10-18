@@ -529,14 +529,25 @@ pub(super) async fn connect_router_websocket_with_headers(
 }
 
 pub(super) async fn local_websocket_pair() -> (
-    WebSocketStream<TcpStream>,
+    BudgetedWebSocket,
     WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = async {
         let (stream, _) = listener.accept().await.unwrap();
-        tokio_tungstenite::accept_async(stream).await.unwrap()
+        let stream = WebSocketIngress::new(
+            stream,
+            Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+        );
+        BudgetedWebSocket::new(
+            tokio_tungstenite::accept_async_with_config(
+                stream,
+                Some(downstream_websocket_config()),
+            )
+            .await
+            .unwrap(),
+        )
     };
     let client = async {
         connect_async_with_config(format!("ws://{address}/responses"), None, false)
@@ -1273,7 +1284,11 @@ async fn idle_cached_upstream_heartbeat_confirms_socket_before_next_request() {
         .await
         .unwrap()
         .unwrap();
-    let Some(WebSocketMessage::Text(text)) = message else {
+    let Some(BudgetedWebSocketMessage {
+        message: WebSocketMessage::Text(text),
+        ..
+    }) = message
+    else {
         panic!("expected the downstream request after Pong");
     };
     assert_eq!(text, "next request");
@@ -1310,7 +1325,13 @@ async fn idle_cached_upstream_pong_timeout_drops_socket_before_next_request() {
         .unwrap()
         .unwrap();
 
-    assert!(matches!(message, Some(WebSocketMessage::Text(_))));
+    assert!(matches!(
+        message,
+        Some(BudgetedWebSocketMessage {
+            message: WebSocketMessage::Text(_),
+            ..
+        })
+    ));
     assert!(downstream.upstream.is_none());
 }
 
@@ -1590,6 +1611,7 @@ async fn official_web_search_declarations_keep_websocket_for_plain_continuations
             account_id: "test-account".into(),
             email: None,
             path: auth_path.clone(),
+            record_path: auth_path.clone(),
             siwc_path: None,
             accepts_incoming_authorization: false,
         });
@@ -1643,9 +1665,10 @@ async fn official_web_search_declarations_keep_websocket_for_plain_continuations
 }
 
 #[tokio::test]
-async fn official_opaque_continuation_uses_http_with_complete_history() {
+async fn official_opaque_history_continues_on_current_websocket_and_reconnects_over_http() {
     for output in [
         json!({"type":"web_search_call","status":"completed","action":{"type":"search","query":"test"}}),
+        json!({"type":"file_search_call","status":"completed","queries":["test"]}),
         json!({"type":"compaction","encrypted_content":"encrypted-compaction"}),
     ] {
         let auth_home = tempfile::tempdir().unwrap();
@@ -1668,6 +1691,28 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
                         "type":"response.completed",
                         "response":{"id":"resp-opaque","status":"completed","output":[output]}
                     })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let WebSocketMessage::Text(text) =
+                tokio::time::timeout(Duration::from_secs(5), websocket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected continuation on the original upstream socket");
+            };
+            let continuation: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(continuation["previous_response_id"], "resp-opaque");
+            assert_eq!(continuation["input"], "next task");
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({"type":"response.completed","response":{
+                        "id":"resp-continued","status":"completed","output":[]
+                    }})
                     .to_string()
                     .into(),
                 ))
@@ -1701,48 +1746,218 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
         route.official_auth = Some(OfficialRouteAuth {
             account_id: "test-account".into(),
             email: None,
+            record_path: auth_path.clone(),
             path: auth_path,
             siwc_path: None,
             accepts_incoming_authorization: false,
         });
         *router.snapshot.write().unwrap() = Arc::new(snapshot);
-        let mut client = connect_router_websocket(&router.endpoint()).await;
+        let headers = [("session-id", "opaque-continuation")];
+        let mut client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
         let alias = model_alias(&provider, &model);
         let first = send_router_websocket_request(&mut client, &alias, "first task").await;
         assert_eq!(first.last().unwrap()["response"]["id"], "resp-opaque");
-        client
-            .send(WebSocketMessage::Text(
-                json!({
-                    "type":"response.create", "model":alias,
-                    "previous_response_id":"resp-opaque", "input":"next task"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let WebSocketMessage::Text(text) = message else {
-            panic!("expected terminal event")
-        };
-        let event: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(event["type"], "response.completed", "{event}");
+        for (previous, input, response) in [
+            ("resp-opaque", "next task", "resp-continued"),
+            ("resp-continued", "after reconnect", "resp-http"),
+        ] {
+            client
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.create", "model":alias,
+                        "previous_response_id":previous, "input":input
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected terminal event");
+            };
+            let event: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(event["type"], "response.completed", "{event}");
+            assert_eq!(event["response"]["id"], response, "{event}");
+            if response == "resp-continued" {
+                client.close(None).await.unwrap();
+                client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
+            }
+        }
         let body = upstream_task.await.unwrap();
         assert!(body.get("previous_response_id").is_none());
         assert_eq!(
             body["input"],
             json!([
                 {"role":"user","content":"first task"}, expected_output,
-                {"role":"user","content":"next task"}
+                {"role":"user","content":"next task"},
+                {"role":"user","content":"after reconnect"}
             ])
         );
         client.close(None).await.unwrap();
         router.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn official_prewarm_generate_false_is_answered_locally_on_http_fallback() {
+    let auth_home = tempfile::tempdir().unwrap();
+    let auth_path = auth_home.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","account_id":"test-account"}}"#,
+    )
+    .unwrap();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let http_requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = http_requests.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _request = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.completed",
+                    "response":{"id":"resp-opaque","status":"completed","output":[
+                        {"type":"compaction","encrypted_content":"encrypted-compaction"}
+                    ]}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let (mut http, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut http).await.unwrap();
+            recorded
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice::<Value>(&request.body).unwrap());
+            let event = json!({"type":"response.completed","response":{
+                "id":"resp-http","status":"completed","output":[]
+            }});
+            write_static_response(
+                &mut http,
+                "text/event-stream",
+                format!("data: {event}\n\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+    config.profiles[0].supports_websockets = true;
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut snapshot = RouterSnapshot::from_config(&config);
+    let route = Arc::make_mut(snapshot.routes.get_mut(&provider).unwrap());
+    route.official_account = true;
+    route.official_auth = Some(OfficialRouteAuth {
+        account_id: "test-account".into(),
+        email: None,
+        record_path: auth_path.clone(),
+        path: auth_path,
+        siwc_path: None,
+        accepts_incoming_authorization: false,
+    });
+    *router.snapshot.write().unwrap() = Arc::new(snapshot);
+    let mut client = connect_router_websocket_with_headers(
+        &router.endpoint(),
+        &[("session-id", "prewarm-http-fallback")],
+    )
+    .await;
+    let alias = model_alias(&provider, &model);
+    let first = send_router_websocket_request(&mut client, &alias, "first task").await;
+    assert_eq!(first.last().unwrap()["response"]["id"], "resp-opaque");
+    // 断开原连接后，含压缩项的完整历史仍通过 HTTP 恢复。
+    client.close(None).await.unwrap();
+    client = connect_router_websocket_with_headers(
+        &router.endpoint(),
+        &[("session-id", "prewarm-http-fallback")],
+    )
+    .await;
+    client
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.create",
+                "model":alias,
+                "generate":false,
+                "previous_response_id":"resp-opaque",
+                "input":"prewarm context"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let prewarm = loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let WebSocketMessage::Text(text) = message {
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            if responses_event_is_terminal(&event) {
+                break event;
+            }
+        }
+    };
+    assert_eq!(prewarm["type"], "response.completed", "{prewarm}");
+    let prewarm_id = prewarm["response"]["id"].as_str().unwrap().to_string();
+    assert!(prewarm_id.starts_with("resp_"), "{prewarm}");
+    assert_eq!(prewarm["response"]["status"], "completed");
+    assert_eq!(prewarm["response"]["output"], json!([]));
+    client
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.create",
+                "model":alias,
+                "previous_response_id":prewarm_id,
+                "input":"real task"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let turn = loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let WebSocketMessage::Text(text) = message {
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            if responses_event_is_terminal(&event) {
+                break event;
+            }
+        }
+    };
+    assert_eq!(turn["response"]["id"], "resp-http", "{turn}");
+    client.close(None).await.unwrap();
+    router.stop().await.unwrap();
+    upstream_task.abort();
+    let http_requests = http_requests.lock().unwrap().clone();
+    assert_eq!(http_requests.len(), 1, "{http_requests:?}");
+    let body = &http_requests[0];
+    assert!(body.get("generate").is_none());
+    assert!(body.get("previous_response_id").is_none());
+    assert_eq!(
+        body["input"],
+        json!([
+            {"role":"user","content":"first task"},
+            {"type":"compaction","encrypted_content":"encrypted-compaction"},
+            {"role":"user","content":"prewarm context"},
+            {"role":"user","content":"real task"}
+        ])
+    );
 }
 
 #[tokio::test]
@@ -2623,7 +2838,7 @@ async fn idle_downstream_websockets_do_not_consume_connection_permits() {
 }
 
 #[tokio::test]
-async fn connections_that_have_not_gone_idle_still_report_router_busy() {
+async fn total_admitted_connection_budget_still_reports_router_busy() {
     let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
@@ -2633,7 +2848,7 @@ async fn connections_that_have_not_gone_idle_still_report_router_busy() {
         "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n",
         endpoint.token
     );
-    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+    for _ in 0..MAX_ADMITTED_CONNECTIONS {
         let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
             .await
             .unwrap();
@@ -4085,6 +4300,7 @@ fn codex_login_route_outranks_stored_accounts_for_default_quota() {
         account_id: "test-default".into(),
         email: None,
         path: std::path::PathBuf::from("/codex/home/auth.json"),
+        record_path: std::path::PathBuf::from("/codey/accounts/test-default.json"),
         siwc_path: None,
         accepts_incoming_authorization: true,
     };
@@ -4092,6 +4308,7 @@ fn codex_login_route_outranks_stored_accounts_for_default_quota() {
         account_id: "test-idle".into(),
         email: None,
         path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
+        record_path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
         siwc_path: None,
         accepts_incoming_authorization: false,
     };
@@ -7497,6 +7714,117 @@ fn streaming_waits_for_a_complete_declared_function_name() {
     assert_eq!(second[0]["type"], "response.output_item.added");
     assert_eq!(second[0]["item"]["name"], "lookup");
     assert_eq!(second[1]["delta"], "{}");
+}
+
+#[tokio::test]
+async fn streaming_finish_preserves_buffered_function_call_and_continuation_history() {
+    for incomplete_reason in [None, Some("max_output_tokens")] {
+        let mut request = json!({
+            "model":"provider-model",
+            "input":[{"role":"user","content":"read the file"}],
+            "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]
+        });
+        let converted = responses_to_chat_completions_request(&request).unwrap();
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        assert!(
+            !downstream
+                .prepare_adapted_response_context(&mut request)
+                .unwrap()
+        );
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+        stream.start(&mut downstream).await.unwrap();
+        let events = stream
+            .tool_delta(
+                0,
+                Some("call-buffered-read"),
+                Some("read"),
+                Some("{\"path\":\"a.txt\"}"),
+                None,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        stream
+            .finish(&mut downstream, None, incomplete_reason)
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        let terminal = loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected downstream JSON text frame");
+            };
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            let terminal = responses_event_is_terminal(&event);
+            received.push(event);
+            if terminal {
+                break received.last().unwrap();
+            }
+        };
+        assert_eq!(
+            terminal["type"],
+            if incomplete_reason.is_some() {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            }
+        );
+        let output = terminal["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        let call = &output[0];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "read");
+        assert_eq!(call["call_id"], "call-buffered-read");
+        assert_eq!(call["arguments"], "{\"path\":\"a.txt\"}");
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let items = received
+                .iter()
+                .filter(|event| event["type"] == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["output_index"], 0);
+            assert_eq!(items[0]["item"]["id"], call["id"]);
+            assert_eq!(items[0]["item"]["call_id"], call["call_id"]);
+        }
+        assert_eq!(
+            downstream.adapted_history.last.as_ref().unwrap().1.last(),
+            Some(call)
+        );
+
+        let mut continuation = json!({
+            "model":"provider-model",
+            "previous_response_id":terminal["response"]["id"],
+            "tools":request["tools"],
+            "input":[{
+                "type":"function_call_output",
+                "call_id":"call-buffered-read",
+                "output":"file contents"
+            }]
+        });
+        assert!(
+            downstream
+                .prepare_adapted_response_context(&mut continuation)
+                .unwrap()
+        );
+        let chat = responses_to_chat_completions_request(&continuation).unwrap();
+        let messages = chat.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-buffered-read");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(
+            messages[2]["tool_call_id"],
+            messages[1]["tool_calls"][0]["id"]
+        );
+        assert_eq!(messages[2]["content"], "file contents");
+    }
 }
 
 #[test]
@@ -12919,12 +13247,11 @@ async fn router_listener_binds_loopback_and_never_repeats_live_ports() {
 
 #[tokio::test]
 async fn an_occupied_candidate_port_is_skipped() {
-    // 模拟区间末尾被占用，确认探测回到起点，不依赖本机端口状态。
+    // 模拟首选端口被占用，确认探测顺序向上，不依赖本机端口状态。
     let mut attempted = Vec::new();
-    let offset = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START);
-    let port = bind_router_listener_with(offset, |address| {
+    let port = bind_router_listener_with(|address| {
         attempted.push(address.port());
-        std::future::ready(if address.port() == ROUTER_PORT_RANGE_END {
+        std::future::ready(if address.port() == ROUTER_PORT_START {
             Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
         } else {
             Ok(address.port())
@@ -12932,31 +13259,22 @@ async fn an_occupied_candidate_port_is_skipped() {
     })
     .await
     .unwrap();
-    assert_eq!(port, ROUTER_PORT_RANGE_START);
-    assert_eq!(
-        attempted,
-        vec![ROUTER_PORT_RANGE_END, ROUTER_PORT_RANGE_START]
-    );
+    assert_eq!(port, ROUTER_PORT_START + 1);
+    assert_eq!(attempted, vec![ROUTER_PORT_START, ROUTER_PORT_START + 1]);
 }
 
 #[tokio::test]
-async fn router_listener_uses_the_first_available_high_port() {
-    for offset in [
-        0,
-        123,
-        u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START),
-    ] {
-        let mut attempted = Vec::new();
-        let port = bind_router_listener_with(offset, |address| {
-            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
-            attempted.push(address.port());
-            std::future::ready(Ok(address.port()))
-        })
-        .await
-        .unwrap();
-        assert_eq!(port, ROUTER_PORT_RANGE_START + offset as u16);
-        assert_eq!(attempted, vec![port]);
-    }
+async fn router_listener_prefers_the_fixed_port() {
+    let mut attempted = Vec::new();
+    let port = bind_router_listener_with(|address| {
+        assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        attempted.push(address.port());
+        std::future::ready(Ok(address.port()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(port, ROUTER_PORT_START);
+    assert_eq!(attempted, vec![ROUTER_PORT_START]);
 }
 
 #[tokio::test]
@@ -12966,7 +13284,7 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
         std::io::ErrorKind::PermissionDenied,
     ] {
         let mut attempted = Vec::new();
-        let port = bind_router_listener_with(0, |address| {
+        let port = bind_router_listener_with(|address| {
             assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
             attempted.push(address.port());
             std::future::ready(if address.port() == 0 {
@@ -12978,18 +13296,34 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
         .await
         .unwrap();
         assert_eq!(port, 59_775);
-        let expected: Vec<_> = (ROUTER_PORT_RANGE_START
-            ..ROUTER_PORT_RANGE_START + ROUTER_PORT_PROBES)
+        let expected: Vec<_> = (ROUTER_PORT_START..ROUTER_PORT_START + ROUTER_PORT_PROBES)
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(attempted, expected);
     }
 }
 
+#[test]
+fn router_token_persists_across_router_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("router-token");
+
+    let first = load_or_create_router_token_at(&path);
+    assert!(first.starts_with("codey-router-"));
+    // 重启再次读取时沿用同一个令牌，旧日志页面刷新后仍能通过鉴权。
+    assert_eq!(load_or_create_router_token_at(&path), first);
+    // 内容损坏时生成并写回新令牌，不阻塞路由启动。
+    std::fs::write(&path, b"garbage").unwrap();
+    let regenerated = load_or_create_router_token_at(&path);
+    assert!(regenerated.starts_with("codey-router-"));
+    assert_ne!(regenerated, first);
+    assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), regenerated);
+}
+
 #[tokio::test]
 async fn router_listener_reports_kernel_allocation_failure() {
     let mut attempts = 0;
-    let error = bind_router_listener_with::<u16, _, _>(0, |address| {
+    let error = bind_router_listener_with::<u16, _, _>(|address| {
         attempts += 1;
         std::future::ready(Err(std::io::Error::from(if address.port() == 0 {
             std::io::ErrorKind::PermissionDenied

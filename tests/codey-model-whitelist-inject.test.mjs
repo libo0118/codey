@@ -20,6 +20,53 @@ const compactionReply = (runtime, id, result) => runtime.dispatchWindowEvent("me
   data: { type: "mcp-response", message: { id, result } },
 });
 
+test("third-party classification requires a current local catalog route and excludes official routes", async () => {
+  const catalog = {
+    status: "ok",
+    models: ["third/shared", "other/shared", "bare-third", "unrouted", "official/model", "codey-official-account-test/model", "openai/model", "local-official/model"],
+    default_model: "third/shared",
+    model_metadata: [
+      { model: "bare-third", provider_id: "codey_router", route_provider_id: "third", source_model: "bare-third" },
+      { model: "official/model", provider_id: "codey_router", route_provider_id: "official", source_model: "model", official_account: true },
+    ],
+  };
+  const storage = memoryStorage();
+  const runtime = await loadPatch(catalog, [statsigClient()], { storage });
+  const snapshot = runtime.patch.snapshot();
+  const bindingBefore = storage.getItem("codey.thread-route-bindings.v1");
+  for (const model of ["third/shared", "other/shared", "bare-third"]) {
+    assert.equal(runtime.patch.isThirdPartyModel({ hostId: "local", model }), true, model);
+    assert.equal(runtime.patch.isThirdPartyModel({ hostId: "remote", model }), false, model);
+    assert.equal(runtime.patch.isThirdPartyModel({ model }), false, model);
+  }
+  for (const model of ["official/model", "codey-official-account-test/model", "openai/model", "local-official/model", "unrouted", "shared", "missing/model", "", "  ", null, 1]) {
+    assert.equal(runtime.patch.isThirdPartyModel({ hostId: "local", model }), false, String(model));
+  }
+  assert.equal(runtime.patch.isThirdPartyModel(), false);
+  assert.deepEqual(runtime.patch.snapshot(), snapshot);
+  assert.equal(storage.getItem("codey.thread-route-bindings.v1"), bindingBefore);
+  catalog.models = ["other/shared"];
+  catalog.default_model = "other/shared";
+  await runtime.patch.refresh();
+  assert.equal(runtime.patch.isThirdPartyModel({ hostId: "local", model: "third/shared" }), false);
+  assert.equal(runtime.patch.isThirdPartyModel({ hostId: "local", model: "other/shared" }), true);
+  runtime.patch.dispose();
+  assert.equal(runtime.patch.isThirdPartyModel({ hostId: "local", model: "other/shared" }), false);
+});
+
+test("third-party classification is disabled before catalog load and in native selection mode", async () => {
+  const catalog = { status: "ok", models: ["third/model"], default_model: "third/model" };
+  const pending = await loadPatch(catalog, [statsigClient()], { bridgeReady: false });
+  assert.equal(pending.patch.isThirdPartyModel({ hostId: "local", model: "third/model" }), false);
+  pending.connectBridge();
+  await pending.patch.refresh();
+  assert.equal(pending.patch.isThirdPartyModel({ hostId: "local", model: "third/model" }), true);
+  pending.patch.dispose();
+  const native = await loadPatch({ ...catalog, native_selection_only: true }, [statsigClient()], { nativeSelectionOnly: true });
+  assert.equal(native.patch.isThirdPartyModel({ hostId: "local", model: "third/model" }), false);
+  native.patch.dispose();
+});
+
 test("all routes use the single router for new and forked threads, including legacy metadata", async () => {
   const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
   for (const method of ["thread/start", "thread/fork"]) {
@@ -74,6 +121,7 @@ test("the native request client sends route changes through its frozen bridge", 
   await started;
   for (const method of ["thread/settings/update", "turn/start", "thread/resume"]) {
     const pending = client.enqueueRequest(method, { threadId: "native", model: "local/shared" });
+    await new Promise(setImmediate);
     const sent = sends.at(-1);
     assert.equal(sent.params.modelProvider, method === "thread/resume" ? "codey_router" : undefined);
     client.onResult(sent.id, { modelProvider: "codey_router", thread: { id: "native", model: "shared" } });
@@ -288,7 +336,7 @@ test(`Fast stays available across routes and models (native selection: ${nativeS
 async function loadPatch(
   catalogResponse,
   clients,
-  { bridgeReady = true, queryClient = null, reactModelState = null, documentBody = null, storage = null, nativeSelectionOnly = false, requestClient = null, cachedRequestClient = null } = {},
+  { bridgeReady = true, queryClient = null, reactModelState = null, documentBody = null, storage = null, nativeSelectionOnly = false, requestClient = null, cachedRequestClient = null, portableBridge = null, sessionModelBridge = null } = {},
 ) {
   const [bridgeSource, source] = await Promise.all([
     readFile(new URL("../public/codey-bridge.js", import.meta.url), "utf8"),
@@ -338,7 +386,9 @@ async function loadPatch(
       documentListeners.get(name)?.delete(listener);
     },
   };
-  const bridge = async (path) => {
+  const bridge = async (path, params) => {
+    if (path === "/session/model") return sessionModelBridge ? sessionModelBridge(params) : { status: "error" };
+    if (path.startsWith("/session/portable-compaction/")) return portableBridge ? portableBridge(path, params) : { status: "ok", required: false };
     assert.equal(path, "/codex-model-catalog");
     return typeof catalogResponse === "function"
       ? catalogResponse()
@@ -893,7 +943,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "66");
+  assert.equal(patch.version, "75");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -1875,7 +1925,7 @@ test("an explicit official settings choice beats an old same-id relay route", as
   assert.deepEqual(turnAfterClear.request.params, {
     threadId: "same-id-thread",
     model: "gpt-5.6-sol",
-    responsesapiClientMetadata: { codey_route: "relay" },
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
   runtime.patch.dispose();
 });
@@ -4722,6 +4772,62 @@ test("a null-model resume restores its saved route instead of selecting the glob
   runtime.patch.dispose();
 });
 
+for (const defaultForm of ["selector", "raw"]) {
+  test(`resume carrying the ${defaultForm} global default preserves the historical model and binding`, async () => {
+    const storage = memoryStorage();
+    const historicalBinding = ["restored", { routeProviderId: "current", sourceModel: "vendor/model" }];
+    storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([historicalBinding]));
+    const historical = historicalRouteCatalog(["current"]);
+    const defaults = historicalRouteCatalog(["another"], "different-model");
+    const runtime = await loadPatch({
+      ...historical, models: [...defaults.models, ...historical.models],
+      default_model: defaults.default_model,
+      model_metadata: [...defaults.model_metadata, ...historical.model_metadata],
+    }, [statsigClient()], { storage });
+    const resumed = runtime.patch.rewriteOutgoingMessage({
+      type: "mcp-request", request: { id: "restore-default", method: "thread/resume", params: {
+        threadId: "restored", model: defaultForm === "selector" ? defaults.default_model : "different-model",
+        modelProvider: "codey_router",
+      } },
+    });
+    assert.equal(resumed.request.params.model, "current/vendor/model");
+    assert.equal(runtime.patch.rewriteOutgoingMessage(resumed).request.params.model, "current/vendor/model");
+    runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: {
+      id: "restore-default", result: { modelProvider: "codey_router", thread: {
+        id: "restored", model: "vendor/model", modelProvider: "codey_router",
+      } },
+    } } });
+    assert.deepEqual(JSON.parse(storage.getItem("codey.thread-route-bindings.v1")), [historicalBinding]);
+
+    runtime.dispatchDocumentEvent("pointerdown", { target: {
+      closest: () => ({ dataset: { codeyRouteModel: defaults.default_model } }),
+    } });
+    const pickerResume = runtime.patch.rewriteOutgoingMessage({ type: "mcp-request", request: {
+      method: "thread/resume", params: { threadId: "restored", model: defaults.default_model },
+    } });
+    assert.equal(pickerResume.request.params.model, defaults.default_model,
+      "a fresh picker selection of the default must override the historical binding");
+
+    // Choosing the default explicitly through settings must still replace history.
+    const selected = runtime.patch.rewriteOutgoingMessage({ type: "mcp-request", request: {
+      method: "thread/settings/update", params: { threadId: "restored", model: defaults.default_model },
+    } });
+    assert.equal(selected.request.params.model, defaults.default_model);
+    assert.deepEqual(JSON.parse(storage.getItem("codey.thread-route-bindings.v1")), [
+      ["restored", { routeProviderId: "another", sourceModel: "different-model" }],
+    ]);
+    const reopened = runtime.patch.rewriteOutgoingMessage({ type: "mcp-request", request: {
+      method: "thread/resume", params: { threadId: "restored", model: defaults.default_model },
+    } });
+    assert.equal(reopened.request.params.model, defaults.default_model);
+    const explicit = runtime.patch.rewriteOutgoingMessage({ type: "mcp-request", request: {
+      method: "thread/resume", params: { threadId: "restored", model: "current/vendor/model" },
+    } });
+    assert.equal(explicit.request.params.model, "current/vendor/model");
+    runtime.patch.dispose();
+  });
+}
+
 test("a model-less resume restores and persists the same model after its route disappears", async () => {
   const storage = memoryStorage();
   storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
@@ -5026,6 +5132,44 @@ test("composer trigger tracks exact route aliases, React updates and renamed rou
   assert.equal(replacement.nodeValue, "gpt-6-astra");
 });
 
+for (const fallback of ["自定义", "Custom", "自訂"]) {
+  test(`composer trigger resolves ${fallback} from the exact official account selection`, async () => {
+    const first = subagentRouteModel;
+    const second = first.replace("d3265a21", "a3265a21");
+    const catalog = {
+      status: "ok", models: [first, second], default_model: first,
+      model_metadata: [first, second].map((model, index) => ({
+        model, display_name: `[官${index + 1}] gpt-6-luna`,
+        route_name: `官方账号${index + 1}`, route_provider_id: model.split("/")[0],
+        source_model: "gpt-6-luna",
+      })),
+    };
+    const body = new FakeElementCore("body", { connected: true });
+    const { trigger, textNode, effortNode, picker } = composerModelTrigger(body, `${fallback} · High`);
+    picker.model = second;
+    const unrelated = composerModelTrigger(body, fallback, { reactPicker: false });
+    const runtime = await loadPatch(catalog, [statsigClient()], { documentBody: body });
+    assert.equal(textNode.nodeValue, "[官2] gpt-6-luna · High");
+    assert.equal(effortNode.nodeValue, "极高");
+    assert.equal(unrelated.textNode.nodeValue, fallback);
+    picker.model = first;
+    await runtime.patch.setCatalog(catalog);
+    assert.equal(textNode.nodeValue, "[官1] gpt-6-luna · High");
+    textNode.nodeValue = `${fallback} · Low`;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    assert.equal(textNode.nodeValue, "[官1] gpt-6-luna · Low");
+    picker.model = "unknown-model";
+    await runtime.patch.setCatalog(catalog);
+    assert.equal(textNode.nodeValue, `${fallback} · Low`, "unknown selection must retain its native label");
+    picker.model = second;
+    textNode.nodeValue = fallback;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    assert.equal(textNode.nodeValue, "[官2] gpt-6-luna");
+    runtime.patch.dispose();
+    assert.equal(textNode.nodeValue, fallback);
+  });
+}
+
 test("composer trigger handles late catalogs and model changes from native labels", async () => {
   const body = new FakeElementCore("body", { connected: true });
   const { trigger, textNode } = composerModelTrigger(body, "GPT-6");
@@ -5263,3 +5407,599 @@ for (const nativeSelectionOnly of [false, true]) {
     runtime.patch.dispose();
   });
 }
+
+test("model settings, resume and fork bypass portable preparation at both transport entries", async () => {
+  const source = await readFile(new URL("../backend/src/renderer_asset_patch.js", import.meta.url), "utf8");
+  const globals = {};
+  Function("globalThis", source)(globals);
+  const original = 'const transport={postMessage:e=>{let t=!1,n=window.electronBridge;if(n?.sendMessageFromView){let r=e;n.sendMessageFromView(r).catch(t=>{errors.push(t);r.type!==`log-message`&&log.warning(`Failed to send message from view`,{message:e,error:t})}),t=!0}let r=new CustomEvent(`codex-message-from-view`,{detail:e});t&&(r.__codexForwardedViaBridge=!0),window.dispatchEvent(r)}};';
+  const patched = globals.__codeyRendererPatchEntry("app://-/assets/app-initial-direct.js", original);
+  assert.ok(patched);
+  for (const entry of ["client", "direct"]) {
+    const sent = [], errors = [], preparations = [];
+    class NativeClient {
+      constructor() { this.hostId = "local"; }
+      enqueueRequest(method, params) { sent.push({ request: { method, params } }); return Promise.resolve(); }
+      createRequest() {}
+      onResult() {}
+    }
+    const client = new NativeClient();
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      requestClient: client,
+      portableBridge: async (path) => { preparations.push(path); return { status: "ok", required: false }; },
+    });
+    const transport = Function("window", "globalThis", "CustomEvent", "errors", "log", `${patched};return transport`)(
+      { electronBridge: { async sendMessageFromView(message) { sent.push(message); } }, dispatchEvent(event) { runtime.dispatchWindowEvent(event.type, event); } },
+      { __codeyModelWhitelistPatch: runtime.patch }, class { constructor(type, init) { this.type = type; this.detail = init.detail; } }, errors, { warning() {} },
+    );
+    if (entry === "client") await runtime.patch.ensureRequestGate();
+    for (const method of ["thread/settings/update", "thread/resume", "thread/fork"]) {
+      const params = { threadId: `bypass-${method}`, model: "remote/shared" };
+      runtime.patch.trackOutgoingMessage(compactionRequest("thread/read", { threadId: params.threadId }, `read-${method}`));
+      compactionReply(runtime, `read-${method}`, { thread: { id: params.threadId, modelProvider: "codey_router" } });
+      if (entry === "client") await client.enqueueRequest(method, params);
+      else transport.postMessage(compactionRequest(method, params));
+      await new Promise(setImmediate);
+      assert.equal(sent.at(-1).request.method, method, entry);
+      assert.equal(sent.at(-1).request.params.model, "remote/shared", entry);
+      assert.equal(sent.at(-1).request.params.modelProvider, method === "thread/settings/update" ? undefined : "codey_router", entry);
+    }
+    assert.equal(sent.length, 3, entry);
+    assert.deepEqual(preparations, [], entry);
+    assert.deepEqual(errors, [], entry);
+    runtime.patch.dispose();
+  }
+});
+
+for (const entry of ["client", "direct"]) {
+  for (const polluted of [false, true]) {
+    test(`cold resume restores persisted model before ${entry} dispatch (polluted cache: ${polluted})`, async () => {
+      const sent = [];
+      let resolveMetadata;
+      const storage = memoryStorage();
+      if (polluted) storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
+        ["cold", { routeProviderId: "local", sourceModel: "shared" }],
+      ]));
+      class NativeClient {
+        constructor() { this.hostId = "local"; }
+        enqueueRequest(method, params) { sent.push({ request: { method, params } }); return Promise.resolve("sent"); }
+        createRequest() {}
+        onResult() {}
+      }
+      const client = new NativeClient();
+      const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+        storage, requestClient: client,
+        sessionModelBridge: () => new Promise((resolve) => { resolveMetadata = resolve; }),
+        portableBridge: () => assert.fail("restoring history must not compact"),
+      });
+      const params = { threadId: "cold", model: polluted ? null : "local/shared", config: { unrelated: true } };
+      let pending;
+      if (entry === "client") {
+        await runtime.patch.ensureRequestGate();
+        pending = client.enqueueRequest("thread/resume", params);
+      } else {
+        const detail = compactionRequest("thread/resume", params);
+        pending = runtime.patch.guardDirectBridgeMessage(detail, () => {
+          sent.push(runtime.patch.rewriteOutgoingMessage(detail));
+          return "sent";
+        });
+      }
+      await new Promise(setImmediate);
+      assert.equal(sent.length, 0, "default must not reach app-server while reading saved model");
+      resolveMetadata({ status: "ok", threadId: "cold", model: "remote/shared", modelProvider: "codey_router", reasoningEffort: "high" });
+      await pending;
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].request.params.model, "remote/shared");
+      assert.equal(sent[0].request.params.modelProvider, "codey_router");
+      assert.deepEqual(sent[0].request.params.config, { unrelated: true, model_reasoning_effort: "high" });
+      const stale = { model: "local/shared", modelProvider: "codey_router", thread: { id: "cold", model: "local/shared", modelProvider: "codey_router" } };
+      const message = { id: "cold-read", result: stale };
+      runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message } });
+      assert.equal(message.result.thread.model, "remote/shared");
+      assert.equal(message.result.model, "remote/shared");
+      assert.equal(runtime.patch.rewriteIncomingResult("thread/resume", stale, "local").thread.model, "remote/shared");
+      assert.equal(runtime.patch.rewriteIncomingResult("thread/resume", stale, "local").model, "remote/shared");
+      assert.equal(runtime.patch.rewriteIncomingResult("thread/read", stale, "remote-host"), stale);
+      assert.equal(runtime.patch.rewriteIncomingResult("thread/read", { thread: { id: "other", model: "local/shared" } }, "local").thread.model, "local/shared");
+      const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "cold" })).request.params;
+      assert.equal(turn.model, "shared");
+      assert.equal(turn.responsesapiClientMetadata.codey_route, "remote");
+      runtime.patch.dispose();
+    });
+  }
+}
+
+test("historical reasoning belongs to its resume request and replaces copied default config", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId, model: "remote/shared", modelProvider: "codey_router",
+      ...(threadId === "legacy" ? {} : { reasoningEffort: threadId === "default" ? null : "high" }) }),
+  });
+  for (const [threadId, config, expected] of [
+    ["high", { unrelated: true }, "high"],
+    ["legacy", { unrelated: true, model_reasoning_effort: "low" }, "low"],
+    ["default", { unrelated: true, model_reasoning_effort: "low" }, undefined],
+    ["explicit", { model_reasoning_effort: "low" }, "high"],
+  ]) {
+    const params = Object.freeze({ threadId, model: null, config: Object.freeze(config) });
+    const originalConfig = { ...config };
+    const result = await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+      () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+    assert.equal(result.request.params.config?.model_reasoning_effort, expected);
+    assert.equal(params.config, config);
+    assert.deepEqual(config, originalConfig);
+    if (threadId === "default") {
+      assert.deepEqual(result.request.params.config, { unrelated: true });
+      assert.equal(Object.hasOwn(result.request.params.config, "model_reasoning_effort"), false);
+    }
+    const nativeResult = { reasoningEffort: "medium", thread: { id: threadId, model: "remote/shared" } };
+    assert.equal(runtime.patch.rewriteIncomingResult("thread/resume", nativeResult, "local").reasoningEffort, "medium");
+  }
+  assert.equal(runtime.patch.guardOutgoingRequest({ hostId: "remote" }, "thread/resume", { threadId: "high", model: null }, () => assert.fail()), null);
+  runtime.patch.dispose();
+});
+
+test("an effort change after historical reading discards the stale resume effort", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId, model: "remote/shared",
+      modelProvider: "codey_router", reasoningEffort: "high" }),
+  });
+  const params = Object.freeze({ threadId: "after-read", model: null,
+    config: Object.freeze({ model_reasoning_effort: "low", unrelated: true }) });
+  const result = await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params, () => {
+    runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update",
+      { threadId: "after-read", effort: "medium" }, "new-effort"));
+    return runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params));
+  });
+  assert.deepEqual(result.request.params.config, { unrelated: true });
+  assert.equal(params.config.model_reasoning_effort, "low");
+  runtime.patch.dispose();
+});
+
+test("an effort change during historical reading discards only the stale resume effort", async () => {
+  let finish;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: () => new Promise((resolve) => { finish = resolve; }),
+  });
+  const params = Object.freeze({ threadId: "effort-race", model: null,
+    config: Object.freeze({ model_reasoning_effort: "low", unrelated: true }) });
+  const pending = runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  await new Promise(setImmediate);
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "effort-race", effort: "medium" }, "effort-update"));
+  finish({ status: "ok", threadId: "effort-race", model: "remote/shared", modelProvider: "codey_router", reasoningEffort: "high" });
+  const result = await pending;
+  assert.equal(result.request.params.model, "remote/shared");
+  assert.deepEqual(result.request.params.config, { unrelated: true });
+  assert.equal(params.config.model_reasoning_effort, "low");
+  runtime.patch.dispose();
+});
+
+test("a null effort update preserves the saved effort while reading history", async () => {
+  let finish;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: () => new Promise((resolve) => { finish = resolve; }),
+  });
+  const params = Object.freeze({ threadId: "effort-noop", model: null,
+    config: Object.freeze({ model_reasoning_effort: "low", unrelated: true }) });
+  const pending = runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  await new Promise(setImmediate);
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "effort-noop", model: null, effort: null }, "effort-noop"));
+  finish({ status: "ok", threadId: "effort-noop", model: "remote/shared", modelProvider: "codey_router", reasoningEffort: "high" });
+  const result = await pending;
+  assert.equal(result.request.params.model, "remote/shared");
+  assert.deepEqual(result.request.params.config, { model_reasoning_effort: "high", unrelated: true });
+  assert.equal(params.config.model_reasoning_effort, "low");
+  runtime.patch.dispose();
+});
+
+test("restored display survives failed selection and follows a successful selection", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId, model: "remote/shared", modelProvider: "codey_router" }),
+  });
+  const params = { threadId: "restored", model: null };
+  await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  const display = () => runtime.patch.rewriteIncomingResult("thread/read", { model: "local/shared", thread: { id: "restored", model: "local/shared" } }, "local");
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "restored", model: "gpt-6-astra" }, "rejected"));
+  runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: { id: "rejected", error: { message: "rejected" } } } });
+  assert.equal(display().thread.model, "remote/shared");
+  assert.equal(display().model, "remote/shared");
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "restored", model: "gpt-6-astra" }, "accepted"));
+  compactionReply(runtime, "accepted", {});
+  assert.equal(display().thread.model, "gpt-6-astra");
+  runtime.patch.dispose();
+});
+
+test("recovered display follows successful turns and clears when history is missing", async () => {
+  let missing = false;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: ({ threadId }) => missing ? { status: "missing", threadId }
+      : { status: "ok", threadId, model: "remote/shared", modelProvider: "codey_router" },
+  });
+  const params = { threadId: "evolving", model: null };
+  const resume = () => runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  await resume();
+  const display = () => runtime.patch.rewriteIncomingResult("thread/read", { model: "local/shared", thread: { id: "evolving", model: "local/shared" } }, "local").thread.model;
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "evolving", model: "gpt-6-astra" }, "turn"));
+  compactionReply(runtime, "turn", { turn: { id: "accepted" } });
+  assert.equal(display(), "gpt-6-astra");
+  missing = true;
+  await resume();
+  assert.equal(display(), "local/shared");
+  assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/start", {})).request.params.model, "local/shared");
+  runtime.patch.dispose();
+});
+
+test("explicit selections survive reload, stale reads and switching sessions without changing new defaults", async () => {
+  const storage = memoryStorage();
+  let runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage });
+  for (const [threadId, model] of [["one", "remote/shared"], ["two", "gpt-6-astra"]]) {
+    compactionReply(runtime, "provider", { thread: { id: threadId, modelProvider: "codey_router" } });
+    runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId, model }));
+    compactionReply(runtime, "thread/settings/update", {});
+  }
+  runtime.patch.dispose();
+  runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    storage, sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId,
+      model: threadId === "one" ? "remote/shared" : "gpt-6-astra", modelProvider: "codey_router" }),
+  });
+  for (const [threadId, model] of [["one", "remote/shared"], ["two", "gpt-6-astra"], ["one", "remote/shared"]]) {
+    compactionReply(runtime, "stale", { thread: { id: threadId, model: "local/shared", modelProvider: "codey_router" } });
+    const params = { threadId, model: "local/shared" };
+    const resumed = await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+      () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+    assert.equal(resumed.request.params.model, model);
+  }
+  assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/start", {})).request.params.model, "local/shared");
+  runtime.patch.dispose();
+});
+
+test("selection before the catalog loads survives a later default resume", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { bridgeReady: false,
+    sessionModelBridge: () => assert.fail("must retain the early explicit choice"),
+  });
+  compactionReply(runtime, "provider", { thread: { id: "early", modelProvider: "codey_router" } });
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "early", model: "remote/shared" }));
+  runtime.connectBridge();
+  const params = { threadId: "early", model: "local/shared" };
+  const send = () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params));
+  const pending = runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params, send);
+  assert.equal((await (pending || send())).request.params.model, "remote/shared");
+  runtime.patch.dispose();
+});
+
+test("failed and out-of-order settings replies retain the latest accepted selection", async () => {
+  const storage = memoryStorage();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage });
+  compactionReply(runtime, "provider", { thread: { id: "settings", modelProvider: "codey_router" } });
+  const choose = (id, model) => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "settings", model }, id));
+  choose("first", "remote/shared");
+  assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+  compactionReply(runtime, "first", {});
+  choose("failed", "gpt-6-astra");
+  runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: { id: "failed", error: { message: "rejected" } } } });
+  assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "settings", model: "local/shared" })).request.params.model, "remote/shared");
+  choose("older", "gpt-6-astra");
+  choose("newer", "local/shared");
+  compactionReply(runtime, "newer", { modelProvider: "codey_router", model: "shared" });
+  compactionReply(runtime, "older", { modelProvider: "codey_router", model: "gpt-6-astra" });
+  assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+  const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "settings" })).request.params;
+  assert.equal(turn.model, "shared");
+  assert.equal(turn.responsesapiClientMetadata.codey_route, "local");
+  for (const failureFirst of [true, false]) {
+    choose("middle", "remote/shared");
+    choose("last", "gpt-6-astra");
+    const failLast = () => runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: { id: "last", error: { message: "rejected" } } } });
+    if (failureFirst) failLast();
+    compactionReply(runtime, "middle", {});
+    if (!failureFirst) failLast();
+    assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+    assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "settings", model: "local/shared" })).request.params.model, "remote/shared");
+  }
+  runtime.patch.dispose();
+});
+
+test("obsolete browser selections cannot override the authoritative native selection", async () => {
+  const storage = memoryStorage();
+  storage.setItem("codey.thread-model-selections.v1", JSON.stringify([["saved", "remote/shared"]]));
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage,
+    sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId, model: "gpt-6-astra", modelProvider: "codey_router" }),
+  });
+  const params = { threadId: "saved", model: "local/shared" };
+  await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)).request.params.model, "gpt-6-astra");
+  const result = { model: "local/shared", thread: { id: "saved", model: "local/shared" }, data: [{ id: "saved", model: "local/shared" }] };
+  const message = { id: "early-read", result };
+  runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message } });
+  assert.equal(message.result.thread.model, "gpt-6-astra");
+  assert.equal(message.result.model, "gpt-6-astra");
+  assert.equal(message.result.data[0].model, "gpt-6-astra");
+  assert.equal(runtime.patch.rewriteIncomingResult("thread/read", result, "local").thread.model, "gpt-6-astra");
+  assert.equal(runtime.patch.rewriteIncomingResult("thread/read", result, "remote-host"), result);
+  runtime.patch.dispose();
+});
+
+test("remote host events cannot rewrite or confirm a local model selection", async () => {
+  const storage = memoryStorage();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage });
+  compactionReply(runtime, "provider", { thread: { id: "same-thread", modelProvider: "codey_router" } });
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "same-thread", model: "remote/shared" }, "same-id"));
+  for (const wrapped of [false, true]) {
+    const detail = wrapped ? { type: "mcp-request", request: { id: "same-id", method: "send-cli-request-for-host", params: {
+      hostId: "remote-host", method: "thread/settings/update", params: { threadId: "same-thread", model: "gpt-6-astra" },
+    } } } : { ...compactionRequest("thread/settings/update", { threadId: "same-thread", model: "gpt-6-astra" }, "same-id"), hostId: "remote-host" };
+    assert.equal(runtime.patch.rewriteOutgoingMessage(detail), detail);
+    runtime.patch.trackOutgoingMessage(detail);
+  }
+  const remote = { hostId: "remote-host", type: "mcp-response", message: { id: "same-id", result: { thread: { id: "same-thread", model: "local/shared" } } } };
+  runtime.dispatchWindowEvent("message", { data: remote });
+  assert.equal(remote.message.result.thread.model, "local/shared");
+  assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+  compactionReply(runtime, "same-id", {});
+  assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+  runtime.patch.dispose();
+});
+
+test("native resolver persists accepted selections and rejected promises restore them without response events", async () => {
+  const storage = memoryStorage();
+  class NativeClient {
+    constructor() { this.hostId = "local"; this.requestPromises = new Map(); this.nextId = 0; }
+    enqueueRequest(method, params) { return this.createRequest(method, params).promise; }
+    createRequest(method, params) {
+      const id = String(++this.nextId);
+      const promise = new Promise((resolve, reject) => this.requestPromises.set(id, { method, resolve, reject }));
+      return { request: { id, method, params }, promise };
+    }
+    onResult(id, value) { this.requestPromises.get(id).resolve(value); this.requestPromises.delete(id); }
+  }
+  const client = new NativeClient();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage, requestClient: client });
+  await runtime.patch.ensureRequestGate();
+  compactionReply(runtime, "provider", { thread: { id: "native-selection", modelProvider: "codey_router" } });
+  const accepted = client.enqueueRequest("thread/settings/update", { threadId: "native-selection", model: "remote/shared" });
+  client.onResult("1", {});
+  await accepted;
+  const rejected = client.enqueueRequest("thread/settings/update", { threadId: "native-selection", model: "gpt-6-astra" });
+  client.requestPromises.get("2").reject(new Error("rejected"));
+  await assert.rejects(rejected, /rejected/);
+  assert.equal(storage.getItem("codey.thread-model-selections.v1"), null);
+  const resumed = runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "native-selection", model: "local/shared" }));
+  assert.equal(resumed.request.params.model, "remote/shared");
+  runtime.patch.dispose();
+});
+
+test("explicit absence of historical metadata falls back to default for frozen resume params", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: ({ threadId }) => ({ status: "missing", threadId }),
+  });
+  const params = Object.freeze({ threadId: "legacy", model: null });
+  const result = await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  assert.equal(result.request.params.model, "local/shared");
+  runtime.patch.dispose();
+});
+
+test("thread/read learns a top-level model when its thread has no model", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+  runtime.patch.trackOutgoingMessage(compactionRequest("thread/read", { threadId: "read" }, "read-top-model"));
+  compactionReply(runtime, "read-top-model", { thread: { id: "read" }, model: "remote/shared", modelProvider: "codey_router" });
+  assert.equal(runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "read", model: "local/shared" })).request.params.model, "remote/shared");
+  runtime.patch.dispose();
+});
+
+test("a saved model from a deleted route is preserved without selecting the default", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: () => ({ status: "ok", threadId: "deleted", model: "removed/unique-model", modelProvider: "codey_router" }),
+  });
+  const params = { threadId: "deleted", model: "local/shared" };
+  const result = await runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  assert.equal(result.request.params.model, "removed/unique-model");
+  runtime.patch.dispose();
+});
+
+test("failed metadata reads preserve bindings and prevent a default resume", async () => {
+  for (const failure of ["reject", "missing"]) {
+    const storage = memoryStorage();
+    storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([["failed", { routeProviderId: "remote", sourceModel: "shared" }]]));
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      storage,
+      sessionModelBridge: () => failure === "reject" ? Promise.reject(new Error("unavailable")) : { status: "error" },
+    });
+    const before = storage.getItem("codey.thread-route-bindings.v1");
+    await assert.rejects(runtime.patch.guardOutgoingRequest({ hostId: "local" }, "thread/resume", { threadId: "failed", model: "local/shared" },
+      () => assert.fail("must not send default")), /会话保存的模型/);
+    assert.equal(storage.getItem("codey.thread-route-bindings.v1"), before);
+    runtime.patch.dispose();
+  }
+});
+
+test("explicit resume models and settings changes take precedence over persisted metadata", async () => {
+  let finish;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    sessionModelBridge: () => new Promise((resolve) => { finish = resolve; }),
+  });
+  const client = { hostId: "local" };
+  assert.equal(runtime.patch.guardOutgoingRequest(client, "thread/resume", { threadId: "explicit", model: "remote/shared" }, () => assert.fail()), null);
+  const params = { threadId: "race", model: "local/shared" };
+  compactionReply(runtime, "race-provider", { thread: { id: "race", modelProvider: "codey_router" } });
+  const pending = runtime.patch.guardOutgoingRequest(client, "thread/resume", params,
+    () => runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", params)));
+  await new Promise(setImmediate);
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "race", model: "gpt-6-astra" }));
+  finish({ status: "ok", threadId: "race", model: "remote/shared", modelProvider: "codey_router", reasoningEffort: "high" });
+  const resumed = (await pending).request.params;
+  assert.equal(resumed.model, "gpt-6-astra");
+  assert.equal(resumed.config?.model_reasoning_effort, undefined);
+  assert.equal(runtime.patch.rewriteIncomingResult("thread/resume", { model: "local/shared", thread: { id: "race", model: "local/shared" } }, "local").thread.model, "gpt-6-astra");
+  assert.equal(runtime.patch.guardOutgoingRequest(client, "thread/resume", params, () => assert.fail()), null);
+  runtime.patch.dispose();
+});
+
+test("portable guard waits for matching compaction and confirms before dispatch", async () => {
+  const calls = [];
+  let runtime;
+  const client = { hostId: "local" };
+  runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    portableBridge: async (path) => {
+      calls.push(path.split("/").at(-1));
+      return path.endsWith("prepare") ? { status: "ok", required: true, token: "ticket" }
+        : { status: "ok", state: "completed" };
+    },
+  });
+  const notify = (method, id, turnId = "compact-turn") => runtime.dispatchWindowEvent("message", {
+    data: { type: "mcp-notification", hostId: "local", method, params: { threadId: "portable", turnId, item: { type: "contextCompaction", id } } },
+  });
+  const result = runtime.patch.guardOutgoingRequest(client, "turn/start", { threadId: "portable", model: "remote/shared" },
+    () => { calls.push("target"); return "sent"; }, async (method) => {
+      calls.push(method);
+      if (method === "thread/read") return { thread: { status: { type: "idle" } } };
+      notify("item/completed", "old");
+      notify("item/started", "current");
+      notify("item/completed", "current");
+      return {};
+    });
+  assert.equal(await result, "sent");
+  assert.deepEqual(calls, ["prepare", "thread/read", "thread/compact/start", "status", "confirm", "target"]);
+  runtime.patch.dispose();
+});
+
+test("portable guard blocks busy threads and retains source selection", async () => {
+  const storage = memoryStorage();
+  const calls = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage,
+    portableBridge: async (path) => { calls.push(path); return { status: "ok", required: true, token: "busy" }; },
+  });
+  const before = storage.getItem("codey.thread-route-bindings.v1");
+  await assert.rejects(runtime.patch.guardOutgoingRequest({ hostId: "local" }, "turn/start", { threadId: "busy", model: "remote/shared" },
+    () => assert.fail("must not send target"), async () => ({ thread: { status: { type: "active" } } })), /任务仍在运行/);
+  assert.equal(storage.getItem("codey.thread-route-bindings.v1"), before);
+  assert.ok(calls.some((path) => path.endsWith("cancel")));
+  runtime.patch.dispose();
+});
+
+test("portable guard serializes a thread and disposal stops pending dispatch", async () => {
+  let resolvePrepare;
+  let prepares = 0;
+  const cancellations = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    portableBridge: (path, params) => {
+      if (path.endsWith("cancel")) { cancellations.push(params.token); return Promise.resolve({ status: "ok" }); }
+      prepares++;
+      return new Promise((resolve) => { resolvePrepare = resolve; });
+    },
+  });
+  const client = { hostId: "local" };
+  const first = runtime.patch.guardOutgoingRequest(client, "turn/start", { threadId: "serial", model: "remote/shared" }, () => assert.fail("disposed"));
+  const second = runtime.patch.guardOutgoingRequest(client, "turn/start", { threadId: "serial", model: "local/shared" }, () => assert.fail("disposed"));
+  await new Promise(setImmediate);
+  assert.equal(prepares, 1);
+  const rejected = Promise.all([assert.rejects(first, /已重新加载/), assert.rejects(second, /已重新加载/)]);
+  runtime.patch.dispose();
+  resolvePrepare({ status: "ok", required: true, token: "late-ticket" });
+  await rejected;
+  assert.equal(prepares, 1);
+  assert.deepEqual(cancellations, ["late-ticket"]);
+});
+
+test("portable guard bypasses compaction when backend says no ticket and blocks failed summaries", async () => {
+  for (const required of [false, true]) {
+    const calls = [];
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      portableBridge: async (path) => {
+        calls.push(path.split("/").at(-1));
+        return path.endsWith("prepare") ? { status: "ok", required, token: required ? "failed" : undefined }
+          : { status: "ok", state: "failed" };
+      },
+    });
+    const pending = runtime.patch.guardOutgoingRequest({ hostId: "local" }, "turn/start", { threadId: "test", model: "remote/shared" },
+      () => { calls.push("target"); return true; }, async (method) => {
+        calls.push(method);
+        return { thread: { status: { type: "idle" } } };
+      });
+    if (required) {
+      await assert.rejects(pending, /交接摘要未完成/);
+      assert.ok(!calls.includes("target"));
+      assert.ok(calls.includes("cancel"));
+    } else {
+      assert.equal(await pending, true);
+      assert.deepEqual(calls, ["prepare", "target"]);
+    }
+    runtime.patch.dispose();
+  }
+});
+
+test("native selection without local router never requests portable preparation", async () => {
+  const runtime = await loadPatch({ status: "ok", native_selection_only: true, native_model_provider: "openai", models: ["gpt-6-astra"], default_model: "gpt-6-astra" }, [statsigClient()], {
+    nativeSelectionOnly: true,
+    portableBridge: () => assert.fail("native provider has no local router"),
+  });
+  assert.equal(runtime.patch.guardOutgoingRequest({ hostId: "local" }, "turn/start", { threadId: "native", model: "gpt-6-astra" }, () => assert.fail("caller handles unguarded requests")), null);
+  assert.equal(runtime.patch.guardDirectBridgeMessage(compactionRequest("turn/start", { threadId: "native", model: "gpt-6-astra" })), true);
+  runtime.patch.dispose();
+});
+
+test("direct source bridge prepares before tracking and sends once, including string idle", async () => {
+  const source = await readFile(new URL("../backend/src/renderer_asset_patch.js", import.meta.url), "utf8");
+  const globals = {};
+  Function("globalThis", source)(globals);
+  const original = 'const transport={postMessage:e=>{let t=!1,n=window.electronBridge;if(n?.sendMessageFromView){let r=e;n.sendMessageFromView(r).catch(t=>{errors.push(t);r.type!==`log-message`&&log.warning(`Failed to send message from view`,{message:e,error:t})}),t=!0}let r=new CustomEvent(`codex-message-from-view`,{detail:e});t&&(r.__codexForwardedViaBridge=!0),window.dispatchEvent(r)}};';
+  const patched = globals.__codeyRendererPatchEntry("app://-/assets/app-initial-direct.js", original);
+  assert.ok(patched);
+  for (const mode of ["same-route", "missing-binding", "required", "failed", "load-failed", "approved"]) {
+    const calls = [], sent = [], errors = [];
+    const storage = memoryStorage();
+    let release, runtime;
+    const preparation = new Promise((resolve) => { release = resolve; });
+    const client = { hostId: "local", async enqueueRequest(method) {
+      calls.push(method);
+      if (method === "thread/read") return { thread: { status: "idle" } };
+      for (const event of ["item/started", "item/completed"]) runtime.dispatchWindowEvent("message", {
+        data: { type: "mcp-notification", hostId: "local", method: event, params: { threadId: "direct", turnId: "compact", item: { type: "contextCompaction", id: "summary" } } },
+      });
+      return {};
+    } };
+    runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      storage, requestClient: mode === "load-failed" ? null : client,
+      cachedRequestClient: mode === "approved" ? client : null,
+      portableBridge: async (path) => {
+        calls.push(path.split("/").at(-1));
+        if (path.endsWith("prepare")) return preparation;
+        return { status: "ok", state: mode === "failed" ? "failed" : "completed" };
+      },
+    });
+    const transport = Function("window", "globalThis", "CustomEvent", "errors", "log", `${patched};return transport`)(
+      { electronBridge: { async sendMessageFromView(message) { sent.push(message); } }, dispatchEvent(event) { runtime.dispatchWindowEvent(event.type, event); } },
+      { __codeyModelWhitelistPatch: runtime.patch }, class { constructor(type, init) { this.type = type; this.detail = init.detail; } }, errors, { warning() {} },
+    );
+    const detail = compactionRequest("turn/start", { threadId: "direct", modelProvider: "codey_router", model: "remote/shared", input: [{ text: "keep" }] }, "original-id");
+    runtime.patch.trackOutgoingMessage(compactionRequest("thread/read", { threadId: "direct" }, "read-direct"));
+    compactionReply(runtime, "read-direct", { thread: { id: "direct", modelProvider: "codey_router" } });
+    if (mode === "same-route") runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "direct", model: "remote/shared" }));
+    const before = storage.getItem("codey.thread-route-bindings.v1");
+    let approved;
+    if (mode === "approved") {
+      approved = runtime.patch.guardOutgoingRequest(client, "turn/start", detail.request.params, () => transport.postMessage(runtime.patch.rewriteOutgoingMessage(detail)));
+    } else transport.postMessage(detail);
+    await new Promise(setImmediate);
+    assert.equal(sent.length, 0);
+    assert.equal(storage.getItem("codey.thread-route-bindings.v1"), before);
+    release({ status: "ok", required: ["required", "failed", "load-failed"].includes(mode), token: "ticket" });
+    await approved;
+    await new Promise(setImmediate);
+    assert.equal(sent.length, ["failed", "load-failed"].includes(mode) ? 0 : 1, mode);
+    assert.equal(calls.filter((call) => call === "prepare").length, 1, mode);
+    if (sent.length) {
+      assert.equal(sent[0].request.id, "original-id");
+      assert.deepEqual(sent[0].request.params.input, [{ text: "keep" }]);
+    }
+    if (["failed", "load-failed"].includes(mode)) assert.equal(errors.length, 1);
+    if (mode === "required") assert.deepEqual(calls, ["prepare", "thread/read", "thread/compact/start", "status", "confirm"]);
+    if (["same-route", "missing-binding", "approved"].includes(mode)) assert.deepEqual(calls, ["prepare"]);
+    runtime.patch.dispose();
+  }
+});

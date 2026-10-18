@@ -25,6 +25,7 @@ pub(super) async fn clear_diagnostic_storage(
     drop(config);
 
     let trace_home = codex_home();
+    let trace_guard_state = state.trace_log_guard_state.clone();
     let previous_protection_active = state
         .trace_log_write_protection_active
         .load(std::sync::atomic::Ordering::Acquire);
@@ -38,7 +39,7 @@ pub(super) async fn clear_diagnostic_storage(
             );
         }
         let before = trace_log_stats::snapshot(trace_home);
-        let guard = trace_log_guard::configure(trace_home, disable_trace_writes);
+        let guard = trace_guard_state.configure(trace_home, disable_trace_writes);
         let trace_log_write_protection_active = guard
             .as_ref()
             .is_ok_and(|report| report.protection_active(disable_trace_writes));

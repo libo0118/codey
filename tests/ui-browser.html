@@ -28,6 +28,7 @@
       ];
       const releaseNotes = state === "empty" ? undefined : state === "long"
         ? Array.from({ length: 40 }, (_, index) => `- ${notes[index % notes.length]} ${index === 0 ? "VeryLongReleaseIdentifier".repeat(12) : ""}`).join("\r\n")
+        : state === "markdown" ? "## 1.2.7\n\n**新增功能**\n- 支持按分类生成更新日志。\n\n### 体验优化\n- 更新提示直接展示完整日志。\n\n## 1.2.6\n\n**问题修复**\n- 修复长日志挤占弹窗的问题。"
         : state === "grouped" ? "**新增功能**\n- 支持按分类生成更新日志。\n\n**体验优化**\n- 更新提示直接展示完整日志。\n\n**问题修复**\n- 修复长日志挤占弹窗的问题。\n- 修复插件导入失败后无法重试的问题。"
         : notes.map(note => `- ${note}`).join("\n");
       createRoot(document.getElementById("root")).render(React.createElement(UiProvider, null,
@@ -54,6 +55,34 @@
             if (index % 6 === 0) continue;
             result.dailyTrend.push({ timestampUnixMs: day, total: 4, totalTokensKnownCount: index % 9 === 0 ? 0 : index % 7 === 0 ? 3 : 4, totalTokensSum: index % 9 === 0 ? null : index % 8 === 0 ? 0 : (index % 5 + 1) ** 2 * 12345 });
           }
+        }
+        if (scenario === "timeline") {
+          // Independent, internally consistent fixture for timeline exploration.
+          const hourMs = 3600000;
+          const dayMs = 24 * hourMs;
+          if (args.allTime) result.fromUnixMs = result.toUnixMs - 90 * dayMs;
+          result.bucketMs = result.toUnixMs - result.fromUnixMs <= 7 * dayMs ? hourMs : dayMs;
+          const last = Math.floor(result.toUnixMs / result.bucketMs) * result.bucketMs;
+          const values = [11800, 18600, 24300, 9200, undefined, undefined, 15600, 32700, null, 41200, 53800, 32900, 0, 27800, 64100, 132400, 78500, 58900, undefined, 23500, 31800, null, 48700, 29300];
+          result.trend = values.flatMap((tokens, index) => tokens === undefined ? [] : [{ timestampUnixMs: last - (23 - index) * result.bucketMs, total: 2 + index % 5, totalTokensSum: tokens, avgDuration: null, avgTtft: null, avgOutputTokensPerSecond: null, avgDownstreamFirstContent: null }]).filter(bucket => bucket.timestampUnixMs + result.bucketMs > result.fromUnixMs);
+          result.total = result.trend.reduce((sum, bucket) => sum + bucket.total, 0);
+          result.totalTokensKnownCount = result.trend.reduce((sum, bucket) => sum + (bucket.totalTokensSum == null ? 0 : bucket.total), 0);
+          result.usageReportedCount = result.totalTokensKnownCount;
+          result.totalTokensSum = result.trend.reduce((sum, bucket) => sum + (bucket.totalTokensSum ?? 0), 0);
+          result.inputTokensSum = result.totalTokensSum * .8;
+          result.outputTokensSum = result.totalTokensSum * .2;
+          result.cachedTokensSum = 0;
+          result.groups = [{ ...result, groups: undefined, trend: undefined, dailyTrend: undefined, key: "gpt-5.6-sol" }];
+          result.groupsTruncated = false;
+          const daily = new Map();
+          for (const bucket of result.trend) {
+            const day = Math.floor(bucket.timestampUnixMs / dayMs) * dayMs;
+            const entry = daily.get(day) ?? { timestampUnixMs: day, total: 0, totalTokensSum: null, totalTokensKnownCount: 0 };
+            entry.total += bucket.total;
+            if (bucket.totalTokensSum != null) { entry.totalTokensSum = (entry.totalTokensSum ?? 0) + bucket.totalTokensSum; entry.totalTokensKnownCount += bucket.total; }
+            daily.set(day, entry);
+          }
+          result.dailyTrend = [...daily.values()];
         }
         if (scenario === "legacy") delete result.dailyTrend;
         if (scenario === "empty") return { ...result, total: 0, groups: [], trend: [] };

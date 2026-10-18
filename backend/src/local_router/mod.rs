@@ -85,6 +85,8 @@ const REQUEST_JSON_OFFLOAD_BYTES: usize = 256 * 1024;
 const MAX_CUSTOM_TOOL_BRIDGE_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_CUSTOM_TOOL_SOURCE_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+// 排队连接与正在执行的连接分开计数，等待不会占满全部执行入口。
+const MAX_ADMITTED_CONNECTIONS: usize = 320;
 const MAX_CONCURRENT_REJECTIONS: usize = 4;
 // 句柄耗尽、对端提前中止等 accept 错误通常是暂时的；监听器一旦退出，Codex
 // 的所有请求都会被拒绝连接，所以只退避重试，关闭信号才结束监听。
@@ -155,9 +157,11 @@ const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_WEBSOCKET_PATHS: [&str; 2] = ["/v1/responses", "/responses"];
 const REQUEST_LOG_PAGE_PATH: &str = "/codey/request-logs";
 const REQUEST_LOG_SCRIPT_PATH: &str = "/codey/request-logs.js";
+const REQUEST_LOG_ICON_PATH: &str = "/codey/request-logs-icon.png";
+const REQUEST_LOG_ICON: &[u8] = include_bytes!("../../icons/favicon.png");
 const REQUEST_LOG_PAGE: &str = r#"<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codey 请求日志</title></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/codey/request-logs-icon.png"><title>Codey 请求日志</title></head>
 <body><div id="root"></div><script src="/codey/request-logs.js"></script></body>
 </html>"#;
 #[cfg(not(test))]
@@ -180,6 +184,7 @@ mod chat_request;
 mod chat_tools;
 mod collaboration_alias;
 mod compaction;
+mod concurrency;
 mod downstream;
 mod errors;
 mod http;
@@ -187,6 +192,7 @@ mod lifecycle;
 mod native_history;
 mod native_response_fix;
 mod plugin_transport;
+mod portable_compaction;
 mod request_log_tap;
 mod request_meta;
 mod resource_budget;
@@ -202,6 +208,7 @@ mod upstream;
 mod upstream_response;
 mod websocket;
 mod websocket_context;
+mod websocket_ingress;
 mod websocket_tls;
 mod xai;
 
@@ -212,12 +219,14 @@ pub(crate) use chat_request::*;
 pub(crate) use chat_tools::*;
 pub(crate) use collaboration_alias::*;
 pub(crate) use compaction::*;
+pub(crate) use concurrency::*;
 pub(crate) use downstream::*;
 pub(crate) use errors::*;
 pub(crate) use http::*;
 use lifecycle::*;
 pub(crate) use native_history::*;
 pub(crate) use native_response_fix::*;
+pub(crate) use portable_compaction::*;
 pub(crate) use request_log_tap::*;
 pub(crate) use request_meta::*;
 pub(crate) use resource_budget::*;
@@ -232,6 +241,7 @@ pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;
 pub(crate) use websocket_context::*;
+pub(crate) use websocket_ingress::*;
 pub(crate) use xai::*;
 
 #[cfg(test)]

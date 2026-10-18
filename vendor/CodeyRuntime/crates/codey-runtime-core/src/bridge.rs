@@ -362,10 +362,10 @@ pub fn reject_bridge_expression(request_id: &str, message: &str) -> anyhow::Resu
     ))
 }
 
-type ConnectedCdpSocket =
+pub type ConnectedCdpSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
+pub async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
     let candidates = cdp_websocket_connect_candidates(websocket_url);
     // 候选共享原来的连接总预算，避免回退把单轮代价翻倍后吃掉启动注入窗口。
     let attempt_timeout = cdp_connect_attempt_timeout(candidates.len());
@@ -487,7 +487,6 @@ async fn run_bridge_pump(
     let mut ready = VecDeque::<BridgeCompletion>::new();
     let mut concurrent = FuturesUnordered::<BridgeCallFuture>::new();
     let mut serial = FuturesUnordered::<BridgeCallFuture>::new();
-    let mut git_work = FuturesUnordered::<BridgeCallFuture>::new();
     let mut stream_open = true;
 
     while let Some(message) = binding_calls.pop_front() {
@@ -500,20 +499,11 @@ async fn run_bridge_pump(
     }
 
     loop {
-        while let Some(index) = pending_concurrent.iter().position(|call| {
-            if bridge_path_is_git_work(&call.path) {
-                git_work.len() < 4
-            } else {
-                concurrent.len() < BRIDGE_MAX_CONCURRENT_READ_HANDLERS
-            }
-        }) {
-            let call = pending_concurrent.remove(index).unwrap();
-            let lane = if bridge_path_is_git_work(&call.path) {
-                &mut git_work
-            } else {
-                &mut concurrent
+        while concurrent.len() < BRIDGE_MAX_CONCURRENT_READ_HANDLERS {
+            let Some(call) = pending_concurrent.pop_front() else {
+                break;
             };
-            lane.push(execute_bridge_call(Arc::clone(&handler), call));
+            concurrent.push(execute_bridge_call(Arc::clone(&handler), call));
         }
         if serial.is_empty()
             && let Some(call) = pending_serial.pop_front()
@@ -531,7 +521,6 @@ async fn run_bridge_pump(
         if !stream_open
             && concurrent.is_empty()
             && serial.is_empty()
-            && git_work.is_empty()
             && pending_concurrent.is_empty()
             && pending_serial.is_empty()
         {
@@ -549,11 +538,6 @@ async fn run_bridge_pump(
                 }
             }
             completion = concurrent.next(), if !concurrent.is_empty() => {
-                if let Some(completion) = completion {
-                    ready.push_back(completion);
-                }
-            }
-            completion = git_work.next(), if !git_work.is_empty() => {
                 if let Some(completion) = completion {
                     ready.push_back(completion);
                 }
@@ -650,31 +634,19 @@ fn queue_bridge_dispatch(
     }
 }
 
-fn bridge_path_is_git_work(path: &str) -> bool {
+fn bridge_path_can_run_concurrently(path: &str) -> bool {
     matches!(
         path,
-        "/api/conversation_git_preview"
-            | "/api/conversation_git_push_preview"
-            | "/api/conversation_git_execute"
+        "/settings/get"
+            | "/codex-model-catalog"
+            | "/backend/status"
+            | "/backend/health"
+            | "/account/usage"
+            | "/session/completion-state"
+            | "/api/check_for_updates"
+            | "/session/wake-watcher"
+            | "/plugins/list"
     )
-}
-
-fn bridge_path_can_run_concurrently(path: &str) -> bool {
-    bridge_path_is_git_work(path)
-        || matches!(
-            path,
-            "/settings/get"
-                | "/codex-model-catalog"
-                | "/backend/status"
-                | "/backend/health"
-                | "/account/usage"
-                | "/session/completion-state"
-                | "/api/check_for_updates"
-                | "/session/wake-watcher"
-                | "/plugins/list"
-                | "/api/conversation_git_status"
-                | "/api/conversation_git_cancel"
-        )
 }
 
 fn execute_bridge_call(handler: BridgeHandler, call: BridgeCall) -> BridgeCallFuture {

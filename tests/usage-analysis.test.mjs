@@ -192,6 +192,10 @@ const panelStats = {
 };
 
 const uiStubs = autoStubModule("ui");
+const timelineGraph = createModuleGraph(new URL("../src/UsageTimeline.tsx", import.meta.url), {
+  autoStub: true,
+  stubs: { react: panelReact, "./components/ui": uiStubs },
+});
 const panelGraph = createModuleGraph(new URL("../src/UsageAnalysisPanel.tsx", import.meta.url), {
   autoStub: true,
   stubs: {
@@ -200,6 +204,7 @@ const panelGraph = createModuleGraph(new URL("../src/UsageAnalysisPanel.tsx", im
     "./appUtils": { withTimeout: (promise) => promise },
     "./components/ui": uiStubs,
     "./UsageHeatmap": autoStubModule("heatmap"),
+    "./UsageTimeline": timelineGraph.exports,
   },
 });
 
@@ -224,19 +229,19 @@ test("用量趋势渲染把未上报的分桶画成虚线标记并标注用量�
   elementProps(barsButton).onPress?.();
   tree = render();
 
-  const bars = collectElements(tree, (element) => elementType(element) === "rect");
+  const [timeline] = collectElements(tree, (element) => elementType(element) === timelineGraph.exports.UsageTimeline);
+  assert.ok(timeline, "直方图入口必须渲染交互时间轴");
+  const chartTree = timelineGraph.exports.UsageTimeline(elementProps(timeline));
+  const bars = collectElements(chartTree, (element) => elementType(element) === "button" && elementProps(element)["data-bucket-index"] != null);
   assert.equal(bars.length, 3);
   const [known, unknown, zero] = bars.map((bar) => ({
-    height: elementProps(bar).height,
-    style: elementProps(bar).style,
-    title: textContent(bar),
+    className: elementProps(bar).className,
+    title: elementProps(bar)["aria-label"],
   }));
-  assert.equal(known.height > 0, true);
   assert.match(known.title, /10 Token/);
-  assert.equal(unknown.height, 3, "未上报的分桶用低矮标记，不画成零高度");
-  assert.match(unknown.style.strokeDasharray, /2 2/);
-  assert.equal(unknown.style.fill, "none");
+  assert.match(unknown.className, /is-unknown/, "未上报分桶有独立的虚线状态");
   assert.match(unknown.title, /用量未上报/);
-  assert.equal(zero.height, 0, "真正的零用量保持空白");
+  assert.match(zero.className, /is-zero/, "已知零有独立标记");
+  assert.match(zero.title, /0 Token/);
   assert.doesNotMatch(zero.title, /用量未上报/);
 });

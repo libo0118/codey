@@ -73,6 +73,25 @@ pub struct OfficialAccountLaunch {
 }
 
 impl OfficialAccountLaunch {
+    /// 提交时从当前账号完整重建线路，包含探测后新增、删除和修改的账号。
+    /// 保留本次启动的认证探测结论；这里只读本地记录，不重新登录或执行网络请求。
+    pub(crate) fn reconcile_current_accounts(
+        &mut self,
+        codex_home: &Path,
+        accounts: &OfficialAccountStore,
+    ) -> Result<()> {
+        let snapshot = local_provider_with_auth_policy(codex_home, AuthProbePolicy::Lenient)?;
+        let (records, default_id) = accounts.route_snapshot()?;
+        self.has_stored_accounts |= !records.is_empty();
+        self.profiles = if records.is_empty() && self.has_stored_accounts {
+            // 最后一个存储账号删除后，不能用旧 Codex 登录再次派生兼容线路。
+            Vec::new()
+        } else {
+            official_profiles_from_records(&snapshot, records, default_id.as_deref())
+        };
+        Ok(())
+    }
+
     pub fn resolve(codex_home: &Path, accounts: &OfficialAccountStore) -> Result<Self> {
         let resolution = accounts.resolve_launch_login(codex_home);
         let snapshot = local_provider_with_auth_policy(codex_home, AuthProbePolicy::Lenient)?;
@@ -124,9 +143,21 @@ fn launch_official_profiles(
     // 新账号、以及从 Codex 登录收编的账号，都补上按添加顺序生成的默认线路名
     // 和短名称，面板和线路列表显示的名称因此保持一致。
     accounts.ensure_generated_route_settings()?;
-    let mut records = accounts.list()?;
+    let (records, default_id) = accounts.route_snapshot()?;
+    let has_stored_accounts = !records.is_empty();
+    Ok((
+        official_profiles_from_records(snapshot, records, default_id.as_deref()),
+        has_stored_accounts,
+    ))
+}
+
+fn official_profiles_from_records(
+    snapshot: &LocalProviderSnapshot,
+    mut records: Vec<crate::official_accounts::OfficialAccountRecord>,
+    default_id: Option<&str>,
+) -> Vec<ProviderProfile> {
     if records.is_empty() {
-        return Ok((vec![official_profile_from_snapshot(snapshot)], false));
+        return vec![official_profile_from_snapshot(snapshot)];
     }
     // 默认名称按添加顺序编号，不随默认账号切换或失效账号离场而改号。
     let added_order = records
@@ -135,16 +166,15 @@ fn launch_official_profiles(
         .map(|(index, record)| (record.id.clone(), index + 1))
         .collect::<BTreeMap<_, _>>();
     records.retain(|record| !record.invalid());
-    let default_id = accounts.default_account_id()?;
     records.sort_by(|left, right| {
-        let left_default = default_id.as_deref() == Some(left.id.as_str());
-        let right_default = default_id.as_deref() == Some(right.id.as_str());
+        let left_default = default_id == Some(left.id.as_str());
+        let right_default = default_id == Some(right.id.as_str());
         right_default
             .cmp(&left_default)
             .then_with(|| left.added_at.cmp(&right.added_at))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let profiles = records
+    records
         .iter()
         .map(|record| {
             let mut profile = official_profile_from_snapshot(snapshot);
@@ -155,8 +185,7 @@ fn launch_official_profiles(
             apply_account_route_overrides(&mut profile, record, index);
             profile
         })
-        .collect::<Vec<_>>();
-    Ok((profiles, true))
+        .collect()
 }
 
 /// The official-account editor stores its route name, short name, proxy and
@@ -175,6 +204,7 @@ fn apply_account_route_overrides(
     profile.short_name = trimmed(record.route_short_name.as_deref())
         .map(ToString::to_string)
         .unwrap_or_default();
+    profile.max_concurrency = record.max_concurrency;
     if let Some(proxy) = trimmed(record.upstream_proxy.as_deref()) {
         profile.upstream_proxy = proxy.to_string();
     }
@@ -398,6 +428,7 @@ fn profile_from_provider(
         plugin_owner_id: None,
         plugin_route_spec: None,
         official_account: provider.official,
+        max_concurrency: 0,
         official_account_id: None,
         official_siwc: false,
         supports_remote_compaction: provider.supports_remote_compaction,
@@ -922,6 +953,7 @@ experimental_bearer_token = "sk-relay"
             added_at,
             route_name: None,
             route_short_name: None,
+            max_concurrency: 0,
             upstream_proxy: None,
             base_url: None,
             invalid_reason: None,
@@ -947,6 +979,68 @@ experimental_bearer_token = "sk-relay"
         write_config(home.path(), "");
         fs::write(home.path().join("auth.json"), b"{").unwrap();
         assert!(current_provider(home.path()).is_err());
+    }
+
+    #[test]
+    fn official_concurrency_uses_current_accounts_after_async_probe() {
+        let home = TempDir::new().unwrap();
+        write_config(home.path(), "");
+        let (_dir, store) = empty_store();
+        let mut record = stored_account("acct-limit", 1);
+        record.max_concurrency = 2;
+        record.upstream_proxy = Some("http://127.0.0.1:8080".into());
+        record.base_url = Some("https://old.example/v1".into());
+        record.siwc = Some(
+            serde_json::from_value(serde_json::json!({
+                "clientId": "snapshot-client", "accessToken": "snapshot-access",
+                "scopes": ["chatgpt.tokens.use.direct"],
+            }))
+            .unwrap(),
+        );
+        store.upsert(&record).unwrap();
+        store.set_default_account_id(Some(&record.id)).unwrap();
+        let mut launch = OfficialAccountLaunch::resolve(home.path(), &store).unwrap();
+        assert_eq!(launch.profiles[0].max_concurrency, 2);
+        assert!(launch.profiles[0].official_siwc);
+        let status = launch.status.clone();
+
+        // 模拟探测尚未提交时修改设置；清空 override 与 SIWC 也要覆盖旧值。
+        store
+            .update_route_settings_with_concurrency(
+                &record.id,
+                Some("新名称".into()),
+                Some("新".into()),
+                None,
+                None,
+                Some(5),
+            )
+            .unwrap();
+        store.clear_siwc(&record.id).unwrap();
+        launch
+            .reconcile_current_accounts(home.path(), &store)
+            .unwrap();
+        assert_eq!(launch.profiles[0].max_concurrency, 5);
+        assert_eq!(launch.profiles[0].name, "新名称");
+        assert_eq!(launch.profiles[0].short_name, "新");
+        assert!(launch.profiles[0].upstream_proxy.is_empty());
+        assert!(launch.profiles[0].base_url.is_empty());
+        assert!(!launch.profiles[0].official_siwc);
+        assert_eq!(launch.status, status);
+        let mut config = crate::config::CodeyConfig::default();
+        config.apply_launch_official_profiles(launch.profiles.clone());
+        let route = &config.profiles[0];
+        assert_eq!(route.max_concurrency, 5);
+        assert_eq!(route.id, crate::config::official_profile_id(&record.id));
+
+        // 已经完成的旧探测也不能重新加入删除后的账号线路。
+        store
+            .remove_with_codex_login(&record.id, home.path())
+            .unwrap();
+        launch
+            .reconcile_current_accounts(home.path(), &store)
+            .unwrap();
+        assert!(launch.profiles.is_empty());
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

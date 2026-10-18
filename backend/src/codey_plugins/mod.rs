@@ -866,7 +866,15 @@ impl Manager {
             self.log_event(id, "uninstalled_data_retained");
         }
         for (_, trash) in moved {
-            if let Err(error) = fs::remove_dir_all(&trash) {
+            // 不跟随符号链接判断类型，目录递归清理，普通文件仅删除该条目。
+            let cleanup = fs::symlink_metadata(&trash).and_then(|metadata| {
+                if metadata.is_dir() {
+                    fs::remove_dir_all(&trash)
+                } else {
+                    fs::remove_file(&trash)
+                }
+            });
+            if let Err(error) = cleanup {
                 return Err(format!(
                     "插件已卸载，但文件清理失败；请退出 Codey 后删除 {}: {error}",
                     trash.display()
@@ -2148,6 +2156,75 @@ mod tests {
         assert_eq!(fs::read(&config_path).unwrap(), b"{\"saved\":true}\n");
         reopened.uninstall("test.boundary", true).unwrap();
         assert!(!context.plugin_dir.exists());
+    }
+
+    #[test]
+    fn retained_uninstall_removes_plain_files_and_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let context = manager.context("test.boundary", false).unwrap();
+        fs::write(context.plugin_dir.join("cache.json"), b"cache").unwrap();
+        fs::create_dir(context.plugin_dir.join("cache")).unwrap();
+        fs::write(context.plugin_dir.join("cache/item"), b"cache").unwrap();
+        fs::write(context.data_dir.join("saved.json"), b"persistent").unwrap();
+        fs::write(context.log_dir.join("plugin.log"), b"log").unwrap();
+        let config = fs::read(context.plugin_dir.join(CONFIG_FILE)).unwrap();
+
+        manager.uninstall("test.boundary", false).unwrap();
+
+        assert!(!manager.state.plugins.contains_key("test.boundary"));
+        assert!(!context.plugin_dir.join("cache.json").exists());
+        assert!(!context.plugin_dir.join("cache").exists());
+        assert!(!context.plugin_dir.join("versions").exists());
+        assert_eq!(
+            fs::read(context.data_dir.join("saved.json")).unwrap(),
+            b"persistent"
+        );
+        assert_eq!(
+            fs::read(context.log_dir.join("plugin.log")).unwrap(),
+            b"log"
+        );
+        assert_eq!(
+            fs::read(context.plugin_dir.join(CONFIG_FILE)).unwrap(),
+            config
+        );
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".trash-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_uninstall_rejects_top_level_symlinks_and_does_not_follow_nested_links() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"preserve").unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let context = manager.context("test.boundary", false).unwrap();
+        let link = context.plugin_dir.join("cache-link");
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+        assert!(
+            manager
+                .uninstall("test.boundary", false)
+                .unwrap_err()
+                .contains("符号链接")
+        );
+        assert!(manager.state.plugins.contains_key("test.boundary"));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        fs::remove_file(link).unwrap();
+        let cache = context.plugin_dir.join("cache");
+        fs::create_dir(&cache).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache.join("outside")).unwrap();
+        manager.uninstall("test.boundary", false).unwrap();
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
+        assert!(!cache.exists());
     }
 
     #[test]

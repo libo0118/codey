@@ -45,9 +45,8 @@ if (import.meta.env.DEV) {
         : new URLSearchParams(window.location.search).get("platform") === "linux"
           ? "linux"
           : "macos";
-    let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "cli"
-      ? "cli" : "node_options";
-    let previewInjectionRepairUntil = 0;
+    let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "none"
+      ? "" : "cli";
     const configRepairPreview = new URLSearchParams(window.location.search).get("configRepair");
     let previewConfigLoadFailed = configRepairPreview === "load-failure";
     const previewEndpoints = {
@@ -221,7 +220,6 @@ if (import.meta.env.DEV) {
         upstreamProtocol: "openaiResponses",
         instruction: "",
       },
-      conversationGit: { enabled: false, model: "" },
       codexAppPath: "/Applications/ChatGPT.app",
       userScripts: [],
       selectedModelsByProvider: {
@@ -309,6 +307,7 @@ if (import.meta.env.DEV) {
           supportsNativeWebSearch: true,
           supportsAutoReview: true,
           upstreamProxy: account.upstreamProxy ?? "",
+          maxConcurrency: account.maxConcurrency ?? 0,
         };
       });
       previewConfig = {
@@ -739,8 +738,6 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "runtime_status") {
-        const injectionRepairing = Date.now() < previewInjectionRepairUntil;
-        if (previewInjectionRepairUntil && !injectionRepairing) previewInjectionMode = "node_options";
         const activeNotificationChannelCount =
           previewConfig.webhook.channels.filter(
             (channel) =>
@@ -765,7 +762,7 @@ if (import.meta.env.DEV) {
             (account) => account.isDefault,
           ),
           restartRequired: false,
-          restartInProgress: injectionRepairing,
+          restartInProgress: false,
           activeProfileId: previewConfig.activeProfileId,
           activeProfileName:
             previewConfig.profiles.find(
@@ -940,6 +937,7 @@ if (import.meta.env.DEV) {
           routeShortName: String(args.routeShortName ?? ""),
           baseUrl: String(args.baseUrl ?? ""),
           upstreamProxy: String(args.upstreamProxy ?? ""),
+          maxConcurrency: String(args.maxConcurrency ?? account.maxConcurrency ?? 0),
         }, previewConfig.profiles, previewOfficialAccounts, account.id);
         const error = Object.values(errors).find(Boolean);
         if (error) return { status: "failed", message: error };
@@ -951,6 +949,7 @@ if (import.meta.env.DEV) {
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
         account.baseUrl = routeOverride(args.baseUrl);
+        if (args.maxConcurrency !== undefined) account.maxConcurrency = Number(args.maxConcurrency);
         previewDeriveOfficialProfiles();
         return {
           status: "ok",
@@ -1476,6 +1475,7 @@ if (import.meta.env.DEV) {
             routeShortName: String(args.routeShortName ?? ""),
             baseUrl: String(args.baseUrl ?? ""),
             upstreamProxy: String(args.upstreamProxy ?? ""),
+            maxConcurrency: String(args.maxConcurrency ?? targetProfile.maxConcurrency ?? 0),
           }, previewConfig.profiles, previewOfficialAccounts, accountId);
           const error = Object.values(errors).find(Boolean);
           if (error) return { status: "failed", message: error };
@@ -1542,6 +1542,7 @@ if (import.meta.env.DEV) {
           account.routeShortName = routeOverride(args.routeShortName);
           account.upstreamProxy = routeOverride(args.upstreamProxy);
           if ("baseUrl" in args) account.baseUrl = routeOverride(args.baseUrl);
+          if (args.maxConcurrency !== undefined) account.maxConcurrency = Number(args.maxConcurrency);
           previewDeriveOfficialProfiles();
         }
         return {
@@ -1563,10 +1564,6 @@ if (import.meta.env.DEV) {
       }
       if (command === "restart_codey") {
         return { status: "restarting" };
-      }
-      if (command === "repair_main_process_injection") {
-        previewInjectionRepairUntil = Date.now() + 8_000;
-        return { status: "repairing" };
       }
       if (command === "repair_codex_config") {
         await new Promise((resolve) => setTimeout(resolve, 1800));

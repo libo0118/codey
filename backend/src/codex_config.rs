@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -14,13 +13,10 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, NO_WRITABLE_SUBAGENT_GUIDANCE,
-    READ_ONLY_AGENT_WRITE_GUARD, ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    CODEY_FASTCTX_GUIDANCE, ROOT_AGENT_COLLABORATION_USAGE_HINT,
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
-    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
-    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_owned_guidance_paragraph, remove_subagent_guidance, subagent_source_config,
-    subagent_source_config_versions,
+    SUBAGENT_GUIDANCE, SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
+    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -194,28 +190,21 @@ impl RuntimeConfigLock {
         let file = options.open(&lock_path).with_context(|| {
             format!("打开 Codey Codex 运行时配置锁失败：{}", lock_path.display())
         })?;
-        let started = Instant::now();
-        loop {
-            match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Self { file }),
-                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                    let elapsed = started.elapsed();
-                    if elapsed >= timeout {
-                        bail!(
-                            "等待 Codey Codex 运行时配置锁超过 {} 毫秒：{}",
-                            timeout.as_millis(),
-                            lock_path.display()
-                        );
-                    }
-                    thread::sleep(RUNTIME_CONFIG_LOCK_RETRY.min(timeout.saturating_sub(elapsed)));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display())
-                    });
-                }
-            }
-        }
+        crate::fs_util::acquire_exclusive_lock_with_timeout(
+            &file,
+            &lock_path,
+            timeout,
+            RUNTIME_CONFIG_LOCK_RETRY,
+            || {
+                format!(
+                    "等待 Codey Codex 运行时配置锁超过 {} 毫秒：{}",
+                    timeout.as_millis(),
+                    lock_path.display()
+                )
+            },
+            || format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display()),
+        )?;
+        Ok(Self { file })
     }
 }
 
@@ -232,7 +221,6 @@ pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
-    pub conversation_git: bool,
     pub subagent_optimization: bool,
     pub subagent_model: &'a str,
     pub subagent_reasoning_effort: &'a str,
@@ -256,7 +244,6 @@ pub(crate) struct FastContextToolsStatus {
 }
 
 struct RouterApplyOptions<'a> {
-    conversation_git: bool,
     local_router: Option<&'a RuntimeRouterEndpoint>,
     remote_compaction_models: Option<&'a [String]>,
     stream_max_retries: u32,
@@ -320,7 +307,6 @@ pub(crate) fn apply_runtime_router_config(
         RouterApplyOptions {
             local_router: options.local_router,
             remote_compaction_models: options.remote_compaction_models,
-            conversation_git: options.conversation_git,
             stream_max_retries: options.stream_max_retries,
             use_official_catalog,
             model_contexts: options.model_contexts,
@@ -401,7 +387,6 @@ fn apply_isolated_runtime_router_config(
     options: RouterApplyOptions<'_>,
 ) -> Result<AppliedRuntimeRouterConfig> {
     let RouterApplyOptions {
-        conversation_git,
         local_router,
         remote_compaction_models,
         stream_max_retries,
@@ -484,11 +469,11 @@ fn apply_isolated_runtime_router_config(
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
-        Some(read_or_create_versioned_constraint_file(
+        rebuild_constraint_file(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
-            CODEY_FASTCTX_GUIDANCE_VERSIONS,
-        )?)
+        )?;
+        Some(CODEY_FASTCTX_GUIDANCE.to_string())
     } else {
         None
     };
@@ -503,19 +488,20 @@ fn apply_isolated_runtime_router_config(
         Vec::new()
     };
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
-        let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
-        let root_instructions = read_or_create_versioned_constraint_file(
-            &root_path,
+        // Every file under `codex-constraints/` is Codey's own asset and is
+        // rewritten from the current definitions; nothing there needs an
+        // upgrade path. Only text injected into Codex's `config.toml` keeps
+        // migration lists, because that file belongs to the user.
+        rebuild_constraint_file(
+            &constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
             SUBAGENT_GUIDANCE,
-            SUBAGENT_GUIDANCE_VERSIONS,
         )?;
-        let root_instructions =
-            runtime_root_instructions_for_roles(&root_instructions, &runtime_roles);
-        let collaboration_hint = read_or_create_versioned_constraint_file(
+        rebuild_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
-            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
         )?;
+        let root_instructions = SUBAGENT_GUIDANCE.to_string();
+        let collaboration_hint = ROOT_AGENT_COLLABORATION_USAGE_HINT.to_string();
         let registration_roles = runtime_registration_roles(
             &runtime_roles,
             &registered_subagent_roles,
@@ -543,18 +529,7 @@ fn apply_isolated_runtime_router_config(
         collaboration_hint.as_deref(),
     )?;
 
-    let runtime_hooks_enabled =
-        subagent_optimization || fastctx_namespace.is_some() || conversation_git;
-    if conversation_git {
-        enable_hooks_feature(&mut effective_document)?;
-    }
-    let git_hook_commands = conversation_git
-        .then(|| {
-            crate::subagent_gate::hook_commands_for(
-                crate::conversation_git::tracking::HOOK_ARGUMENT,
-            )
-        })
-        .transpose()?;
+    let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some();
     let original_hooks = if runtime_hooks_enabled {
         read_optional(&hooks_path)?
     } else {
@@ -581,7 +556,6 @@ fn apply_isolated_runtime_router_config(
             subagent_hook_commands.as_ref(),
             fastctx_hook_commands.as_ref(),
             combined_hook_commands.as_ref(),
-            git_hook_commands.as_ref(),
         )?;
         (Some(contents), trust_entries)
     } else {
@@ -605,7 +579,6 @@ fn apply_isolated_runtime_router_config(
         root_instructions.as_deref(),
         &runtime_agents,
         fastctx_namespace,
-        conversation_git,
         local_router.map(|_| local_router::ROUTER_PROVIDER_ID),
         &hook_trust_entries,
         stream_max_retries,
@@ -730,7 +703,6 @@ fn apply_isolated_test_runtime_config(
         RouterApplyOptions {
             local_router: Some(test_runtime_router_endpoint()),
             remote_compaction_models: None,
-            conversation_git: false,
             stream_max_retries: 5,
             use_official_catalog,
             model_contexts: None,
@@ -746,30 +718,17 @@ fn apply_isolated_test_runtime_config(
     )
 }
 
-fn read_or_create_constraint_file(path: &Path, default_contents: &str) -> Result<String> {
-    if let Some(existing) = read_optional(path)? {
-        return String::from_utf8(existing)
-            .with_context(|| format!("Codey 约束文件不是 UTF-8：{}", path.display()));
+/// Rewrite a file under `codex-constraints/` from the current definition.
+///
+/// These files are Codey's own runtime assets: nothing outside this module
+/// writes them, and no user-facing surface exposes them for editing. Comparing
+/// against historical text only invited drift, so the content is simply
+/// regenerated. An identical file is left untouched to keep its mtime stable.
+fn rebuild_constraint_file(path: &Path, contents: &str) -> Result<()> {
+    if read_optional(path)?.is_some_and(|existing| existing == contents.as_bytes()) {
+        return Ok(());
     }
-    write_private_file(path, default_contents.as_bytes())?;
-    Ok(default_contents.to_string())
-}
-
-fn read_or_create_versioned_constraint_file(
-    path: &Path,
-    current: &str,
-    owned_versions: &[&str],
-) -> Result<String> {
-    let source = read_or_create_constraint_file(path, current)?;
-    // 仅在运行时替换完整匹配的旧默认文本，可编辑源文件和用户改动保持原样。
-    if owned_versions
-        .iter()
-        .any(|version| source.trim() == version.trim())
-    {
-        Ok(current.to_string())
-    } else {
-        Ok(source)
-    }
+    write_private_file(path, contents.as_bytes())
 }
 
 fn runtime_subagent_roles(
@@ -833,14 +792,6 @@ fn registered_roles_for_lease(state: &RuntimeConfigLease) -> Vec<String> {
     } else {
         state.registered_subagent_roles.clone()
     }
-}
-
-fn runtime_root_instructions_for_roles(
-    root_instructions: &str,
-    _roles: &BTreeMap<String, SubagentRoleConfig>,
-) -> String {
-    remove_owned_guidance_paragraph(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
-        .unwrap_or_else(|| root_instructions.to_string())
 }
 
 fn prepare_runtime_agent_files(
@@ -907,7 +858,7 @@ fn plan_runtime_agent_files(
         let Some(selection) = roles.get(role) else {
             continue;
         };
-        let default_source = subagent_source_config(role)
+        let source = subagent_source_config(role)
             .with_context(|| format!("缺少 Codey 子代理约束模板：{role}"))?;
         let source_path = if role == SUBAGENT_ROLE_DEFAULT {
             constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)
@@ -919,14 +870,10 @@ fn plan_runtime_agent_files(
         if let Some(parent) = source_path.parent() {
             create_private_dir_all(parent)?;
         }
-        let source = read_or_create_versioned_constraint_file(
-            &source_path,
-            default_source,
-            &subagent_source_config_versions(role).unwrap(),
-        )?;
+        rebuild_constraint_file(&source_path, source)?;
         let runtime_path = runtime_agent_path(constraints_dir, role);
         let (contents, description) = render_runtime_agent(
-            &source,
+            source,
             role,
             selection,
             fastctx_instructions,
@@ -978,11 +925,6 @@ fn render_runtime_agent(
         .filter(|description| !description.is_empty())
         .with_context(|| format!("Codey 子代理约束文件缺少非空 description：{role}"))?
         .to_string();
-    remove_guidance_from_table(
-        document.as_table_mut(),
-        "developer_instructions",
-        remove_codey_fastctx_guidance,
-    );
     if let Some(instructions) = fastctx_instructions {
         append_table_constraint_text(
             document.as_table_mut(),
@@ -991,11 +933,6 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
-    remove_guidance_from_table(
-        document.as_table_mut(),
-        "developer_instructions",
-        |current| remove_owned_guidance_paragraph(current, READ_ONLY_AGENT_WRITE_GUARD),
-    );
     append_table_constraint_text(
         document.as_table_mut(),
         "developer_instructions",
@@ -1361,10 +1298,11 @@ fn runtime_fastctx_instructions(
     state: &RuntimeConfigLease,
 ) -> Result<Option<String>> {
     if state.fastctx_command.is_some() {
-        Ok(Some(read_or_create_constraint_file(
+        rebuild_constraint_file(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
-        )?))
+        )?;
+        Ok(Some(CODEY_FASTCTX_GUIDANCE.to_string()))
     } else {
         Ok(None)
     }
@@ -2287,7 +2225,7 @@ fn patch_config_with_fastctx_mode(
         set_model_selection(&mut doc, default_model);
     }
     enable_desktop_reasoning_efforts(&mut doc)?;
-    ensure_default_service_tier(&mut doc);
+    set_runtime_model_defaults(&mut doc);
     let fastctx_namespace = if let Some(command) = fastctx_command {
         enable_fast_context_tools(&mut doc, command)?
     } else {
@@ -2450,17 +2388,6 @@ const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 7] = [
     },
 ];
 
-const CONVERSATION_GIT_HOOKS: [CodeyHookSpec; 2] = [
-    CodeyHookSpec {
-        timeout_seconds: crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS,
-        ..SUBAGENT_GATE_HOOKS[0]
-    },
-    CodeyHookSpec {
-        timeout_seconds: crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS,
-        ..SUBAGENT_GATE_HOOKS[1]
-    },
-];
-
 const FASTCTX_ROUTE_HOOKS: [CodeyHookSpec; 1] = [CodeyHookSpec {
     toml_event: "PreToolUse",
     event_key: "pre_tool_use",
@@ -2474,7 +2401,6 @@ fn build_runtime_hooks_file(
     subagent_commands: Option<&crate::subagent_gate::HookCommands>,
     fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
     combined_commands: Option<&crate::subagent_gate::HookCommands>,
-    git_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
     let mut root = match existing {
         Some(existing) => serde_json::from_slice::<serde_json::Value>(existing)
@@ -2501,9 +2427,6 @@ fn build_runtime_hooks_file(
     }
 
     let mut hook_plans = Vec::with_capacity(3);
-    if let Some(commands) = git_commands {
-        hook_plans.push((&CONVERSATION_GIT_HOOKS[..], commands));
-    }
     if let Some(subagent_commands) = subagent_commands {
         if let Some(combined_commands) = combined_commands {
             hook_plans.push((&SUBAGENT_GATE_HOOKS[..1], combined_commands));
@@ -2595,7 +2518,6 @@ fn build_isolated_runtime_overrides(
     root_instructions: Option<&str>,
     runtime_agents: &[RuntimeAgentRegistration],
     fastctx_namespace: Option<&str>,
-    conversation_git: bool,
     provider_id: Option<&str>,
     hook_trust_entries: &[RuntimeHookTrustEntry],
     stream_max_retries: u32,
@@ -2632,6 +2554,12 @@ fn build_isolated_runtime_overrides(
         effective,
         &["desktop", "enabled-reasoning-efforts"],
         "desktop.enabled-reasoning-efforts",
+    )?;
+    push_required_document_override(
+        &mut overrides,
+        effective,
+        &["model_reasoning_effort"],
+        "model_reasoning_effort",
     )?;
     push_required_document_override(&mut overrides, effective, &["service_tier"], "service_tier")?;
 
@@ -2871,14 +2799,10 @@ fn build_isolated_runtime_overrides(
             &["features", "hooks"],
             "features.hooks",
         )?;
-        let expected_hook_count = (if runtime_agents.is_empty() {
+        let expected_hook_count = if runtime_agents.is_empty() {
             usize::from(fastctx_namespace.is_some())
         } else {
             SUBAGENT_GATE_HOOKS.len()
-        }) + if conversation_git {
-            CONVERSATION_GIT_HOOKS.len()
-        } else {
-            0
         };
         anyhow::ensure!(
             hook_trust_entries.len() == expected_hook_count,
@@ -3051,7 +2975,6 @@ fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {
 fn hook_command_is_codey_owned(command: &str) -> bool {
     command.contains(crate::subagent_gate::HOOK_ARGUMENT)
         || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
-        || command.contains(crate::conversation_git::tracking::HOOK_ARGUMENT)
 }
 
 /// Releases before the runtime `hooks.json` carried their hook definitions in
@@ -3401,10 +3324,10 @@ fn enable_desktop_reasoning_efforts(doc: &mut DocumentMut) -> Result<()> {
     Ok(())
 }
 
-fn ensure_default_service_tier(doc: &mut DocumentMut) {
-    if doc.get("service_tier").is_none() {
-        doc["service_tier"] = value("default");
-    }
+fn set_runtime_model_defaults(doc: &mut DocumentMut) {
+    // 运行参数为新会话提供默认值，不写回用户配置。
+    doc["model_reasoning_effort"] = value("medium");
+    doc["service_tier"] = value("default");
 }
 
 fn remove_model_selection(doc: &mut DocumentMut) {

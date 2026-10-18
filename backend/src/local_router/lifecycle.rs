@@ -498,6 +498,24 @@ impl<D: ResponsesDownstream + ?Sized> LifecycleDownstream<'_, D> {
 
 #[async_trait]
 impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstream<'_, D> {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.inner.wait_for_admission(future).await
+    }
+    async fn write_admission_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        self.inner
+            .write_admission_error(status, code, message, route)
+            .await
+    }
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
     where
         T: Send,
@@ -612,6 +630,7 @@ mod tests {
             account_id: "local-account".into(),
             email: Some("member@example.com".into()),
             path: PathBuf::from("/unused/auth.json"),
+            record_path: PathBuf::from("/unused/local-account.json"),
             siwc_path: None,
             accepts_incoming_authorization: false,
         });

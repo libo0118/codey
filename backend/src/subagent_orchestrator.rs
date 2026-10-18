@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -183,27 +182,20 @@ impl LedgerStore {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("打开 Codey 子代理编排账本锁失败：{}", lock_path.display()))?;
-        let lock_started = Instant::now();
-        loop {
-            match lock.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                    if lock_started.elapsed() >= Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS) {
-                        anyhow::bail!(
-                            "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
-                            LEDGER_LOCK_TIMEOUT_MILLIS,
-                            lock_path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display())
-                    });
-                }
-            }
-        }
+        crate::fs_util::acquire_exclusive_lock_with_timeout(
+            &lock,
+            &lock_path,
+            Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS),
+            Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS),
+            || {
+                format!(
+                    "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
+                    LEDGER_LOCK_TIMEOUT_MILLIS,
+                    lock_path.display()
+                )
+            },
+            || format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display()),
+        )?;
         cleanup_stale_ledger_temps(&session_dir)?;
         Ok(Self {
             lock,
@@ -2128,67 +2120,6 @@ pub(crate) fn settle_interrupt_acknowledgement(
     TraceRecorder::new(state_root).record_best_effort(&event);
 
     Ok(Some(InterruptSettlement { agent_id_hash }))
-}
-
-/// Git 文件记录只读取既有身份，不改变代理的生命周期或授权状态。
-pub(crate) fn trusted_child_workspace(
-    state_root: &Path,
-    runtime_id: &str,
-    parent_session: &str,
-    context: ChildToolContext<'_>,
-    workspace: &Path,
-) -> Result<bool> {
-    let path = state_root
-        .join(hash_component(parent_session))
-        .join(LEDGER_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.len() <= MAX_LEDGER_BYTES,
-        "子代理身份记录无效"
-    );
-    let mut ledger: SessionLedger = serde_json::from_slice(&fs::read(path)?)?;
-    validate_ledger(&mut ledger)?;
-    validate_unique_agent_bindings(&ledger)?;
-    if ledger.session_id_hash != hash_component(parent_session)
-        || ledger.runtime_id_hash != hash_component(runtime_id)
-    {
-        return Ok(false);
-    }
-    let Some(task) = task_id_from_subagent_transcript(
-        state_root,
-        parent_session,
-        context.agent_id,
-        context.agent_type,
-        context.transcript_path,
-        &ledger,
-    ) else {
-        return Ok(false);
-    };
-    let candidates = identity_task_candidates(&ledger, context.agent_id);
-    if candidates.iter().any(|candidate| candidate != &task) {
-        return Ok(false);
-    }
-    let reservation = &ledger.reservations[&task];
-    let agent_hash = hash_component(context.agent_id);
-    if reservation
-        .agent_id_hash
-        .as_deref()
-        .is_some_and(|bound| bound != agent_hash && !is_provisional_task_binding(bound, &task))
-    {
-        return Ok(false);
-    }
-    Ok(reservation
-        .workspace_root
-        .as_deref()
-        .and_then(|path| Path::new(path).canonicalize().ok())
-        .as_deref()
-        == Some(workspace))
 }
 
 pub(crate) struct ChildToolContext<'a> {

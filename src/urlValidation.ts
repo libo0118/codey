@@ -17,8 +17,8 @@ export function validateOutboundProxyUrl(value: string, label = "上游代理") 
 }
 
 /** Validates the Codex launch proxy before it is saved. Stricter than route
- * proxies: Chromium's --proxy-server cannot authenticate and SOCKS rules
- * require an explicit port. */
+ * proxies: credentials are injected by the local auth relay (Chromium's
+ * --proxy-server cannot carry them) and SOCKS rules require an explicit port. */
 export function validateCodexLaunchProxy(value: string, label = "Codex 启动代理") {
   const normalized = value.trim();
   if (!normalized) return "";
@@ -30,12 +30,9 @@ export function validateCodexLaunchProxy(value: string, label = "Codex 启动代
     ) {
       return `${label}必须是 http、https、socks5 或 socks5h 地址`;
     }
-    if (parsed.username || parsed.password) {
-      return `${label}不能包含用户名或密码`;
-    }
     // 非特殊协议（socks5/socks5h）的 pathname 是空串而非 "/"。
     if (!["", "/"].includes(parsed.pathname) || parsed.search || parsed.hash) {
-      return `${label}只能包含协议、地址和端口`;
+      return `${label}只能包含协议、地址、端口和认证信息`;
     }
     if (
       (parsed.protocol === "socks5:" || parsed.protocol === "socks5h:") &&
@@ -43,9 +40,25 @@ export function validateCodexLaunchProxy(value: string, label = "Codex 启动代
     ) {
       return `${label}的 SOCKS 地址必须带端口`;
     }
+    // RFC 1929 的用户名和密码各限 255 字节；http/https 代理没有这个限制，
+    // 后端也只对 SOCKS 地址做同样约束。
+    if (
+      (parsed.protocol === "socks5:" || parsed.protocol === "socks5h:") &&
+      (credentialByteLength(parsed.username) > 255 || credentialByteLength(parsed.password) > 255)
+    ) {
+      return `${label}的 SOCKS 用户名或密码不能超过 255 字节`;
+    }
     return "";
   } catch {
     return `${label}格式无效`;
+  }
+}
+
+function credentialByteLength(value: string) {
+  try {
+    return new TextEncoder().encode(decodeURIComponent(value)).length;
+  } catch {
+    return value.length;
   }
 }
 

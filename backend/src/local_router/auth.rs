@@ -102,12 +102,86 @@ pub(crate) async fn resolve_official_upstream_auth(
     // so one conversation never spends another account's login.
     accepts_incoming_authorization: bool,
 ) -> Option<OfficialUpstreamAuth> {
+    let stored = read_cached_official_auth(auth_path, auth_caches).await;
+    resolve_official_auth_from_stored(
+        request,
+        router_bearer_token,
+        stored,
+        accepts_incoming_authorization,
+    )
+}
+
+/// 不使用凭据缓存的 TTL 判断账号是否存在，旧路由快照也必须遵守删除结果。
+pub(crate) async fn validate_managed_official_account(auth: &OfficialRouteAuth) -> Result<()> {
+    let record_path = auth.record_path.clone();
+    let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(record_path))
+        .await
+        .context("检查官方账号记录任务异常退出")?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("官方账号已移除，请刷新线路后重试")
+            } else {
+                anyhow::anyhow!(error).context("无法确认官方账号记录，已停止转发")
+            }
+        })?;
+    anyhow::ensure!(metadata.is_file(), "官方账号记录不是文件，已停止转发");
+    Ok(())
+}
+
+pub(crate) async fn resolve_managed_official_upstream_auth(
+    request: &HttpRequest,
+    router_bearer_token: &str,
+    route_auth: &OfficialRouteAuth,
+    auth_caches: &Mutex<crate::account_usage::OfficialAuthCaches>,
+) -> Option<OfficialUpstreamAuth> {
+    let account = read_cached_official_auth(&route_auth.record_path, auth_caches).await?;
+    let mut stored = account.clone();
+    let mut accepts_incoming = false;
+    if route_auth.accepts_incoming_authorization
+        && let Some(login) = read_cached_official_auth(&route_auth.path, auth_caches).await
+    {
+        // 默认账号切换后旧快照仍可能存在；登录文件属于别的账号时使用
+        // 选中账号自己的凭据，不按 JWT 的签发时间跨账号挑选令牌。
+        let same_account = match (&account.account_id, &login.account_id) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => account.access_token == login.access_token,
+        };
+        if same_account {
+            accepts_incoming = true;
+            stored = login;
+        }
+    }
+    if let Some(expected) = stored.account_id.as_deref() {
+        let incoming_claims = incoming_openai_authorization(request, router_bearer_token)
+            .and_then(bearer_token)
+            .and_then(crate::official_accounts::jwt_claims);
+        let token_account = incoming_claims.as_ref().and_then(|claims| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+                .or_else(|| claims.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        });
+        if incoming_chatgpt_account_id(request).is_some_and(|id| id != expected)
+            || token_account.is_some_and(|id| id != expected)
+        {
+            accepts_incoming = false;
+        }
+    }
+    resolve_official_auth_from_stored(request, router_bearer_token, Some(stored), accepts_incoming)
+}
+
+fn resolve_official_auth_from_stored(
+    request: &HttpRequest,
+    router_bearer_token: &str,
+    stored: Option<Arc<crate::account_usage::OfficialAuth>>,
+    accepts_incoming_authorization: bool,
+) -> Option<OfficialUpstreamAuth> {
     if accepts_incoming_authorization
         && let Some(authorization) = incoming_openai_authorization(request, router_bearer_token)
     {
         // 重新登录只替换账号文件，已经启动的 Codex 仍会发送登录时缓存的旧
         // 令牌；账号文件里的令牌更新时以它为准，新登录才能立即生效。
-        let stored = read_cached_official_auth(auth_path, auth_caches).await;
         if let Some(stored_auth) = stored.as_ref()
             && stored_auth_supersedes_incoming(authorization, stored_auth)
         {
@@ -129,7 +203,7 @@ pub(crate) async fn resolve_official_upstream_auth(
         });
     }
 
-    let auth = read_cached_official_auth(auth_path, auth_caches).await?;
+    let auth = stored?;
     Some(OfficialUpstreamAuth {
         authorization: format!("Bearer {}", auth.access_token),
         // The account ID stored with the selected OAuth token is authoritative.

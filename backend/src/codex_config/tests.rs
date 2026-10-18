@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, codey_fastctx_guidance_for_namespace,
-    remove_codey_fastctx_guidance,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE_VERSIONS,
+    codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
 };
 const LEGACY_GLOBAL_PROVIDER_ID: &str = "codey_global";
 
@@ -685,7 +685,6 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -850,7 +849,6 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -903,7 +901,6 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -1187,7 +1184,7 @@ fn legacy_unregistered_role_requires_restart_without_mutating_runtime_assets() {
 }
 
 #[test]
-fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
+fn stale_role_template_source_is_repaired_instead_of_failing_the_reconcile() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let marker = temp.path().join("state/codex-lease.json");
@@ -1197,100 +1194,22 @@ fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
     };
     dynamic_role_runtime_fixture(&home, &marker, &config);
     let constraints = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
-    let original_lease = fs::read(&marker).unwrap();
     let (policy_path, pending) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
-    let original_policy = fs::read(&policy_path).unwrap();
     let role = crate::config::SUBAGENT_ROLE_WORKER;
-    let role_path = runtime_agent_path(&constraints, role);
-    let original_file = fs::read(&role_path).unwrap();
+    let source_path = constraints
+        .join(CODEY_SUBAGENT_SOURCES_DIR)
+        .join(format!("{role}.toml"));
+    // A truncated or stale template used to abort the whole reconcile and left
+    // that role permanently unable to upgrade. It is now simply rebuilt.
+    fs::write(&source_path, "invalid = [").unwrap();
     config.subagent_roles.get_mut(role).unwrap().enabled = false;
-    fs::write(
-        constraints
-            .join(CODEY_SUBAGENT_SOURCES_DIR)
-            .join(format!("{role}.toml")),
-        "invalid = [",
-    )
-    .unwrap();
-    assert!(reconcile_runtime_subagent_roles_at(&config, &marker).is_err());
-    assert_eq!(fs::read(&marker).unwrap(), original_lease);
-    assert_eq!(fs::read(policy_path).unwrap(), original_policy);
-    assert_eq!(fs::read(role_path).unwrap(), original_file);
+    reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    assert_eq!(
+        fs::read_to_string(&source_path).unwrap(),
+        subagent_source_config(role).unwrap()
+    );
+    assert!(policy_path.exists());
     assert!(!pending.exists());
-}
-
-#[test]
-fn runtime_guidance_keeps_analysis_roles_available_for_authorized_writes() {
-    let mut configured = crate::config::default_subagent_roles();
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
-        .unwrap()
-        .enabled = false;
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_VISUAL_WORKER)
-        .unwrap()
-        .enabled = false;
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_DEFAULT)
-        .unwrap()
-        .enabled = false;
-    let runtime_roles = runtime_subagent_roles(
-        Some(&configured),
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-    );
-
-    let instructions = runtime_root_instructions_for_roles("BASE", &runtime_roles);
-    assert!(instructions.contains("BASE"));
-    assert_eq!(instructions, "BASE");
-    assert_eq!(
-        runtime_root_instructions_for_roles(
-            &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
-            &runtime_roles
-        ),
-        "BASE"
-    );
-
-    let writable_roles = runtime_subagent_roles(
-        Some(&crate::config::default_subagent_roles()),
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-    );
-    assert_eq!(
-        runtime_root_instructions_for_roles("BASE", &writable_roles),
-        "BASE"
-    );
-}
-
-#[test]
-fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("instructions.md");
-    for (current, versions) in [
-        (SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
-        (CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS),
-        (
-            ROOT_AGENT_COLLABORATION_USAGE_HINT,
-            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-        ),
-    ] {
-        for version in versions {
-            let original = format!("\n{version}\n");
-            fs::write(&path, &original).unwrap();
-            assert_eq!(
-                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
-                current
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
-            let customized = format!("{version}\n\n用户自定义要求");
-            fs::write(&path, &customized).unwrap();
-            assert_eq!(
-                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
-                customized
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), customized);
-        }
-    }
 }
 
 #[test]
@@ -1311,8 +1230,10 @@ fn isolated_prompt_sources_migrate_historical_defaults_and_preserve_user_guidanc
         ),
     ] {
         let path = temp.path().join(name);
-        fs::write(&path, versions.last().unwrap()).unwrap();
-        sources.push(read_or_create_versioned_constraint_file(&path, current, versions).unwrap());
+        rebuild_constraint_file(&path, current).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        sources.push(current.to_string());
+        assert!(!versions.is_empty());
     }
     let mut document = parse_document(
         r#"[features.multi_agent_v2]
@@ -1400,7 +1321,6 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_QUICK_SCAN)
         .unwrap();
     let quick_scan = String::from_utf8(quick_scan.contents.clone()).unwrap();
-    assert!(!quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
     assert!(quick_scan.contains("sandbox_mode = \"workspace-write\""));
     assert!(quick_scan.contains("按本次任务授权使用所需工具"));
 
@@ -1409,14 +1329,13 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_WORKER)
         .unwrap();
     let worker = String::from_utf8(worker.contents.clone()).unwrap();
-    assert!(!worker.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(worker.contains("逻辑开发子代理"));
 
     let default_agent = plans
         .iter()
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_DEFAULT)
         .unwrap();
     let default_agent = String::from_utf8(default_agent.contents.clone()).unwrap();
-    assert!(!default_agent.contains(READ_ONLY_AGENT_WRITE_GUARD));
     assert!(default_agent.contains("sandbox_mode = \"workspace-write\""));
 }
 
@@ -1448,23 +1367,26 @@ fn runtime_agents_select_compaction_from_their_own_model() {
 }
 
 #[test]
-fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources() {
-    for role in [
-        "codey_quick_scan",
-        "codey_deep_research",
-        "codey_visual_analysis",
-    ] {
+fn runtime_agent_sources_are_rebuilt_from_the_current_definitions() {
+    for role in crate::config::SUBAGENT_ROLE_IDS {
         let temp = tempfile::tempdir().unwrap();
         let constraints_dir = temp.path().join("codex-constraints");
-        let source_path = constraints_dir
-            .join(CODEY_SUBAGENT_SOURCES_DIR)
-            .join(format!("{role}.toml"));
+        let source_path = if role == SUBAGENT_ROLE_DEFAULT {
+            constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)
+        } else {
+            constraints_dir
+                .join(CODEY_SUBAGENT_SOURCES_DIR)
+                .join(format!("{role}.toml"))
+        };
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-        let [current, previous] = subagent_source_config_versions(role).unwrap();
-        fs::write(&source_path, previous).unwrap();
+        // A stale or hand-edited source file cannot survive a rebuild: the
+        // file is Codey's own asset, so its content always tracks the template.
+        fs::write(&source_path, "stale = \"hand edited\"\n").unwrap();
         let roles = crate::config::default_subagent_roles();
         let plans = plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
-        assert_eq!(fs::read_to_string(&source_path).unwrap(), previous);
+
+        let current = subagent_source_config(role).unwrap();
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), current, "{role}");
         let plan = plans
             .iter()
             .find(|plan| plan.registration.role == role)
@@ -1473,13 +1395,18 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
         assert_eq!(rendered["sandbox_mode"].as_str(), Some("workspace-write"));
         assert_eq!(
             rendered["description"].as_str(),
-            parse_document(current).unwrap()["description"].as_str()
+            parse_document(current).unwrap()["description"].as_str(),
+            "{role}"
         );
 
-        let customized = format!("{previous}\n# User customization\n");
-        fs::write(&source_path, &customized).unwrap();
+        // An already-current source file is left untouched rather than rewritten.
+        let stable = fs::metadata(&source_path).unwrap();
         plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
-        assert_eq!(fs::read_to_string(&source_path).unwrap(), customized);
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), current, "{role}");
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().modified().unwrap(),
+            stable.modified().unwrap()
+        );
     }
 }
 
@@ -1592,7 +1519,6 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1638,7 +1564,6 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1700,7 +1625,6 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
             &home,
             RouterApplyOptions {
                 remote_compaction_models: None,
-                conversation_git: false,
                 local_router: router.then(test_runtime_router_endpoint),
                 use_official_catalog: router,
                 model_contexts: Some(contexts),
@@ -1779,7 +1703,6 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             local_router: Some(test_runtime_router_endpoint()),
             use_official_catalog: true,
             model_contexts: Some(&policies),
@@ -1852,7 +1775,6 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
             &home,
             RouterApplyOptions {
                 remote_compaction_models: None,
-                conversation_git: false,
                 model_contexts: None,
                 stream_max_retries: 7,
                 local_router: None,
@@ -1900,7 +1822,6 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 7,
             local_router: None,
@@ -1958,7 +1879,6 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
                 &home,
                 RouterApplyOptions {
                     remote_compaction_models: None,
-                    conversation_git: false,
                     model_contexts: None,
                     stream_max_retries: 5,
                     local_router,
@@ -2012,7 +1932,6 @@ wire_api = "responses"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -2160,13 +2079,68 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
 }
 
 #[test]
-fn router_patch_preserves_selected_service_tier() {
-    let result = patch_config("service_tier = \"priority\"\n", true).unwrap();
+fn isolated_runtime_sets_medium_and_normal_defaults_without_changing_user_config() {
+    let inherited_preferences = r#"model_reasoning_effort = "high"
+service_tier = "priority"
+profile = "work"
 
-    assert_eq!(
-        root_key_string(&result, "service_tier").as_deref(),
-        Some("priority")
-    );
+[profiles.work]
+model_reasoning_effort = "xhigh"
+service_tier = "flex"
+"#;
+    for original in ["", inherited_preferences] {
+        for local_router in [None, Some(test_runtime_router_endpoint())] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            let marker = temp.path().join("codey-state/codex-lease.json");
+            let backup_root = temp.path().join("codey-state/codex-backups");
+            fs::create_dir_all(&home).unwrap();
+            let config_path = home.join("config.toml");
+            fs::write(&config_path, original).unwrap();
+
+            let applied = apply_isolated_runtime_router_config(
+                &home,
+                RouterApplyOptions {
+                    remote_compaction_models: None,
+                    model_contexts: None,
+                    stream_max_retries: 5,
+                    local_router,
+                    use_official_catalog: false,
+                    default_model: None,
+                    fastctx_command: None,
+                    subagent_optimization: false,
+                    subagent_model: DEFAULT_SUBAGENT_MODEL,
+                    subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                    subagent_roles: None,
+                    marker: &marker,
+                    backup_root: &backup_root,
+                },
+            )
+            .unwrap();
+
+            for (key, expected) in [
+                ("model_reasoning_effort", "medium"),
+                ("service_tier", "default"),
+            ] {
+                let values = applied
+                    .runtime_config_overrides
+                    .iter()
+                    .filter(|entry| runtime_override_key(entry) == key)
+                    .map(|entry| root_key_string(entry, key).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, [expected]);
+            }
+            assert!(
+                applied
+                    .runtime_config_overrides
+                    .iter()
+                    .all(|entry| !entry.starts_with("profiles."))
+            );
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+            assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        }
+    }
 }
 
 #[test]
@@ -3357,7 +3331,6 @@ experimental_bearer_token = "upstream-secret-token"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3494,7 +3467,6 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3535,7 +3507,6 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
-            conversation_git: false,
             local_router: Some(test_runtime_router_endpoint()),
             stream_max_retries: 5,
             use_official_catalog: false,
@@ -3589,7 +3560,6 @@ wire_api = "responses"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
-            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3895,6 +3865,7 @@ wire_api = "responses"
     for required_key in [
         "model_catalog_json",
         "desktop.enabled-reasoning-efforts",
+        "model_reasoning_effort",
         "service_tier",
         "developer_instructions",
         "mcp_servers.codey_fastctx.command",
@@ -4050,6 +4021,8 @@ wire_api = "responses"
     assert!(!marker.exists());
     fs::write(home.join("config.toml"), original_config).unwrap();
 
+    // Codey-owned constraint files are rebuilt from the current definitions;
+    // hand-edited or stale content there does not carry into the runtime.
     fs::write(
         constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
         "CUSTOM ROOT CONSTRAINT",
@@ -4067,10 +4040,7 @@ wire_api = "responses"
     .unwrap();
     fs::write(
         constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE),
-        r#"name = "default"
-description = "Custom editable subagent"
-developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
-"#,
+        "stale = \"hand edited\"\n",
     )
     .unwrap();
 
@@ -4086,6 +4056,14 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         &backup_root,
     )
     .unwrap();
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
+        SUBAGENT_GUIDANCE
+    );
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
+        ROOT_AGENT_COLLABORATION_USAGE_HINT
+    );
     let developer_override = reapplied
         .runtime_config_overrides
         .iter()
@@ -4096,10 +4074,10 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     let developer_instructions = developer_override["developer_instructions"]
         .as_str()
         .unwrap();
-    assert!(developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
-    assert!(developer_instructions.contains("CUSTOM FASTCTX CONSTRAINT"));
-    assert!(!developer_instructions.contains(SUBAGENT_GUIDANCE));
-    assert!(!developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
+    // Injected text is trimmed, so compare against the trimmed guidance.
+    assert!(developer_instructions.contains(SUBAGENT_GUIDANCE.trim()));
+    assert!(developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
     let collaboration_override = reapplied
         .runtime_config_overrides
         .iter()
@@ -4109,12 +4087,13 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         .unwrap();
     assert_eq!(
         collaboration_override["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
-        Some("CUSTOM COLLABORATION HINT")
+        Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
     );
     let runtime_agent =
         fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();
-    assert!(runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
-    assert!(runtime_agent.contains("CUSTOM FASTCTX CONSTRAINT"));
+    assert!(runtime_agent.contains("通用子代理"));
+    assert!(runtime_agent.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
     assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
 }
 
@@ -4261,64 +4240,4 @@ fn unrelated_provider_ids_and_missing_configs_stay_untouched() {
 
     assert!(repair_reserved_provider_ids(&home).unwrap().is_empty());
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
-}
-
-#[test]
-fn conversation_git_installs_only_trusted_edit_hooks_without_other_enhancements() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    let marker = temp.path().join("state/lease.json");
-    let backup = temp.path().join("state/backups");
-    let applied = apply_isolated_runtime_router_config(
-        &home,
-        RouterApplyOptions {
-            remote_compaction_models: None,
-            conversation_git: true,
-            local_router: None,
-            use_official_catalog: false,
-            model_contexts: None,
-            stream_max_retries: 5,
-            default_model: None,
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            subagent_roles: None,
-            marker: &marker,
-            backup_root: &backup,
-        },
-    )
-    .unwrap();
-    assert!(
-        applied
-            .runtime_config_overrides
-            .iter()
-            .any(|entry| entry == "features.hooks=true")
-    );
-    let hooks: serde_json::Value =
-        serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
-    for event in ["PreToolUse", "PostToolUse"] {
-        let handlers = hooks["hooks"][event].as_array().unwrap();
-        assert_eq!(handlers.len(), 1);
-        assert!(
-            handlers[0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains(crate::conversation_git::tracking::HOOK_ARGUMENT)
-        );
-        assert_eq!(
-            handlers[0]["hooks"][0]["timeout"],
-            crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS
-        );
-    }
-    assert_eq!(hooks["hooks"].as_object().unwrap().len(), 2);
-    assert!(
-        applied
-            .runtime_config_overrides
-            .iter()
-            .any(|entry| entry.starts_with("hooks.state="))
-    );
-    assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
-    assert!(!home.join("hooks.json").exists());
 }

@@ -1,13 +1,13 @@
 import { memo, type CSSProperties } from "react";
 import {
   IconAdjustments,
-  IconCode,
   IconDeviceDesktopCode,
   IconFocus2,
   IconHelpCircle,
   IconInfoCircle,
   IconNetwork,
   IconPhotoSearch,
+  IconTerminal2,
   IconUsersGroup,
   IconWorldSearch,
   IconX,
@@ -77,24 +77,24 @@ const SUBAGENT_TASK_TYPES = [
   },
   {
     id: "codey_visual_analysis",
-    name: "视觉分析",
+    name: "界面核验",
     kind: "analysis",
     icon: IconPhotoSearch,
-    description: "用于截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
+    description: "用于截图、页面、GUI、PDF 的视觉证据观察，以及前端改动的独立核验。",
   },
   {
     id: "codey_worker",
-    name: "代码实施",
+    name: "逻辑开发",
     kind: "implementation",
-    icon: IconCode,
-    description: "用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
+    icon: IconTerminal2,
+    description: "用于后端、数据、算法、命令行和脚本等不改变可见界面的逻辑实现。",
   },
   {
     id: "codey_visual_worker",
-    name: "视觉实施",
+    name: "前端开发",
     kind: "implementation",
     icon: IconDeviceDesktopCode,
-    description: "用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
+    description: "用于界面、布局、样式与交互实现，客户端可截图时附渲染证据。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
@@ -333,7 +333,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责定位、跨文件检索及视觉证据分析，可按任务授权调用工具
+                    负责定位、跨文件检索及界面核验，可按任务授权调用工具
                   </span>
                 </div>
                 <div className="subagent-group-items">
@@ -344,7 +344,7 @@ export function SubagentPolicyCardComponent({
               <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
-                    <span className="subagent-group-title">实施角色</span>
+                    <span className="subagent-group-title">开发角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--write">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
                       <span>已启用</span>
@@ -354,7 +354,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责代码修改、文件写入与页面渲染验证，受父任务权限约束
+                    负责前端界面与逻辑实现，受父任务权限约束
                   </span>
                 </div>
                 <div className="subagent-group-items">
@@ -371,7 +371,7 @@ export function SubagentPolicyCardComponent({
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : "各角色工具权限一致，按任务分工选择模型。角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；旧实例首次启用未注册角色时需重启一次。实际操作受父任务权限约束。"}
+                    : "各角色工具权限一致，按任务分工选择模型。角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；实际操作受父任务权限约束。"}
                 </div>
               </div>
             </>
@@ -419,12 +419,13 @@ const LAUNCH_PROXY_TOOLTIP_CONTENT = (
       支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
     </div>
     <div>
-      限制说明：不支持代理认证（不可携带用户名密码）；SOCKS 代理必须指定端口。
+      限制说明：认证可用 http://用户名:密码@主机:端口 形式；SOCKS 代理必须指定端口；https:// 表示用 TLS 连接代理本身。
     </div>
     <div className="pt-0.5">
       <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
       <div className="mt-0.5 space-y-0.5 font-mono text-[11px] opacity-90">
         <div>http://127.0.0.1:7890</div>
+        <div>http://user:pass@127.0.0.1:7890</div>
         <div>socks5://127.0.0.1:1080</div>
       </div>
     </div>

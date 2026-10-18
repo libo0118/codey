@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useState } from "react";
+import { parseReleaseNotes } from "./releaseNotes";
 import {
   IconAlertTriangle as AlertTriangle,
   IconCheck as Check,
@@ -505,22 +506,10 @@ function ConfirmationDialogComponent({
   const isUpdate =
     confirmation?.action === "download-update" ||
     confirmation?.action === "install-update";
-  const noteGroups = useMemo(() => {
-    const groups: Array<{ title: string; lines: string[] }> = [];
-    if (!isUpdate) return groups;
-    let group = { title: "", lines: [] as string[] };
-    groups.push(group);
-    for (const line of confirmation?.releaseNotes?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? []) {
-      const heading = /^\*\*(新增功能|体验优化|问题修复)\*\*$/.exec(line);
-      if (heading) {
-        group = { title: heading[1], lines: [] };
-        groups.push(group);
-      } else {
-        group.lines.push(line.replace(/^[-*•]\s+/, ""));
-      }
-    }
-    return groups.filter((group) => group.lines.length > 0);
-  }, [isUpdate, confirmation?.releaseNotes]);
+  const noteGroups = useMemo(
+    () => isUpdate ? parseReleaseNotes(confirmation?.releaseNotes) : [],
+    [isUpdate, confirmation?.releaseNotes],
+  );
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent
@@ -547,14 +536,17 @@ function ConfirmationDialogComponent({
               <div className="space-y-3">
                 {noteGroups.map((group, groupIndex) => (
                   <div key={groupIndex}>
-                    {group.title && <h4 className="m-0 mb-1 text-xs font-semibold text-foreground">{group.title}</h4>}
-                    <ul className="m-0 list-disc space-y-2 pl-4">
+                    {group.title && <h4
+                      aria-level={Math.min(Math.max(group.level + 2, 4), 6)}
+                      className={`m-0 mb-1 font-semibold text-foreground ${group.level <= 2 ? "text-sm" : "text-xs"}`}
+                    >{group.title}</h4>}
+                    {group.lines.length > 0 && <ul className="m-0 list-disc space-y-2 pl-4">
                       {group.lines.map((line, index) => (
                         <li key={index} className="pl-1 whitespace-pre-wrap">
                           {line}
                         </li>
                       ))}
-                    </ul>
+                    </ul>}
                   </div>
                 ))}
               </div>
