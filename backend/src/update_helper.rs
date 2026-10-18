@@ -126,14 +126,7 @@ pub(crate) fn parse_installed_version_marker(contents: &str) -> Option<String> {
     contents
         .split_whitespace()
         .map(|token| token.trim_start_matches('v'))
-        .find(|token| {
-            let mut parts = token.split('.');
-            let segments = parts.by_ref().take(3).collect::<Vec<_>>();
-            segments.len() == 3
-                && segments.iter().all(|segment| {
-                    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
-                })
-        })
+        .find(|token| semver::Version::parse(token).is_ok())
         .map(ToString::to_string)
 }
 
@@ -179,53 +172,35 @@ fn executable_was_replaced(path: &Path, before: Option<ExecutableFingerprint>) -
 }
 
 /// 从安装包文件名解析版本号：`Codey-<version>-windows-x64-setup.exe`、
-/// 旧版的 `Codey setup <version>.exe`、以及带 v 前缀的写法都接受。只接受
-/// 恰好三段数字，避免把 `x64` 之类的标记当成版本。
+/// 旧版的 `Codey setup <version>.exe`、以及带 v 前缀的写法都接受。
+/// 保留完整 SemVer 后缀，避免 fork 版本和实验版退化成基础版本。
 #[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
 pub(crate) fn version_from_installer_name(file_name: &str) -> Option<String> {
     let stem = file_name
         .strip_suffix(".exe")
         .or_else(|| file_name.strip_suffix(".EXE"))
         .unwrap_or(file_name);
+    let stem = stem
+        .strip_suffix("-windows-x64-setup")
+        .or_else(|| stem.strip_suffix("-setup"))
+        .unwrap_or(stem);
     let bytes = stem.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let starts_version = bytes[index].is_ascii_digit()
-            && (index == 0 || !bytes[index - 1].is_ascii_digit() || bytes[index - 1] == b'.');
-        if !starts_version {
-            index += 1;
-            continue;
+    bytes.iter().enumerate().find_map(|(index, byte)| {
+        if !byte.is_ascii_digit()
+            || (index > 0 && (bytes[index - 1].is_ascii_digit() || bytes[index - 1] == b'.'))
+        {
+            return None;
         }
-        let start = index;
-        let mut segments: Vec<&str> = Vec::new();
-        let mut cursor = index;
-        loop {
-            let digits_start = cursor;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-                cursor += 1;
-            }
-            if cursor == digits_start {
-                break;
-            }
-            segments.push(&stem[digits_start..cursor]);
-            if cursor < bytes.len() && bytes[cursor] == b'.' {
-                cursor += 1;
-                continue;
-            }
-            break;
-        }
-        let ends_cleanly = cursor >= bytes.len() || !bytes[cursor].is_ascii_digit();
-        if segments.len() == 3 && ends_cleanly {
-            return Some(segments.join("."));
-        }
-        index = start + 1;
-    }
-    None
+        let candidate = &stem[index..];
+        semver::Version::parse(candidate)
+            .ok()
+            .map(|_| candidate.to_string())
+    })
 }
 
 /// 安装结果判定策略（与平台无关，便于直接测试）：
 /// - 期望版本已知时，安装目录的版本标记必须一致，且可执行文件必须真的换过；
-/// - 期望版本未知（文件名解析不出，例如预发布号）时只能依赖文件指纹；
+/// - 期望版本未知（文件名解析不出）时只能依赖文件指纹；
 /// - 没有版本标记（旧版本装出来的目录）时不能谎报成功，无法证明的结果按
 ///   未验证处理，让重启后的新版自行确认。
 #[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
@@ -1100,6 +1075,49 @@ mod tests {
             version_from_installer_name("Codey-windows-x64-setup.exe"),
             None
         );
+    }
+
+    #[test]
+    fn fork_and_experimental_versions_match_the_full_installed_marker() {
+        for version in ["1.3.1", "1.3.1-libo.1", "1.3.1-libo.10", "1.3.1-beta.1"] {
+            for name in [
+                format!("Codey-{version}-windows-x64-setup.exe"),
+                format!("Codey setup {version}.exe"),
+                format!("Codey-{version}-setup.exe"),
+                format!("Codey-v{version}-windows-x64-setup.EXE"),
+            ] {
+                let expected = version_from_installer_name(&name);
+                let marker = parse_installed_version_marker(&format!("v{version}\r\n"));
+                assert_eq!(expected.as_deref(), Some(version), "{name}");
+                assert_eq!(marker.as_deref(), Some(version));
+                assert_eq!(
+                    decide_install_outcome(marker.as_deref(), expected.as_deref(), true, true),
+                    UpdateInstallOutcome::Updated
+                );
+                assert_eq!(
+                    decide_install_outcome(Some("1.3.1-libo.2"), expected.as_deref(), true, true),
+                    UpdateInstallOutcome::Failed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_versions_are_not_truncated_to_a_valid_base_version() {
+        for version in [
+            "1.3.1-libo.",
+            "1.3.1-libo.01",
+            "1.3.1-libo..1",
+            "1.3.1-libo.1!",
+            "1.3.1.2",
+        ] {
+            assert_eq!(parse_installed_version_marker(version), None, "{version}");
+            assert_eq!(
+                version_from_installer_name(&format!("Codey-{version}-windows-x64-setup.exe")),
+                None,
+                "{version}"
+            );
+        }
     }
 
     #[test]
