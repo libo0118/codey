@@ -25,7 +25,9 @@ const PENDING_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeSessionStats {
+pub(crate) struct NativeTurnStats {
+    pub turn_id: String,
+    pub latest_sample_started_at_unix_ms: u64,
     pub model_duration_ms: u64,
     pub average_ttft_ms: Option<f64>,
     pub average_output_tokens_per_second: Option<f64>,
@@ -34,7 +36,6 @@ pub(crate) struct NativeSessionStats {
     pub average_speed_request_count: u64,
     pub average_speed_updated_at_unix_ms: Option<u64>,
     pub updated_at_unix_ms: u64,
-    pub model: Option<String>,
 }
 
 struct RunningSink {
@@ -101,11 +102,31 @@ pub(crate) async fn runtime_overrides(home: PathBuf) -> anyhow::Result<Vec<Strin
     Ok(vec![config])
 }
 
-pub(crate) fn snapshot(home: &Path, session_id: &str) -> Option<NativeSessionStats> {
+pub(crate) fn latest_turn(home: &Path, session_id: &str) -> Option<NativeTurnStats> {
     let session_id = session_uuid(session_id)?;
+    let connection = open_snapshot_connection(home)?;
+    let turn_id: String = connection
+        .query_row(
+            "SELECT turn_id FROM native_samples INDEXED BY native_samples_session_turn
+         WHERE session_id = ?1 AND valid = 1 AND turn_id IS NOT NULL
+         ORDER BY start_ns DESC, turn_id DESC LIMIT 1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    snapshot(home, &session_id, &turn_id)
+}
+
+fn open_snapshot_connection(home: &Path) -> Option<Connection> {
     let connection =
         Connection::open_with_flags(home.join(DB_NAME), OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     connection.busy_timeout(Duration::from_millis(50)).ok()?;
+    Some(connection)
+}
+
+pub(crate) fn snapshot(home: &Path, session_id: &str, turn_id: &str) -> Option<NativeTurnStats> {
+    let session_id = session_uuid(session_id)?;
+    let connection = open_snapshot_connection(home)?;
     connection.query_row(
         "SELECT COUNT(*), SUM((end_ns - start_ns) / 1000000.0),
                 AVG((first_ns - start_ns) / 1000000.0), COUNT(first_ns),
@@ -113,15 +134,19 @@ pub(crate) fn snapshot(home: &Path, session_id: &str) -> Option<NativeSessionSta
                 SUM(CASE WHEN completed_ns > first_ns THEN (completed_ns - first_ns) / 1000000000.0 END),
                 MAX(end_ns / 1000000),
                 COUNT(CASE WHEN completed_ns > first_ns THEN 1 END),
-                MAX(CASE WHEN completed_ns > first_ns THEN end_ns / 1000000 END)
-         FROM native_samples WHERE session_id = ?1 AND valid = 1",
-        [session_id],
+                MAX(CASE WHEN completed_ns > first_ns THEN end_ns / 1000000 END),
+                MAX(start_ns / 1000000)
+         FROM native_samples INDEXED BY native_samples_session_turn
+         WHERE session_id = ?1 AND turn_id = ?2 AND valid = 1",
+        params![session_id, turn_id],
         |row| {
             let request_count: u64 = row.get(0)?;
             let duration: Option<f64> = row.get(1)?;
             let output: Option<f64> = row.get(4)?;
             let seconds: Option<f64> = row.get(5)?;
-            Ok((request_count > 0).then(|| NativeSessionStats {
+            Ok((request_count > 0).then(|| NativeTurnStats {
+                turn_id: turn_id.to_owned(),
+                latest_sample_started_at_unix_ms: row.get(9).unwrap_or_default(),
                 model_duration_ms: duration.unwrap_or_default() as u64,
                 average_ttft_ms: row.get(2).ok().flatten(),
                 average_output_tokens_per_second: output.zip(seconds)
@@ -132,7 +157,6 @@ pub(crate) fn snapshot(home: &Path, session_id: &str) -> Option<NativeSessionSta
                 average_speed_request_count: row.get(7).unwrap_or_default(),
                 average_speed_updated_at_unix_ms: row.get(8).ok().flatten(),
                 updated_at_unix_ms: row.get(6).unwrap_or_default(),
-                model: None,
             }))
         },
     ).ok().flatten()
@@ -507,21 +531,23 @@ impl Pending {
                 transaction.execute(
                     "INSERT INTO native_samples
                         (trace_id, sampling_span_id, request_span_id, stream_span_id, completed_span_id,
-                         session_id, start_ns, end_ns, completed_ns, first_ns, output_tokens, valid)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+                         session_id, turn_id, start_ns, end_ns, completed_ns, first_ns, output_tokens, valid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
                      ON CONFLICT(trace_id, sampling_span_id) DO UPDATE SET
                         valid = native_samples.valid AND
                             native_samples.request_span_id = excluded.request_span_id AND
                             native_samples.stream_span_id = excluded.stream_span_id AND
                             native_samples.completed_span_id = excluded.completed_span_id AND
                             native_samples.session_id = excluded.session_id AND
+                            (native_samples.turn_id IS NULL OR native_samples.turn_id = excluded.turn_id) AND
                             native_samples.start_ns = excluded.start_ns AND native_samples.end_ns = excluded.end_ns AND
                             native_samples.completed_ns = excluded.completed_ns AND native_samples.output_tokens = excluded.output_tokens,
+                        turn_id = COALESCE(native_samples.turn_id, excluded.turn_id),
                         first_ns = CASE WHEN native_samples.first_ns IS NULL THEN excluded.first_ns
                                         WHEN excluded.first_ns IS NULL THEN native_samples.first_ns
                                         ELSE MIN(native_samples.first_ns, excluded.first_ns) END",
                     params![id, sample.span.id, sample.request.id, sample.stream.id, sample.completed.id,
-                        sample.span.session, sample.span.start, sample.span.end,
+                        sample.span.session, sample.span.turn, sample.span.start, sample.span.end,
                         sample.completed.end, sample.first, sample.output_tokens],
                 )?;
             }
@@ -707,7 +733,7 @@ fn open_database(home: &Path) -> anyhow::Result<Connection> {
          CREATE TABLE IF NOT EXISTS native_samples (
              trace_id TEXT NOT NULL, sampling_span_id TEXT NOT NULL,
              request_span_id TEXT NOT NULL, stream_span_id TEXT NOT NULL, completed_span_id TEXT NOT NULL,
-             session_id TEXT NOT NULL, start_ns INTEGER NOT NULL, end_ns INTEGER NOT NULL,
+             session_id TEXT NOT NULL, turn_id TEXT, start_ns INTEGER NOT NULL, end_ns INTEGER NOT NULL,
              completed_ns INTEGER NOT NULL, first_ns INTEGER, output_tokens INTEGER NOT NULL,
              valid INTEGER NOT NULL, PRIMARY KEY (trace_id, sampling_span_id)
          );
@@ -718,6 +744,11 @@ fn open_database(home: &Path) -> anyhow::Result<Connection> {
              PRIMARY KEY (trace_id, request_span_id)
          );"
     )?;
+    // Old samples have no provable turn owner; only a validated replay may fill it in.
+    if !crate::sqlite_util::table_columns(&connection, "native_samples")?.contains("turn_id") {
+        connection.execute("ALTER TABLE native_samples ADD COLUMN turn_id TEXT", [])?;
+    }
+    connection.execute("CREATE INDEX IF NOT EXISTS native_samples_session_turn ON native_samples(session_id, turn_id, valid, start_ns)", [])?;
     Ok(connection)
 }
 

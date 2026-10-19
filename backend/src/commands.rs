@@ -459,7 +459,7 @@ impl AppState {
                 }
                 let runtime = self.runtime.lock().await.clone();
                 let runtime_stats =
-                    runtime.and_then(|runtime| runtime.conversation_stats_snapshot(&session_id));
+                    runtime.and_then(|runtime| runtime.conversation_stats_registry());
                 let stats = crate::conversation_stats::snapshot_with_history(
                     codex_home().to_path_buf(),
                     session_id,

@@ -136,6 +136,56 @@ fn live_speed_throttles_without_losing_counts_and_handles_missing_timing() {
 }
 
 #[test]
+fn last_turn_statistics_keep_multiple_completed_steps_with_logging_disabled() {
+    let directory = tempfile::tempdir().unwrap();
+    let controller = RouteRequestLogController::with_root(directory.path().to_path_buf());
+    let registry = controller.session_stats();
+    let now = Instant::now();
+    for (id, output, generation) in [("a", 100, 1000), ("b", 600, 3000)] {
+        let probe = controller
+            .begin(|producer| {
+                producer.begin(RouteRequestLogStart {
+                    request_id: id,
+                    started_at: now - Duration::from_millis(generation + 300),
+                    request_protocol: RequestProtocol::Sse,
+                    request_kind: "responses",
+                    requested_model: "model",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: Some("disabled-session"),
+                    codex_session_is_parent: false,
+                })
+            })
+            .unwrap();
+        assert!(probe.shared.producer.sender.is_none());
+        probe
+            .shared
+            .router_pre_upstream_micros
+            .store(100_001, Ordering::Relaxed);
+        probe
+            .shared
+            .first_byte_micros
+            .store(200_001, Ordering::Relaxed);
+        probe.observe_event(&serde_json::json!({"type":"response.completed","response":{"usage":{"output_tokens":output}}}));
+        probe.finish_success();
+    }
+    // 第一次查询在两个请求结束后，摘要仍可按原生轮边界恢复。
+    let mut turn = crate::conversation_stats::LastTurnStatsSnapshot::default();
+    turn.id = "turn".into();
+    turn.started_at_unix_ms = Some(super::unix_timestamp_ms_at(now - Duration::from_secs(10)));
+    turn.status = "running";
+    let result = registry
+        .snapshot_with_turn("disabled-session", Some(turn))
+        .unwrap()
+        .last_turn
+        .unwrap();
+    assert_eq!(result.step_count, Some(2));
+    assert!((result.average_output_tokens_per_second.unwrap() - 175.0).abs() < 1.0);
+    assert_eq!(result.coverage, "runtime");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn live_speed_ignores_parent_and_compaction_and_cancelled_requests() {
     let controller = RouteRequestLogController::with_root(PathBuf::new());
     let registry = controller.session_stats();

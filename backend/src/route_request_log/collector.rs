@@ -576,7 +576,13 @@ impl RouteRequestLogProbe {
                 &self.shared.router_pre_upstream_micros,
                 self.shared.started_at,
             );
-            let _ = self.shared.upstream_started_at.set(Instant::now());
+            let started = *self.shared.upstream_started_at.get_or_init(Instant::now);
+            if let (Some(registry), Some((session, request))) = (
+                &self.shared.producer.session_stats,
+                &self.shared.session_request,
+            ) {
+                registry.mark_request_upstream_started(session, request, started);
+            }
             lock_unpoisoned(&self.shared.entry).upstream_transport = Some(transport);
         });
     }

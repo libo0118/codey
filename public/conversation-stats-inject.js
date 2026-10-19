@@ -1,8 +1,8 @@
-// 会话状态条：区分历史会话累计与本次运行统计，未知数据保留空值。
+// 状态条：会话总轮数、最近一轮的活动统计与会话累计 Token 用量，未知数据保留空值。
 // /session/stats 返回统计范围；会话 id 取自可见 composer，隐藏会话不参与。
 (() => {
   const PROBE_KEY = "__codeyConversationStats";
-  const VERSION = 6;
+  const VERSION = 8;
   const previous = window[PROBE_KEY];
   if (previous?.installed && (previous.version === VERSION || !previous.dispose)) return;
   previous?.dispose?.();
@@ -187,7 +187,7 @@
         element.style.setProperty?.("--cs-icon", `url("data:image/svg+xml,${encodeURIComponent(svg)}")`);
       };
       for (const [kind, title, fields] of [
-        ["activity", "会话统计", [["modelDurationMs", "模型用时"], ["toolDurationMs", "工具调用用时"], ["averageTtftMs", "首 token 平均（TTFT）"], ["speed", "平均速度（TPS）"]]],
+        ["activity", "最近一轮统计", [["modelDurationMs", "模型用时"], ["toolDurationMs", "工具调用用时"], ["averageTtftMs", "首 token 平均（TTFT）"], ["speed", "平均速度（TPS）"]]],
         ["tokens", "Token 用量", [["cacheRate", "缓存命中"], ["uncachedInputTokens", "未缓存输入"], ["cachedInputTokens", "缓存读取"], ["outputTokens", "输出"]]],
       ]) {
         const button = make("button", `codey-cs-summary codey-cs-${kind}-summary`, "", groups);
@@ -196,7 +196,8 @@
         button.setAttribute("aria-controls", `${barId}-${kind}`);
         icon(kind, button);
         if (kind === "activity") {
-          refs.activity = make("span", "codey-cs-metric codey-cs-activity", "— 轮 — 步", button);
+          refs.activity = make("span", "codey-cs-metric codey-cs-activity", "— 轮 · — 步", button);
+          refs.activity.title = "轮数为会话总轮数，步骤和速度为最近一轮统计。";
           make("span", "", "·", button).setAttribute("aria-hidden", "true");
           refs.speed = make("span", "codey-cs-metric codey-cs-speed", "—", button);
         } else {
@@ -364,34 +365,31 @@
     const runtimeRequests = data.requestsScope === "runtime"
       || (data.usageSource == null && data.usageScope == null);
     const hasRuntimeRequest = runtimeRequests && (data.requests > 0 || data.inFlight > 0);
-    const running = hasRuntimeRequest && data.inFlight > 0;
+    const turn = typeof data.lastTurn?.id === "string" && data.lastTurn.id.trim()
+      ? data.lastTurn : null;
+    const running = turn?.status === "running";
     const stale = fetchAttempted && !lastFetchOk;
-    const recordedSpeed = data.averageSpeedSource === "request_log"
-      && data.averageSpeedScope === "recorded_requests";
-    const runtimeSpeed = data.averageSpeedSource === "runtime"
-      && data.averageSpeedScope === "runtime";
-    const combinedSpeed = data.averageSpeedSource === "runtime_and_request_log"
-      && data.averageSpeedScope === "recorded_and_runtime";
-    const codexSpeed = data.averageSpeedSource === "codex"
-      && data.averageSpeedScope === "recorded_requests";
     if (!hasRuntimeRequest) {
       for (const key of ["requests", "inFlight", "model", "lastStatus", "updatedAtUnixMs"]) data[key] = null;
     }
-    // 只展示后端按累计输出与生成耗时计算的平均值，不回退到旧的单次请求速度。
-    if ((!recordedSpeed && !runtimeSpeed && !combinedSpeed && !codexSpeed) || (running && stale)) data.averageOutputTokensPerSecond = null;
+    // 最近一轮由后端按用户 turn 归属聚合；不回退到会话累计或单次请求字段。
     for (const key of ["totalTokens", "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens", "requests", "inFlight"]) {
       if (!Number.isFinite(data[key]) || data[key] < 0) data[key] = null;
     }
-    const formattedSpeed = formatSpeed(data.averageOutputTokensPerSecond);
+    if (!Number.isInteger(data.turnCount) || data.turnCount < 0) data.turnCount = null;
+    const formattedSpeed = formatSpeed(running && stale ? null : turn?.averageOutputTokensPerSecond);
     const speedKnown = formattedSpeed != null;
-    const estimatedSpeed = data.averageSpeedIsEstimate === true;
-    const speedText = speedKnown ? `${estimatedSpeed ? "≈" : ""}${formattedSpeed}` : running ? stale ? "更新暂停" : data.speedState === "waiting" ? "等待输出" : "生成中" : "—";
-    const averageScopeNote = combinedSpeed ? "覆盖有记录的历史请求与本次运行，未记录的历史请求不计入"
-      : codexSpeed ? "仅覆盖有记录且有有效计时的请求，计时来自 Codex 原生遥测"
-        : recordedSpeed ? "仅覆盖有记录且有有效计时的请求"
-          : runtimeSpeed ? "仅覆盖本次运行中有有效计时的请求" : "缺少有效计时时显示 —";
-    const speedNote = running && stale ? "实时统计更新失败，恢复后继续显示会话平均速度"
-      : `累计输出 Token ÷ 累计生成耗时，工具间隔不计；${averageScopeNote}${estimatedSpeed && speedKnown ? "；含生成中的 Token 估算" : ""}`;
+    const codexSpeed = turn?.averageSpeedSource === "codex";
+    const estimatedSpeed = !codexSpeed && turn?.speedIsEstimate === true;
+    const speedText = speedKnown ? `${estimatedSpeed ? "≈" : ""}${formattedSpeed}` : running ? stale ? "更新暂停" : turn.speedState === "waiting" ? "等待输出" : "生成中" : "—";
+    const coverageNote = ({
+      runtime: "仅覆盖本轮在本次运行中可统计的步骤",
+      recorded: "仅覆盖本轮可恢复且有有效计时的记录",
+      recorded_and_runtime: "合并本轮可恢复记录与本次运行统计，缺失记录不计入",
+      partial: "本轮记录不完整，仅统计可恢复的部分",
+    })[turn?.coverage] || "本轮统计范围未知，缺失值显示 —";
+    const speedNote = running && stale ? "实时统计更新失败，恢复后继续显示本轮平均速度"
+      : `本轮总输出 Token ÷ 本轮生成耗时，工具间隔不计；${coverageNote}${codexSpeed ? "；计时来自 Codex 原生遥测" : ""}${estimatedSpeed && speedKnown ? "；含生成中的 Token 估算" : ""}`;
     const rate = cacheRatePercent(data.inputTokens, data.cachedInputTokens) || "—";
     const refs = bar.__codeyCs;
     setText(refs.speed, speedText);
@@ -406,34 +404,34 @@
       if (average || seconds < 60) return `${Number(seconds.toFixed(1))}秒`;
       return `${Math.floor(seconds / 60)}分 ${Math.floor(seconds % 60)}秒`;
     };
-    setText(refs.activity, `${count(data.turnCount)} 轮 ${count(data.stepCount)} 步`);
-    const hasData = stats && (hasRuntimeRequest || speedKnown || [data.totalTokens, data.inputTokens, data.outputTokens, data.turnCount, data.stepCount, data.modelDurationMs, data.toolDurationMs, data.averageTtftMs].some(finite));
+    setText(refs.activity, `${count(data.turnCount)} 轮 · ${count(turn?.stepCount)} 步`);
+    const hasData = stats && (turn || hasRuntimeRequest || [data.turnCount, data.totalTokens, data.inputTokens, data.outputTokens].some(finite));
     const unknownUsage = data.usageSource === "unknown" || data.usageScope === "unknown";
     const scopeLabel = !stats || unknownUsage ? "统计范围未知" : sessionUsage ? "会话累计" : "本次运行";
     const state = !currentSessionId ? "waiting" : stale ? "stale" : !fetchAttempted ? "loading" : !hasData ? "empty" : "ok";
     const status = {
       waiting: "等待会话", loading: "读取统计中", stale: "统计暂不可用", empty: "暂无统计",
-      ok: fetchInFlight ? "更新统计中" : data.inFlight > 0 ? `${data.inFlight} 个进行中` : ({ failed: "最近请求失败", incomplete: "最近请求未完成", cancelled: "最近请求已取消", canceled: "最近请求已取消" }[data.lastStatus] || (sessionUsage ? "历史统计" : unknownUsage && recordedSpeed ? "历史速度记录" : "运行期统计")),
+      ok: fetchInFlight ? "更新统计中" : running ? "本轮进行中" : turn?.status === "aborted" ? "本轮已中止" : (sessionUsage ? "历史统计" : "运行期统计"),
     }[state];
     bar.dataset.status = status;
     const tokenValue = value => finite(value) ? `${count(value)} tok` : "—";
     data.uncachedInputTokens = finite(data.inputTokens) && finite(data.cachedInputTokens) && data.cachedInputTokens <= data.inputTokens ? data.inputTokens - data.cachedInputTokens : null;
     for (const [key, element] of Object.entries(refs.fields)) {
-      setText(element, key === "cacheRate" ? rate : key === "speed" ? speedText : key.endsWith("Ms") ? duration(data[key], key === "averageTtftMs") : tokenValue(data[key]));
+      setText(element, key === "cacheRate" ? rate : key === "speed" ? speedText : key.endsWith("Ms") ? duration(turn?.[key], key === "averageTtftMs") : tokenValue(data[key]));
     }
     const pendingNote = stale ? (stats ? "更新失败，当前数据可能已过期。" : "暂时无法读取统计，将自动重试。") : !currentSessionId ? "建立会话后显示统计。" : !stats ? "缺失数据以 — 显示。" : "";
     const sourceNote = unknownUsage ? "Token 统计范围未知。" : sessionUsage ? "会话累计用量，缓存已包含在输入中。" : "仅统计本次运行的用量。";
-    const codexTiming = data.timingSource === "codex" && data.timingScope === "recorded_requests";
-    const timingNote = codexTiming ? "模型计时来自 Codex 原生遥测，仅覆盖有有效计时的请求。" : data.timingScope === "runtime" ? "模型计时仅覆盖本次运行。" : data.timingScope ? "模型计时仅覆盖有有效计时的请求。" : "缺少有效计时时显示 —。";
-    const ttftBoundary = data.ttftBoundary ?? (codexTiming ? "first_output_item" : "first_content");
-    const ttftNote = !finite(data.averageTtftMs) ? "" : ttftBoundary === "first_output_item" ? "TTFT 计至首个输出项。" : ttftBoundary === "first_content" ? "TTFT 计至首个实际内容。" : "TTFT 边界未知。";
-    const activityNote = data.stepScope === "runtime" ? "步数仅覆盖本次运行。" : data.stepScope === "recorded_requests" ? "步数仅覆盖有记录的生成请求。" : data.stepScope === "recorded_session" ? "步数为会话内模型生成次数。" : "缺失的轮数和步数显示 —。";
-    const toolNote = data.toolTimingScope ? "工具用时为累计值，并行调用可能重叠。" : "";
+    const codexTiming = turn?.timingSource === "codex";
+    const timingNote = codexTiming || codexSpeed ? "模型计时来自 Codex 原生遥测，按原生 trace 导出后刷新。" : "";
+    const ttftBoundary = turn?.ttftBoundary ?? (codexTiming ? "first_output_item" : "first_content");
+    const ttftNote = !finite(turn?.averageTtftMs) ? "" : ttftBoundary === "first_output_item" ? "TTFT 计至首个输出项。" : ttftBoundary === "first_content" ? "TTFT 计至首个实际内容。" : "TTFT 边界未知。";
+    const activityNote = turn ? "一次提问为一轮，步数为该轮模型生成次数。" : "暂无可识别的最近一轮。";
+    const toolNote = finite(turn?.toolDurationMs) ? "工具用时为本轮累计值，并行调用可能重叠。" : "";
     setText(refs.notes.activity, `${pendingNote}${activityNote}${timingNote}${ttftNote}${toolNote}${speedNote}。`);
     setText(refs.notes.tokens, `${pendingNote}${sourceNote}`);
-    refs.buttons.activity.setAttribute("aria-label", `会话统计，${refs.activity.textContent}，会话平均速度 ${speedText}，${status}。${speedNote}。查看统计详情`);
+    refs.buttons.activity.setAttribute("aria-label", `会话总轮数 ${count(data.turnCount)} 轮，最近一轮统计 ${count(turn?.stepCount)} 步，本轮平均速度 ${speedText}，${status}。${speedNote}。查看统计详情`);
     refs.buttons.tokens.setAttribute("aria-label", `Token 用量，${scopeLabel} ${refs.total.textContent}，缓存命中 ${rate}，${status}。查看统计详情`);
-    bar.dataset.running = data.inFlight > 0 ? "true" : "false";
+    bar.dataset.running = running ? "true" : "false";
     bar.dataset.state = state;
     positionPanel();
   };
@@ -443,6 +441,9 @@
     clearTimeout(pollTimer);
     pollTimer = setTimeout(poll, delay);
   };
+
+  const pollInterval = () => stats?.lastTurn?.status === "running" || stats?.inFlight > 0
+    ? POLL_ACTIVE_MS : POLL_IDLE_MS;
 
   const poll = async () => {
     if (disposed) return;
@@ -488,13 +489,13 @@
         fetchInFlight = false;
         if (!disposed) {
           completedContext ||= resolveSessionContext();
-          schedulePoll(requestGeneration !== sessionGeneration || completedContext.sessionId !== requestSessionId ? 0 : stats?.inFlight > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+          schedulePoll(requestGeneration !== sessionGeneration || completedContext.sessionId !== requestSessionId ? 0 : pollInterval());
         }
       }
       render(completedContext?.anchor);
       return;
     }
-    schedulePoll(stats?.inFlight > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    schedulePoll(pollInterval());
   };
 
   const scheduleRescan = () => {

@@ -7,15 +7,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags, params, params_from_iter, types::Value as SqlValue};
+#[cfg(test)]
+use rusqlite::params;
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue};
 
+#[cfg(test)]
+use super::SessionRecordedTiming;
 use super::{
     MAX_LOG_STRING_BYTES, NDJSON_FILE_NAME, RouteRequestLogAnalytics, RouteRequestLogClearResult,
     RouteRequestLogCursor, RouteRequestLogDailyTrend, RouteRequestLogGroup,
     RouteRequestLogModelPage, RouteRequestLogModelQuery, RouteRequestLogQuery,
     RouteRequestLogQueryItem, RouteRequestLogQueryPage, RouteRequestLogSummary,
     RouteRequestLogTrend, SQLITE_BUSY_TIMEOUT, SQLITE_FILE_NAME, SessionGenerationTotals,
-    SessionRecordedAverage, SessionRecordedTiming, lock_unpoisoned, to_i64, unix_timestamp_ms,
+    lock_unpoisoned, to_i64, unix_timestamp_ms,
 };
 use crate::config::RouteRequestLogBackend;
 use crate::sqlite_util::table_columns;
@@ -170,6 +174,7 @@ impl RouteRequestLogQuery {
 
 /// 从现有日志恢复最近一次具备有效生成计时的正式请求，不改变日志开关。
 /// 日志库跨 Codex home 共用，归属仅通过精确会话 UUID 确定。
+#[cfg(test)]
 pub(crate) fn latest_session_recorded_speed(root: &Path, session_id: &str) -> Option<(f64, u64)> {
     let path = root.join(SQLITE_FILE_NAME);
     if !path.is_file() {
@@ -196,45 +201,63 @@ pub(crate) fn latest_session_recorded_speed(root: &Path, session_id: &str) -> Op
 }
 
 /// 只统计保留的自身生成请求；缺失、采样或已清理的日志不补零，不宣称全会话覆盖。
+#[cfg(test)]
 pub(crate) fn session_recorded_timing(
     root: &Path,
     session_id: &str,
+    boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
 ) -> Option<SessionRecordedTiming> {
     let path = root.join(SQLITE_FILE_NAME);
     if !path.is_file() {
         return None;
     }
     let connection = open_query_connection(&path).ok()?;
-    connection.query_row(
-        "SELECT COUNT(*),
+    let (sql, values) = session_timing_query(session_id, boundary);
+    connection
+        .query_row(&sql, params_from_iter(values), |row| {
+            Ok(SessionRecordedTiming {
+                requests: row.get(0)?,
+                model_duration_ms: row.get(1)?,
+                average_ttft_ms: row.get(2)?,
+                timing_request_count: row.get(3)?,
+                ttft_sample_count: row.get(4)?,
+            })
+        })
+        .ok()
+        .filter(|value| value.requests > 0)
+}
+
+#[cfg(test)]
+fn session_timing_query(
+    session_id: &str,
+    boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from("SELECT COUNT(*),
           SUM(CASE WHEN router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms
               THEN total_duration_ms - router_pre_upstream_ms END),
           AVG(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms
               THEN downstream_first_content_ms END),
           COUNT(CASE WHEN router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms THEN 1 END),
-          COUNT(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms THEN 1 END),
-          MAX(CASE WHEN (router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms)
-              OR (downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms)
-              THEN timestamp_unix_ms END)
+          COUNT(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms THEN 1 END)
          FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
-         WHERE codex_session_id IN (?1, ?2) AND request_kind = 'responses'
-           AND COALESCE(codex_session_is_parent, 0) = 0",
-        params![session_id, format!("local:{session_id}")],
-        |row| Ok(SessionRecordedTiming {
-            requests: row.get(0)?, model_duration_ms: row.get(1)?, average_ttft_ms: row.get(2)?,
-            timing_request_count: row.get(3)?, ttft_sample_count: row.get(4)?,
-            updated_at_unix_ms: row.get(5)?,
-        }),
-    ).ok().filter(|value| value.requests > 0)
+         WHERE codex_session_id IN (?, ?) AND request_kind = 'responses'
+           AND COALESCE(codex_session_is_parent, 0) = 0 AND timestamp_unix_ms >= 0");
+    let mut values = vec![
+        SqlValue::Text(session_id.to_owned()),
+        SqlValue::Text(format!("local:{session_id}")),
+    ];
+    append_runtime_history_boundary(&mut sql, &mut values, boundary);
+    (sql, values)
 }
 
 /// 只读聚合历史与运行期边界之前的合格请求。短回复与零输出也参与累计，
 /// 但缺 usage、缺计时、逆序计时和零生成时长不能进入分子或分母。
+#[cfg(test)]
 pub(crate) fn session_recorded_average(
     root: &Path,
     session_id: &str,
     boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
-) -> Option<SessionRecordedAverage> {
+) -> Option<SessionGenerationTotals> {
     let path = root.join(SQLITE_FILE_NAME);
     if !path.is_file() {
         return None;
@@ -243,27 +266,24 @@ pub(crate) fn session_recorded_average(
     let (sql, values) = session_average_query(session_id, boundary);
     connection
         .query_row(&sql, params_from_iter(values), |row| {
-            Ok(SessionRecordedAverage {
-                totals: SessionGenerationTotals {
-                    output_tokens: row.get(0)?,
-                    generation_ms: row.get(1)?,
-                    requests: row.get(2)?,
-                },
-                updated_at_unix_ms: row.get(3)?,
+            Ok(SessionGenerationTotals {
+                output_tokens: row.get(0)?,
+                generation_ms: row.get(1)?,
+                requests: row.get(2)?,
             })
         })
         .ok()
-        .filter(|recorded| recorded.totals.speed().is_some())
+        .filter(|totals| totals.speed().is_some())
 }
 
+#[cfg(test)]
 fn session_average_query(
     session_id: &str,
     boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
 ) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         "SELECT SUM(output_tokens * 1.0),
-        SUM((total_duration_ms - router_pre_upstream_ms - upstream_first_byte_ms) * 1.0), COUNT(*),
-        MAX(timestamp_unix_ms)
+        SUM((total_duration_ms - router_pre_upstream_ms - upstream_first_byte_ms) * 1.0), COUNT(*)
         FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
         WHERE codex_session_id IN (?, ?) AND request_kind = 'responses'
           AND COALESCE(codex_session_is_parent, 0) = 0
@@ -275,6 +295,15 @@ fn session_average_query(
         SqlValue::Text(session_id.to_owned()),
         SqlValue::Text(format!("local:{session_id}")),
     ];
+    append_runtime_history_boundary(&mut sql, &mut values, boundary);
+    (sql, values)
+}
+
+fn append_runtime_history_boundary(
+    sql: &mut String,
+    values: &mut Vec<SqlValue>,
+    boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
+) {
     if let Some(boundary) = boundary {
         if boundary.exclude_entire_millisecond {
             sql.push_str(" AND timestamp_unix_ms < ?");
@@ -297,6 +326,96 @@ fn session_average_query(
             }
         }
     }
+}
+
+/// 最近一轮只查询明确时间窗，沿用会话时间索引，不扫描其他会话或旧轮次。
+pub(crate) fn last_turn_recorded_stats(
+    root: &Path,
+    session_id: &str,
+    window: &crate::conversation_stats::TurnWindow,
+    boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
+) -> Option<crate::conversation_stats::TurnRequestTotals> {
+    let path = root.join(SQLITE_FILE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    let connection = open_query_connection(&path).ok()?;
+    let (sql, values) = last_turn_stats_query(session_id, window, boundary);
+    connection
+        .query_row(&sql, params_from_iter(values), |row| {
+            Ok(crate::conversation_stats::TurnRequestTotals {
+                requests: row.get(0)?,
+                model_duration_ms: row.get::<_, Option<u64>>(1)?.unwrap_or(0),
+                model_samples: row.get(2)?,
+                ttft_total_ms: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                ttft_samples: row.get(4)?,
+                generation: SessionGenerationTotals {
+                    output_tokens: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    generation_ms: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                    requests: row.get(7)?,
+                },
+                excluded_boundary_requests: row.get(8)?,
+                timing_updated_at_unix_ms: row.get(9)?,
+                speed_updated_at_unix_ms: row.get(10)?,
+            })
+        })
+        .ok()
+        .filter(|totals| totals.requests > 0 || totals.excluded_boundary_requests > 0)
+}
+
+fn last_turn_stats_query(
+    session_id: &str,
+    window: &crate::conversation_stats::TurnWindow,
+    boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
+) -> (String, Vec<SqlValue>) {
+    let generation = "output_tokens >= 0 AND router_pre_upstream_ms >= 0 AND upstream_first_byte_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms AND total_duration_ms - router_pre_upstream_ms > upstream_first_byte_ms";
+    let model = "router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms";
+    let ttft =
+        "downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms";
+    let mut sql = format!("SELECT COUNT(CASE WHEN inside_turn = 1 THEN 1 END),
+        SUM(CASE WHEN {model} THEN total_duration_ms - router_pre_upstream_ms END),
+        COUNT(CASE WHEN {model} THEN 1 END),
+        SUM(CASE WHEN {ttft} THEN downstream_first_content_ms * 1.0 END),
+        COUNT(CASE WHEN {ttft} THEN 1 END),
+        SUM(CASE WHEN {generation} THEN output_tokens * 1.0 END),
+        SUM(CASE WHEN {generation} THEN (total_duration_ms - router_pre_upstream_ms - upstream_first_byte_ms) * 1.0 END),
+        COUNT(CASE WHEN {generation} THEN 1 END),
+        COUNT(CASE WHEN inside_turn = 0 THEN 1 END),
+        MAX(CASE WHEN ({model}) OR ({ttft}) THEN timestamp_unix_ms + total_duration_ms END),
+        MAX(CASE WHEN {generation} THEN timestamp_unix_ms + total_duration_ms END)
+        FROM (SELECT total_duration_ms, router_pre_upstream_ms, downstream_first_content_ms,
+            upstream_first_byte_ms, output_tokens, timestamp_unix_ms, 1 AS inside_turn
+        FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
+        WHERE codex_session_id IN (?, ?) AND request_kind = 'responses'
+        AND COALESCE(codex_session_is_parent, 0) = 0 AND timestamp_unix_ms > ?");
+    let mut values = vec![
+        SqlValue::Text(session_id.to_owned()),
+        SqlValue::Text(format!("local:{session_id}")),
+        SqlValue::Integer(to_i64(window.started_at_unix_ms)),
+    ];
+    if let Some(end) = window.completed_at_unix_ms {
+        sql.push_str(" AND timestamp_unix_ms < ?");
+        values.push(SqlValue::Integer(to_i64(end)));
+    }
+    append_runtime_history_boundary(&mut sql, &mut values, boundary);
+    // 起止毫秒内没有 turn ID 的请求无法可靠归属。单独精确查这两个毫秒，
+    // 不扩大上述历史范围，也不漏掉运行期去重上界之后的结束边界样本。
+    sql.push_str(
+        " UNION ALL SELECT NULL, NULL, NULL, NULL, NULL, NULL, 0
+        FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
+        WHERE codex_session_id IN (?, ?) AND request_kind = 'responses'
+        AND COALESCE(codex_session_is_parent, 0) = 0 AND timestamp_unix_ms IN (?",
+    );
+    values.extend([
+        SqlValue::Text(session_id.to_owned()),
+        SqlValue::Text(format!("local:{session_id}")),
+        SqlValue::Integer(to_i64(window.started_at_unix_ms)),
+    ]);
+    if let Some(end) = window.completed_at_unix_ms {
+        sql.push_str(", ?");
+        values.push(SqlValue::Integer(to_i64(end)));
+    }
+    sql.push_str("))");
     (sql, values)
 }
 

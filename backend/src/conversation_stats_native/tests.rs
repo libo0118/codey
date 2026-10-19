@@ -6,6 +6,10 @@ const FOREIGN: &str = "01a1431a-c590-70c1-8cb3-6dbdfff19cc1";
 const TRACE: &str = "00112233445566778899aabbccddeeff";
 const BASE: i64 = 1_790_000_000_000_000_000;
 
+fn snapshot(home: &Path, session: &str) -> Option<NativeTurnStats> {
+    latest_turn(home, session)
+}
+
 fn attr(key: &str, value: Value) -> Value {
     json!({"key":key,"value":value})
 }
@@ -122,7 +126,6 @@ fn real_shape_parent_chain_excludes_tool_wait_and_first_wait_from_speed() {
     assert_eq!(stats.request_count, 1);
     assert_eq!(stats.ttft_sample_count, 1);
     assert_eq!(stats.updated_at_unix_ms, (BASE / 1_000_000 + 4_000) as u64);
-    assert!(stats.model.is_none());
     assert!(snapshot(home.path(), FOREIGN).is_none());
     assert!(snapshot(home.path(), "not-a-session").is_none());
 }
@@ -396,6 +399,173 @@ fn aggregate_speed_weights_generation_windows_and_keeps_distinct_traces_separate
     assert_eq!(stats.model_duration_ms, 5_000);
     assert_eq!(stats.average_ttft_ms, Some(900.0));
     assert!((stats.average_output_tokens_per_second.unwrap() - 500.0 / 3.0).abs() < 1e-9);
+}
+
+#[test]
+fn exact_turn_queries_do_not_mix_different_turn_speeds_or_foreign_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    let mut connection = open_database(home.path()).unwrap();
+    let mut pending = Pending::default();
+    ingest(&mut pending, &mut connection, &fixture());
+    let mut second = fixture();
+    for value in &mut second {
+        value["traceId"] = json!("112233445566778899aabbccddeeff00");
+        for field in ["startTimeUnixNano", "endTimeUnixNano"] {
+            let timestamp = value[field].as_str().unwrap().parse::<i64>().unwrap();
+            value[field] = json!((timestamp + 30_000_000_000).to_string());
+        }
+        for attribute in value["attributes"].as_array_mut().unwrap() {
+            if matches!(attribute["key"].as_str(), Some("turn.id" | "turn_id")) {
+                attribute["value"]["stringValue"] = json!("turn-2");
+            }
+        }
+    }
+    second[5]["attributes"][0] = attr("gen_ai.usage.output_tokens", json!({"intValue":400}));
+    ingest(&mut pending, &mut connection, &second);
+    for (turn, speed) in [("turn-1", 50.0), ("turn-2", 200.0)] {
+        let stats = super::snapshot(home.path(), OWN, turn).unwrap();
+        assert_eq!(stats.turn_id, turn);
+        assert_eq!(stats.request_count, 1);
+        assert_eq!(stats.model_duration_ms, 3_000);
+        assert_eq!(stats.average_output_tokens_per_second, Some(speed));
+    }
+    assert_eq!(latest_turn(home.path(), OWN).unwrap().turn_id, "turn-2");
+    assert!(super::snapshot(home.path(), OWN, "turn-3").is_none());
+    assert!(super::snapshot(home.path(), FOREIGN, "turn-2").is_none());
+    let plan = connection.prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM native_samples INDEXED BY native_samples_session_turn WHERE session_id = ?1 AND turn_id = ?2 AND valid = 1").unwrap()
+        .query_map(params![OWN, "turn-2"], |row| row.get::<_, String>(3)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap().join(" ");
+    assert!(plan.contains("SEARCH native_samples USING"), "{plan}");
+    assert!(!plan.contains("SCAN native_samples"), "{plan}");
+}
+
+#[test]
+fn old_database_migration_preserves_samples_without_guessing_their_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let connection = Connection::open(home.path().join(DB_NAME)).unwrap();
+    connection.execute_batch("CREATE TABLE native_samples (
+        trace_id TEXT NOT NULL, sampling_span_id TEXT NOT NULL,
+        request_span_id TEXT NOT NULL, stream_span_id TEXT NOT NULL, completed_span_id TEXT NOT NULL,
+        session_id TEXT NOT NULL, start_ns INTEGER NOT NULL, end_ns INTEGER NOT NULL,
+        completed_ns INTEGER NOT NULL, first_ns INTEGER, output_tokens INTEGER NOT NULL,
+        valid INTEGER NOT NULL, PRIMARY KEY (trace_id, sampling_span_id));").unwrap();
+    connection.execute("INSERT INTO native_samples VALUES (?1,'0000000000000002','0000000000000001','0000000000000003','0000000000000007',?2,?3,?4,?5,?6,100,1)",
+        params![TRACE, OWN, BASE + 1_000_000_000, BASE + 4_000_000_000, BASE + 3_900_000_000, BASE + 1_900_000_000]).unwrap();
+    assert!(latest_turn(home.path(), OWN).is_none());
+    assert!(
+        !crate::sqlite_util::table_columns(&connection, "native_samples")
+            .unwrap()
+            .contains("turn_id")
+    );
+    drop(connection);
+    let mut connection = open_database(home.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_samples WHERE turn_id IS NULL",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert!(super::snapshot(home.path(), OWN, "turn-1").is_none());
+    // A full, matching span replay supplies direct ownership evidence for this old sample.
+    ingest(&mut Pending::default(), &mut connection, &fixture());
+    assert_eq!(
+        super::snapshot(home.path(), OWN, "turn-1")
+            .unwrap()
+            .request_count,
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM native_samples", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    assert_eq!(
+        open_database(home.path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM native_samples", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn native_only_history_returns_last_turn_without_claiming_user_boundaries_or_tokens() {
+    let home = tempfile::tempdir().unwrap();
+    let mut connection = open_database(home.path()).unwrap();
+    ingest(&mut Pending::default(), &mut connection, &fixture());
+    let snapshot =
+        crate::conversation_stats::snapshot_with_history(home.path().into(), OWN.into(), None)
+            .await
+            .unwrap();
+    assert_eq!(snapshot.total_tokens, None);
+    assert_eq!(snapshot.turn_count, None);
+    assert_eq!(snapshot.step_count, None);
+    assert_eq!(snapshot.tool_duration_ms, None);
+    assert_eq!(snapshot.average_output_tokens_per_second, None);
+    let turn = snapshot.last_turn.unwrap();
+    assert_eq!(turn.id, "turn-1");
+    assert_eq!(turn.status, "unknown");
+    assert_eq!(turn.started_at_unix_ms, None);
+    assert_eq!(turn.completed_at_unix_ms, None);
+    assert_eq!(turn.step_count, None);
+    assert_eq!(turn.average_output_tokens_per_second, Some(50.0));
+    assert_eq!(turn.coverage, "partial");
+}
+
+#[tokio::test]
+async fn history_new_rollout_turn_clears_previous_native_values_without_exact_match() {
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let mut connection = open_database(home.path()).unwrap();
+    ingest(&mut Pending::default(), &mut connection, &fixture());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let rollout = sessions.join(format!("rollout-test-{OWN}.jsonl"));
+    let started = |id: &str, offset: i64| {
+        json!({"type":"event_msg", "timestamp":
+        chrono::DateTime::from_timestamp_millis(BASE / 1_000_000 + offset).unwrap().to_rfc3339(),
+        "payload":{"type":"task_started","turn_id":id}})
+    };
+    std::fs::write(&rollout, format!("{}\n{}\n{}\n",
+        json!({"type":"session_meta","payload":{"id":OWN}}), started("turn-1", 0),
+        json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"output_tokens":20,"total_tokens":100}}}}))).unwrap();
+    let first =
+        crate::conversation_stats::snapshot_with_history(home.path().into(), OWN.into(), None)
+            .await
+            .unwrap();
+    assert_eq!(first.total_tokens, Some(100));
+    assert_eq!(first.turn_count, Some(1));
+    assert_eq!(
+        first.last_turn.unwrap().average_output_tokens_per_second,
+        Some(50.0)
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(rollout)
+        .unwrap();
+    writeln!(file, "{}", started("turn-2", 30_000)).unwrap();
+    file.flush().unwrap();
+    let next =
+        crate::conversation_stats::snapshot_with_history(home.path().into(), OWN.into(), None)
+            .await
+            .unwrap();
+    assert_eq!(next.total_tokens, Some(100));
+    assert_eq!(next.turn_count, Some(2));
+    let turn = next.last_turn.unwrap();
+    assert_eq!(turn.id, "turn-2");
+    assert_eq!(turn.model_duration_ms, None);
+    assert_eq!(turn.average_output_tokens_per_second, None);
+    assert_eq!(turn.average_ttft_ms, None);
+    assert_eq!(turn.timing_source, None);
+    assert_eq!(turn.average_speed_source, None);
 }
 
 #[test]

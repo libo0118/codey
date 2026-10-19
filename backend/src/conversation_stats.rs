@@ -14,7 +14,10 @@ use crate::route_request_log::{RouteRequestLogEntry, SessionGenerationTotals};
 mod activity;
 #[path = "conversation_stats_history.rs"]
 mod history;
+#[path = "conversation_stats_turn.rs"]
+mod turn;
 pub(crate) use history::snapshot_with_history;
+pub(crate) use turn::{LastTurnStatsSnapshot, TurnRequestTotals, TurnWindow};
 
 /// 单会话状态条口径只统计正式生成请求（Responses create）；压缩等其他请求
 /// 仍会计入 Token 累计，但不刷新速度与请求计数。
@@ -27,6 +30,7 @@ const MAX_BOUNDARY_REQUESTS: usize = 256;
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConversationStatsSnapshot {
+    pub last_turn: Option<LastTurnStatsSnapshot>,
     /// 最近一次完成请求实际使用的模型；上游未回报时回退请求模型。
     pub model: Option<String>,
     /// 正式生成请求完成数（含失败）。
@@ -63,6 +67,7 @@ pub(crate) struct ConversationStatsSnapshot {
     pub usage_source: &'static str,
     pub usage_scope: &'static str,
     pub requests_scope: Option<&'static str>,
+    /// 原生会话的累计用户轮数，独立于 last_turn；无法可靠去重时保持未知。
     pub turn_count: Option<u64>,
     pub step_count: Option<u64>,
     pub model_duration_ms: Option<u64>,
@@ -83,6 +88,7 @@ pub(crate) struct ConversationStatsSnapshot {
 
 #[derive(Debug, Default)]
 struct SessionStats {
+    turn: turn::TurnRuntime,
     model: Option<String>,
     requests: u64,
     active_requests: HashMap<String, ActiveRequestStats>,
@@ -145,6 +151,8 @@ impl RuntimeHistoryBoundary {
 #[derive(Debug, Default)]
 struct ActiveRequestStats {
     started_seq: u64,
+    started_at_unix_ms: u64,
+    upstream_started_at: Option<Instant>,
     sample: Option<LiveSpeedSample>,
     streaming: bool,
     recorded_at_unix_ms: Option<u64>,
@@ -201,6 +209,7 @@ impl ConversationStatsRegistry {
         let touched_seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mut sessions = lock_unpoisoned(&self.sessions);
         let stats = sessions.entry(session_id.to_string()).or_default();
+        stats.turn.begin(request_id, started_at_unix_ms);
         RuntimeHistoryBoundary::observe(
             &mut stats.history_boundary,
             started_at_unix_ms,
@@ -213,18 +222,36 @@ impl ConversationStatsRegistry {
                 .iter()
                 .min_by_key(|(_, request)| request.started_seq)
                 .map(|(id, _)| id.clone())
+            && let Some(removed) = stats.active_requests.remove(&oldest)
         {
-            stats.active_requests.remove(&oldest);
+            stats.turn.lost_active(removed.started_at_unix_ms);
         }
         stats
             .active_requests
             .entry(request_id.to_string())
             .or_insert(ActiveRequestStats {
                 started_seq: touched_seq,
+                started_at_unix_ms,
                 ..Default::default()
             });
         stats.touched_seq = touched_seq;
         evict_overflow(&mut sessions);
+    }
+
+    /// 模型用时从真实上游发送开始，不包含路由准备和工具间隔。
+    pub(crate) fn mark_request_upstream_started(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        at: Instant,
+    ) {
+        let mut sessions = lock_unpoisoned(&self.sessions);
+        if let Some(active) = sessions
+            .get_mut(normalize_session_id(session_id))
+            .and_then(|stats| stats.active_requests.get_mut(request_id))
+        {
+            active.upstream_started_at.get_or_insert(at);
+        }
     }
 
     /// 只更新仍属于同一活动请求的数字摘要，不保存流式内容或累计 Token。
@@ -265,6 +292,7 @@ impl ConversationStatsRegistry {
         let own_generation =
             entry.request_kind == CONVERSATION_REQUEST_KIND && !entry.codex_session_is_parent;
         if own_generation {
+            stats.turn.finish(entry);
             RuntimeHistoryBoundary::observe(
                 &mut stats.history_boundary,
                 entry.timestamp_unix_ms,
@@ -338,6 +366,29 @@ impl ConversationStatsRegistry {
 
     pub(crate) fn snapshot(&self, session_id: &str) -> Option<ConversationStatsSnapshot> {
         self.snapshot_at(session_id, Instant::now())
+    }
+
+    pub(crate) fn snapshot_with_turn(
+        &self,
+        session_id: &str,
+        last_turn: Option<LastTurnStatsSnapshot>,
+    ) -> Option<ConversationStatsSnapshot> {
+        let last_turn = last_turn.map(|turn| {
+            let mut sessions = lock_unpoisoned(&self.sessions);
+            // 即便首个请求还未到达，也记住明确轮边界，后续完成只做数字累计。
+            let stats = sessions
+                .entry(normalize_session_id(session_id).to_owned())
+                .or_default();
+            stats.touched_seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+            let result = stats
+                .turn
+                .snapshot(turn, &stats.active_requests, Instant::now());
+            evict_overflow(&mut sessions);
+            result
+        });
+        let mut snapshot = self.snapshot(session_id)?;
+        snapshot.last_turn = last_turn;
+        Some(snapshot)
     }
 
     fn snapshot_at(&self, session_id: &str, now: Instant) -> Option<ConversationStatsSnapshot> {
