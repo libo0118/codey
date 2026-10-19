@@ -682,6 +682,121 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
   }
 });
 
+test("API-key service-tier access follows the current model without changing native account gates", async () => {
+  try {
+    (0, eval)(await loadStartupPatchTemplate());
+    // Keep the native memo dependencies: access (27), request (36), options (38).
+    const source = [
+      "const caches=new WeakMap;function settings(auth,model,tier){",
+      "const u=auth,h={models:auth.models??[model],isLoading:auth.catalogLoading===true},o={model:model.model,isLoading:auth.modelLoading===true},conversation=null,pending=auth.requirementsPending===true;",
+      "let a=caches.get(auth);if(a==null){a=Array(56).fill(Symbol.for(`react.memo_cache_sentinel`));caches.set(auth,a)}",
+      "let b=BYe(u),S=b?.authMethod??null;",
+      "let{serviceTierAccess:D}=KVi(auth),A,k,M,N,O,j,R;",
+      "if(a[13]!==tier||a[15]!==pending||a[17]!==h.isLoading||a[21]!==h.models||a[22]!==o.isLoading||a[23]!==o.model||a[27]!==D||a[31]!==auth.isLoading){",
+      "let t=fVi(h?.models,o.model);",
+      "N=RZe(t,tier,D),k=N==null?null:sve(t,N);",
+      "O=o.isLoading||h.isLoading||conversation==null&&pending,j=async()=>{};",
+      "R=D;let H;a[42]===D?H=a[43]:(H=e=>vne(e.value,D),a[42]=D,a[43]=H);",
+      "M=Rwe(t).filter(H),a[13]=tier,a[15]=pending,a[17]=h.isLoading,a[21]=h.models,a[22]=o.isLoading,a[23]=o.model,a[27]=D,a[31]=auth.isLoading,a[33]=O,a[34]=k,a[36]=N,a[38]=M,a[41]=R}",
+      "else O=a[33],k=a[34],N=a[36],M=a[38],R=a[41];let I;",
+      "a[44]!==O||a[45]!==k||a[47]!==N||a[48]!==M?(I={availableOptions:M,isLoading:O,selectedServiceTier:k,selectedServiceTierForModel:null,serviceTierForRequest:N},a[44]=O,a[45]=k,a[47]=N,a[48]=M,a[49]=I):I=a[49];",
+      "return{hasManagedNewThreadSettings:false,serviceTierAccess:R,serviceTierSettings:I}}",
+      "function composer(auth,model,tier,{draft:fe=false,hidden:he=false,daybreak:Ge=false}={}){",
+      "let{serviceTierSettings:rt}=settings(auth,model,tier);",
+      "let{serviceTierAccess:ot}=KVi(auth);",
+      "let St=model,Kt=rt.selectedServiceTier,Jt=rt.availableOptions.find(e=>e.value===Kt),",
+      "Zt=Jt?.iconKind??null,Qt=!Ge&&!he&&Zt!=null&&Ht(St,Kt),",
+      "$t=!he&&!fe&&ot!=null&&rt.availableOptions.length>1;",
+      "return{modelPickerTriggerConfig:{selectedServiceTierIconKind:Qt?Zt:null},show:$t,settings:rt}}",
+      "function speedCommands(auth,model,tier){const marker=`composer.speedSlashCommand.disableDescription`;let{serviceTierSettings:s}=settings(auth,model,tier);",
+      "let{serviceTierAccess:o}=KVi(auth);",
+      "return s.availableOptions.map(e=>({enabled:vne(e.value,o)&&!s.isLoading,option:e}))}",
+      "function speedSettings(auth,model,tier){let{serviceTierAccess:n}=KVi(auth),{serviceTierSettings:r}=settings(auth,model,tier);",
+      "if(n==null||r.availableOptions.length<=1)return null;return r}",
+      "function setTier(auth,model,tier,nextTier){let{serviceTierAccess:d}=settings(auth,model,tier);",
+      "if(!vne(nextTier,d))return false;return nextTier}",
+      "function BYe(auth){return auth}",
+      "function KVi(auth){return{serviceTierAccess:auth.isLoading===true?null:auth.access??null,isLoading:auth.isLoading===true}}",
+      "function fVi(models,model){return models.find(e=>e.model===model)}",
+      "function vne(tier,access){return tier==null||tier===`default`||access?.[tier===`ultrafast`?`ultrafast`:`fast`]===true}",
+      "function RZe(model,tier,access){return vne(tier,access)?tier:null}",
+      "function sve(model,tier){return model?.serviceTiers?.find(e=>e.id===tier||tier===`fast`&&e.id===`priority`)?.id??null}",
+      "function Rwe(model){return[{value:null,iconKind:null},...(model?.serviceTiers??[]).map(e=>",
+      "({value:e.id,iconKind:e.id===`priority`?`fast`:e.id===`ultrafast`?`ultrafast`:null}))]}",
+      "function Ht(model,tier){return sve(model,tier)!=null}",
+    ].join("");
+    const patched = globalThis.__codeyRendererPatchEntry(
+      "app://-/assets/app-primary-19fe57fd8c00.js", source,
+    ) ?? source;
+    const controls = Function(`${patched};return {composer,speedCommands,speedSettings,setTier};`)();
+    const api = { authMethod: "apikey" };
+    const fast = { model: "fast", serviceTiers: [{ id: "priority", name: "Fast" }] };
+    const plain = { model: "plain", serviceTiers: [] };
+    const ultra = { model: "ultra", serviceTiers: [{ id: "ultrafast", name: "Ultrafast" }] };
+    api.models = [fast, plain, ultra];
+    assert.equal(controls.composer(api, fast, null).show, true);
+    assert.equal(controls.composer(api, fast, null).settings.serviceTierForRequest, null);
+    assert.equal(controls.composer(api, fast, null).modelPickerTriggerConfig.selectedServiceTierIconKind, null);
+    assert.equal(controls.composer(api, fast, "priority").modelPickerTriggerConfig.selectedServiceTierIconKind, "fast");
+    assert.equal(controls.composer(api, fast, "priority").settings.serviceTierForRequest, "priority");
+    assert.equal(controls.composer(api, fast, "fast").settings.serviceTierForRequest, "priority");
+    assert.deepEqual(controls.composer(api, fast, "priority").settings.serviceTierAccess, { fast: true });
+    assert.equal(controls.speedCommands(api, fast, null)[1].enabled, true);
+    assert.ok(controls.speedSettings(api, fast, null));
+    assert.equal(controls.setTier(api, fast, null, "priority"), "priority");
+    for (const loading of [{ isLoading: true }, { modelLoading: true }, { catalogLoading: true }]) {
+      assert.equal(controls.speedCommands({ ...api, ...loading }, fast, null)[1].enabled, false);
+    }
+    api.catalogLoading = true;
+    assert.equal(controls.speedCommands(api, fast, null)[1].enabled, false);
+    api.catalogLoading = false;
+    assert.equal(controls.speedCommands(api, fast, null)[1].enabled, true);
+    assert.equal(controls.speedCommands({ ...api, requirementsPending: true }, fast, null)[1].enabled, true);
+    for (const flags of [{ draft: true }, { hidden: true }]) {
+      assert.equal(controls.composer(api, fast, "priority", flags).show, false);
+    }
+    assert.equal(controls.composer(api, fast, "priority", { daybreak: true }).modelPickerTriggerConfig.selectedServiceTierIconKind, null);
+    // A tier saved for the previous model must be revalidated at every switch.
+    for (const model of [plain, ultra, fast]) {
+      const current = controls.composer(api, model, "priority");
+      assert.equal(current.settings.serviceTierForRequest, model === fast ? "priority" : null);
+      assert.equal(current.settings.selectedServiceTier, current.settings.serviceTierForRequest);
+      assert.equal(current.show, model !== plain);
+    }
+    assert.equal(controls.speedSettings(api, plain, null), null);
+    assert.equal(controls.setTier(api, plain, null, "priority"), false);
+    assert.deepEqual(controls.composer(api, ultra, "ultrafast").settings.serviceTierAccess, { ultrafast: true });
+    assert.equal(controls.composer(api, ultra, "ultrafast").settings.serviceTierForRequest, "ultrafast");
+    const unknownTier = { model: "unknown-tier", serviceTiers: [{ id: "unknown" }] };
+    assert.equal(controls.composer({ ...api, models: [unknownTier] }, unknownTier, null).show, false);
+    api.authMethod = "chatgpt";
+    assert.equal(controls.composer(api, fast, "priority").show, false);
+    api.authMethod = "apikey";
+    assert.equal(controls.composer(api, fast, "priority").show, true);
+    for (const authMethod of ["chatgpt", "personalAccessToken", "amazonBedrock", "unknown", null, "APIKey", "apiKey"]) {
+      const auth = { authMethod, access: null };
+      assert.equal(controls.composer(auth, fast, "priority").show, false, authMethod);
+      assert.equal(controls.composer(auth, fast, "priority").settings.serviceTierForRequest, null, authMethod);
+      assert.equal(controls.speedSettings(auth, fast, null), null, authMethod);
+      assert.equal(controls.setTier(auth, fast, null, "priority"), false, authMethod);
+    }
+    const native = { authMethod: "chatgpt", access: { fast: true } };
+    assert.equal(controls.composer(native, fast, "priority").show, true);
+    assert.equal(controls.composer(native, fast, "priority").modelPickerTriggerConfig.selectedServiceTierIconKind, "fast");
+    assert.equal(controls.speedCommands({ ...native, requirementsPending: true }, fast, null)[1].enabled, false);
+    const legacySource = source.replace("let b=BYe(u),S=b?.authMethod??null;", "let S=BYe(u)?.authMethod??null;")
+      .replace("selectedServiceTierForModel:null,", "");
+    const legacyPatched = globalThis.__codeyRendererPatchEntry("app://-/assets/app-primary-legacy-access.js", legacySource) ?? legacySource;
+    const legacy = Function(`${legacyPatched};return {composer};`)();
+    assert.equal(legacy.composer(api, fast, "priority").settings.serviceTierForRequest, "priority");
+    assert.equal(legacy.composer(api, plain, "priority").show, false);
+  } finally {
+    delete globalThis.__codeyRendererPatchEntry;
+    delete globalThis.__codeyRendererPatchInstalled;
+    delete globalThis.__CODEY_RENDERER_PATCH_OPTIONS__;
+  }
+});
+
 test("starting or restarting Codex replaces the old runtime with one managed by Codey", async () => {
   const [runtimeSource, launcherSource, launcherProcessSource, launcherPlatformSource, appSource] =
     await Promise.all([
