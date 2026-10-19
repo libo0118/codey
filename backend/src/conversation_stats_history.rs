@@ -154,11 +154,15 @@ fn apply_recorded_stats(
         .filter(|speed| speed.is_finite() && *speed >= 0.0)
         && (snapshot.average_output_tokens_per_second.is_none()
             || (snapshot.average_speed_source == Some("request_log")
-                && average_updated_at.is_some_and(|at| native.updated_at_unix_ms > at)))
+                && average_updated_at.is_some_and(|at| {
+                    native
+                        .average_speed_updated_at_unix_ms
+                        .is_some_and(|native_at| native_at > at)
+                })))
     {
         snapshot.average_output_tokens_per_second = Some(speed);
         snapshot.average_speed_is_estimate = false;
-        snapshot.average_speed_request_count = Some(native.request_count);
+        snapshot.average_speed_request_count = Some(native.average_speed_request_count);
         snapshot.average_speed_source = Some("codex");
         snapshot.average_speed_scope = Some("recorded_requests");
         applied = true;
@@ -644,6 +648,8 @@ mod tests {
             average_output_tokens_per_second: Some(75.0),
             request_count: 2,
             ttft_sample_count: 2,
+            average_speed_request_count: 2,
+            average_speed_updated_at_unix_ms: Some(2_000),
             updated_at_unix_ms: 2_000,
             model: Some("native-model".to_string()),
         }
@@ -669,6 +675,24 @@ mod tests {
             },
             updated_at_unix_ms: updated_at,
         }
+    }
+
+    #[test]
+    fn later_native_model_timing_does_not_make_older_decode_samples_fresh() {
+        let mut native = native_stats();
+        native.updated_at_unix_ms = 3_000;
+        native.average_speed_updated_at_unix_ms = Some(1_000);
+        native.average_speed_request_count = 1;
+        let snapshot = apply_recorded_stats(
+            None,
+            Some(recorded_timing(2_000)),
+            Some(recorded_average(2_000)),
+            Some(native),
+        )
+        .unwrap();
+        assert_eq!(snapshot.timing_source, Some("codex"));
+        assert_eq!(snapshot.average_speed_source, Some("request_log"));
+        assert_eq!(snapshot.average_speed_request_count, Some(1));
     }
 
     #[test]
@@ -714,6 +738,7 @@ mod tests {
         ] {
             let mut native = native_stats();
             native.updated_at_unix_ms = native_at;
+            native.average_speed_updated_at_unix_ms = Some(native_at);
             let snapshot = apply_recorded_stats(
                 parse_tail(event(1_000).as_bytes(), ID),
                 Some(recorded_timing(route_at)),

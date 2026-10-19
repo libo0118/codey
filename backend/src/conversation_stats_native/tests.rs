@@ -190,6 +190,40 @@ fn missing_first_output_stays_unknown_and_late_first_populates_it() {
 }
 
 #[test]
+fn samples_without_decode_timing_do_not_refresh_the_speed_source() {
+    let home = tempfile::tempdir().unwrap();
+    let mut connection = open_database(home.path()).unwrap();
+    let mut pending = Pending::default();
+    let spans = fixture();
+    ingest(&mut pending, &mut connection, &spans);
+    let later: Vec<_> = spans
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut span)| {
+            if [3, 4].contains(&index) {
+                return None;
+            }
+            span["traceId"] = json!("112233445566778899aabbccddeeff00");
+            for field in ["startTimeUnixNano", "endTimeUnixNano"] {
+                let timestamp = span[field].as_str().unwrap().parse::<i64>().unwrap();
+                span[field] = json!((timestamp + 10_000_000_000).to_string());
+            }
+            Some(span)
+        })
+        .collect();
+    ingest(&mut pending, &mut connection, &later);
+    let stats = snapshot(home.path(), OWN).unwrap();
+    assert_eq!(stats.request_count, 2);
+    assert_eq!(stats.average_speed_request_count, 1);
+    assert_eq!(stats.updated_at_unix_ms, (BASE / 1_000_000 + 14_000) as u64);
+    assert_eq!(
+        stats.average_speed_updated_at_unix_ms,
+        Some((BASE / 1_000_000 + 4_000) as u64)
+    );
+    assert_eq!(stats.average_output_tokens_per_second, Some(50.0));
+}
+
+#[test]
 fn missing_usage_reversed_time_invalid_ids_and_wrong_owners_do_not_yield_samples() {
     for variant in 0..9 {
         let home = tempfile::tempdir().unwrap();

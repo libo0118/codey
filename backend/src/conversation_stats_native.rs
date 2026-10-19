@@ -31,6 +31,8 @@ pub(crate) struct NativeSessionStats {
     pub average_output_tokens_per_second: Option<f64>,
     pub request_count: u64,
     pub ttft_sample_count: u64,
+    pub average_speed_request_count: u64,
+    pub average_speed_updated_at_unix_ms: Option<u64>,
     pub updated_at_unix_ms: u64,
     pub model: Option<String>,
 }
@@ -109,7 +111,9 @@ pub(crate) fn snapshot(home: &Path, session_id: &str) -> Option<NativeSessionSta
                 AVG((first_ns - start_ns) / 1000000.0), COUNT(first_ns),
                 SUM(CASE WHEN completed_ns > first_ns THEN output_tokens * 1.0 END),
                 SUM(CASE WHEN completed_ns > first_ns THEN (completed_ns - first_ns) / 1000000000.0 END),
-                MAX(end_ns / 1000000)
+                MAX(end_ns / 1000000),
+                COUNT(CASE WHEN completed_ns > first_ns THEN 1 END),
+                MAX(CASE WHEN completed_ns > first_ns THEN end_ns / 1000000 END)
          FROM native_samples WHERE session_id = ?1 AND valid = 1",
         [session_id],
         |row| {
@@ -125,6 +129,8 @@ pub(crate) fn snapshot(home: &Path, session_id: &str) -> Option<NativeSessionSta
                     .map(|(tokens, seconds)| tokens / seconds),
                 request_count,
                 ttft_sample_count: row.get(3).unwrap_or_default(),
+                average_speed_request_count: row.get(7).unwrap_or_default(),
+                average_speed_updated_at_unix_ms: row.get(8).ok().flatten(),
                 updated_at_unix_ms: row.get(6).unwrap_or_default(),
                 model: None,
             }))
