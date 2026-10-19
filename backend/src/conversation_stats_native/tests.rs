@@ -417,6 +417,27 @@ fn pending_trace_count_and_batch_size_are_bounded() {
 }
 
 #[test]
+fn reaching_pending_span_capacity_keeps_previously_valid_samples() {
+    let home = tempfile::tempdir().unwrap();
+    let mut connection = open_database(home.path()).unwrap();
+    let mut pending = Pending::default();
+    let spans = fixture();
+    ingest(&mut pending, &mut connection, &spans);
+    let template = parse_batch(&batch(&spans)).unwrap().remove(0);
+    let extra = (100..MAX_SPANS_PER_TRACE + 200)
+        .map(|index| {
+            let mut span = template.clone();
+            span.id = format!("{index:016x}");
+            span
+        })
+        .collect();
+    pending.ingest(&mut connection, extra).unwrap();
+    assert_eq!(pending.traces[TRACE].spans.len(), MAX_SPANS_PER_TRACE);
+    assert!(!pending.traces[TRACE].poisoned);
+    assert_eq!(snapshot(home.path(), OWN).unwrap().request_count, 1);
+}
+
+#[test]
 fn http_limits_and_unsupported_payloads_are_rejected_before_ingestion() {
     let head = |headers: &str| {
         format!(

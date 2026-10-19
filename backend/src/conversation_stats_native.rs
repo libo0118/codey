@@ -469,7 +469,8 @@ impl Pending {
             } else if trace.spans.len() < MAX_SPANS_PER_TRACE {
                 trace.spans.insert(span.id.clone(), span);
             } else {
-                trace.poisoned = true;
+                // Capacity loss is missing coverage, not evidence that earlier samples are invalid.
+                continue;
             }
             affected.insert(id);
         }
