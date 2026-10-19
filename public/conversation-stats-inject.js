@@ -2,7 +2,7 @@
 // /session/stats 返回统计范围；会话 id 取自可见 composer，隐藏会话不参与。
 (() => {
   const PROBE_KEY = "__codeyConversationStats";
-  const VERSION = 5;
+  const VERSION = 6;
   const previous = window[PROBE_KEY];
   if (previous?.installed && (previous.version === VERSION || !previous.dispose)) return;
   previous?.dispose?.();
@@ -372,11 +372,13 @@
       && data.averageSpeedScope === "runtime";
     const combinedSpeed = data.averageSpeedSource === "runtime_and_request_log"
       && data.averageSpeedScope === "recorded_and_runtime";
+    const codexSpeed = data.averageSpeedSource === "codex"
+      && data.averageSpeedScope === "recorded_requests";
     if (!hasRuntimeRequest) {
       for (const key of ["requests", "inFlight", "model", "lastStatus", "updatedAtUnixMs"]) data[key] = null;
     }
     // 只展示后端按累计输出与生成耗时计算的平均值，不回退到旧的单次请求速度。
-    if ((!recordedSpeed && !runtimeSpeed && !combinedSpeed) || (running && stale)) data.averageOutputTokensPerSecond = null;
+    if ((!recordedSpeed && !runtimeSpeed && !combinedSpeed && !codexSpeed) || (running && stale)) data.averageOutputTokensPerSecond = null;
     for (const key of ["totalTokens", "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens", "requests", "inFlight"]) {
       if (!Number.isFinite(data[key]) || data[key] < 0) data[key] = null;
     }
@@ -385,8 +387,9 @@
     const estimatedSpeed = data.averageSpeedIsEstimate === true;
     const speedText = speedKnown ? `${estimatedSpeed ? "≈" : ""}${formattedSpeed}` : running ? stale ? "更新暂停" : data.speedState === "waiting" ? "等待输出" : "生成中" : "—";
     const averageScopeNote = combinedSpeed ? "覆盖有记录的历史请求与本次运行，未记录的历史请求不计入"
-      : recordedSpeed ? "仅覆盖有记录且有有效计时的请求"
-        : runtimeSpeed ? "仅覆盖本次运行中有有效计时的请求" : "缺少有效计时时显示 —";
+      : codexSpeed ? "仅覆盖有记录且有有效计时的请求，计时来自 Codex 原生遥测"
+        : recordedSpeed ? "仅覆盖有记录且有有效计时的请求"
+          : runtimeSpeed ? "仅覆盖本次运行中有有效计时的请求" : "缺少有效计时时显示 —";
     const speedNote = running && stale ? "实时统计更新失败，恢复后继续显示会话平均速度"
       : `累计输出 Token ÷ 累计生成耗时，工具间隔不计；${averageScopeNote}${estimatedSpeed && speedKnown ? "；含生成中的 Token 估算" : ""}`;
     const rate = cacheRatePercent(data.inputTokens, data.cachedInputTokens) || "—";
@@ -420,10 +423,13 @@
     }
     const pendingNote = stale ? (stats ? "更新失败，当前数据可能已过期。" : "暂时无法读取统计，将自动重试。") : !currentSessionId ? "建立会话后显示统计。" : !stats ? "缺失数据以 — 显示。" : "";
     const sourceNote = unknownUsage ? "Token 统计范围未知。" : sessionUsage ? "会话累计用量，缓存已包含在输入中。" : "仅统计本次运行的用量。";
-    const timingNote = data.timingScope === "runtime" ? "模型计时仅覆盖本次运行。" : data.timingScope ? "模型计时仅覆盖有有效计时的请求。" : "缺少有效计时时显示 —。";
+    const codexTiming = data.timingSource === "codex" && data.timingScope === "recorded_requests";
+    const timingNote = codexTiming ? "模型计时来自 Codex 原生遥测，仅覆盖有有效计时的请求。" : data.timingScope === "runtime" ? "模型计时仅覆盖本次运行。" : data.timingScope ? "模型计时仅覆盖有有效计时的请求。" : "缺少有效计时时显示 —。";
+    const ttftBoundary = data.ttftBoundary ?? (codexTiming ? "first_output_item" : "first_content");
+    const ttftNote = !finite(data.averageTtftMs) ? "" : ttftBoundary === "first_output_item" ? "TTFT 计至首个输出项。" : ttftBoundary === "first_content" ? "TTFT 计至首个实际内容。" : "TTFT 边界未知。";
     const activityNote = data.stepScope === "runtime" ? "步数仅覆盖本次运行。" : data.stepScope === "recorded_requests" ? "步数仅覆盖有记录的生成请求。" : data.stepScope === "recorded_session" ? "步数为会话内模型生成次数。" : "缺失的轮数和步数显示 —。";
     const toolNote = data.toolTimingScope ? "工具用时为累计值，并行调用可能重叠。" : "";
-    setText(refs.notes.activity, `${pendingNote}${activityNote}${timingNote}${toolNote}${speedNote}。`);
+    setText(refs.notes.activity, `${pendingNote}${activityNote}${timingNote}${ttftNote}${toolNote}${speedNote}。`);
     setText(refs.notes.tokens, `${pendingNote}${sourceNote}`);
     refs.buttons.activity.setAttribute("aria-label", `会话统计，${refs.activity.textContent}，会话平均速度 ${speedText}，${status}。${speedNote}。查看统计详情`);
     refs.buttons.tokens.setAttribute("aria-label", `Token 用量，${scopeLabel} ${refs.total.textContent}，缓存命中 ${rate}，${status}。查看统计详情`);

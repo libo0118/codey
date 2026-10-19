@@ -1,0 +1,188 @@
+{
+  "resourceSpans": [
+    {
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "9d9cc47f93f05ffb",
+              "parentSpanId": "d6219cd40c021693",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390324452700",
+              "endTimeUnixNano": "1792375390324460300",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "d6219cd40c021693",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390324450200",
+              "endTimeUnixNano": "1792375390324553900",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "186c1d01fa9bc54f",
+              "parentSpanId": "75ca02e2d015cae1",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390324555900",
+              "endTimeUnixNano": "1792375390324621200",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "75ca02e2d015cae1",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390324554600",
+              "endTimeUnixNano": "1792375390324625800",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "b4ee2cfd3cc9798d",
+              "parentSpanId": "6d204d5c3b1c7aa3",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390324629600",
+              "endTimeUnixNano": "1792375390416826100",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "6d204d5c3b1c7aa3",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390324627200",
+              "endTimeUnixNano": "1792375390417203600",
+              "attributes": [
+                {
+                  "key": "from",
+                  "value": {
+                    "stringValue": "output_item_added"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "6c7b821f12b7aad9",
+              "parentSpanId": "3f76cb88d76418b1",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390417209000",
+              "endTimeUnixNano": "1792375390417210100",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "3f76cb88d76418b1",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390417206300",
+              "endTimeUnixNano": "1792375390417272400",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "23c1dd59e593a1f2",
+              "parentSpanId": "0610846299edab51",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390417273600",
+              "endTimeUnixNano": "1792375390524086500",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "0610846299edab51",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390417272800",
+              "endTimeUnixNano": "1792375390526604300",
+              "attributes": [
+                {
+                  "key": "from",
+                  "value": {
+                    "stringValue": "output_item_done"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "ed508f00fef0ac54",
+              "parentSpanId": "c3dd1c19e72a5d51",
+              "name": "receiving",
+              "startTimeUnixNano": "1792375390526613300",
+              "endTimeUnixNano": "1792375390526614900",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "c3dd1c19e72a5d51",
+              "parentSpanId": "ef9da16526797711",
+              "name": "handle_responses",
+              "startTimeUnixNano": "1792375390526611100",
+              "endTimeUnixNano": "1792375390527725400",
+              "attributes": [
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "2"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "836012304306c6e1",
+              "parentSpanId": "c046341fa73aedbe",
+              "name": "codex.sampling",
+              "startTimeUnixNano": "1792375390317938400",
+              "endTimeUnixNano": "1792375390527727900",
+              "attributes": [
+                {
+                  "key": "conversation.id",
+                  "value": {
+                    "stringValue": "01a151e5-ff6c-7de2-90d3-5af417ad92a1"
+                  }
+                },
+                {
+                  "key": "turn.id",
+                  "value": {
+                    "stringValue": "01a151e6-0001-7912-a063-e8da1118c2f5"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "ef9da16526797711",
+              "parentSpanId": "c046341fa73aedbe",
+              "name": "receiving_stream",
+              "startTimeUnixNano": "1792375390324336900",
+              "endTimeUnixNano": "1792375390529459000",
+              "attributes": []
+            },
+            {
+              "traceId": "69228ae983f7730937b919ce6754a796",
+              "spanId": "c046341fa73aedbe",
+              "parentSpanId": "9f05742591546731",
+              "name": "try_run_sampling_request",
+              "startTimeUnixNano": "1792375390317206800",
+              "endTimeUnixNano": "1792375390529474400",
+              "attributes": [
+                {
+                  "key": "turn_id",
+                  "value": {
+                    "stringValue": "01a151e6-0001-7912-a063-e8da1118c2f5"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

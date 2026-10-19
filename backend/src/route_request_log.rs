@@ -650,6 +650,13 @@ pub(crate) struct SessionRecordedTiming {
     pub average_ttft_ms: Option<f64>,
     pub timing_request_count: u64,
     pub ttft_sample_count: u64,
+    pub updated_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SessionRecordedAverage {
+    pub totals: SessionGenerationTotals,
+    pub updated_at_unix_ms: u64,
 }
 
 /// 会话平均速度使用同一批请求的输出量和生成时长，不对单步 TPS 求平均。

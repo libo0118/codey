@@ -15,7 +15,7 @@ use super::{
     RouteRequestLogModelPage, RouteRequestLogModelQuery, RouteRequestLogQuery,
     RouteRequestLogQueryItem, RouteRequestLogQueryPage, RouteRequestLogSummary,
     RouteRequestLogTrend, SQLITE_BUSY_TIMEOUT, SQLITE_FILE_NAME, SessionGenerationTotals,
-    SessionRecordedTiming, lock_unpoisoned, to_i64, unix_timestamp_ms,
+    SessionRecordedAverage, SessionRecordedTiming, lock_unpoisoned, to_i64, unix_timestamp_ms,
 };
 use crate::config::RouteRequestLogBackend;
 use crate::sqlite_util::table_columns;
@@ -212,7 +212,10 @@ pub(crate) fn session_recorded_timing(
           AVG(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms
               THEN downstream_first_content_ms END),
           COUNT(CASE WHEN router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms THEN 1 END),
-          COUNT(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms THEN 1 END)
+          COUNT(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms THEN 1 END),
+          MAX(CASE WHEN (router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms)
+              OR (downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms)
+              THEN timestamp_unix_ms END)
          FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
          WHERE codex_session_id IN (?1, ?2) AND request_kind = 'responses'
            AND COALESCE(codex_session_is_parent, 0) = 0",
@@ -220,6 +223,7 @@ pub(crate) fn session_recorded_timing(
         |row| Ok(SessionRecordedTiming {
             requests: row.get(0)?, model_duration_ms: row.get(1)?, average_ttft_ms: row.get(2)?,
             timing_request_count: row.get(3)?, ttft_sample_count: row.get(4)?,
+            updated_at_unix_ms: row.get(5)?,
         }),
     ).ok().filter(|value| value.requests > 0)
 }
@@ -230,7 +234,7 @@ pub(crate) fn session_recorded_average(
     root: &Path,
     session_id: &str,
     boundary: Option<&crate::conversation_stats::RuntimeHistoryBoundary>,
-) -> Option<SessionGenerationTotals> {
+) -> Option<SessionRecordedAverage> {
     let path = root.join(SQLITE_FILE_NAME);
     if !path.is_file() {
         return None;
@@ -239,14 +243,17 @@ pub(crate) fn session_recorded_average(
     let (sql, values) = session_average_query(session_id, boundary);
     connection
         .query_row(&sql, params_from_iter(values), |row| {
-            Ok(SessionGenerationTotals {
-                output_tokens: row.get(0)?,
-                generation_ms: row.get(1)?,
-                requests: row.get(2)?,
+            Ok(SessionRecordedAverage {
+                totals: SessionGenerationTotals {
+                    output_tokens: row.get(0)?,
+                    generation_ms: row.get(1)?,
+                    requests: row.get(2)?,
+                },
+                updated_at_unix_ms: row.get(3)?,
             })
         })
         .ok()
-        .filter(|totals| totals.speed().is_some())
+        .filter(|recorded| recorded.totals.speed().is_some())
 }
 
 fn session_average_query(
@@ -255,7 +262,8 @@ fn session_average_query(
 ) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         "SELECT SUM(output_tokens * 1.0),
-        SUM((total_duration_ms - router_pre_upstream_ms - upstream_first_byte_ms) * 1.0), COUNT(*)
+        SUM((total_duration_ms - router_pre_upstream_ms - upstream_first_byte_ms) * 1.0), COUNT(*),
+        MAX(timestamp_unix_ms)
         FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
         WHERE codex_session_id IN (?, ?) AND request_kind = 'responses'
           AND COALESCE(codex_session_is_parent, 0) = 0

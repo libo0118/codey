@@ -92,7 +92,7 @@ test("launch proxy reaches Chromium arguments, spawn environment and restart det
   assert.match(proxySource, /"NO_PROXY"/);
   assert.match(
     processSource,
-    /local_router_proxy_bypass_environment[\s\S]*launch_proxy_environment/,
+    /cli_runtime_environment[\s\S]*launch_proxy_environment/,
   );
   assert.match(
     appServerSource,

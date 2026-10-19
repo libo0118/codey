@@ -757,6 +757,82 @@ test("shows recorded historical average independently of runtime request fields"
   assert.equal(metric(env.bar(), "status"), "历史速度记录");
 });
 
+test("shows Codex native timings without adding telemetry tokens to session usage", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": {
+    ...STATS, usageSource: "rollout", usageScope: "session", requestsScope: null,
+    requests: null, inFlight: null, averageOutputTokensPerSecond: 62.35,
+    averageSpeedSource: "codex", averageSpeedScope: "recorded_requests",
+    modelDurationMs: 30000, averageTtftMs: 1200,
+    timingSource: "codex", timingScope: "recorded_requests", ttftBoundary: "first_output_item",
+  } } });
+  try {
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), "62.4 tok/s");
+    assert.equal(field(env.bar(), "speed"), "62.4 tok/s");
+    assert.equal(field(env.bar(), "modelDurationMs"), "30秒");
+    assert.equal(field(env.bar(), "averageTtftMs"), "1.2秒");
+    assert.equal(field(env.bar(), "totalTokens"), "131,500 tok");
+    assert.equal(field(env.bar(), "outputTokens"), "3,100 tok");
+    assert.match(env.bar().__codeyCs.speed.title, /计时来自 Codex 原生遥测/);
+    const note = env.bar().__codeyCs.notes.activity.textContent;
+    assert.match(note, /模型计时来自 Codex 原生遥测/);
+    assert.match(note, /仅覆盖有记录且有有效计时的请求/);
+    assert.match(note, /TTFT 计至首个输出项/);
+    assert.doesNotMatch(note, /首个实际内容/);
+  } finally {
+    env.dispose();
+  }
+});
+
+test("keeps invalid or missing Codex timing values and untrusted averages unknown", async () => {
+  const env = createEnvironment();
+  const native = { ...STATS, averageSpeedSource: "codex", averageSpeedScope: "recorded_requests",
+    timingSource: "codex", timingScope: "recorded_requests" };
+  try {
+    for (const value of [null, undefined, NaN, Infinity, -1]) {
+      env.setStats("conversation-1", { ...native, averageOutputTokensPerSecond: value,
+        modelDurationMs: value, averageTtftMs: value });
+      env.refresh();
+      await flushTimers(30);
+      for (const key of ["speed", "modelDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), key), "—");
+      assert.equal(metric(env.bar(), "total"), "132k tok");
+    }
+    for (const attribution of [
+      { averageSpeedScope: "runtime" }, { averageSpeedScope: undefined },
+      { averageSpeedSource: "unknown" }, { averageSpeedSource: undefined },
+    ]) {
+      env.setStats("conversation-1", { ...native, ...attribution });
+      env.refresh();
+      await flushTimers(30);
+      assert.equal(metric(env.bar(), "speed"), "—");
+    }
+  } finally {
+    env.dispose();
+  }
+});
+
+test("keeps routing TTFT at first content and respects explicit native boundaries", async () => {
+  const env = createEnvironment();
+  try {
+    for (const [timingSource, timingScope, ttftBoundary, expected] of [
+      ["runtime", "runtime", undefined, "计至首个实际内容"],
+      ["request_log", "recorded_requests", undefined, "计至首个实际内容"],
+      ["codex", "recorded_requests", undefined, "计至首个输出项"],
+      ["codex", "recorded_requests", "first_content", "计至首个实际内容"],
+      ["codex", "recorded_requests", "unknown", "边界未知"],
+    ]) {
+      env.setStats("conversation-1", { ...STATS, averageTtftMs: 1200,
+        timingSource, timingScope, ttftBoundary });
+      env.refresh();
+      await flushTimers(30);
+      assert.ok(env.bar().__codeyCs.notes.activity.textContent.includes(`TTFT ${expected}。`));
+      assert.equal(field(env.bar(), "averageTtftMs"), "1.2秒");
+    }
+  } finally {
+    env.dispose();
+  }
+});
+
 test("preserves the recorded average while the next step waits for output", async () => {
   const data = { ...STATS, averageSpeedSource: "request_log", averageSpeedScope: "recorded_requests" };
   const env = createEnvironment({ statsBySession: { "conversation-1": data } });

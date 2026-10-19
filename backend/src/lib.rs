@@ -11,6 +11,7 @@ mod commands;
 mod computer_use;
 mod config;
 mod conversation_stats;
+mod conversation_stats_native;
 mod crashpad_pending_guard;
 #[cfg(windows)]
 mod desktop_instance;

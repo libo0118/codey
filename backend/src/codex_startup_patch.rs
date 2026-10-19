@@ -1816,6 +1816,29 @@ mod tests {
     }
 
     #[test]
+    fn native_stats_cli_override_preserves_direct_model_configuration() {
+        let args = [
+            "app-server",
+            "-c",
+            "model_provider='relay'",
+            "-c",
+            "model_providers.relay.base_url='https://model.example/v1'",
+            "-c",
+            "model_providers.relay.env_key='RELAY_KEY'",
+            "-c",
+            "model='direct-model'",
+        ]
+        .map(OsString::from);
+        let trace = "otel.trace_exporter={ otlp-http={ endpoint='http://127.0.0.1:1/v1/traces', protocol='json' } }";
+        let rewritten = rewrite_app_server_args(&args, &[trace.to_string()]).unwrap();
+        assert_eq!(&rewritten[..args.len()], &args);
+        assert_eq!(
+            &rewritten[args.len()..],
+            ["-c", "analytics.enabled=false", "-c", trace].map(OsString::from)
+        );
+    }
+
+    #[test]
     fn router_runtime_rejects_shared_app_server_commands() {
         for id in crate::local_router::ROUTER_PROVIDER_IDS {
             for router in [

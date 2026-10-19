@@ -1122,16 +1122,11 @@ async fn prepare_cli_wrapper(
             marker_path.to_string_lossy().to_string(),
         ),
     ];
-    if crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides) {
-        // 主进程补丁移除后，包装器环境是此变量唯一的投递通道：
-        // 让 Desktop 始终为本进程拉起本地 app-server CLI（走包装器路由）。
-        environment.push(("CODEX_APP_SERVER_FORCE_CLI".to_string(), "1".to_string()));
-        environment.extend(local_router_proxy_bypass_environment(
-            runtime_config_overrides,
-            std::env::var("NO_PROXY").ok().as_deref(),
-            std::env::var("no_proxy").ok().as_deref(),
-        ));
-    }
+    environment.extend(cli_runtime_environment(
+        runtime_config_overrides,
+        std::env::var("NO_PROXY").ok().as_deref(),
+        std::env::var("no_proxy").ok().as_deref(),
+    ));
     #[cfg(windows)]
     let wrapper = codey;
     #[cfg(target_os = "macos")]
@@ -1169,28 +1164,35 @@ async fn prepare_cli_wrapper(
     })
 }
 
-/// Local routing terminates at Codey's loopback listener. Keep that hop out of
-/// the user's system proxy while preserving every existing bypass rule. Windows
-/// treats environment keys case-insensitively, so it receives one canonical key.
+/// Desktop must execute the wrapper for process overrides to reach app-server.
+/// Router and native telemetry use loopback; direct model traffic keeps its proxy.
 #[cfg(any(windows, target_os = "macos"))]
-fn local_router_proxy_bypass_environment(
+fn cli_runtime_environment(
     runtime_config_overrides: &[String],
     no_proxy: Option<&str>,
     lowercase_no_proxy: Option<&str>,
 ) -> Vec<(String, String)> {
-    if !crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides) {
-        return Vec::new();
+    let mut environment = Vec::new();
+    if !runtime_config_overrides.is_empty() {
+        environment.push(("CODEX_APP_SERVER_FORCE_CLI".to_string(), "1".to_string()));
+    }
+    if !crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides)
+        && !runtime_config_overrides
+            .iter()
+            .any(|value| value.starts_with("otel.trace_exporter="))
+    {
+        return environment;
     }
     #[cfg(windows)]
     {
-        vec![(
+        environment.push((
             "NO_PROXY".to_string(),
             crate::launch_proxy::merge_loopback_no_proxy(no_proxy.or(lowercase_no_proxy)),
-        )]
+        ));
     }
     #[cfg(target_os = "macos")]
     {
-        vec![
+        environment.extend([
             (
                 "NO_PROXY".to_string(),
                 crate::launch_proxy::merge_loopback_no_proxy(no_proxy),
@@ -1199,13 +1201,13 @@ fn local_router_proxy_bypass_environment(
                 "no_proxy".to_string(),
                 crate::launch_proxy::merge_loopback_no_proxy(lowercase_no_proxy.or(no_proxy)),
             ),
-        ]
+        ]);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (no_proxy, lowercase_no_proxy);
-        Vec::new()
     }
+    environment
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1749,15 +1751,69 @@ mod cli_wrapper_tests {
         let router = vec!["model_provider=codey_router".to_string()];
         let direct = vec!["model_provider=openai".to_string()];
 
-        let enabled = local_router_proxy_bypass_environment(&router, inherited, None);
+        let enabled = cli_runtime_environment(&router, inherited, None);
         assert_eq!(
             enabled.len(),
-            1,
+            2,
             "Windows must not receive case-conflicting proxy variables"
         );
-        assert_eq!(enabled[0].0, "NO_PROXY");
-        assert_eq!(enabled[0].1, "corp.internal,127.0.0.1,localhost,::1");
-        assert!(local_router_proxy_bypass_environment(&direct, inherited, None).is_empty());
+        assert_eq!(enabled[1].0, "NO_PROXY");
+        assert_eq!(enabled[1].1, "corp.internal,127.0.0.1,localhost,::1");
+        assert_eq!(
+            cli_runtime_environment(&direct, inherited, None),
+            vec![("CODEX_APP_SERVER_FORCE_CLI".to_string(), "1".to_string())]
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_stats_force_cli_without_changing_model_proxy_environment() {
+        let overrides = vec!["otel.trace_exporter={ otlp-http={ endpoint='http://127.0.0.1:1/v1/traces', protocol='json' } }".to_string()];
+        let environment = cli_runtime_environment(
+            &overrides,
+            Some("corp.internal,127.0.0.1"),
+            Some("other.internal,[::1]"),
+        );
+        let expected = vec![
+            ("CODEX_APP_SERVER_FORCE_CLI".to_string(), "1".to_string()),
+            (
+                "NO_PROXY".to_string(),
+                "corp.internal,127.0.0.1,localhost,::1".to_string(),
+            ),
+        ];
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let mut expected = expected;
+            expected.push((
+                "no_proxy".to_string(),
+                "other.internal,[::1],127.0.0.1,localhost".to_string(),
+            ));
+            expected
+        };
+        assert_eq!(environment, expected);
+        let fallback = cli_runtime_environment(&overrides, None, Some("other.internal"));
+        #[cfg(windows)]
+        assert_eq!(
+            fallback[1],
+            (
+                "NO_PROXY".to_string(),
+                "other.internal,127.0.0.1,localhost,::1".to_string(),
+            )
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(fallback[1].1, "127.0.0.1,localhost,::1");
+            assert_eq!(fallback[2].1, "other.internal,127.0.0.1,localhost,::1");
+            let uppercase = cli_runtime_environment(&overrides, Some("corp.internal"), None);
+            assert_eq!(uppercase[1].1, uppercase[2].1);
+        }
+        for direct in ["model_provider=openai", "otel.trace_exporter_extra='none'"] {
+            assert_eq!(
+                cli_runtime_environment(&[direct.to_string()], Some("corp.internal"), None),
+                vec![("CODEX_APP_SERVER_FORCE_CLI".to_string(), "1".to_string())]
+            );
+        }
+        assert!(cli_runtime_environment(&[], Some("corp.internal"), None).is_empty());
     }
 
     // 【自动化测试】启动 - 查询失败不报告退出，真实退出仍立即识别
