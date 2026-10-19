@@ -68,6 +68,7 @@ pub(crate) struct ConversationStatsSnapshot {
     pub model_duration_ms: Option<u64>,
     pub tool_duration_ms: Option<u64>,
     pub average_ttft_ms: Option<f64>,
+    pub ttft_boundary: Option<&'static str>,
     pub activity_source: Option<&'static str>,
     pub activity_scope: Option<&'static str>,
     pub step_source: Option<&'static str>,
@@ -438,6 +439,7 @@ impl ConversationStatsRegistry {
             model_duration_ms: (stats.timing_request_count > 0).then_some(stats.model_duration_ms),
             average_ttft_ms: (stats.ttft_sample_count > 0)
                 .then(|| stats.ttft_total_ms as f64 / stats.ttft_sample_count as f64),
+            ttft_boundary: (stats.ttft_sample_count > 0).then_some("first_content"),
             timing_source: Some("runtime"),
             timing_scope: Some("runtime"),
             timing_request_count: Some(stats.timing_request_count),

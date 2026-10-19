@@ -1799,7 +1799,7 @@ async fn prepare_native_runtime_state(
     let subagent_optimization = config.subagent_optimization;
     let stream_max_retries = config.stream_max_retries;
     let native_subagent_config = config.clone();
-    let applied = tokio::task::spawn_blocking(move || {
+    let mut applied = tokio::task::spawn_blocking(move || {
         let native_subagent_config = reconciled_native_subagent_runtime_config(
             &native_subagent_config,
             &runtime_config_home,
@@ -1825,6 +1825,7 @@ async fn prepare_native_runtime_state(
     .map_err(|error| {
         anyhow::Error::new(error).context("应用原生 Provider 运行配置任务异常退出")
     })??;
+    applied.enable_native_stats(home.to_path_buf()).await;
     let mut runtime_config = config.clone();
     runtime_config.fast_context_tools = applied.fast_context_tools_active;
     Ok(PreparedProviderState {

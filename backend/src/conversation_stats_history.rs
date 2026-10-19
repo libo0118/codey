@@ -2,7 +2,7 @@
 use super::{
     ConversationStatsSnapshot, RuntimeHistoryBoundary, lock_unpoisoned, normalize_session_id,
 };
-use crate::route_request_log::SessionGenerationTotals;
+use crate::route_request_log::SessionRecordedAverage;
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
@@ -94,7 +94,7 @@ pub(crate) async fn snapshot_with_history(
     let average_boundary = runtime
         .as_ref()
         .and_then(|s| s.average_history_boundary.clone());
-    let (history, speed, timing, average) = tokio::task::spawn_blocking(move || {
+    let (history, speed, timing, average, native) = tokio::task::spawn_blocking(move || {
         let history = cached_history(&home, &session_id);
         let speed = if suppress_history_speed {
             None
@@ -103,18 +103,73 @@ pub(crate) async fn snapshot_with_history(
         };
         let timing = cached_timing(&home, &session_id);
         let average = cached_average(&home, &session_id, average_boundary.as_ref());
-        (history, speed, timing, average)
+        let native = crate::conversation_stats_native::snapshot(&home, &session_id);
+        (history, speed, timing, average, native)
     })
     .await
     .ok()
     .unwrap_or_default();
-    apply_recorded_average(
-        apply_recorded_speed(
-            apply_recorded_timing(merge(history, runtime), timing),
-            speed,
-        ),
+    apply_recorded_stats(
+        apply_recorded_speed(merge(history, runtime), speed),
+        timing,
         average,
+        native,
     )
+}
+
+fn apply_recorded_stats(
+    snapshot: Option<ConversationStatsSnapshot>,
+    timing: Option<crate::route_request_log::SessionRecordedTiming>,
+    average: Option<SessionRecordedAverage>,
+    native: Option<crate::conversation_stats_native::NativeSessionStats>,
+) -> Option<ConversationStatsSnapshot> {
+    let timing_updated_at = timing.and_then(|timing| timing.updated_at_unix_ms);
+    let average_updated_at = average.map(|average| average.updated_at_unix_ms);
+    let snapshot = apply_recorded_average(apply_recorded_timing(snapshot, timing), average);
+    let Some(native) = native.filter(|native| native.request_count > 0) else {
+        return snapshot;
+    };
+    let mut snapshot = snapshot.unwrap_or_else(|| ConversationStatsSnapshot {
+        usage_source: "unknown",
+        usage_scope: "unknown",
+        ..Default::default()
+    });
+    let mut applied = false;
+    // 两类采样可能覆盖同一请求；每组只选最新的有效来源，运行期已有值优先。
+    if (snapshot.model_duration_ms.is_none() && snapshot.average_ttft_ms.is_none())
+        || (snapshot.timing_source == Some("request_log")
+            && timing_updated_at.is_some_and(|at| native.updated_at_unix_ms > at))
+    {
+        snapshot.model_duration_ms = Some(native.model_duration_ms);
+        snapshot.average_ttft_ms = native.average_ttft_ms;
+        snapshot.ttft_boundary = native.average_ttft_ms.map(|_| "first_output_item");
+        snapshot.timing_request_count = Some(native.request_count);
+        snapshot.ttft_sample_count = Some(native.ttft_sample_count);
+        snapshot.timing_source = Some("codex");
+        snapshot.timing_scope = Some("recorded_requests");
+        applied = true;
+    }
+    if let Some(speed) = native
+        .average_output_tokens_per_second
+        .filter(|speed| speed.is_finite() && *speed >= 0.0)
+        && (snapshot.average_output_tokens_per_second.is_none()
+            || (snapshot.average_speed_source == Some("request_log")
+                && average_updated_at.is_some_and(|at| native.updated_at_unix_ms > at)))
+    {
+        snapshot.average_output_tokens_per_second = Some(speed);
+        snapshot.average_speed_is_estimate = false;
+        snapshot.average_speed_request_count = Some(native.request_count);
+        snapshot.average_speed_source = Some("codex");
+        snapshot.average_speed_scope = Some("recorded_requests");
+        applied = true;
+    }
+    if applied && snapshot.in_flight.unwrap_or(0) == 0 {
+        if snapshot.model.is_none() {
+            snapshot.model = native.model;
+        }
+        snapshot.updated_at_unix_ms = snapshot.updated_at_unix_ms.max(native.updated_at_unix_ms);
+    }
+    Some(snapshot)
 }
 
 type AverageCache = HashMap<(PathBuf, PathBuf, String), Arc<Mutex<CachedAverage>>>;
@@ -125,7 +180,7 @@ const LOG_LOOKUP_TTL: Duration = Duration::from_secs(30);
 struct CachedAverage {
     at: Option<Instant>,
     boundary: Option<RuntimeHistoryBoundary>,
-    totals: Option<SessionGenerationTotals>,
+    totals: Option<SessionRecordedAverage>,
 }
 
 impl CachedAverage {
@@ -133,8 +188,8 @@ impl CachedAverage {
         &mut self,
         boundary: Option<&RuntimeHistoryBoundary>,
         now: Instant,
-        query: impl FnOnce() -> Option<SessionGenerationTotals>,
-    ) -> Option<SessionGenerationTotals> {
+        query: impl FnOnce() -> Option<SessionRecordedAverage>,
+    ) -> Option<SessionRecordedAverage> {
         if self
             .at
             .is_some_and(|at| now.saturating_duration_since(at) < LOG_LOOKUP_TTL)
@@ -153,7 +208,7 @@ fn cached_average(
     home: &Path,
     session_id: &str,
     boundary: Option<&RuntimeHistoryBoundary>,
-) -> Option<SessionGenerationTotals> {
+) -> Option<SessionRecordedAverage> {
     let session_id = normalize_session_id(session_id);
     uuid::Uuid::parse_str(session_id).ok()?;
     let root = codey_runtime_core::paths::default_app_state_dir();
@@ -180,7 +235,7 @@ fn cached_average(
 
 fn apply_recorded_average(
     snapshot: Option<ConversationStatsSnapshot>,
-    recorded: Option<SessionGenerationTotals>,
+    recorded: Option<SessionRecordedAverage>,
 ) -> Option<ConversationStatsSnapshot> {
     let Some(recorded) = recorded else {
         return snapshot;
@@ -192,7 +247,7 @@ fn apply_recorded_average(
     });
     let mut totals = snapshot.average_runtime_totals;
     let has_runtime = totals.requests > 0;
-    totals.add(recorded);
+    totals.add(recorded.totals);
     snapshot.average_output_tokens_per_second = totals.speed();
     snapshot.average_speed_request_count = Some(totals.requests);
     snapshot.average_speed_source = Some(if has_runtime {
@@ -268,6 +323,7 @@ fn apply_recorded_timing(
     if snapshot.model_duration_ms.is_none() && snapshot.average_ttft_ms.is_none() {
         snapshot.model_duration_ms = timing.model_duration_ms;
         snapshot.average_ttft_ms = timing.average_ttft_ms;
+        snapshot.ttft_boundary = timing.average_ttft_ms.map(|_| "first_content");
         snapshot.timing_request_count = Some(timing.timing_request_count);
         snapshot.ttft_sample_count = Some(timing.ttft_sample_count);
         snapshot.timing_source = Some("request_log");
@@ -369,6 +425,7 @@ fn merge(
         history.updated_at_unix_ms = runtime.updated_at_unix_ms;
         history.model_duration_ms = runtime.model_duration_ms;
         history.average_ttft_ms = runtime.average_ttft_ms;
+        history.ttft_boundary = runtime.ttft_boundary;
         history.timing_source = runtime.timing_source;
         history.timing_scope = runtime.timing_scope;
         history.timing_request_count = runtime.timing_request_count;
@@ -567,6 +624,7 @@ pub(super) fn usage_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route_request_log::{SessionGenerationTotals, SessionRecordedTiming};
     use serde_json::json;
     const ID: &str = "01a1471c-962b-7d00-a9c4-0658dd26dd46";
 
@@ -579,15 +637,268 @@ mod tests {
         .to_string()
     }
 
+    fn native_stats() -> crate::conversation_stats_native::NativeSessionStats {
+        crate::conversation_stats_native::NativeSessionStats {
+            model_duration_ms: 4_000,
+            average_ttft_ms: Some(250.0),
+            average_output_tokens_per_second: Some(75.0),
+            request_count: 2,
+            ttft_sample_count: 2,
+            updated_at_unix_ms: 2_000,
+            model: Some("native-model".to_string()),
+        }
+    }
+
+    fn recorded_timing(updated_at: u64) -> SessionRecordedTiming {
+        SessionRecordedTiming {
+            requests: 1,
+            model_duration_ms: Some(1_000),
+            average_ttft_ms: Some(100.0),
+            timing_request_count: 1,
+            ttft_sample_count: 1,
+            updated_at_unix_ms: Some(updated_at),
+        }
+    }
+
+    fn recorded_average(updated_at: u64) -> SessionRecordedAverage {
+        SessionRecordedAverage {
+            totals: SessionGenerationTotals {
+                output_tokens: 100.0,
+                generation_ms: 1_000.0,
+                requests: 1,
+            },
+            updated_at_unix_ms: updated_at,
+        }
+    }
+
+    #[test]
+    fn native_timing_fills_missing_metrics_without_recounting_rollout_usage_or_activity() {
+        let mut history = parse_tail(event(1_000).as_bytes(), ID).unwrap();
+        history.turn_count = Some(3);
+        history.step_count = Some(4);
+        history.step_source = Some("rollout");
+        history.tool_duration_ms = Some(6_000);
+        let snapshot =
+            apply_recorded_stats(Some(history), None, None, Some(native_stats())).unwrap();
+        assert_eq!(snapshot.total_tokens, Some(1_000));
+        assert_eq!(snapshot.output_tokens, Some(20));
+        assert_eq!(snapshot.usage_source, "rollout");
+        assert_eq!(snapshot.turn_count, Some(3));
+        assert_eq!(snapshot.step_count, Some(4));
+        assert_eq!(snapshot.step_source, Some("rollout"));
+        assert_eq!(snapshot.tool_duration_ms, Some(6_000));
+        assert_eq!(snapshot.requests, None);
+        assert_eq!(snapshot.in_flight, None);
+        assert_eq!(snapshot.model_duration_ms, Some(4_000));
+        assert_eq!(snapshot.average_ttft_ms, Some(250.0));
+        assert_eq!(snapshot.timing_request_count, Some(2));
+        assert_eq!(snapshot.timing_source, Some("codex"));
+        assert_eq!(snapshot.timing_scope, Some("recorded_requests"));
+        assert_eq!(snapshot.average_output_tokens_per_second, Some(75.0));
+        assert_eq!(snapshot.average_speed_source, Some("codex"));
+        assert_eq!(snapshot.average_speed_scope, Some("recorded_requests"));
+        assert_eq!(snapshot.average_speed_request_count, Some(2));
+        assert_eq!(snapshot.output_tokens_per_second, None);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap()["ttftBoundary"],
+            "first_output_item"
+        );
+    }
+
+    #[test]
+    fn recorded_sources_select_the_latest_valid_samples_without_recounting_tokens() {
+        for (route_at, native_at, source) in [
+            (1_000, 2_000, "codex"),
+            (3_000, 2_000, "request_log"),
+            (2_000, 2_000, "request_log"),
+        ] {
+            let mut native = native_stats();
+            native.updated_at_unix_ms = native_at;
+            let snapshot = apply_recorded_stats(
+                parse_tail(event(1_000).as_bytes(), ID),
+                Some(recorded_timing(route_at)),
+                Some(recorded_average(route_at)),
+                Some(native),
+            )
+            .unwrap();
+            let is_native = source == "codex";
+            assert_eq!(snapshot.timing_source, Some(source));
+            assert_eq!(snapshot.timing_scope, Some("recorded_requests"));
+            assert_eq!(
+                snapshot.model_duration_ms,
+                Some(if is_native { 4_000 } else { 1_000 })
+            );
+            assert_eq!(
+                snapshot.average_ttft_ms,
+                Some(if is_native { 250.0 } else { 100.0 })
+            );
+            assert_eq!(
+                snapshot.timing_request_count,
+                Some(if is_native { 2 } else { 1 })
+            );
+            assert_eq!(
+                snapshot.ttft_sample_count,
+                Some(if is_native { 2 } else { 1 })
+            );
+            assert_eq!(
+                snapshot.ttft_boundary,
+                Some(if is_native {
+                    "first_output_item"
+                } else {
+                    "first_content"
+                })
+            );
+            assert_eq!(
+                snapshot.average_output_tokens_per_second,
+                Some(if is_native { 75.0 } else { 100.0 })
+            );
+            assert_eq!(snapshot.average_speed_source, Some(source));
+            assert_eq!(snapshot.average_speed_scope, Some("recorded_requests"));
+            assert_eq!(
+                snapshot.average_speed_request_count,
+                Some(if is_native { 2 } else { 1 })
+            );
+            assert!(!snapshot.average_speed_is_estimate);
+            assert_eq!(snapshot.total_tokens, Some(1_000));
+            assert_eq!(snapshot.output_tokens, Some(20));
+            assert_eq!(snapshot.usage_source, "rollout");
+        }
+    }
+
+    #[test]
+    fn timing_and_average_choose_sources_independently_and_keep_valid_route_speed() {
+        for (timing_at, average_at, timing_source, average_source) in [
+            (1_000, 3_000, "codex", "request_log"),
+            (3_000, 1_000, "request_log", "codex"),
+        ] {
+            let snapshot = apply_recorded_stats(
+                None,
+                Some(recorded_timing(timing_at)),
+                Some(recorded_average(average_at)),
+                Some(native_stats()),
+            )
+            .unwrap();
+            assert_eq!(snapshot.timing_source, Some(timing_source));
+            assert_eq!(snapshot.average_speed_source, Some(average_source));
+        }
+        for speed in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+            let mut native = native_stats();
+            native.average_output_tokens_per_second = speed;
+            let snapshot = apply_recorded_stats(
+                None,
+                Some(recorded_timing(1_000)),
+                Some(recorded_average(1_000)),
+                Some(native),
+            )
+            .unwrap();
+            assert_eq!(snapshot.timing_source, Some("codex"));
+            assert_eq!(snapshot.average_output_tokens_per_second, Some(100.0));
+            assert_eq!(snapshot.average_speed_source, Some("request_log"));
+            assert_eq!(snapshot.average_speed_request_count, Some(1));
+        }
+        let timing_only = apply_recorded_stats(
+            None,
+            Some(recorded_timing(3_000)),
+            None,
+            Some(native_stats()),
+        )
+        .unwrap();
+        assert_eq!(timing_only.timing_source, Some("request_log"));
+        assert_eq!(timing_only.average_speed_source, Some("codex"));
+        let average_only = apply_recorded_stats(
+            None,
+            None,
+            Some(recorded_average(3_000)),
+            Some(native_stats()),
+        )
+        .unwrap();
+        assert_eq!(average_only.timing_source, Some("codex"));
+        assert_eq!(average_only.average_speed_source, Some("request_log"));
+    }
+
+    #[test]
+    fn native_samples_preserve_completed_and_active_runtime_metrics_and_state() {
+        let mut runtime = super::super::tests::sample_entry(Some(ID), "responses");
+        runtime.total_duration_ms = 1_200;
+        runtime.router_pre_upstream_ms = Some(200);
+        runtime.upstream_first_byte_ms = Some(100);
+        runtime.downstream_first_content_ms = Some(100);
+        let registry = super::super::ConversationStatsRegistry::default();
+        registry.finish_request(&runtime);
+        for active in [false, true] {
+            if active {
+                registry.begin_request(ID, "active", 3_000);
+            }
+            for native_at in [1, u64::MAX] {
+                let mut native = native_stats();
+                native.updated_at_unix_ms = native_at;
+                let current = registry.snapshot(ID);
+                let expected = apply_recorded_stats(
+                    current.clone(),
+                    Some(recorded_timing(1_000)),
+                    Some(recorded_average(1_000)),
+                    None,
+                );
+                let snapshot = apply_recorded_stats(
+                    current,
+                    Some(recorded_timing(1_000)),
+                    Some(recorded_average(1_000)),
+                    Some(native),
+                )
+                .unwrap();
+                assert_eq!(snapshot.in_flight, Some(u32::from(active)));
+                assert_eq!(snapshot.timing_source, Some("runtime"));
+                assert_eq!(
+                    snapshot.average_speed_source,
+                    Some("runtime_and_request_log")
+                );
+                assert_eq!(snapshot.speed_state, active.then_some("waiting"));
+                assert_eq!(
+                    serde_json::to_value(snapshot).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_native_samples_keep_missing_metrics_and_other_session_state() {
+        assert!(apply_recorded_stats(None, None, None, None).is_none());
+        let history = parse_tail(event(100).as_bytes(), ID);
+        let expected = serde_json::to_value(&history).unwrap();
+        let snapshot = apply_recorded_stats(history, None, None, None).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), expected);
+        let native_only = apply_recorded_stats(None, None, None, Some(native_stats())).unwrap();
+        assert_eq!(native_only.total_tokens, None);
+        assert_eq!(native_only.step_count, None);
+        assert_eq!(native_only.turn_count, None);
+
+        let active = ConversationStatsSnapshot {
+            in_flight: Some(1),
+            requests: Some(0),
+            speed_state: Some("waiting"),
+            ..Default::default()
+        };
+        let active = apply_recorded_stats(Some(active), None, None, Some(native_stats())).unwrap();
+        assert_eq!(active.in_flight, Some(1));
+        assert_eq!(active.requests, Some(0));
+        assert_eq!(active.speed_state, Some("waiting"));
+        assert_eq!(active.model, None);
+        assert_eq!(active.updated_at_unix_ms, 0);
+    }
+
     #[test]
     fn average_cache_reuses_history_until_ttl_or_boundary_changes() {
         let mut cache = CachedAverage::default();
         let now = Instant::now();
         let mut queries = 0;
-        let totals = SessionGenerationTotals {
-            output_tokens: 10.0,
-            generation_ms: 1000.0,
-            requests: 1,
+        let totals = SessionRecordedAverage {
+            totals: SessionGenerationTotals {
+                output_tokens: 10.0,
+                generation_ms: 1000.0,
+                requests: 1,
+            },
+            updated_at_unix_ms: 1_000,
         };
         let mut boundary = RuntimeHistoryBoundary {
             timestamp_unix_ms: 1000,
@@ -768,6 +1079,7 @@ mod tests {
             average_ttft_ms: Some(300.0),
             timing_request_count: 4,
             ttft_sample_count: 4,
+            updated_at_unix_ms: Some(1_000),
         };
         let snapshot = apply_recorded_timing(merged, Some(timing)).unwrap();
         assert_eq!(snapshot.total_tokens, Some(10));
@@ -786,6 +1098,7 @@ mod tests {
             average_ttft_ms: Some(3000.0),
             timing_request_count: 100,
             ttft_sample_count: 100,
+            updated_at_unix_ms: Some(1_000),
         };
         let recovered = apply_recorded_timing(None, Some(timing)).unwrap();
         assert_eq!(recovered.step_count, Some(100));

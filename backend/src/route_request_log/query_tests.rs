@@ -751,22 +751,27 @@ fn session_recorded_timing_excludes_parent_compaction_and_missing_measurements()
     entry.codex_session_id = Some("own".into());
     entry.codex_session_is_parent = false;
     entry.request_kind = "responses".into();
+    entry.timestamp_unix_ms = 100;
     entry.total_duration_ms = 1500;
     entry.router_pre_upstream_ms = Some(500);
     entry.downstream_first_content_ms = Some(600);
     let mut missing = entry.clone();
     missing.request_id = "missing".into();
+    missing.timestamp_unix_ms = 400;
     missing.router_pre_upstream_ms = None;
     missing.downstream_first_content_ms = None;
     missing.ttft_ms = Some(5);
     let mut parent = entry.clone();
     parent.request_id = "parent".into();
+    parent.timestamp_unix_ms = 500;
     parent.codex_session_is_parent = true;
     let mut compact = entry.clone();
     compact.request_id = "compact".into();
+    compact.timestamp_unix_ms = 600;
     compact.request_kind = "responses_compact".into();
     let mut prefixed = entry.clone();
     prefixed.request_id = "prefixed".into();
+    prefixed.timestamp_unix_ms = 200;
     prefixed.codex_session_id = Some("local:own".into());
     prefixed.downstream_first_content_ms = Some(800);
     sink.write_batch(&[
@@ -785,6 +790,7 @@ fn session_recorded_timing_excludes_parent_compaction_and_missing_measurements()
     assert_eq!(timing.average_ttft_ms, Some(700.0));
     assert_eq!(timing.timing_request_count, 2);
     assert_eq!(timing.ttft_sample_count, 2);
+    assert_eq!(timing.updated_at_unix_ms, Some(200));
     assert!(session_recorded_timing(directory.path(), "foreign").is_none());
     // 旧库缺计时字段时只返回未知，不迁移、不创建字段，也不依赖当前日志开关。
     let old = tempfile::tempdir().unwrap();
@@ -846,7 +852,10 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
             "parent" => entry.codex_session_is_parent = true,
             "compact" => entry.request_kind = "responses_compact".into(),
             "foreign" => entry.codex_session_id = Some("foreign".into()),
-            "missing-usage" => entry.token_usage.output_tokens = None,
+            "missing-usage" => {
+                entry.token_usage.output_tokens = None;
+                entry.timestamp_unix_ms = 900;
+            }
             "missing-time" => entry.router_pre_upstream_ms = None,
             "invalid" => entry.upstream_first_byte_ms = Some(5_000),
             "zero-duration" => entry.total_duration_ms = 300,
@@ -866,7 +875,9 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
         request_ids: std::collections::HashSet::from(["runtime".to_owned()]),
         exclude_entire_millisecond: false,
     };
-    let totals = session_recorded_average(directory.path(), "own", Some(&boundary)).unwrap();
+    let recorded = session_recorded_average(directory.path(), "own", Some(&boundary)).unwrap();
+    assert_eq!(recorded.updated_at_unix_ms, 200);
+    let totals = recorded.totals;
     assert_eq!(totals.output_tokens, 40.0);
     assert_eq!(totals.generation_ms, 3_000.0);
     assert_eq!(totals.requests, 3);
@@ -880,11 +891,13 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
         }),
     )
     .unwrap();
-    assert_eq!(old_only.requests, 2);
-    assert_eq!(old_only.speed(), Some(5.0));
+    assert_eq!(old_only.totals.requests, 2);
+    assert_eq!(old_only.totals.speed(), Some(5.0));
+    assert_eq!(old_only.updated_at_unix_ms, 100);
     let all = session_recorded_average(directory.path(), "own", None).unwrap();
-    assert_eq!(all.requests, 5);
-    assert_eq!(all.output_tokens, 950.0);
+    assert_eq!(all.totals.requests, 5);
+    assert_eq!(all.totals.output_tokens, 950.0);
+    assert_eq!(all.updated_at_unix_ms, 201);
     let connection = Connection::open(directory.path().join(SQLITE_FILE_NAME)).unwrap();
     connection
         .execute(
@@ -895,6 +908,7 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
     assert_eq!(
         session_recorded_average(directory.path(), "own", Some(&boundary))
             .unwrap()
+            .totals
             .requests,
         2
     );
@@ -959,8 +973,9 @@ fn session_average_query_uses_index_with_large_unrelated_history() {
         "session average: 100000 unrelated + 10000 own rows, indexed aggregate of 5000 rows: {:?}",
         started.elapsed()
     );
-    assert_eq!(totals.requests, 5000);
-    assert_eq!(totals.speed(), Some(100.0));
+    assert_eq!(totals.totals.requests, 5000);
+    assert_eq!(totals.totals.speed(), Some(100.0));
+    assert_eq!(totals.updated_at_unix_ms, 4999);
     let (sql, params) = session_average_query("own", Some(&boundary));
     let plan = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))

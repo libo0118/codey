@@ -232,6 +232,35 @@ pub(crate) struct RuntimeRouterConfigOptions<'a> {
 pub(crate) struct AppliedRuntimeRouterConfig {
     pub runtime_config_overrides: Vec<String>,
     pub fast_context_tools_active: bool,
+    native_stats_trace_exporter_available: bool,
+}
+
+impl AppliedRuntimeRouterConfig {
+    pub(crate) async fn enable_native_stats(&mut self, home: PathBuf) {
+        if !self.native_stats_trace_exporter_available {
+            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                "conversation_stats.native_disabled",
+                serde_json::json!({ "reason": "user_trace_exporter" }),
+            );
+            return;
+        }
+        match crate::conversation_stats_native::runtime_overrides(home).await {
+            Ok(overrides) => self.runtime_config_overrides.extend(overrides),
+            Err(error) => {
+                crate::error_log::record_failure_with_metadata(
+                    "conversation_stats_unavailable",
+                    "start_native_conversation_stats",
+                    format!("{error:#}"),
+                    crate::error_log::FailureMetadata {
+                        stage: Some("startup.native_stats".to_string()),
+                        recoverable: Some(true),
+                    },
+                    serde_json::json!({ "fallback": "native_stats_disabled" }),
+                );
+                eprintln!("原生会话计时采集不可用，Codex 将继续直连启动：{error:#}");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -682,7 +711,22 @@ fn apply_isolated_runtime_router_config(
     Ok(AppliedRuntimeRouterConfig {
         runtime_config_overrides,
         fast_context_tools_active: fastctx_command.is_some(),
+        native_stats_trace_exporter_available: native_stats_trace_exporter_available(
+            &effective_document,
+        ),
     })
+}
+
+fn native_stats_trace_exporter_available(document: &DocumentMut) -> bool {
+    let profile_exporter = document
+        .get("profile")
+        .and_then(Item::as_str)
+        .and_then(|profile| {
+            document_item_at(document, &["profiles", profile, "otel", "trace_exporter"])
+        });
+    profile_exporter
+        .or_else(|| document_item_at(document, &["otel", "trace_exporter"]))
+        .is_none_or(|exporter| exporter.as_str() == Some("none"))
 }
 
 #[cfg(test)]

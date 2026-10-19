@@ -1590,6 +1590,112 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     assert!(!home.join("config.toml").exists());
 }
 
+#[tokio::test]
+async fn native_stats_overrides_keep_direct_provider_and_user_monitoring_unchanged() {
+    for (trace_exporter, available) in [
+        ("\"none\"", true),
+        (
+            "{ otlp-http = { endpoint = 'https://monitor.example/v1/traces', protocol = 'json' } }",
+            false,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let original = format!(
+            "model_provider = 'relay'\n\
+             [model_providers.relay]\nbase_url = 'https://model.example/v1'\nenv_key = 'RELAY_KEY'\n\
+             [otel]\nexporter = 'none'\nlog_user_prompt = true\ntrace_exporter = {trace_exporter}\n"
+        );
+        fs::write(home.join("config.toml"), &original).unwrap();
+        let marker = temp.path().join("state/lease.json");
+        let backups = temp.path().join("state/backups");
+        let mut applied = apply_isolated_runtime_router_config(
+            &home,
+            RouterApplyOptions {
+                local_router: None,
+                remote_compaction_models: None,
+                stream_max_retries: 5,
+                use_official_catalog: false,
+                model_contexts: None,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                subagent_roles: None,
+                marker: &marker,
+                backup_root: &backups,
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.native_stats_trace_exporter_available, available);
+        let before = applied.runtime_config_overrides.clone();
+        applied.enable_native_stats(home.clone()).await;
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
+        );
+        assert_eq!(&applied.runtime_config_overrides[..before.len()], &before);
+        let added = &applied.runtime_config_overrides[before.len()..];
+        assert_eq!(added.len(), usize::from(available));
+        if available {
+            let document = parse_document(&added[0]).unwrap();
+            let exporter = &document["otel"]["trace_exporter"]["otlp-http"];
+            assert_eq!(exporter["protocol"].as_str(), Some("json"));
+            assert!(
+                exporter["endpoint"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("http://127.0.0.1:")
+            );
+        }
+        assert!(applied.runtime_config_overrides.iter().all(|entry| {
+            !entry.starts_with("model_provider=")
+                && !entry.contains(".base_url=")
+                && !entry.contains(".env_key=")
+                && !entry.starts_with("otel.exporter=")
+                && !entry.starts_with("otel.log_user_prompt=")
+        }));
+    }
+}
+
+#[test]
+fn native_stats_respect_effective_profile_trace_exporter() {
+    for (config, expected) in [
+        ("", true),
+        ("otel = { trace_exporter = 'none' }", true),
+        (
+            "profile = 'work'\n[profiles.work.otel]\ntrace_exporter = 'custom'\n",
+            false,
+        ),
+        (
+            "profile = 'work'\n[otel]\ntrace_exporter = 'custom'\n[profiles.work.otel]\ntrace_exporter = 'none'\n",
+            true,
+        ),
+    ] {
+        assert_eq!(
+            native_stats_trace_exporter_available(&parse_document(config).unwrap()),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_stats_start_failure_keeps_direct_runtime_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut applied = AppliedRuntimeRouterConfig {
+        runtime_config_overrides: vec!["model_reasoning_effort=\"medium\"".to_string()],
+        fast_context_tools_active: false,
+        native_stats_trace_exporter_available: true,
+    };
+    let before = applied.runtime_config_overrides.clone();
+    applied
+        .enable_native_stats(temp.path().join("missing-home"))
+        .await;
+    assert_eq!(applied.runtime_config_overrides, before);
+}
+
 #[test]
 fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
     let temp = tempfile::tempdir().unwrap();
