@@ -180,10 +180,10 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let mut buffer = Vec::new();
     let head_end = loop {
-        if let Some(end) = memchr::memmem::find(&buffer, b"\r\n\r\n") {
-            if end + 4 <= MAX_HEADER {
-                break end + 4;
-            }
+        if let Some(end) = memchr::memmem::find(&buffer, b"\r\n\r\n")
+            && end + 4 <= MAX_HEADER
+        {
+            break end + 4;
         }
         if buffer.len() >= MAX_HEADER {
             respond(&mut stream, "431 Request Header Fields Too Large").await?;

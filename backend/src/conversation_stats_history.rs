@@ -190,14 +190,13 @@ fn select_last_turn(
     if route_active {
         return last_turn;
     }
-    if let Some(turn) = &last_turn {
-        if turn.id == native.turn_id
+    if let Some(turn) = &last_turn
+        && (turn.id == native.turn_id
             || !turn.started_at_unix_ms.is_some_and(|start| {
                 native.latest_sample_started_at_unix_ms > turn.completed_at_unix_ms.unwrap_or(start)
-            })
-        {
-            return last_turn;
-        }
+            }))
+    {
+        return last_turn;
     }
     // Sampling times identify freshness, never the user's turn start or completion.
     Some(LastTurnStatsSnapshot {
