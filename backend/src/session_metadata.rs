@@ -57,13 +57,13 @@ impl SessionMetadataCache {
             return FALLBACK_SESSION_NAME.to_string();
         }
 
-        let preferred_title = preferred_title
-            .map(clean_session_name)
-            .filter(|title| !title.is_empty());
+        // 正式标题可以与首条消息同文，按来源识别，不按文本相等关系排除。
+        if let Some(title) = preferred_title.and_then(clean_session_name_candidate) {
+            return title;
+        }
         let mut thread_names = Vec::new();
         let mut catalog_titles = Vec::new();
         let mut legacy_titles = Vec::new();
-        let mut placeholder_titles = HashSet::new();
         for path in self.active_database_paths(home) {
             if !self.ensure_connection(&path) {
                 continue;
@@ -84,13 +84,7 @@ impl SessionMetadataCache {
                 }
             };
 
-            if let Some((name, title, first_user_message, preview)) = metadata.thread {
-                for placeholder in [first_user_message, preview]
-                    .into_iter()
-                    .filter_map(clean_optional_session_name)
-                {
-                    placeholder_titles.insert(placeholder);
-                }
+            if let Some((name, title)) = metadata.thread {
                 if let Some(name) = clean_optional_session_name(name) {
                     thread_names.push(name);
                 }
@@ -106,22 +100,11 @@ impl SessionMetadataCache {
             );
         }
 
-        if let Some(preferred_title) = preferred_title
-            && !placeholder_titles.contains(&preferred_title)
-        {
-            return preferred_title;
-        }
-        if placeholder_titles.is_empty() {
-            // The catalog display title can temporarily mirror the first prompt.
-            // Only trust it when a thread row supplied the values needed to
-            // reject that placeholder form.
-            catalog_titles.clear();
-        }
         thread_names
             .into_iter()
             .chain(catalog_titles)
             .chain(legacy_titles)
-            .find(|title| !placeholder_titles.contains(title))
+            .next()
             .unwrap_or_else(|| FALLBACK_SESSION_NAME.to_string())
     }
 
@@ -132,7 +115,7 @@ impl SessionMetadataCache {
     ) -> HashMap<String, u64> {
         let session_ids = session_ids
             .iter()
-            .map(|session_id| normalize_session_id(session_id).to_string())
+            .map(|session_id| normalize_session_id(session_id))
             .filter(|session_id| !session_id.is_empty())
             .collect::<HashSet<_>>();
         if session_ids.is_empty() {
@@ -146,8 +129,8 @@ impl SessionMetadataCache {
             }
             let unresolved = session_ids
                 .iter()
+                .copied()
                 .filter(|session_id| !timestamps.contains_key(*session_id))
-                .cloned()
                 .collect::<Vec<_>>();
             if unresolved.is_empty() {
                 break;
@@ -177,8 +160,9 @@ impl SessionMetadataCache {
             .into_iter()
             .filter(|path| path.exists())
             .collect::<Vec<_>>();
-        let active = paths.iter().cloned().collect::<HashSet<_>>();
-        self.connections.retain(|path, _| active.contains(path));
+        let active = paths.iter().map(PathBuf::as_path).collect::<HashSet<_>>();
+        self.connections
+            .retain(|path, _| active.contains(path.as_path()));
         paths
     }
 
@@ -192,12 +176,10 @@ impl SessionMetadataCache {
             .connections
             .get(path)
             .is_some_and(|cached| cached.signature == signature);
-        if !is_current {
-            self.connections.remove(path);
-        }
-        if self.connections.contains_key(path) {
+        if is_current {
             return true;
         }
+        self.connections.remove(path);
         let Ok(connection) = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -263,12 +245,7 @@ pub fn resolve_session_name_with_preferred(
     )
 }
 
-type SessionNameRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+type SessionNameRow = (Option<String>, Option<String>);
 
 #[derive(Debug, Default)]
 struct SessionNameMetadata {
@@ -298,29 +275,14 @@ fn session_name_row(connection: &Connection, session_id: &str) -> Result<Option<
     } else {
         "NULL"
     };
-    let first_user_message = if columns.contains("first_user_message") {
-        "first_user_message"
-    } else {
-        "NULL"
-    };
-    let preview = if columns.contains("preview") {
-        "preview"
-    } else {
-        "NULL"
-    };
     Ok(connection
         .query_row(
-            &format!(
-                "SELECT {name}, {title}, {first_user_message}, {preview} \
-                 FROM threads WHERE id=?1 LIMIT 1"
-            ),
+            &format!("SELECT {name}, {title} FROM threads WHERE id=?1 LIMIT 1"),
             params![session_id],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
@@ -365,7 +327,7 @@ fn catalog_session_titles(connection: &Connection, session_id: &str) -> Result<V
 
 fn session_timestamp_rows(
     connection: &Connection,
-    session_ids: &[String],
+    session_ids: &[&str],
 ) -> Result<HashMap<String, u64>> {
     if session_ids.is_empty() {
         return Ok(HashMap::new());
@@ -462,8 +424,8 @@ mod tests {
             .unwrap();
         }
         tx.commit().unwrap();
-        let mut requested = ids.clone();
-        requested.extend([ids[2].clone(), "missing' OR 1=1 --".to_string()]);
+        let mut requested = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        requested.extend([ids[2].as_str(), "missing' OR 1=1 --"]);
         let timestamps = session_timestamp_rows(&connection, &requested).unwrap();
         assert_eq!(timestamps.len(), 403);
         assert!(!timestamps.contains_key(&ids[0]));
@@ -486,6 +448,7 @@ mod tests {
              INSERT INTO threads SELECT 'thread-' || n, n, 1 FROM ids;"
         ).unwrap();
         let ids: Vec<_> = (1..=200).map(|id| format!("thread-{}", id * 23)).collect();
+        let borrowed_ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
         let legacy = || {
             let columns = table_columns(&connection, "threads").unwrap();
             assert!(columns.contains("updated_at"));
@@ -507,7 +470,10 @@ mod tests {
             }
             result
         };
-        assert_eq!(legacy(), session_timestamp_rows(&connection, &ids).unwrap());
+        assert_eq!(
+            legacy(),
+            session_timestamp_rows(&connection, &borrowed_ids).unwrap()
+        );
         let mut before = Vec::new();
         let mut after = Vec::new();
         for sample in 0..9 {
@@ -519,7 +485,7 @@ mod tests {
                 let start = Instant::now();
                 for _ in 0..100 {
                     black_box(if batched {
-                        session_timestamp_rows(&connection, &ids).unwrap()
+                        session_timestamp_rows(&connection, &borrowed_ids).unwrap()
                     } else {
                         legacy()
                     });
@@ -654,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_a_catalog_title_without_thread_placeholder_metadata() {
+    fn resolves_a_catalog_title_without_thread_metadata() {
         let home = tempdir().unwrap();
         let sqlite_dir = home.path().join("sqlite");
         fs::create_dir_all(&sqlite_dir).unwrap();
@@ -667,19 +633,19 @@ mod tests {
                     display_title TEXT NOT NULL
                 );
                 INSERT INTO local_thread_catalog VALUES
-                    ('local', 'thread-catalog-only', '可能仍是首条消息');",
+                    ('local', 'thread-catalog-only', '目录会话名称');",
             )
             .unwrap();
         drop(catalog);
 
         assert_eq!(
             resolve_session_name_with_preferred(home.path(), "thread-catalog-only", None),
-            FALLBACK_SESSION_NAME
+            "目录会话名称"
         );
     }
 
     #[test]
-    fn rejects_new_name_sources_that_still_contain_the_first_message() {
+    fn accepts_formal_titles_matching_the_first_message() {
         let home = tempdir().unwrap();
         let state_path = home.path().join("state_5.sqlite");
         let state = Connection::open(state_path).unwrap();
@@ -693,8 +659,10 @@ mod tests {
                     preview TEXT
                 );
                 INSERT INTO threads (id, name, title, first_user_message, preview)
-                VALUES ('thread-placeholder', '帮我处理这个问题', '帮我处理这个问题',
-                        '帮我处理这个问题', '帮我处理这个问题');",
+                VALUES
+                    ('thread-name', '测试123', NULL, '测试123', '测试123'),
+                    ('thread-title', NULL, '测试123', '测试123', '测试123'),
+                    ('thread-catalog', NULL, NULL, '测试123', '测试123');",
             )
             .unwrap();
         drop(state);
@@ -709,19 +677,22 @@ mod tests {
                     display_title TEXT NOT NULL
                 );
                 INSERT INTO local_thread_catalog VALUES
-                    ('thread-placeholder', '帮我处理这个问题');",
+                    ('thread-catalog', '测试123');",
             )
             .unwrap();
         drop(catalog);
 
-        assert_eq!(
-            resolve_session_name_with_preferred(home.path(), "thread-placeholder", None),
-            FALLBACK_SESSION_NAME
-        );
+        for session_id in ["thread-name", "thread-title", "thread-catalog"] {
+            assert_eq!(
+                resolve_session_name_with_preferred(home.path(), session_id, None),
+                "测试123",
+                "formal title source for {session_id} must remain usable"
+            );
+        }
     }
 
     #[test]
-    fn never_uses_the_first_user_message_as_the_title() {
+    fn never_falls_back_to_the_first_user_message_or_preview() {
         let home = tempdir().unwrap();
         let path = home.path().join("state_5.sqlite");
         let connection = Connection::open(path).unwrap();
@@ -740,11 +711,7 @@ mod tests {
             .execute(
                 "INSERT INTO threads (id, title, first_user_message, preview)
                  VALUES (?1, ?2, ?3, ?3)",
-                params![
-                    "thread-2",
-                    "请帮我\n检查  飞书通知",
-                    "请帮我\n检查  飞书通知"
-                ],
+                params!["thread-2", "  ", "请帮我\n检查  飞书通知"],
             )
             .unwrap();
         drop(connection);
@@ -795,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_sidebar_title_that_is_still_the_first_message() {
+    fn accepts_a_sidebar_title_matching_the_first_message() {
         let home = tempdir().unwrap();
         let path = home.path().join("state_5.sqlite");
         let connection = Connection::open(path).unwrap();
@@ -821,7 +788,7 @@ mod tests {
 
         assert_eq!(
             resolve_session_name_with_preferred(home.path(), "thread-4", Some("帮我处理这个问题")),
-            FALLBACK_SESSION_NAME
+            "帮我处理这个问题"
         );
     }
 
@@ -858,6 +825,10 @@ mod tests {
                 "thread-updated-ms".to_string(),
                 "thread-updated".to_string(),
                 "missing".to_string(),
+                " thread-recency-ms ".to_string(),
+                " local: thread-updated ".to_string(),
+                " local: ".to_string(),
+                String::new(),
             ],
         );
 
@@ -866,6 +837,84 @@ mod tests {
         assert_eq!(timestamps["thread-updated-ms"], 22_001);
         assert_eq!(timestamps["thread-updated"], 23_000);
         assert!(!timestamps.contains_key("missing"));
+        assert_eq!(timestamps.len(), 4);
+    }
+
+    // Unix permits removing or replacing a database while a cached connection is open.
+    #[cfg(unix)]
+    #[test]
+    fn clears_missing_legacy_connections_before_timestamp_lookup_stops_early() {
+        let home = tempdir().unwrap();
+        let sqlite = home.path().join("sqlite");
+        fs::create_dir(&sqlite).unwrap();
+        let legacy = home.path().join("state_5.sqlite");
+        for (path, timestamp) in [
+            (sqlite.join("codex-dev.db"), 10),
+            (sqlite.join("secondary.db"), 20),
+            (legacy.clone(), 30),
+        ] {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER)")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES ('shared-thread', ?1)",
+                    [timestamp],
+                )
+                .unwrap();
+        }
+
+        let mut cache = SessionMetadataCache::default();
+        let timestamps = cache.resolve_session_timestamps(
+            home.path(),
+            &["shared-thread".to_string(), "missing".to_string()],
+        );
+        assert_eq!(timestamps["shared-thread"], 10_000);
+        assert_eq!(cache.connections.len(), 3);
+
+        fs::remove_file(&legacy).unwrap();
+        let timestamps =
+            cache.resolve_session_timestamps(home.path(), &["shared-thread".to_string()]);
+        assert_eq!(timestamps["shared-thread"], 10_000);
+        assert!(!cache.connections.contains_key(&legacy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopens_a_replaced_database_before_reading_timestamps() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let replacement = home.path().join("replacement.sqlite");
+        for (path, timestamp) in [(&path, 10), (&replacement, 20)] {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER)")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES ('replaced-thread', ?1)",
+                    [timestamp],
+                )
+                .unwrap();
+        }
+
+        let mut cache = SessionMetadataCache::default();
+        let ids = ["replaced-thread".to_string()];
+        assert_eq!(
+            cache.resolve_session_timestamps(home.path(), &ids)["replaced-thread"],
+            10_000
+        );
+        assert_eq!(
+            cache.resolve_session_timestamps(home.path(), &ids)["replaced-thread"],
+            10_000
+        );
+
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            cache.resolve_session_timestamps(home.path(), &ids)["replaced-thread"],
+            20_000
+        );
     }
 
     #[test]

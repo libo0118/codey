@@ -22,6 +22,7 @@ import {
   IconShieldCheck,
   IconSparkles,
   IconTrash as Trash,
+  IconUserCircle,
   IconWorld,
 } from "@tabler/icons-react";
 
@@ -72,7 +73,6 @@ import {
 } from "./routeConnectionImport";
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
-import { readHostTheme } from "./overlayTheme";
 import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
@@ -223,6 +223,14 @@ const routeProtocolOptions: Array<{
 
 const REQUIRED_FIELD_MARKER = <span aria-hidden="true" className="text-[var(--codey-red,#d70015)]">*</span>;
 
+type RouteTab = "accounts" | "routes" | "advanced";
+
+const ROUTE_TABS: { id: RouteTab; label: string; icon: typeof IconRoute }[] = [
+  { id: "routes", label: "供应商线路", icon: IconRoute },
+  { id: "accounts", label: "官方账号", icon: IconUserCircle },
+  { id: "advanced", label: "高级设置", icon: IconAdjustmentsHorizontal },
+];
+
 function ModelSectionComponent({
   config,
   runtimeStatus,
@@ -275,6 +283,7 @@ function ModelSectionComponent({
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[] | null>(null);
   // 脱敏只作用于当前页面显示，每次进入页面默认关闭。
   const [maskSensitive, setMaskSensitive] = useState(false);
+  const [routeTab, setRouteTab] = useState<RouteTab>("routes");
   const [officialRouteDraft, setOfficialRouteDraft] =
     useState<OfficialRouteSettingsDraft | null>(null);
   const [officialDialogScope, setOfficialDialogScope] =
@@ -620,7 +629,7 @@ function ModelSectionComponent({
     }
     setRouteImportError(
       clipboardText?.trim()
-        ? "剪贴板内容不是有效的 New API 连接信息，请手动粘贴"
+        ? "剪贴板内容不是有效的线路连接信息，请手动粘贴"
         : "",
     );
     setRouteImportOpen(true);
@@ -632,7 +641,7 @@ function ModelSectionComponent({
     if (info) {
       applyRouteConnectionInfo(info);
     } else {
-      setRouteImportError(value.trim() ? "不是有效的 New API 连接信息" : "");
+      setRouteImportError(value.trim() ? "不是有效的线路连接信息" : "");
     }
   };
   const openHeadersDialog = (profile: Profile) => {
@@ -790,6 +799,12 @@ function ModelSectionComponent({
     </div>
   );
 
+  const showRouteTabs = !routeConfigReadOnly;
+  const routeTabHidden = (tab: RouteTab) => showRouteTabs && routeTab !== tab;
+  const routePanelProps = (tab: RouteTab) => showRouteTabs
+    ? { role: "tabpanel", id: `route-panel-${tab}`, "aria-labelledby": `route-tab-${tab}`, hidden: routeTab !== tab }
+    : {};
+
   return (
     <section className="route-section" aria-labelledby="route-title">
       <SettingsPageHeader
@@ -856,7 +871,7 @@ function ModelSectionComponent({
                     color="primary"
                     variant="filled"
                     size="sm"
-                    onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                    onClick={() => void invoke("open_route_request_logs")}
                   >
                     <IconFileText size={14} aria-hidden="true" />
                     <span>查看请求日志</span>
@@ -869,8 +884,48 @@ function ModelSectionComponent({
       />
 
       <div className="route-content">
+        {showRouteTabs && (
+          <div className="route-tabs" role="tablist" aria-label="线路与模型分区">
+            {ROUTE_TABS.map((tab, index) => {
+              const TabIcon = tab.icon;
+              const count = tab.id === "routes"
+                ? visibleProfiles.length
+                : tab.id === "accounts"
+                  ? officialAccounts?.length
+                  : undefined;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  id={`route-tab-${tab.id}`}
+                  aria-selected={routeTab === tab.id}
+                  aria-controls={`route-panel-${tab.id}`}
+                  tabIndex={routeTab === tab.id ? 0 : -1}
+                  className="route-tab"
+                  onClick={() => setRouteTab(tab.id)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+                    event.preventDefault();
+                    const step = event.key === "ArrowRight" ? 1 : -1;
+                    const next = ROUTE_TABS[(index + step + ROUTE_TABS.length) % ROUTE_TABS.length];
+                    setRouteTab(next.id);
+                    event.currentTarget.parentElement
+                      ?.querySelector<HTMLButtonElement>(`#route-tab-${next.id}`)
+                      ?.focus();
+                  }}
+                >
+                  <TabIcon size={15} aria-hidden="true" />
+                  <span>{tab.label}</span>
+                  {count !== undefined && <span className="route-tab-count">{count}</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
+            <div {...routePanelProps("accounts")}>
             {!routeConfigReadOnly && (
               <OfficialAccountsPanel
                 officialAccountAvailable={officialAccountAvailable}
@@ -884,7 +939,9 @@ function ModelSectionComponent({
                 onRequestConfirmation={onRequestConfirmation}
               />
             )}
+            </div>
 
+            <div {...routePanelProps("routes")}>
             <div className="catalog-aggregate-heading">
               <div className="catalog-aggregate-title-wrap">
                 <div className="catalog-aggregate-title">
@@ -988,22 +1045,6 @@ function ModelSectionComponent({
                         </div>
                         <div className="provider-heading-text">
                           <div className="provider-heading-title-row">
-                            {!routeConfigReadOnly && (
-                              <span
-                                title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
-                                className="provider-route-toggle-wrap"
-                              >
-                                <Switch
-                                  size="xs"
-                                  checked={!disabled}
-                                  disabled={isBusy || dirty || pendingRouteToggle !== null}
-                                  aria-busy={pendingRouteToggle?.id === profile.id}
-                                  onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
-                                  aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
-                                  className="route-status-switch"
-                                />
-                              </span>
-                            )}
                             <strong id={`provider-model-${profile.id}`} title={profile.name}>{prefixedRouteName(profile)}</strong>
                             <div className="route-item-badges">
                               {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
@@ -1041,8 +1082,7 @@ function ModelSectionComponent({
                       <div className="provider-card-toolbar">
                         {!disabled && (
                           <Button
-                            color="primary"
-                            variant="filled"
+                            variant="outline"
                             size="xs"
                             disabled={!canSyncCurrentProvider || isBusy}
                             onClick={syncModels}
@@ -1092,6 +1132,22 @@ function ModelSectionComponent({
                               </Button>
                             )}
                           </div>
+                        )}
+                        {!routeConfigReadOnly && (
+                          <span
+                            title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
+                            className="provider-route-toggle-wrap"
+                          >
+                            <Switch
+                              size="xs"
+                              checked={!disabled}
+                              disabled={isBusy || dirty || pendingRouteToggle !== null}
+                              aria-busy={pendingRouteToggle?.id === profile.id}
+                              onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
+                              aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
+                              className="route-status-switch"
+                            />
+                          </span>
                         )}
                       </div>
                     </div>
@@ -1207,10 +1263,11 @@ function ModelSectionComponent({
                 );
               })}
             </div>
+            </div>
           </div>
         </div>
 
-        <div className="route-auxiliary-bar">
+        <div className="route-auxiliary-bar" {...routePanelProps("advanced")}>
           <div className="route-auxiliary-header">
             <div className="route-auxiliary-title-wrap">
               <div className="route-auxiliary-title-row">
@@ -1220,15 +1277,23 @@ function ModelSectionComponent({
               <small className="route-auxiliary-subtitle">配置辅助任务专用模型与长会话中断后的自动恢复策略</small>
             </div>
           </div>
-          <div className="route-auxiliary-grid">
-            <div className="route-auxiliary-misc">
-              <Tooltip content={miscModelTooltip} position="top">
-                <span className="route-auxiliary-label cursor-help">
-                  <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
-                  <strong>杂事模型</strong>
-                  <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
-                </span>
-              </Tooltip>
+          <div className="route-setting-row">
+            <div className="route-setting-text">
+              <div className="route-setting-title">
+                <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                <strong>杂事模型</strong>
+                <Tooltip content={miscModelTooltip} position="top">
+                  <span className="route-auxiliary-help-trigger" aria-label="杂事模型说明">
+                    <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+                  </span>
+                </Tooltip>
+              </div>
+              <p>会话命名、Git 提交消息、环境建议与自动复核回退使用的模型；留空沿用默认选择</p>
+              {miscModelUnavailable && (
+                <p className="route-setting-warning">当前选择不在可用模型列表中，请重新选择</p>
+              )}
+            </div>
+            <div className="route-setting-control">
               <div className="route-auxiliary-combobox">
                 <ModelCombobox
                   aria-label="杂事模型"
@@ -1236,7 +1301,7 @@ function ModelSectionComponent({
                   placeholder={
                     subagentModelOptions.length === 0
                       ? "所有线路均暂无模型"
-                      : "请选择模型"
+                      : "默认选择"
                   }
                   disabled={miscModelDisabled}
                   options={subagentModelOptions}
@@ -1259,34 +1324,40 @@ function ModelSectionComponent({
                 恢复默认
               </Button>
             </div>
+          </div>
 
-            <div className="route-auxiliary-retry">
-              <div className="local-router-toggle route-retry-toggle">
+          <div className="route-setting-row">
+            <div className="route-setting-text">
+              <div className="route-setting-title">
+                <RefreshCw size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                <strong>会话重试</strong>
                 <Tooltip content="每轮请求的流式错误重试次数；切换传输方式时可能另行计数，不等于总请求上限。保存并重启 Codex 后生效" position="top">
-                  <span className="route-retry-label cursor-help">
-                    <strong>会话重试</strong>
+                  <span className="route-auxiliary-help-trigger" aria-label="会话重试说明">
                     <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
                   </span>
                 </Tooltip>
-                <NumberInput
-                  size="sm"
-                  value={config.streamMaxRetries}
-                  minValue={0}
-                  maxValue={100}
-                  disabled={isBusy}
-                  onChange={(value) => {
-                    if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
-                      onConfigChange?.({ ...config, streamMaxRetries: value });
-                    }
-                  }}
-                  aria-label="会话错误重试次数"
-                />
               </div>
+              <p>每轮请求的流式错误重试次数（0–100），保存并重启 Codex 后生效</p>
+            </div>
+            <div className="route-setting-control">
+              <NumberInput
+                size="sm"
+                value={config.streamMaxRetries}
+                minValue={0}
+                maxValue={100}
+                disabled={isBusy}
+                onChange={(value) => {
+                  if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
+                    onConfigChange?.({ ...config, streamMaxRetries: value });
+                  }
+                }}
+                aria-label="会话错误重试次数"
+              />
             </div>
           </div>
         </div>
 
-        <div className="readonly-note">
+        <div className="readonly-note" hidden={routeTabHidden("routes")}>
           <IconInfoCircle size={14} className="readonly-note-icon" aria-hidden="true" />
           <span className="readonly-note-text">
             {routeConfigReadOnly
@@ -1345,7 +1416,7 @@ function ModelSectionComponent({
                     variant="outline"
                     className="ml-auto shrink-0"
                     disabled={isBusy}
-                    title="粘贴 New API「复制连接串」内容，自动填入 URL 与 Key"
+                    title="粘贴 New API JSON 或 Sub2API 的 CC Switch 导入链接，自动填入 URL 与 Key"
                     aria-expanded={routeImportOpen}
                     onClick={() => void handleRouteQuickImport()}
                   >
@@ -1619,9 +1690,9 @@ function ModelSectionComponent({
                 {isNewRouteDraft && routeImportOpen && (
                   <div className="route-import-panel">
                     <label className="route-field">
-                      <span>New API 连接信息</span>
+                      <span>快捷导入连接信息</span>
                       <TextArea
-                        aria-label="New API 连接信息"
+                        aria-label="快捷导入连接信息"
                         aria-invalid={Boolean(routeImportError)}
                         aria-describedby={
                           routeImportError ? "route-import-error" : "route-import-hint"
@@ -1631,7 +1702,7 @@ function ModelSectionComponent({
                         rows={2}
                         autoFocus
                         className="route-import-input font-mono text-xs"
-                        placeholder='{"_type":"newapi_channel_conn","key":"sk-…","url":"https://api.example.com"}'
+                        placeholder="New API JSON 或 Sub2API 的 ccswitch://v1/import?... 链接"
                         onChange={(event) => handleRouteImportTextChange(event.target.value)}
                       />
                       {routeImportError ? (
@@ -1644,7 +1715,7 @@ function ModelSectionComponent({
                         </small>
                       ) : (
                         <small id="route-import-hint" className="route-field-hint">
-                          粘贴 New API 令牌的「复制连接串」内容，识别后自动填入 URL 与 Key
+                          粘贴 New API JSON 或 Sub2API 的 CC Switch 导入链接，自动填入 URL 与 Key
                         </small>
                       )}
                     </label>

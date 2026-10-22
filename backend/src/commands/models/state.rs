@@ -371,6 +371,7 @@ pub(crate) fn renderer_route_model_catalog(
     config: &CodeyConfig,
     active_model_state: &model_catalog::ModelSelectionState,
 ) -> Vec<RendererRouteModelEntry> {
+    let context = model_catalog::CatalogContext::new(&config.codex_app_path);
     let mut entries = Vec::new();
     let mut aliases = HashSet::new();
     // 多个官方账号并存时，模型 ID 必须带线路前缀，否则渲染进程的模型列表会
@@ -406,7 +407,7 @@ pub(crate) fn renderer_route_model_catalog(
         let state = if provider_id == config.current_provider_id().unwrap_or_default() {
             active_model_state.clone()
         } else {
-            model_catalog::selection_state_with_manual_models(
+            model_catalog::selection_state_in_context(
                 codex_home(),
                 profile.official_account,
                 upstream_models,
@@ -414,7 +415,7 @@ pub(crate) fn renderer_route_model_catalog(
                 manual_models,
                 Some(&reasoning_efforts),
                 default_model.as_deref(),
-                &config.codex_app_path,
+                &context,
             )
             .map(|state| {
                 state.with_upstream_reasoning(Some(

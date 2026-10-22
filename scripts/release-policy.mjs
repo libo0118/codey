@@ -11,7 +11,7 @@ export function releaseIdentity(version) {
   const prerelease = version.includes("-") && !/^\d+\.\d+\.\d+-libo\.(0|[1-9]\d*)$/.test(version);
   const channel = prerelease ? "experimental" : "stable";
   const tag = `v${version}`;
-  return { version, tag, channel, prerelease, name: `${prerelease ? "实验版" : "正式版"} ${tag}` };
+  return { version, tag, channel, prerelease, makeLatest: prerelease ? "false" : "true", name: `${prerelease ? "实验版" : "正式版"} ${tag}` };
 }
 
 export function resolveReleaseVersion(version, channel) {

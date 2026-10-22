@@ -254,6 +254,8 @@ export function OfficialAccountsPanel({
   const [siwcCopied, setSiwcCopied] = useState(false);
   const [confirmSiwcAccount, setConfirmSiwcAccount] = useState<OfficialAccount | null>(null);
   const [confirmDefaultAccount, setConfirmDefaultAccount] = useState<OfficialAccount | null>(null);
+  const [switchTipTarget, setSwitchTipTarget] = useState<string | null>(null);
+  const [switchTipOpen, setSwitchTipOpen] = useState<string | null>(null);
   const loginRef = useRef<LoginStart | null>(null);
   loginRef.current = login;
   const siwcLoginRef = useRef<(LoginStart & { accountId: string }) | null>(null);
@@ -595,6 +597,14 @@ export function OfficialAccountsPanel({
   }
 
   const disabled = isBusy || pending !== null;
+  useEffect(() => {
+    if (!active || disabled || !switchTipTarget) {
+      setSwitchTipOpen(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setSwitchTipOpen(switchTipTarget), 400);
+    return () => window.clearTimeout(timer);
+  }, [active, disabled, switchTipTarget]);
 
   return (
     <div className="official-accounts-panel" aria-label="官方账号">
@@ -670,45 +680,69 @@ export function OfficialAccountsPanel({
                   ? `${account.siwcInvalidReason || "官方直连授权已失效"}，点击重新授权`
                   : "通过 Sign in with ChatGPT 二次授权，对话走 OpenAI 官方通道；额度查询等继续使用现有登录";
             return (
-              <li
+              <Tooltip
                 key={account.id}
+                asChild
+                content={switchable ? "点击切换为默认账号" : undefined}
+                open={active && !disabled && switchTipOpen === account.id}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    setSwitchTipTarget((current) => current === account.id ? null : current);
+                    setSwitchTipOpen((current) => current === account.id ? null : current);
+                  }
+                }}
+              >
+              <li
                 className={`official-account-item${account.isDefault ? " is-default" : ""}${account.invalid ? " is-invalid" : ""}${switchable ? " is-switchable" : ""}`}
                 {...(switchable
                   ? {
                       role: "button",
                       tabIndex: 0,
-                      title: "点击切换为默认官方账号",
+                      onPointerOverCapture: (event: React.PointerEvent) => {
+                        if (event.pointerType === "touch") return;
+                        const target = event.target as HTMLElement;
+                        const nestedTrigger = target.closest("[data-slot='tooltip-trigger']");
+                        const overControl = target.closest("button, a, input, textarea") ||
+                          (nestedTrigger && nestedTrigger !== event.currentTarget);
+                        setSwitchTipTarget(overControl ? null : account.id);
+                        if (overControl) setSwitchTipOpen(null);
+                      },
+                      onPointerLeave: () => {
+                        setSwitchTipTarget(null);
+                        setSwitchTipOpen(null);
+                      },
+                      onFocusCapture: (event: React.FocusEvent) => {
+                        const target = event.target === event.currentTarget ? account.id : null;
+                        setSwitchTipTarget(target);
+                        setSwitchTipOpen(target);
+                      },
+                      onBlurCapture: (event: React.FocusEvent) => {
+                        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                          setSwitchTipTarget(null);
+                          setSwitchTipOpen(null);
+                        }
+                      },
                       onClick: (event: React.MouseEvent) => {
                         // li 自身也是 role=button，不能把卡片算进交互元素。
                         if ((event.target as HTMLElement).closest("button, a, input, textarea")) return;
                         // 拖选文本时的点击不弹确认窗。
                         if (window.getSelection()?.toString()) return;
+                        setSwitchTipTarget(null);
+                        setSwitchTipOpen(null);
                         askSetDefault(account);
                       },
                       onKeyDown: (event: React.KeyboardEvent) => {
                         if (event.target !== event.currentTarget) return;
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
+                          setSwitchTipTarget(null);
+                          setSwitchTipOpen(null);
                           askSetDefault(account);
                         }
                       },
                     }
                   : {})}
               >
-                {account.isDefault && (
-                  <span
-                    className={`official-account-default-corner${account.invalid ? " is-invalid" : officialAccountAvailable ? " is-ready" : " is-pending"}`}
-                    title={
-                      account.invalid
-                        ? "默认官方账号（凭据已失效）"
-                        : officialAccountAvailable
-                          ? "默认官方账号，Codex 以此账号登录"
-                          : "默认官方账号，Codex 重启后生效"
-                    }
-                  >
-                    默认
-                  </span>
-                )}
                 <div className="official-account-item-top">
                   <div className="official-account-item-left">
                     <div className="official-account-item-icon-pill" aria-hidden="true">
@@ -717,6 +751,22 @@ export function OfficialAccountsPanel({
                     <div className="official-account-main">
                       <div className="official-account-line">
                         <strong title={label}>{label}</strong>
+                      </div>
+                      <div className="official-account-tags">
+                        {account.isDefault && (
+                          <span
+                            className={`official-account-default-corner${account.invalid ? " is-invalid" : officialAccountAvailable ? " is-ready" : " is-pending"}`}
+                            title={
+                              account.invalid
+                                ? "默认官方账号（凭据已失效）"
+                                : officialAccountAvailable
+                                  ? "默认官方账号，Codex 以此账号登录"
+                                  : "默认官方账号，Codex 重启后生效"
+                            }
+                          >
+                            默认
+                          </span>
+                        )}
                         {plan && (
                           <span className={planTagClass(planType)}>
                             {isProPlan(planType) ? (
@@ -752,20 +802,6 @@ export function OfficialAccountsPanel({
                             </button>
                           </Tooltip>
                         )}
-                        {!account.invalid && !usageInvalid && (
-                          <Tooltip content={usageLoading ? "正在刷新额度…" : "刷新额度"}>
-                            <button
-                              type="button"
-                              className="official-account-usage-refresh-chip"
-                              disabled={disabled || usageLoading}
-                              aria-label={usageLoading ? "正在刷新额度" : "刷新额度"}
-                              onClick={() => void refreshUsage(account.id, true)}
-                            >
-                              <IconRefresh size={11} className={usageLoading ? "animate-spin" : undefined} aria-hidden="true" />
-                              <span>{usageLoading ? "正在刷新" : "刷新额度"}</span>
-                            </button>
-                          </Tooltip>
-                        )}
                       </div>
                     </div>
                   </div>
@@ -795,6 +831,21 @@ export function OfficialAccountsPanel({
                   )}
                 </div>
                 <div className="official-account-controls">
+                  {!account.invalid && !usageInvalid && (
+                    <Tooltip content={usageLoading ? "正在刷新额度…" : "刷新额度"}>
+                      <Button
+                        variant="link"
+                        size="icon-sm"
+                        className="official-account-usage-refresh-btn"
+                        disabled={disabled || usageLoading}
+                        aria-label={usageLoading ? "正在刷新额度" : "刷新额度"}
+                        aria-busy={usageLoading}
+                        onClick={() => void refreshUsage(account.id, true)}
+                      >
+                        <IconRefresh size={14} className={usageLoading ? "animate-spin" : undefined} aria-hidden="true" />
+                      </Button>
+                    </Tooltip>
+                  )}
                   <Button
                     variant="link"
                     color="danger"
@@ -813,6 +864,7 @@ export function OfficialAccountsPanel({
                   </Button>
                 </div>
               </li>
+              </Tooltip>
             );
           })}
         </ul>

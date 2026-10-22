@@ -316,10 +316,22 @@ pub(crate) fn current_model_state_at(
     config: &CodeyConfig,
     home: &std::path::Path,
 ) -> Result<model_catalog::ModelSelectionState, String> {
+    current_model_state_in_context(
+        config,
+        home,
+        &model_catalog::CatalogContext::new(&config.codex_app_path),
+    )
+}
+
+pub(crate) fn current_model_state_in_context(
+    config: &CodeyConfig,
+    home: &std::path::Path,
+    context: &model_catalog::CatalogContext<'_>,
+) -> Result<model_catalog::ModelSelectionState, String> {
     if !config.local_router_enabled {
         let provider = codex_provider::current_provider(home)
             .map_err(|error| format!("读取当前 Codex 线路失败：{error:#}"))?;
-        return native_model_state_for_provider(config, &provider, home);
+        return native_model_state_for_provider_in_context(config, &provider, home, context);
     }
     let active_profile = config
         .profiles
@@ -342,7 +354,7 @@ pub(crate) fn current_model_state_at(
     };
     let requested_default_model = config.default_model_for_profile(active_profile);
     let reasoning_efforts = config.model_reasoning_efforts_for_provider(provider_id);
-    model_catalog::selection_state_with_manual_models(
+    model_catalog::selection_state_in_context(
         home,
         official,
         config
@@ -357,7 +369,7 @@ pub(crate) fn current_model_state_at(
             .unwrap_or_default(),
         Some(&reasoning_efforts),
         requested_default_model.as_deref(),
-        &config.codex_app_path,
+        context,
     )
     .map(|state| {
         state.with_upstream_reasoning(Some(

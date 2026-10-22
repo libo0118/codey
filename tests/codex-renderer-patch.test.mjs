@@ -15,6 +15,121 @@ const newDraftFixture = [
   "function vwo(e,t){let r=e===void 0?null:e,i=t===void 0?null:t,a=hi(U),{draftSettings:o,isNewThreadDraft:s,updateDraftSettings:c}=Lva(),l=_wo(r,uxo(r),o.serviceTier,s,i),{serviceTierAccess:d,...u}=l;return{...u,setServiceTier:async(e,t)=>{if(!We(e,d))return!1;let n=r==null&&s&&(u.hasManagedNewThreadSettings||i!=null||o.serviceTier!=null);n&&c(t=>({...t,isManuallyChanged:!0,serviceTier:{value:xir(e)}}));let[l]=await Promise.all([u.setServiceTier(e,t),n?Vh(a,u.hostId).clearPrewarmedThreads():void 0]);return l}}}function afterSpeed(){}",
 ].join("");
 
+// 原样摘自 Codex 26.1007.71326 的 app-initial-1ab6fbe93c4f.js。
+// 该缓存版本与用户日志版本不同，只验证已取得的真实函数形态。
+const nativeCatalogModelFilterFixture = "function ERi({additionalAvailableModels:e,apiKeyDaybreakSupported:t,authMethod:n,availableModels:r,hasConfiguredModelCatalog:i,isCustomModelProvider:a,model:o,useHiddenModels:s}){let c=o.availableAccessPrograms?.cyber;return n===`apikey`&&!t&&c!=null&&c.length>0&&!c.includes(`standard`)?!1:e?.has(o.model)===!0||o.model!==`codex-auto-review`&&(i&&!o.hidden||(s&&!a&&n!==`amazonBedrock`?r.has(o.model)||n===`apikey`&&t&&!o.hidden&&c?.some(e=>e!==`standard`)===!0:!o.hidden))}";
+
+async function captureRendererPatch(source) {
+  const records = [];
+  const savedLog = globalThis.__codeyPatchLog;
+  const savedError = console.error;
+  globalThis.__codeyPatchLog = (record) => records.push(JSON.parse(record));
+  console.error = () => {};
+  try {
+    (0, eval)(await loadStartupPatchTemplate());
+    const patch = () => globalThis.__codeyRendererPatchEntry(
+      "app://-/assets/app-initial-model-filter-diagnostic.js", source,
+    ) ?? source;
+    const patched = patch();
+    assert.equal(patch(), patched, "repeated requests retain the same patch result");
+    return { patched, records };
+  } finally {
+    if (savedLog === undefined) delete globalThis.__codeyPatchLog;
+    else globalThis.__codeyPatchLog = savedLog;
+    console.error = savedError;
+  }
+}
+
+test("model failure excerpts select filter code ahead of unrelated Fast anchors and remain bounded", async () => {
+  const driftedFilter = nativeCatalogModelFilterFixture.replace("s&&!a&&", "s&&a&&");
+  const source = [
+    "const unrelated=`composer.toggleFastMode`,selectedServiceTier=`fast`;",
+    "/* unrelated static asset region */".repeat(80),
+    "const includeUltraReasoningEffort=true;",
+    driftedFilter,
+    "/* 模型过滤之后的静态代码 */",
+    "/* unrelated static asset region */".repeat(80),
+    "const isServiceTierAllowed=true;",
+    "function settingsView(){if(!allowed||settings.availableOptions.length<=1)return null;return selectedServiceTier}",
+  ].join("");
+  const { patched, records } = await captureRendererPatch(source);
+  assert.deepEqual(records.map(({ operation }) => operation), [
+    "renderer_patch:model allowlist", "renderer_patch:model visibility",
+    "renderer_patch:model-aware service tier control", "renderer_patch:model-aware Fast toggle",
+  ], "each failed gate is recorded only once despite repeated requests");
+  for (const { context } of records.slice(2)) {
+    assert.match(context.excerpts.join("\n"), /composer\.toggleFastMode|selectedServiceTier/,
+      "other gates retain their general diagnostic anchors");
+  }
+  assert.ok(patched.includes(driftedFilter), "unrecognized model rules remain unchanged");
+  assert.match(patched, /if\(settings\.availableOptions\.length<=1\)return null/,
+    "a failed model gate still permits an independent compatible patch");
+  for (const { context } of records.slice(0, 2)) {
+    assert.equal(context.matchCount, 0);
+    assert.ok(context.excerpts.length > 0 && context.excerpts.length <= 2);
+    for (const excerpt of context.excerpts) {
+      assert.ok(excerpt.length > 0 && excerpt.length <= 640);
+      assert.match(excerpt, /^[\x20-\x7E]+$/);
+      assert.doesNotMatch(excerpt, /composer\.toggleFastMode|selectedServiceTier/);
+    }
+    const excerpt = context.excerpts.join("\n");
+    assert.match(excerpt, /function ERi\(/);
+    assert.match(excerpt, /r\.has\(o\.model\)/);
+    assert.match(excerpt, /!o\.hidden/);
+    assert.match(excerpt, /amazonBedrock/);
+  }
+});
+
+test("native catalog model access keeps official, custom and hidden-model rules unchanged", async () => {
+  const source = `const includeUltraReasoningEffort=true;${nativeCatalogModelFilterFixture}`;
+  const { patched, records } = await captureRendererPatch(source);
+  assert.equal(patched, source, "native access rules need no source rewrite");
+  assert.deepEqual(records, [], "the real catalog-aware shape is not a compatibility failure");
+  const filter = Function(`${patched};return ERi`)();
+  const cases = [
+    { label: "custom visible model bypasses the native allowlist", custom: true, expected: true },
+    { label: "custom hidden model stays hidden even when allowlisted", custom: true, hidden: true, listed: true, expected: false },
+    { label: "official visible model still requires the allowlist", expected: false },
+    { label: "official allowlisted model is visible", listed: true, expected: true },
+    { label: "official allowlisted hidden model is available", hidden: true, listed: true, expected: true },
+    { label: "configured catalog permits a visible official model", catalog: true, expected: true },
+    { label: "configured catalog does not expose a hidden custom model", custom: true, hidden: true, catalog: true, expected: false },
+    { label: "Bedrock retains the visibility fallback", auth: "amazonBedrock", expected: true },
+    { label: "API key cyber restriction remains before the custom-provider bypass", auth: "apikey", custom: true, cyber: ["cyber"], expected: false },
+    { label: "supported API key cyber access retains its native branch", auth: "apikey", daybreak: true, cyber: ["cyber"], expected: true },
+    { label: "auto-review is still excluded", custom: true, model: "codex-auto-review", expected: false },
+    { label: "explicit additional availability is preserved", custom: true, hidden: true, additional: true, expected: true },
+  ];
+  for (const entry of cases) {
+    const model = entry.model ?? "candidate";
+    assert.equal(filter({
+      additionalAvailableModels: new Set(entry.additional ? [model] : []),
+      apiKeyDaybreakSupported: entry.daybreak ?? false,
+      authMethod: entry.auth ?? "chatgpt",
+      availableModels: new Set(entry.listed ? [model] : []),
+      hasConfiguredModelCatalog: entry.catalog ?? false,
+      isCustomModelProvider: entry.custom ?? false,
+      model: { model, hidden: entry.hidden ?? false, availableAccessPrograms: { cyber: entry.cyber } },
+      useHiddenModels: true,
+    }), entry.expected, entry.label);
+  }
+});
+
+test("similar model filters without the confirmed custom-provider bypass are still diagnosed", async () => {
+  for (const filter of [
+    nativeCatalogModelFilterFixture.replace("s&&!a&&", "s&&"),
+    nativeCatalogModelFilterFixture.replace("s&&!a&&", "s&&a&&"),
+    nativeCatalogModelFilterFixture.replace(":!o.hidden))", ":!o.hidden&&!a))"),
+  ]) {
+    const source = `const includeUltraReasoningEffort=true;${filter}`;
+    const { patched, records } = await captureRendererPatch(source);
+    assert.equal(patched, source);
+    assert.deepEqual(records.map(({ operation }) => operation), [
+      "renderer_patch:model allowlist", "renderer_patch:model visibility",
+    ]);
+  }
+});
+
 function exerciseDraftHooks(source) {
   const takeFunction = (name) => {
     const start = source.indexOf(`function ${name}(`);

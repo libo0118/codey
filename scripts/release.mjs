@@ -225,7 +225,7 @@ function main() {
   console.log(`Preparing ${options.tag} from ${branch}`);
   updatePackageJson(options.version);
   updateCargoToml(options.version);
-  run("cargo", ["generate-lockfile"]);
+  run("cargo", ["update", "--workspace"]);
   ensureVersionsMatch(options.version);
 
   if (!options.skipChecks) runChecks();

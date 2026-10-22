@@ -34,33 +34,27 @@ function fixture(search, systemDark) {
   };
 }
 
-test("request logs use the opening Codex theme even when the browser system theme differs", () => {
-  for (const theme of ["light", "dark"]) {
-    const f = fixture(`?theme=${theme}`, theme === "light");
-    installRequestLogTheme(f.document);
-    f.expectTheme(theme);
-    f.change(theme === "dark");
-    f.change(theme === "light");
-    f.expectTheme(theme);
-    assert.equal(f.listeners.size, 0);
+test("request logs follow the system theme and changes even with legacy theme parameters", () => {
+  for (const search of ["", "?theme=light", "?theme=dark", "?theme=system", "?theme=untrusted"]) {
+    for (const systemDark of [false, true]) {
+      const f = fixture(search, systemDark);
+      const dispose = installRequestLogTheme(f.document);
+      const initialTheme = systemDark ? "dark" : "light";
+      f.expectTheme(initialTheme);
+      assert.equal(f.listeners.size, 1);
+      f.change(!systemDark);
+      f.expectTheme(systemDark ? "light" : "dark");
+      f.change(systemDark);
+      f.expectTheme(initialTheme);
+      dispose();
+      assert.equal(f.listeners.size, 0);
+      f.change(!systemDark);
+      f.expectTheme(initialTheme);
+    }
   }
 });
 
-test("old and invalid log links follow system changes without locking to their first theme", () => {
-  for (const search of ["", "?theme=system", "?theme=untrusted"]) {
-    const f = fixture(search, true);
-    const dispose = installRequestLogTheme(f.document);
-    f.expectTheme("dark");
-    f.change(false);
-    f.expectTheme("light");
-    f.change(true);
-    f.expectTheme("dark");
-    dispose();
-    assert.equal(f.listeners.size, 0);
-  }
-});
-
-test("removing the request log token from the URL preserves the theme on reload", async () => {
+test("removing the request log token from the URL preserves query parameters on reload", async () => {
   const overlay = await readSource("src/overlay.tsx");
   const source = overlay.match(/function installBrowserBridge\(\) \{[\s\S]*?\n\}/)?.[0];
   assert.ok(source);

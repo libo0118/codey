@@ -15,6 +15,8 @@ pub struct NotificationDeliveryError {
     settle_delivery: bool,
     retry_with_fresh_context: bool,
     stale_token: bool,
+    uncertain: bool,
+    retry_after_ms: Option<u64>,
 }
 
 impl NotificationDeliveryError {
@@ -24,6 +26,8 @@ impl NotificationDeliveryError {
             settle_delivery: false,
             retry_with_fresh_context: false,
             stale_token: false,
+            uncertain: false,
+            retry_after_ms: None,
         }
     }
 
@@ -33,6 +37,8 @@ impl NotificationDeliveryError {
             settle_delivery: true,
             retry_with_fresh_context: false,
             stale_token: false,
+            uncertain: true,
+            retry_after_ms: None,
         }
     }
 
@@ -42,6 +48,8 @@ impl NotificationDeliveryError {
             settle_delivery: false,
             retry_with_fresh_context: true,
             stale_token: false,
+            uncertain: false,
+            retry_after_ms: None,
         }
     }
 
@@ -51,9 +59,12 @@ impl NotificationDeliveryError {
             settle_delivery: false,
             retry_with_fresh_context: false,
             stale_token: true,
+            uncertain: false,
+            retry_after_ms: None,
         }
     }
 
+    #[cfg(test)]
     pub fn should_settle_delivery(&self) -> bool {
         self.settle_delivery
     }
@@ -64,6 +75,18 @@ impl NotificationDeliveryError {
 
     pub fn indicates_stale_token(&self) -> bool {
         self.stale_token
+    }
+
+    pub(crate) fn outcome(&self) -> super::outbox::DeliveryOutcome {
+        if self.uncertain {
+            super::outbox::DeliveryOutcome::Uncertain
+        } else if self.settle_delivery {
+            super::outbox::DeliveryOutcome::PermanentFailure
+        } else {
+            super::outbox::DeliveryOutcome::Retryable {
+                retry_after_ms: self.retry_after_ms,
+            }
+        }
     }
 }
 
@@ -92,37 +115,43 @@ impl NotificationDispatcher {
         Self { client, config }
     }
 
-    pub async fn send(
+    /// 自动通知由持久队列安排重试，一次认领只执行一次 HTTP 投递。
+    pub(crate) async fn send_once(
         &self,
         event: &NotificationEvent,
     ) -> std::result::Result<(), NotificationDeliveryError> {
-        if !self.config.enabled || !self.config.is_configured() {
-            return Ok(());
-        }
         let adapter = adapter_for(&self.config);
-        self.send_with_attempts(event, adapter.as_ref(), 2).await
+        self.send_with_adapter(event, adapter.as_ref()).await
     }
 
-    async fn send_with_attempts(
+    async fn send_with_adapter(
         &self,
         event: &NotificationEvent,
         adapter: &dyn NotificationChannelAdapter,
-        attempts: u32,
     ) -> std::result::Result<(), NotificationDeliveryError> {
-        let mut last_error = None;
-        for attempt in 0..attempts.max(1) {
+        let last_error;
+        let mut retry_after_ms = None;
+        {
             let request = adapter
                 .build_request(&self.client, event)
                 .map_err(|error| {
-                    NotificationDeliveryError::retryable(format!(
+                    self.record_attempt(event, 1, "request_build_failed", None, None);
+                    let mut failure = NotificationDeliveryError::settled(format!(
                         "{}消息发送失败：{}",
                         adapter.display_name(),
                         adapter.sanitize_error(&error.to_string())
-                    ))
+                    ));
+                    failure.uncertain = false;
+                    failure
                 })?;
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    retry_after_ms = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(parse_retry_after_ms);
                     match crate::http_response::read_bounded_body(
                         response,
                         MAX_NOTIFICATION_RESPONSE_BYTES,
@@ -132,7 +161,34 @@ impl NotificationDispatcher {
                     {
                         Ok(response_body) => {
                             let response_body = String::from_utf8_lossy(&response_body);
-                            match validate_http_response(adapter, status, &response_body) {
+                            let validation =
+                                validate_http_response(adapter, status, &response_body);
+                            let outcome = if validation.is_ok() {
+                                "delivered"
+                            } else if status.is_success()
+                                && (adapter
+                                    .pause_on_stale_token_success_status_error(&response_body)
+                                    || adapter.retry_with_fresh_context_on_success_status_error(
+                                        &response_body,
+                                    ))
+                            {
+                                "retryable_error"
+                            } else if (status.is_success()
+                                && adapter.settle_on_success_status_error(&response_body))
+                                || is_permanent_client_error(status)
+                            {
+                                "settled_error"
+                            } else {
+                                "retryable_error"
+                            };
+                            self.record_attempt(
+                                event,
+                                1,
+                                outcome,
+                                Some(status),
+                                notification_response_code(&response_body),
+                            );
+                            match validation {
                                 Ok(()) => return Ok(()),
                                 Err(error) => {
                                     if status.is_success()
@@ -165,7 +221,7 @@ impl NotificationDispatcher {
                                         && adapter.settle_on_success_status_error(&response_body)
                                     {
                                         return Err(NotificationDeliveryError::settled(format!(
-                                            "{}消息发送失败：{error}",
+                                            "{}消息发送失败，已停止自动重试：{error}",
                                             adapter.display_name()
                                         )));
                                     }
@@ -173,17 +229,28 @@ impl NotificationDispatcher {
                                         // A rejected token, unknown chat or malformed
                                         // payload will not fix itself; retrying every
                                         // scan only burns the ledger with fsyncs.
-                                        return Err(NotificationDeliveryError::settled(format!(
-                                            "{}消息发送失败（HTTP {}，已停止自动重试）：{error}",
-                                            adapter.display_name(),
-                                            status.as_u16()
-                                        )));
+                                        let mut failure = NotificationDeliveryError::settled(
+                                            format!(
+                                                "{}消息发送失败（HTTP {}，已停止自动重试）：{error}",
+                                                adapter.display_name(),
+                                                status.as_u16()
+                                            ),
+                                        );
+                                        failure.uncertain = false;
+                                        return Err(failure);
                                     }
                                     last_error = Some(error);
                                 }
                             }
                         }
                         Err(error) => {
+                            self.record_attempt(
+                                event,
+                                1,
+                                "response_read_uncertain",
+                                Some(status),
+                                None,
+                            );
                             return Err(NotificationDeliveryError::settled(format!(
                                 "{}消息发送结果不确定，已停止自动重试：{}",
                                 adapter.display_name(),
@@ -196,6 +263,14 @@ impl NotificationDispatcher {
                     }
                 }
                 Err(error) => {
+                    let outcome = if error.is_timeout() {
+                        "timeout_uncertain"
+                    } else if error.is_connect() {
+                        "connect_failed"
+                    } else {
+                        "transport_uncertain"
+                    };
+                    self.record_attempt(event, 1, outcome, None, None);
                     if error.is_timeout() || !error.is_connect() {
                         return Err(NotificationDeliveryError::settled(format!(
                             "{}消息发送结果不确定，已停止自动重试：{}",
@@ -206,16 +281,41 @@ impl NotificationDispatcher {
                     last_error = Some(adapter.sanitize_error(&error.to_string()));
                 }
             }
-            if attempt + 1 < attempts.max(1) {
-                tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt))).await;
-            }
         }
         let error = last_error.unwrap_or_else(|| "未知错误".to_string());
-        Err(NotificationDeliveryError::retryable(format!(
+        let mut failure = NotificationDeliveryError::retryable(format!(
             "{}消息发送失败：{}",
             adapter.display_name(),
             adapter.sanitize_error(&error)
-        )))
+        ));
+        failure.retry_after_ms = retry_after_ms;
+        Err(failure)
+    }
+
+    fn record_attempt(
+        &self,
+        event: &NotificationEvent,
+        attempt: u32,
+        outcome: &'static str,
+        status: Option<StatusCode>,
+        response_code: Option<i64>,
+    ) {
+        let detail = notification_attempt_diagnostic(
+            event,
+            self.config.kind,
+            attempt,
+            outcome,
+            status,
+            response_code,
+        );
+        // 只记录固定分类和数值状态，不写入渠道凭据、消息正文或远端错误文本。
+        #[cfg(not(test))]
+        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+            "notification.delivery_attempt",
+            detail,
+        );
+        #[cfg(test)]
+        let _ = detail;
     }
 
     pub async fn test(&self) -> Result<Value> {
@@ -239,11 +339,24 @@ impl NotificationDispatcher {
         // Background notifications only retry failures known not to be timeouts.
         let adapter = adapter_for(&tester.config);
         tester
-            .send_with_attempts(&event, adapter.as_ref(), 1)
+            .send_with_adapter(&event, adapter.as_ref())
             .await
             .map_err(anyhow::Error::new)?;
         Ok(json!({"status":"ok", "eventId": event.event_id}))
     }
+}
+
+fn parse_retry_after_ms(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000));
+    }
+    chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|date| {
+            date.timestamp_millis()
+                .saturating_sub(chrono::Utc::now().timestamp_millis())
+                .max(0) as u64
+        })
 }
 
 /// 4xx responses other than request-timeout and rate-limit describe a request
@@ -288,6 +401,38 @@ pub(crate) fn shared_notification_http_client() -> Result<Client> {
     let client = notification_http_client()?;
     *shared = Some((std::time::Instant::now(), client.clone()));
     Ok(client)
+}
+
+fn notification_response_code(body: &str) -> Option<i64> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    ["code", "StatusCode", "errcode", "ret", "error_code"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_i64))
+}
+
+fn notification_attempt_diagnostic(
+    event: &NotificationEvent,
+    channel: super::NotificationChannelKind,
+    attempt: u32,
+    outcome: &'static str,
+    status: Option<StatusCode>,
+    response_code: Option<i64>,
+) -> Value {
+    let event_type = match event.event.as_str() {
+        "session.completed" | "session.failed" | "session.waiting" | "codey.test" => {
+            event.event.as_str()
+        }
+        _ => "unknown",
+    };
+    json!({
+        "eventId": event.event_id,
+        "eventType": event_type,
+        "channelType": channel,
+        "attempt": attempt,
+        "outcome": outcome,
+        "httpStatus": status.map(|status| status.as_u16()),
+        "responseCode": response_code,
+    })
 }
 
 fn validate_http_response(
@@ -376,10 +521,14 @@ mod tests {
             None,
         );
 
-        let error = dispatcher.send(&event).await.unwrap_err();
+        let error = dispatcher.send_once(&event).await.unwrap_err();
 
         assert!(error.should_settle_delivery());
         assert!(error.to_string().contains("已停止自动重试"));
+        assert!(matches!(
+            error.outcome(),
+            super::super::outbox::DeliveryOutcome::Uncertain
+        ));
         server.await.unwrap();
         assert_eq!(request_count.load(Ordering::Acquire), 1);
     }
@@ -426,11 +575,56 @@ mod tests {
             None,
         );
 
-        let error = dispatcher.send(&event).await.unwrap_err();
+        let error = dispatcher.send_once(&event).await.unwrap_err();
 
         assert!(error.should_settle_delivery());
         assert!(error.to_string().contains("HTTP 401"));
+        assert!(matches!(
+            error.outcome(),
+            super::super::outbox::DeliveryOutcome::PermanentFailure
+        ));
         assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_retry_after_to_the_queue_without_an_internal_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _n = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"code\":0}").await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(350), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let dispatcher = NotificationDispatcher::with_client(
+            Client::builder().no_proxy().build().unwrap(),
+            NotificationChannelConfig {
+                url: format!("http://{address}"),
+                allow_insecure_test_url: true,
+                ..NotificationChannelConfig::default()
+            },
+        );
+        let event =
+            NotificationEvent::new("session.failed", "session", "profile", "model", 0, None);
+        let error = dispatcher.send_once(&event).await.unwrap_err();
+        assert!(matches!(
+            error.outcome(),
+            super::super::outbox::DeliveryOutcome::Retryable {
+                retry_after_ms: Some(7_000)
+            }
+        ));
+        assert_eq!(parse_retry_after_ms("invalid"), None);
+        assert_eq!(
+            parse_retry_after_ms("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(0)
+        );
+        server.await.unwrap();
     }
 
     #[test]
@@ -500,7 +694,7 @@ mod tests {
             None,
         );
 
-        let error = dispatcher.send(&event).await.unwrap_err();
+        let error = dispatcher.send_once(&event).await.unwrap_err();
 
         assert!(error.should_settle_delivery());
         assert!(error.to_string().contains("无法解析"));
@@ -552,7 +746,7 @@ mod tests {
             None,
         );
 
-        let error = dispatcher.send(&event).await.unwrap_err();
+        let error = dispatcher.send_once(&event).await.unwrap_err();
 
         assert!(error.indicates_stale_token());
         assert!(!error.should_settle_delivery());
@@ -607,7 +801,7 @@ mod tests {
             None,
         );
 
-        let error = dispatcher.send(&event).await.unwrap_err();
+        let error = dispatcher.send_once(&event).await.unwrap_err();
 
         assert!(!error.should_settle_delivery());
         assert!(error.should_retry_with_fresh_context());
@@ -664,6 +858,36 @@ mod tests {
             validate_http_response(adapter.as_ref(), StatusCode::OK, "not json").unwrap_err();
 
         assert!(error.contains("无法解析"));
+    }
+
+    #[test]
+    fn attempt_diagnostics_exclude_message_content_and_remote_text() {
+        let event = NotificationEvent::new(
+            "session.failed",
+            "private-session",
+            "private-profile",
+            "private-model",
+            10,
+            Some("private-error".to_string()),
+        )
+        .with_session_name("private-title");
+        let body = r#"{"code":9499,"msg":"private-remote-text"}"#;
+        let detail = notification_attempt_diagnostic(
+            &event,
+            NotificationChannelKind::Feishu,
+            2,
+            "retryable_error",
+            Some(StatusCode::OK),
+            notification_response_code(body),
+        );
+        assert_eq!(detail["eventId"], event.event_id);
+        assert_eq!(detail["responseCode"], 9499);
+        assert_eq!(detail["httpStatus"], 200);
+        assert!(!detail.to_string().contains("private-"));
+        assert_eq!(
+            notification_response_code(r#"{"code":"private-token"}"#),
+            None
+        );
     }
 
     #[test]

@@ -241,15 +241,16 @@ pub(crate) fn refresh_for_provider_with_capabilities(
     capabilities: CapabilityLists<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
+    let context = CatalogContext::new(codex_app_path);
     let models = render_catalog_for_provider(
         home,
         official_provider,
         upstream_models,
         selected_models,
         capabilities,
-        codex_app_path,
+        &context,
     )?;
-    write_verified_catalog_for_app(home, &models, codex_app_path)
+    write_verified_catalog_in_context(home, &models, &context)
 }
 
 pub(crate) fn refresh_for_provider_with_contexts(
@@ -261,16 +262,36 @@ pub(crate) fn refresh_for_provider_with_contexts(
     overrides: CatalogOverrides<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
+    refresh_for_provider_in_context(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        capabilities,
+        overrides,
+        &CatalogContext::new(codex_app_path),
+    )
+}
+
+pub(crate) fn refresh_for_provider_in_context(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    capabilities: CapabilityLists<'_>,
+    overrides: CatalogOverrides<'_>,
+    context: &CatalogContext<'_>,
+) -> Result<usize> {
     let mut models = render_catalog_for_provider(
         home,
         official_provider,
         upstream_models,
         selected_models,
         capabilities,
-        codex_app_path,
+        context,
     )?;
     apply_overrides_to_models(&mut models, overrides)?;
-    write_verified_catalog_for_app(home, &models, codex_app_path)
+    write_verified_catalog_in_context(home, &models, context)
 }
 
 pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'_>) -> Result<()> {
@@ -280,13 +301,15 @@ pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'
     Ok(())
 }
 
-/// 用户目录只覆盖明确配置的预算，保留模型指令和其余元数据，也不执行
-/// Codey 缓存迁移。每次从原目录生成，恢复默认不会继承旧副本的预算。
+/// 用户目录按完整标识补齐必需模型，仅覆盖明确配置的预算。
+/// 保留外部条目的元数据，每次从原目录生成，恢复默认不会继承旧副本的预算。
 pub(crate) fn render_context_catalog_overlay(
+    home: &Path,
     source: &Path,
     contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+    required_models: &[String],
 ) -> Result<Option<Vec<u8>>> {
-    if contexts.is_empty() {
+    if contexts.is_empty() && required_models.is_empty() {
         return Ok(None);
     }
     let bytes = fs::read(source)
@@ -306,37 +329,126 @@ pub(crate) fn render_context_catalog_overlay(
                 .or_insert(Some(index));
         }
     }
-    for (model, policy) in contexts {
-        let index = match indices.get(&model_id::key(model)) {
-            Some(Some(index)) => *index,
-            Some(None) => {
-                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
-                    "自定义模型目录中的预算模型重复：{model}（{}）",
-                    source.display()
-                ))
-                .into());
-            }
-            None => {
-                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
-                    "自定义模型目录缺少已启用的预算模型：{model}（{}）",
-                    source.display()
-                ))
-                .into());
+    let mut targets = contexts
+        .iter()
+        .map(|(model, policy)| (model_id::key(model), (model.as_str(), Some(policy))))
+        .collect::<BTreeMap<_, _>>();
+    for model in required_models {
+        targets
+            .entry(model_id::key(model))
+            .or_insert((model.as_str(), None));
+    }
+    let mut runtime_models = None;
+    let mut supplemented = false;
+    for (key, (model, policy)) in targets {
+        let kind = if policy.is_some() {
+            "预算模型"
+        } else {
+            "必需模型"
+        };
+        let target_error = |error: anyhow::Error| -> anyhow::Error {
+            if policy.is_some() {
+                ContextBudgetCatalogError(error).into()
+            } else {
+                error
             }
         };
-        apply_model_context(&mut models[index], Some(policy)).map_err(ContextBudgetCatalogError)?;
+        let missing_model = || {
+            anyhow::anyhow!(
+                "自定义模型目录缺少已启用的{kind}：{model}（{}）",
+                source.display()
+            )
+        };
+        let index = match indices.get(&key) {
+            Some(Some(index)) => *index,
+            Some(None) => {
+                return Err(target_error(anyhow::anyhow!(
+                    "自定义模型目录中的{kind}重复：{model}（{}）",
+                    source.display()
+                )));
+            }
+            None => {
+                let runtime_path = home.join(relative_path());
+                // 普通运行时读取会去重；补齐前必须保留原数组以检查歧义。
+                let fallback = match &runtime_models {
+                    Some(models) => models,
+                    None => {
+                        let models = read_context_fallback_models(&runtime_path)
+                            .with_context(missing_model)
+                            .map_err(target_error)?;
+                        runtime_models.insert(models)
+                    }
+                };
+                let mut matches = fallback.iter().filter(|candidate| {
+                    candidate
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .is_some_and(|slug| model_id::key(slug) == key)
+                });
+                let candidate = matches
+                    .next()
+                    .ok_or_else(|| target_error(missing_model()))?;
+                if matches.next().is_some() {
+                    return Err(target_error(anyhow::anyhow!(
+                        "Codey 运行时模型目录中的{kind}重复：{model}（{}）",
+                        runtime_path.display()
+                    )));
+                }
+                if !runtime_compatible_models(std::slice::from_ref(candidate)) {
+                    return Err(target_error(anyhow::anyhow!(
+                        "Codey 运行时模型目录中的{kind}缺少 Codex 必需字段：{model}（{}）",
+                        runtime_path.display()
+                    )));
+                }
+                let mut candidate = candidate.clone();
+                normalize_third_party_compaction_identity(&mut candidate);
+                if policy.is_none()
+                    && candidate
+                        .get("codey_context_source")
+                        .and_then(Value::as_str)
+                        == Some("user_declared")
+                    && candidate.get("codey_context_base").is_some()
+                {
+                    // 仅恢复已取消的用户预算，不迁移后备元数据或移除插件预算。
+                    prepare_cached_context_window(&mut candidate);
+                }
+                let index = models.len();
+                models.push(candidate);
+                indices.insert(key, Some(index));
+                supplemented = true;
+                index
+            }
+        };
+        apply_model_context(&mut models[index], policy).map_err(ContextBudgetCatalogError)?;
+    }
+    if contexts.is_empty() && !supplemented {
+        return Ok(None);
     }
     let mut bytes = serde_json::to_vec_pretty(&catalog).context("序列化模型预算副本失败")?;
     bytes.push(b'\n');
     Ok(Some(bytes))
 }
 
+fn read_context_fallback_models(path: &Path) -> Result<Vec<Value>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("读取 Codey 运行时模型目录失败：{}", path.display()))?;
+    let catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析 Codey 运行时模型目录失败：{}", path.display()))?;
+    catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Codey 运行时模型目录缺少 models 数组：{}", path.display()))
+}
+
 pub(crate) fn prepare_context_catalog_overlay(
     home: &Path,
     source: &Path,
     contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+    required_models: &[String],
 ) -> Result<PathBuf> {
-    let Some(bytes) = render_context_catalog_overlay(source, contexts)? else {
+    let Some(bytes) = render_context_catalog_overlay(home, source, contexts, required_models)?
+    else {
         return Ok(source.to_path_buf());
     };
     // 内容变化使用新路径，保存设置或另一个进程启动不会改写运行中的目录。
@@ -395,6 +507,7 @@ pub(super) fn apply_overrides_to_models(
         }) {
             model["display_name"] = json!(display_name);
         }
+        normalize_third_party_compaction_identity(model);
     }
     Ok(())
 }
@@ -577,7 +690,7 @@ fn render_catalog_for_provider(
     upstream_models: Option<&[String]>,
     selected_models: &[String],
     capabilities: CapabilityLists<'_>,
-    codex_app_path: &str,
+    context: &CatalogContext<'_>,
 ) -> Result<Vec<Value>> {
     let CapabilityLists {
         websocket_models,
@@ -591,7 +704,7 @@ fn render_catalog_for_provider(
     {
         return Ok(Vec::new());
     }
-    let mut official_models = read_official_entries(home, codex_app_path)?;
+    let mut official_models = read_official_entries_in_context(home, context)?;
     // Codex 26.908+ may never write `models_cache.json`; capture the CLI's own
     // catalog before declaring the runtime cache unusable. A snapshot older
     // than the local Codex binary is refreshed again so a
@@ -599,15 +712,15 @@ fn render_catalog_for_provider(
     let sources_unusable = official_models
         .iter()
         .all(|model| model_instruction_source(model).is_none());
-    let stale_snapshot = !sources_unusable && runtime_snapshot_is_stale(home, codex_app_path);
+    let stale_snapshot = !sources_unusable && runtime_snapshot_is_stale(home, context);
     if sources_unusable || stale_snapshot {
         let snapshot_synced =
-            sync_runtime_catalog_snapshot(home, codex_app_path).unwrap_or_else(|error| {
+            sync_runtime_catalog_snapshot(home, context).unwrap_or_else(|error| {
                 eprintln!("读取 Codex 命令行模型清单失败：{error:#}");
                 false
             });
         if snapshot_synced {
-            official_models = read_official_entries(home, codex_app_path)?;
+            official_models = read_official_entries_in_context(home, context)?;
         }
     }
     if official_models
@@ -747,6 +860,7 @@ fn render_catalog_for_provider(
         }
     }
     for model in &mut catalog_models {
+        normalize_third_party_compaction_identity(model);
         prepare_cached_context_window(model);
         // Codex 只发送模型目录里声明过的思考强度。目录没有 ultra 时，界面仍能
         // 选中它，请求会被静默改成该模型的默认档（luna 是 medium）。
@@ -798,11 +912,37 @@ pub fn selection_state_with_manual_models(
     requested_default_model: Option<&str>,
     codex_app_path: &str,
 ) -> Result<ModelSelectionState> {
+    selection_state_in_context(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        manual_third_party_models,
+        reasoning_efforts,
+        requested_default_model,
+        &CatalogContext::new(codex_app_path),
+    )
+}
+
+/// 只读取模型选择信息。CLI 快照由启动准备和明确的刷新操作生成，打开配置页不启动进程。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn selection_state_in_context(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    manual_third_party_models: &[String],
+    reasoning_efforts: Option<
+        &std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+    >,
+    requested_default_model: Option<&str>,
+    context: &CatalogContext<'_>,
+) -> Result<ModelSelectionState> {
     // Model provenance comes from the route, not from a slug prefix. An API-key
     // provider may legitimately expose a model whose id also appears in the
     // official catalog; it must remain a route-scoped model and go through the
     // local router instead of acquiring official-account semantics.
-    let official_entries = match read_official_entries(home, codex_app_path) {
+    let official_entries = match read_official_entries_in_context(home, context) {
         Ok(entries) => entries,
         Err(error) if official_provider => return Err(error),
         Err(_) => Arc::new(Vec::new()),
@@ -1627,6 +1767,23 @@ fn official_template_for_route_alias<'a>(
 fn is_official_route_alias(model_id: &str) -> bool {
     crate::model_id::parse_alias(model_id)
         .is_some_and(|alias| crate::config::is_official_profile_id(alias.provider_key))
+}
+
+/// 匹配官方模板的第三方模型不能继承其压缩身份，否则切换模型时 Codex
+/// 会先用旧线路压缩。字段缺失还能兼容会话中已经记录的旧值；改成新常量仍会触发。
+pub(super) fn normalize_third_party_compaction_identity(model: &mut Value) {
+    let is_third_party_alias = model.get("codey_source").and_then(Value::as_str)
+        == Some("third_party")
+        && model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| {
+                // 官方裸模型及派生账号优先按身份保留，兼容旧目录中的错误来源标记。
+                model_id::parse_alias(slug).is_some() && !is_official_route_alias(slug)
+            });
+    if is_third_party_alias && let Some(object) = model.as_object_mut() {
+        object.remove("comp_hash");
+    }
 }
 
 fn third_party_reasoning_levels(template: &Value, use_template_metadata: bool) -> Value {

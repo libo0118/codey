@@ -137,8 +137,18 @@ test("Startup waits end on process exit, marker confirmation or handshake", asyn
     /Err\(error\) if error\.kind\(\) == std::io::ErrorKind::ConnectionRefused => \{\s*return Err\(error\);/,
   );
   assert.match(startupPatch, /readiness\.mark\(CliWrapperMarkerStatus::Launching, None\)/);
-  assert.match(startupPatch, /fn executed\(self\) \{\s*self\.mark_executed\(\);/);
-  assert.match(startupPatch, /self\.mark\(CliWrapperMarkerStatus::Failed, Some\(failure\)\)/);
+  assert.match(
+    startupPatch,
+    /fn executed\(self\) \{\s*self\.finish_with\(None, connect_cli_wrapper_handshake\);/,
+  );
+  assert.match(
+    startupPatch,
+    /let marker_written = match failure \{\s*Some\(failure\) => self\.mark\(CliWrapperMarkerStatus::Failed, Some\(failure\)\),\s*None => self\.mark_executed\(\),\s*\};/,
+  );
+  assert.match(
+    startupPatch,
+    /fn mark_executed\(&self\) -> bool \{\s*self\.mark\(CliWrapperMarkerStatus::Executed, None\)/,
+  );
 });
 
 test("macOS startup patch requires app-server runtime override validation", async () => {

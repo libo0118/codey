@@ -187,6 +187,8 @@ pub(super) fn load_or_create_router_token_at(path: &Path) -> String {
 }
 
 pub(crate) struct LocalRouter {
+    #[cfg(test)]
+    pub(crate) portable_history_cache: std::sync::Weak<Mutex<PortableHistoryCache>>,
     pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
@@ -273,6 +275,7 @@ impl LocalRouter {
             bindings: Arc::clone(&bindings),
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
+            portable_history_cache: Arc::new(Mutex::new(PortableHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
             // 系统证书与代理配置加载是同步操作，不占用路由的异步工作线程。
             client: tokio::task::spawn_blocking(|| upstream_http_client_builder().build())
@@ -289,12 +292,20 @@ impl LocalRouter {
             request_log: Arc::clone(&request_log),
         };
         let server = Arc::new(server);
+        #[cfg(test)]
+        let portable_history_cache = Arc::downgrade(&server.portable_history_cache);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             let mut consecutive_accept_failures = 0_u32;
+            let mut history_sweep = tokio::time::interval(PORTABLE_HISTORY_SWEEP_INTERVAL);
+            history_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = history_sweep.tick() => {
+                        server.portable_history_cache.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner).prune();
+                    }
                     joined = connections.join_next(), if !connections.is_empty() => {
                         if let Some(Err(error)) = joined
                             && error.is_panic()
@@ -411,8 +422,15 @@ impl LocalRouter {
                 connections.abort_all();
                 while connections.join_next().await.is_some() {}
             }
+            server
+                .portable_history_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         });
         Ok(Self {
+            #[cfg(test)]
+            portable_history_cache,
             endpoint,
             bindings,
             snapshot,
@@ -653,6 +671,7 @@ pub(crate) struct RouterServer {
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) native_history_cache: Arc<Mutex<NativeHistoryCache>>,
+    pub(crate) portable_history_cache: Arc<Mutex<PortableHistoryCache>>,
     pub(crate) idle_downstreams: Arc<Mutex<IdleDownstreamRegistry>>,
     pub(crate) client: reqwest::Client,
     /// 按代理地址缓存的线路专用客户端，保留连接池复用。上限内缓存，
@@ -727,6 +746,7 @@ impl ResponsesRequestKind {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouteBindings {
+    pub(crate) portable_source_retries: HashMap<String, PortableSourceRetry>,
     pub(crate) portable_tickets: HashMap<String, PortableTicket>,
     pub(crate) compacting: HashSet<String>,
     pub(crate) routes: HashMap<String, RouteBinding>,
@@ -811,6 +831,8 @@ impl RouteBindings {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouterSnapshot {
+    pub(crate) settings_revision: u64,
+    pub(crate) declared_model_contexts: BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) routes: HashMap<String, Arc<RouteTarget>>,
     pub(crate) aliases: HashMap<String, AliasTarget>,
     pub(crate) raw_models: HashMap<String, Vec<AliasTarget>>,
@@ -836,19 +858,8 @@ impl RouterSnapshot {
         let mut raw_models = HashMap::<String, Vec<AliasTarget>>::new();
         let mut default_official_provider = None;
         let mut default_official_rank = None;
-        for profile in &config.profiles {
-            if !profile.enabled {
-                continue;
-            }
-            // 存储账号的官方线路自带凭据，本地路由可以独立转发，不再依赖
-            // 本次启动的默认登录。
-            if profile.official_account && !config.official_route_usable(profile) {
-                continue;
-            }
+        for profile in config.runtime_profiles() {
             let provider_id = profile.provider_id().trim();
-            if provider_id.is_empty() {
-                continue;
-            }
             // 凭据平面先于上游地址决定：SIWC 直连时对话走官方公开 API，
             // 账号保存的自定义网关只对 Codex backend-api 平面生效。
             let official_auth = official_route_auth(profile);
@@ -916,7 +927,7 @@ impl RouterSnapshot {
             };
             target.context_config = target.context_config_fingerprint();
             target.websocket_config = target.websocket_config_fingerprint();
-            for model in route_models(config, profile, provider_id) {
+            for model in config.routable_profile_models(profile) {
                 let alias_target = AliasTarget {
                     provider_id: provider_id.to_string(),
                     model: model.clone(),
@@ -948,6 +959,8 @@ impl RouterSnapshot {
             .collect::<Vec<_>>();
         model_ids.sort_unstable();
         Self {
+            declared_model_contexts: config.runtime_enabled_model_contexts(),
+            settings_revision: config.settings_revision,
             routes,
             aliases,
             raw_models,
@@ -979,77 +992,149 @@ impl RouterSnapshot {
 
     /// 图片请求不沿用对话线程绑定。显式线路提示优先；模型能唯一确定线路时用该线路；
     /// 模型未登记时才退到默认模型所在线路。同名模型归属不明时仍然拒绝。
+    #[cfg(test)]
     pub(crate) fn route_for_image_request(
         &self,
         model: &str,
         route_hint: Option<&str>,
     ) -> Result<Arc<RouteTarget>> {
+        self.route_for_image_request_observed(model, route_hint, None)
+    }
+
+    pub(crate) fn route_for_image_request_observed(
+        &self,
+        model: &str,
+        route_hint: Option<&str>,
+        mut decision: Option<&mut crate::route_request_log::RouteDecision>,
+    ) -> Result<Arc<RouteTarget>> {
+        use crate::route_request_log::RouteDecisionReason as Reason;
+        if let Some(decision) = decision.as_deref_mut() {
+            decision.settings_revision = self.settings_revision;
+        }
         if let Some(route_hint) = route_hint.map(str::trim).filter(|hint| !hint.is_empty())
             && let Some(route) = self.routes.get(route_hint)
         {
+            record_decision(&mut decision, Reason::RouteHint, 1);
             return Ok(Arc::clone(route));
+        }
+        if route_hint.is_some()
+            && let Some(decision) = decision.as_deref_mut()
+        {
+            decision.rejected_hint =
+                Some(crate::route_request_log::RouteCheckRejection::RouteMissing);
         }
         let model = model.trim();
         if !model.is_empty() {
             let model_key = model_id::key(model);
             if let Some(alias) = self.aliases.get(&model_key) {
+                record_decision(&mut decision, Reason::ExplicitAlias, 1);
                 return self
                     .target_for_route_model(&alias.provider_id, &alias.model, model)
                     .map(|selection| selection.route);
             }
             if let Some(candidates) = self.raw_models.get(&model_key) {
                 if candidates.len() > 1 {
+                    record_decision(&mut decision, Reason::AmbiguousModel, candidates.len());
                     anyhow::bail!("模型 {model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
                 }
                 if let Some(candidate) = candidates.first() {
+                    record_decision(&mut decision, Reason::UniqueCandidate, 1);
                     return self
                         .target_for_route_model(&candidate.provider_id, &candidate.model, model)
                         .map(|selection| selection.route);
                 }
             }
         }
-        self.target_for_auxiliary_request(None, None)
+        if let Some(decision) = decision.as_deref_mut() {
+            decision.defaulted_model = true;
+        }
+        self.resolve_request_observed(
+            RouteRequest {
+                requested_model: self.default_model.trim(),
+                route_hint: None,
+                bound_route: None,
+            },
+            decision,
+        )
+        .map(|selection| selection.route)
     }
 
-    pub(crate) fn target_for_auxiliary_request(
-        &self,
-        route_hint: Option<&str>,
-        bound_route: Option<&str>,
-    ) -> Result<Arc<RouteTarget>> {
-        for provider_id in [route_hint, bound_route].into_iter().flatten() {
-            if let Some(route) = self.routes.get(provider_id) {
-                return Ok(Arc::clone(route));
-            }
-        }
-        Ok(self
-            .target_for_request(self.default_model.trim(), None, None)?
-            .route)
+    pub(crate) fn active_model_alias(&self, requested_model: &str) -> Option<&AliasTarget> {
+        // 历史别名只提供模型恢复信息，不能作为本次请求的明确线路选择。
+        self.aliases.get(&model_id::key(requested_model.trim()))
     }
 
     pub(crate) fn resolve_request(&self, request: RouteRequest<'_>) -> Result<RouteSelection> {
+        self.resolve_request_observed(request, None)
+    }
+
+    pub(crate) fn resolve_request_observed(
+        &self,
+        request: RouteRequest<'_>,
+        mut decision: Option<&mut crate::route_request_log::RouteDecision>,
+    ) -> Result<RouteSelection> {
+        let result = self.resolve_request_inner(request, decision.as_deref_mut());
+        if result.is_err()
+            && let Some(decision) = decision
+        {
+            use crate::route_request_log::RouteDecisionReason as Reason;
+            if !matches!(
+                decision.reason,
+                Reason::MissingModel | Reason::AmbiguousModel | Reason::ModelNotEnabled
+            ) {
+                decision.reason = Reason::RouteUnavailable;
+            }
+        }
+        result
+    }
+
+    fn resolve_request_inner(
+        &self,
+        request: RouteRequest<'_>,
+        mut decision: Option<&mut crate::route_request_log::RouteDecision>,
+    ) -> Result<RouteSelection> {
+        if let Some(decision) = decision.as_deref_mut() {
+            decision.settings_revision = self.settings_revision;
+        }
         let requested_model = request.requested_model.trim();
         if requested_model.is_empty() {
+            record_decision(
+                &mut decision,
+                crate::route_request_log::RouteDecisionReason::MissingModel,
+                0,
+            );
             anyhow::bail!("请求缺少 model 字段");
         }
-        let requested_key = model_id::key(requested_model);
-        if let Some(alias) = self.aliases.get(&requested_key) {
+        if let Some(alias) = self.active_model_alias(requested_model) {
+            record_decision(
+                &mut decision,
+                crate::route_request_log::RouteDecisionReason::ExplicitAlias,
+                1,
+            );
             // A qualified `provider/model` selector already identifies the
             // route. Codex can replay client metadata from an earlier turn, so
             // an independent route hint must not redirect an explicit alias.
             return self.target_for_route_model(&alias.provider_id, &alias.model, requested_model);
         }
+        let requested_key = model_id::key(requested_model);
         if !self.raw_models.contains_key(&requested_key)
-            && let Some(source_model) =
-                model_id::historical_source(requested_model, &self.model_alias_history)
+            && let Some(source_model) = self
+                .model_alias_history
+                .get(&requested_key)
+                .map(String::as_str)
         {
+            if let Some(decision) = decision.as_deref_mut() {
+                decision.historical_alias = true;
+            }
             // Resolve a recorded upstream id as raw data, never recursively as
             // another selector (an upstream id can itself contain a slash).
             return self
-                .resolve_raw_request(
-                    source_model,
+                .resolve_raw_request_observed(
+                    &model_id::key(source_model),
                     request.route_hint,
                     request.bound_route,
                     requested_model,
+                    decision,
                 )
                 .with_context(|| {
                     format!(
@@ -1057,38 +1142,48 @@ impl RouterSnapshot {
                     )
                 });
         }
-        self.resolve_raw_request(
-            requested_model,
+        self.resolve_raw_request_observed(
+            &requested_key,
             request.route_hint,
             request.bound_route,
             requested_model,
+            decision,
         )
     }
 
-    pub(crate) fn resolve_raw_request(
+    /// 当前与历史模型 id 共用同一套优先级；诊断只记录实际执行的分支。
+    fn resolve_raw_request_observed(
         &self,
-        model: &str,
+        model_key: &str,
         route_hint: Option<&str>,
         bound_route: Option<&str>,
         requested_model: &str,
+        mut decision: Option<&mut crate::route_request_log::RouteDecision>,
     ) -> Result<RouteSelection> {
+        use crate::route_request_log::RouteDecisionReason as Reason;
         let candidates = self
             .raw_models
-            .get(&model_id::key(model))
+            .get(model_key)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        record_decision(&mut decision, Reason::NotResolved, candidates.len());
+        let auto_review = model_id::equal(model_key, CODEX_AUTO_REVIEW_MODEL);
         if let Some(route_hint) = route_hint
             && let Some(candidate) = candidates
                 .iter()
                 .find(|candidate| candidate.provider_id == route_hint)
         {
+            record_decision(&mut decision, Reason::RouteHint, candidates.len());
             return self.target_for_route_model(route_hint, &candidate.model, requested_model);
+        }
+        if let (Some(hint), Some(decision)) = (route_hint, decision.as_deref_mut()) {
+            decision.rejected_hint = Some(self.rejection_for_route(hint));
         }
         // Raw ids in the mixed runtime catalog are native OpenAI entries;
         // third-party selections remain route-qualified. An explicit hint
         // above can still select a third-party route with the same model.
         // 同名模型在多条官方线路并存时优先给默认账号，避免随机消耗其它账号额度。
-        if !model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+        if !auto_review
             && let Some(official) = self
                 .default_official_provider
                 .as_deref()
@@ -1110,6 +1205,7 @@ impl RouterSnapshot {
                     })
                 })
         {
+            record_decision(&mut decision, Reason::DefaultOfficial, candidates.len());
             return self.target_for_route_model(
                 &official.provider_id,
                 &official.model,
@@ -1126,7 +1222,11 @@ impl RouterSnapshot {
                 .iter()
                 .find(|candidate| candidate.provider_id == bound_route)
         {
+            record_decision(&mut decision, Reason::SessionBinding, candidates.len());
             return self.target_for_route_model(bound_route, &candidate.model, requested_model);
+        }
+        if let (Some(bound), Some(decision)) = (bound_route, decision.as_deref_mut()) {
+            decision.rejected_binding = Some(self.rejection_for_route(bound));
         }
         // Codex starts automatic approval review as a separate request with a
         // fixed hidden model. Some builds omit turn route metadata on that
@@ -1134,7 +1234,7 @@ impl RouterSnapshot {
         // binding identified a route above. A capable bound third-party route
         // still wins before this fallback.
         // 多账号并存时优先用默认账号，避免复核请求随机消耗其它账号的额度。
-        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+        if auto_review
             && let Some(official_route) = self
                 .default_official_provider
                 .as_deref()
@@ -1148,6 +1248,7 @@ impl RouterSnapshot {
                     })
                 })
         {
+            record_decision(&mut decision, Reason::AutoReviewOfficial, candidates.len());
             return self.target_for_route_model(
                 &official_route.provider_id,
                 CODEX_AUTO_REVIEW_MODEL,
@@ -1160,6 +1261,7 @@ impl RouterSnapshot {
         // the normal unique-candidate lookup below. Ambiguous raw ids still
         // fail closed, so this fallback never guesses between routes.
         if candidates.len() == 1 {
+            record_decision(&mut decision, Reason::UniqueCandidate, 1);
             let candidate = &candidates[0];
             return self.target_for_route_model(
                 &candidate.provider_id,
@@ -1168,19 +1270,33 @@ impl RouterSnapshot {
             );
         }
         if candidates.len() > 1 {
+            record_decision(&mut decision, Reason::AmbiguousModel, candidates.len());
             anyhow::bail!("模型 {requested_model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
         }
         // 没有任何线路支持自动复核时，用杂事模型承接这一请求。这里保留
         // 请求里的原始模型名，让下游的日志与提示头仍能看出这是一次回退。
-        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+        if auto_review
             && let Some(misc) = &self.misc_model
             && let Ok(mut selection) =
                 self.target_for_route_model(&misc.provider_id, &misc.model, requested_model)
         {
+            record_decision(&mut decision, Reason::AutoReviewMiscModel, candidates.len());
             selection.fallback_reason = Some("auto_review_misc_model".to_string());
             return Ok(selection);
         }
+        record_decision(&mut decision, Reason::ModelNotEnabled, 0);
         anyhow::bail!("模型未在线路路由表中启用：{requested_model}")
+    }
+
+    fn rejection_for_route(
+        &self,
+        provider_id: &str,
+    ) -> crate::route_request_log::RouteCheckRejection {
+        if self.routes.contains_key(provider_id) {
+            crate::route_request_log::RouteCheckRejection::ModelNotEnabled
+        } else {
+            crate::route_request_log::RouteCheckRejection::RouteMissing
+        }
     }
 
     #[cfg(test)]
@@ -1220,6 +1336,17 @@ impl RouterSnapshot {
         let mut aliases = self.aliases.keys().cloned().collect::<Vec<_>>();
         aliases.sort_unstable();
         aliases
+    }
+}
+
+fn record_decision(
+    decision: &mut Option<&mut crate::route_request_log::RouteDecision>,
+    reason: crate::route_request_log::RouteDecisionReason,
+    count: usize,
+) {
+    if let Some(decision) = decision.as_deref_mut() {
+        decision.reason = reason;
+        decision.candidate_count = count as u64;
     }
 }
 
@@ -1383,25 +1510,149 @@ pub(crate) struct RouteRequest<'a> {
     pub(crate) bound_route: Option<&'a str>,
 }
 
-pub(crate) fn route_models(
-    config: &CodeyConfig,
-    profile: &crate::config::ProviderProfile,
-    provider_id: &str,
-) -> Vec<String> {
-    let mut models = if profile.official_account {
-        config.enabled_official_route_models(provider_id)
-    } else {
-        config.enabled_route_models(provider_id)
-    };
-    let supports_auto_review = profile.official_account || profile.supports_auto_review;
-    if supports_auto_review
-        && !models
-            .iter()
-            .any(|model| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL))
-    {
-        models.push(CODEX_AUTO_REVIEW_MODEL.to_string());
-    }
-    models
-}
-
 pub(crate) use crate::model_id::model_alias;
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+    use crate::route_request_log::{
+        RouteCheckRejection as Rejection, RouteDecision, RouteDecisionReason as Reason,
+    };
+
+    #[test]
+    fn decision_records_only_the_priority_branches_actually_considered() {
+        let (mut config, provider, model) =
+            super::super::tests::router_config("https://example.test/v1".into());
+        let mut second = config.profiles[0].clone();
+        second.id = "route-b".into();
+        config.profiles.push(second);
+        config
+            .selected_models_by_provider
+            .insert("route-b".into(), vec![model.clone()]);
+        let historical = model_alias("retired", &model);
+        config
+            .model_alias_history
+            .insert(historical.clone(), model.clone());
+        config.settings_revision = 17;
+        let snapshot = RouterSnapshot::from_config(&config);
+        for (requested, hint, bound, reason, historical_alias) in [
+            (
+                model_alias(&provider, &model),
+                Some("missing"),
+                Some("missing"),
+                Reason::ExplicitAlias,
+                false,
+            ),
+            (
+                model.clone(),
+                Some("route-b"),
+                Some(&*provider),
+                Reason::RouteHint,
+                false,
+            ),
+            (
+                model.clone(),
+                Some("missing"),
+                Some(&*provider),
+                Reason::SessionBinding,
+                false,
+            ),
+            (
+                historical,
+                None,
+                Some(&*provider),
+                Reason::SessionBinding,
+                true,
+            ),
+        ] {
+            let mut decision = RouteDecision::default();
+            snapshot
+                .resolve_request_observed(
+                    RouteRequest {
+                        requested_model: &requested,
+                        route_hint: hint,
+                        bound_route: bound,
+                    },
+                    Some(&mut decision),
+                )
+                .unwrap();
+            assert_eq!(decision.settings_revision, 17);
+            assert_eq!(decision.reason, reason);
+            assert_eq!(decision.historical_alias, historical_alias);
+            assert_eq!(
+                decision.candidate_count,
+                if reason == Reason::ExplicitAlias {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                decision.rejected_hint,
+                (reason == Reason::SessionBinding && hint.is_some())
+                    .then_some(Rejection::RouteMissing)
+            );
+            assert_eq!(decision.rejected_binding, None);
+        }
+        let mut decision = RouteDecision::default();
+        assert!(
+            snapshot
+                .resolve_request_observed(
+                    RouteRequest {
+                        requested_model: &model,
+                        route_hint: Some("missing"),
+                        bound_route: None
+                    },
+                    Some(&mut decision)
+                )
+                .is_err()
+        );
+        assert_eq!(decision.reason, Reason::AmbiguousModel);
+        assert_eq!(decision.candidate_count, 2);
+        assert_eq!(decision.rejected_hint, Some(Rejection::RouteMissing));
+
+        let mut official = snapshot.clone();
+        Arc::make_mut(official.routes.get_mut(&provider).unwrap()).official_account = true;
+        official.default_official_provider = Some(provider.clone());
+        let mut decision = RouteDecision::default();
+        official
+            .resolve_request_observed(
+                RouteRequest {
+                    requested_model: &model,
+                    route_hint: None,
+                    bound_route: Some("route-b"),
+                },
+                Some(&mut decision),
+            )
+            .unwrap();
+        assert_eq!(decision.reason, Reason::DefaultOfficial);
+        assert_eq!(decision.rejected_binding, None);
+    }
+
+    #[tokio::test]
+    async fn hot_reload_decisions_report_the_snapshot_revision_used_by_the_request() {
+        let (mut config, _, model) =
+            super::super::tests::router_config("http://127.0.0.1:9/v1".into());
+        config.settings_revision = 7;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let original = router.snapshot.read().unwrap().clone();
+        config.settings_revision = 8;
+        router.update_config(&config);
+        for (snapshot, revision) in [(original, 7), (router.snapshot.read().unwrap().clone(), 8)] {
+            let mut decision = RouteDecision::default();
+            snapshot
+                .resolve_request_observed(
+                    RouteRequest {
+                        requested_model: &model,
+                        route_hint: None,
+                        bound_route: Some("missing"),
+                    },
+                    Some(&mut decision),
+                )
+                .unwrap();
+            assert_eq!(decision.settings_revision, revision);
+            assert_eq!(decision.reason, Reason::UniqueCandidate);
+            assert_eq!(decision.rejected_binding, Some(Rejection::RouteMissing));
+        }
+    }
+}

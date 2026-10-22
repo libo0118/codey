@@ -347,30 +347,50 @@ pub(crate) fn request_body_budget_permit_count(wire_bytes: usize) -> Result<usiz
     Ok(estimated_memory.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES))
 }
 
+/// 名额按正文大小的固定倍数预留，反推即可判断请求正文是否至少有 `bytes` 大。
+pub(crate) fn request_budget_covers(permit: Option<&OwnedSemaphorePermit>, bytes: usize) -> bool {
+    permit.is_some_and(|permit| {
+        permit
+            .num_permits()
+            .saturating_mul(REQUEST_BODY_BUDGET_UNIT_BYTES)
+            >= bytes.saturating_mul(REQUEST_MEMORY_BUDGET_MULTIPLIER)
+    })
+}
+
 pub(crate) fn grow_request_body_budget(
     permit: &mut Option<OwnedSemaphorePermit>,
     body_budget: &Arc<Semaphore>,
     bytes: usize,
 ) -> Result<()> {
-    let required = request_body_budget_permit_count(bytes)?;
-    let held = permit
-        .as_ref()
-        .map(OwnedSemaphorePermit::num_permits)
-        .unwrap_or(0);
-    let additional = required.saturating_sub(held);
-    if additional == 0 {
+    let Some(additional_permit) =
+        reserve_request_body_budget_growth(permit.as_ref(), body_budget, bytes)?
+    else {
         return Ok(());
-    }
-    let additional = u32::try_from(additional).context("请求体解压预算超出内部上限")?;
-    let additional_permit = Arc::clone(body_budget)
-        .try_acquire_many_owned(additional)
-        .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))?;
+    };
     if let Some(held) = permit.as_mut() {
         held.merge(additional_permit);
     } else {
         *permit = Some(additional_permit);
     }
     Ok(())
+}
+
+pub(crate) fn reserve_request_body_budget_growth(
+    permit: Option<&OwnedSemaphorePermit>,
+    body_budget: &Arc<Semaphore>,
+    bytes: usize,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let required = request_body_budget_permit_count(bytes)?;
+    let held = permit.map(OwnedSemaphorePermit::num_permits).unwrap_or(0);
+    let additional = required.saturating_sub(held);
+    if additional == 0 {
+        return Ok(None);
+    }
+    let additional = u32::try_from(additional).context("请求体解压预算超出内部上限")?;
+    Arc::clone(body_budget)
+        .try_acquire_many_owned(additional)
+        .map(Some)
+        .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))
 }
 
 fn shrink_request_body_budget(

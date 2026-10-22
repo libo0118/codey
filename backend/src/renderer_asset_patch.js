@@ -82,11 +82,26 @@
   // is what previously hid the whole Fast/service-tier control on the builds
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
-  // Field builds ship minified bundles whose shapes drift between platforms
-  // and releases. When a gate matches nothing, these are the neighborhood
-  // markers every gate sits near; capturing printable windows around them lets
-  // a field diagnostic log be turned into the next compatible variant without
-  // reproducing that exact bundle locally.
+  // 只截取传入的静态资产源码，不读取输入框、会话状态或凭据。
+  // 模型补丁优先记录过滤函数，避免被同一资产里更早的 Fast 控件占满。
+  const rendererModelFilterDiagnosticAnchor =
+    /function\s+[$A-Z_a-z][$\w]*\(\{[^}]{0,1024}\bisCustomModelProvider\s*:[^}]{0,256}\bmodel\s*:[^}]{0,256}\buseHiddenModels\s*:[^}]{0,256}\}\)\s*\{/;
+  const rendererModelGateDiagnosticAnchors = {
+    "model allowlist": [
+      rendererModelFilterDiagnosticAnchor,
+      /[$A-Z_a-z][$\w]*\.has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)/,
+      "useHiddenModels:",
+      "availableModels:",
+      "isCustomModelProvider:",
+    ],
+    "model visibility": [
+      rendererModelFilterDiagnosticAnchor,
+      "amazonBedrock",
+      /[$A-Z_a-z][$\w]*\.hidden\b/,
+      "useHiddenModels:",
+      "isCustomModelProvider:",
+    ],
+  };
   const rendererGateDiagnosticAnchors = [
     "`composer.toggleFastMode`",
     "composer.speedSlashCommand.disableDescription",
@@ -98,15 +113,24 @@
     "includeUltraReasoningEffort",
     "isCustomModelProvider",
   ];
-  const rendererGateFailureExcerpts = (source) => {
+  const rendererGateFailureExcerpts = (source, name) => {
     const excerpts = [];
-    for (const anchor of rendererGateDiagnosticAnchors) {
+    const ranges = [];
+    const anchors = rendererModelGateDiagnosticAnchors[name] ??
+      rendererGateDiagnosticAnchors;
+    for (const anchor of anchors) {
       if (excerpts.length >= 2) break;
-      const index = source.indexOf(anchor);
+      const index = typeof anchor === "string"
+        ? source.indexOf(anchor)
+        : source.search(anchor);
       if (index < 0) continue;
+      if (ranges.some(([start, end]) => index >= start && index < end)) continue;
+      const start = Math.max(0, index - 120);
+      const end = Math.min(source.length, start + 640);
+      ranges.push([start, end]);
       excerpts.push(
         source
-          .slice(Math.max(0, index - 150), index + anchor.length + 190)
+          .slice(start, end)
           .replace(/[^\x20-\x7E]/g, "?"),
       );
     }
@@ -117,7 +141,7 @@
     const message =
       `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
     const context = { matchCount };
-    const excerpts = rendererGateFailureExcerpts(source);
+    const excerpts = rendererGateFailureExcerpts(source, name);
     if (excerpts.length) context.excerpts = excerpts;
     recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
     try {
@@ -208,10 +232,27 @@
       replaced +
       source.slice(absoluteOffset + args[0].length);
   };
-  const rendererHasNativeCustomProviderModelAccess = (source) =>
-    /function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
+  const rendererHasNativeCustomProviderModelAccess = (source) => {
+    if (/function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
       source,
-    );
+    )) return true;
+    // Codex 26.1007 的实际过滤函数增加了 API key/cyber 与配置目录检查。
+    // 精确核对其完整分支，只识别原生兼容性，不改写这些访问规则。
+    for (const match of source.matchAll(
+      /function\s+[$A-Z_a-z][$\w]*\(\{additionalAvailableModels:(?<additional>[$A-Z_a-z][$\w]*),apiKeyDaybreakSupported:(?<daybreak>[$A-Z_a-z][$\w]*),authMethod:(?<auth>[$A-Z_a-z][$\w]*),availableModels:(?<available>[$A-Z_a-z][$\w]*),hasConfiguredModelCatalog:(?<catalog>[$A-Z_a-z][$\w]*),isCustomModelProvider:(?<custom>[$A-Z_a-z][$\w]*),model:(?<model>[$A-Z_a-z][$\w]*),useHiddenModels:(?<hidden>[$A-Z_a-z][$\w]*)\}\)\{let (?<access>[$A-Z_a-z][$\w]*)=\k<model>\.availableAccessPrograms\?\.cyber;(?<body>[^{}]{1,1024})\}/g,
+    )) {
+      const { additional, daybreak, auth, available, catalog, custom, model,
+        hidden, access, body } = match.groups;
+      const expected = [
+        `return ${auth}===\`apikey\`&&!${daybreak}&&${access}!=null&&${access}.length>0&&!${access}.includes(\`standard\`)?!1:`,
+        `${additional}?.has(${model}.model)===!0||${model}.model!==\`codex-auto-review\`&&`,
+        `(${catalog}&&!${model}.hidden||(${hidden}&&!${custom}&&${auth}!==\`amazonBedrock\`?`,
+        `${available}.has(${model}.model)||${auth}===\`apikey\`&&${daybreak}&&!${model}.hidden&&${access}?.some(e=>e!==\`standard\`)===!0:!${model}.hidden))`,
+      ].join("");
+      if (body === expected) return true;
+    }
+    return false;
+  };
   const replacePetRendererImportWithStubs = (match, importClause) => {
     if (typeof importClause !== "string" || importClause.trim() === "") {
       return "";

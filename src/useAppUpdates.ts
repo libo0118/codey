@@ -124,6 +124,7 @@ export function useAppUpdates({
   const updateCheckRef = useRef<UpdateCheck | null>(null);
   const promptedVersionRef = useRef<string | null>(null);
   const [automaticallyChecking, setAutomaticallyChecking] = useState(false);
+  const [pendingPrompt, setPendingPrompt] = useState<UpdateCheck | null>(null);
   const manualCheckVersion = useRef(0);
   const updateCheckInFlightRef = useRef<Promise<UpdateCheck> | null>(null);
   const policyRef = useRef(codeyUpdatePolicy);
@@ -139,6 +140,7 @@ export function useAppUpdates({
     setDownloadedUpdate(null);
     setUpdateResult({ tone: "idle", text: "" });
     publishUpdateAvailability(null);
+    setPendingPrompt(null);
     setConfirmation(current => current && ["download-update", "install-update"].includes(current.action) ? null : current);
   }, [codeyUpdatePolicy]);
   const requestUpdateCheck = useCallback((forceRefresh = false, manual = false) => {
@@ -259,7 +261,7 @@ export function useAppUpdates({
             deferredVersion !== updatePromptKey(result)
           ) {
             promptedVersionRef.current = updatePromptKey(result);
-            askDownloadUpdate(result);
+            setPendingPrompt(result);
           }
           return;
         }
@@ -288,10 +290,18 @@ export function useAppUpdates({
     };
   }, [codeyUpdatePolicy, configLoaded, embedded, requestUpdateCheck]);
 
+  // 定时检查的闭包不随渲染更新；由这里按当前忙碌状态弹窗，忙时等操作结束。
+  useEffect(() => {
+    if (!pendingPrompt || isBusy) return;
+    setPendingPrompt(null);
+    askDownloadUpdate(pendingPrompt);
+  }, [pendingPrompt, isBusy]);
+
   async function checkForUpdates() {
     if (!configLoaded || isBusy) return;
     manualCheckVersion.current += 1;
     const requestVersion = manualCheckVersion.current;
+    setPendingPrompt(null);
     setBusy("check-update");
     setUpdateResult({ tone: "pending", text: "正在检查更新…" });
     setUpdateCheck(null);

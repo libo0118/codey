@@ -2,14 +2,9 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(super) struct RuntimeCatalogSource {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     len: u64,
     modified: std::time::SystemTime,
-}
-
-#[cfg(not(test))]
-pub(super) fn catalog_source_for_app(codex_app_path: &str) -> Option<RuntimeCatalogSource> {
-    runtime_catalog_source(&codex_cli_candidates_for(codex_app_path))
 }
 
 // Tests use a stable virtual runtime for existing catalog fixtures and real
@@ -63,22 +58,20 @@ pub(super) fn codex_cli_stamp_for(candidates: &[PathBuf]) -> Option<std::time::S
 /// counts as stale because a Codex upgrade that arrives without a
 /// `models_cache.json` has no other way to produce one, while an existing
 /// instruction-bearing source would otherwise suppress the capture.
-#[cfg(not(test))]
-pub(super) fn runtime_snapshot_is_stale(home: &Path, codex_app_path: &str) -> bool {
+pub(super) fn runtime_snapshot_is_stale(home: &Path, context: &CatalogContext<'_>) -> bool {
     let snapshot = home.join(DEBUG_CATALOG_RELATIVE_PATH);
     let Some(value) = read_catalog_value(&snapshot) else {
         return true;
     };
-    let candidates = codex_cli_candidates_for(codex_app_path);
     if value.get("codey_account_snapshot").and_then(Value::as_bool) != Some(true)
-        || !snapshot_matches_runtime_source(&value, runtime_catalog_source(&candidates).as_ref())
+        || !snapshot_matches_runtime_source(&value, context.source())
     {
         return true;
     }
     let snapshot_mtime = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
         .and_then(|metadata| metadata.modified())
         .ok();
-    runtime_snapshot_is_stale_at(snapshot_mtime, codex_cli_stamp_for(&candidates))
+    runtime_snapshot_is_stale_at(snapshot_mtime, codex_cli_stamp_for(context.candidates()))
 }
 
 pub(super) fn runtime_snapshot_is_stale_at(
@@ -89,14 +82,6 @@ pub(super) fn runtime_snapshot_is_stale_at(
         return false;
     };
     snapshot_mtime.is_none_or(|snapshot_mtime| cli_stamp > snapshot_mtime)
-}
-
-/// Unit tests never run the Codex CLI installed on the build machine, and the
-/// snapshot capture itself is stubbed there. Staleness stays reachable through
-/// `runtime_snapshot_is_stale_at` so the decision logic can still be tested.
-#[cfg(test)]
-pub(super) fn runtime_snapshot_is_stale(_home: &Path, _codex_app_path: &str) -> bool {
-    false
 }
 
 #[cfg(not(test))]
@@ -125,9 +110,18 @@ pub(super) fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option
 pub(super) fn codex_cli_candidates_for(codex_app_path: &str) -> Vec<PathBuf> {
     selected_app_cli_candidates(
         codex_app_path,
-        codey_runtime_core::app_paths::resolve_codex_app_dir,
+        |selected| {
+            match codey_runtime_core::app_paths::resolve_validated_codex_app_dir_with_saved_checked(
+                selected, None,
+            ) {
+                Ok(app_dir) => app_dir,
+                Err(error) => {
+                    eprintln!("确认 Codex 模型目录来源失败：{error:#}");
+                    None
+                }
+            }
+        },
         |app_dir| {
-            codey_runtime_core::app_paths::validate_codex_app_dir(app_dir).ok()?;
             #[cfg(windows)]
             {
                 crate::launcher::windows_cli_wrapper_target(app_dir).ok()

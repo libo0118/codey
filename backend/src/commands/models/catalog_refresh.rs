@@ -18,15 +18,23 @@ pub(crate) struct RefreshedModelState {
     pub(crate) custom_contexts_restored: bool,
 }
 
+#[cfg(test)]
 fn refresh_model_catalog_or_fallback_at(
     config: &CodeyConfig,
     home: &std::path::Path,
 ) -> Result<ModelCatalogRefresh, String> {
-    crate::codex_config::validate_runtime_model_contexts(
+    refresh_model_catalog_or_fallback_in_context(
+        config,
         home,
-        &config.runtime_enabled_model_contexts(),
+        &model_catalog::CatalogContext::new(&config.codex_app_path),
     )
-    .map_err(|error| error.to_string())?;
+}
+
+fn refresh_model_catalog_or_fallback_in_context(
+    config: &CodeyConfig,
+    home: &std::path::Path,
+    context: &model_catalog::CatalogContext<'_>,
+) -> Result<ModelCatalogRefresh, String> {
     let snapshot = model_catalog::snapshot(home).map_err(|error| error.to_string())?;
     let native_web_search_models = config.runtime_native_web_search_model_aliases();
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
@@ -34,15 +42,15 @@ fn refresh_model_catalog_or_fallback_at(
     let runtime_model_contexts = config.runtime_model_contexts();
     let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
     let runtime_display_names = config.runtime_catalog_display_names();
-    let refresh = try_refresh_model_catalog(config, home);
+    let refresh = try_refresh_model_catalog(config, home, context);
     let reused_cached_catalog = refresh.is_err();
-    let result = model_catalog_fallback(
+    let result = model_catalog_fallback_in_context(
         refresh,
         home,
         &native_web_search_models,
         &image_detail_original_models,
         &config.runtime_remote_compaction_model_aliases(),
-        &config.codex_app_path,
+        context,
     );
     match result {
         Ok(fallback) => {
@@ -73,6 +81,13 @@ fn refresh_model_catalog_or_fallback_at(
                     },
                 )
             {
+                return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
+            }
+            if let Err(error) = crate::codex_config::validate_runtime_model_contexts(
+                home,
+                &config.runtime_enabled_model_contexts(),
+                &crate::codex_config::runtime_required_catalog_models(config, home, available),
+            ) {
                 return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
             }
             Ok(ModelCatalogRefresh { fallback, snapshot })
@@ -108,14 +123,17 @@ async fn refreshed_model_state_at_async(
     let config = config.clone();
     let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        let context = model_catalog::CatalogContext::new(&config.codex_app_path);
         if refresh_only_when_populated {
-            let model_state = current_model_state_at(&config, &home)?;
+            let model_state = current_model_state_in_context(&config, &home, &context)?;
             if !should_refresh_model_catalog(&model_state) {
                 return Ok((None, model_state));
             }
         }
-        let refresh = Some(refresh_model_catalog_or_fallback_at(&config, &home)?);
-        match current_model_state_at(&config, &home) {
+        let refresh = Some(refresh_model_catalog_or_fallback_in_context(
+            &config, &home, &context,
+        )?);
+        match current_model_state_in_context(&config, &home, &context) {
             Ok(model_state) => Ok((refresh, model_state)),
             Err(error) => Err(rollback_model_catalog_after_config_save(refresh, error)),
         }
@@ -270,6 +288,7 @@ pub(crate) fn rollback_model_catalog_snapshot(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn model_catalog_fallback(
     result: anyhow::Result<()>,
     home: &std::path::Path,
@@ -278,15 +297,33 @@ pub(crate) fn model_catalog_fallback(
     remote_compaction_models: &[String],
     codex_app_path: &str,
 ) -> Result<bool, String> {
+    model_catalog_fallback_in_context(
+        result,
+        home,
+        native_web_search_models,
+        image_detail_original_models,
+        remote_compaction_models,
+        &model_catalog::CatalogContext::new(codex_app_path),
+    )
+}
+
+fn model_catalog_fallback_in_context(
+    result: anyhow::Result<()>,
+    home: &std::path::Path,
+    native_web_search_models: &[String],
+    image_detail_original_models: &[String],
+    remote_compaction_models: &[String],
+    context: &model_catalog::CatalogContext<'_>,
+) -> Result<bool, String> {
     match result {
         Ok(()) => Ok(false),
         Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
-            model_catalog::prepare_cached_catalog_for_current_capabilities(
+            model_catalog::prepare_cached_catalog_in_context(
                 home,
                 native_web_search_models,
                 image_detail_original_models,
                 remote_compaction_models,
-                codex_app_path,
+                context,
             )
             .map(|available| !available)
             .map_err(|fallback_error| fallback_error.to_string())
@@ -295,14 +332,18 @@ pub(crate) fn model_catalog_fallback(
     }
 }
 
-fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> anyhow::Result<()> {
+fn try_refresh_model_catalog(
+    config: &CodeyConfig,
+    home: &std::path::Path,
+    context: &model_catalog::CatalogContext<'_>,
+) -> anyhow::Result<()> {
     let use_builtin_official_catalog = config.uses_builtin_official_model_catalog();
     let (upstream_models, selected_models) = config.runtime_catalog_models();
     let websocket_models = config.runtime_websocket_model_aliases();
     let native_web_search_models = config.runtime_native_web_search_model_aliases();
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
-    model_catalog::refresh_for_provider_with_contexts(
+    model_catalog::refresh_for_provider_in_context(
         home,
         config.official_account_available_this_launch && use_builtin_official_catalog,
         (!use_builtin_official_catalog)
@@ -321,7 +362,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
             reasoning_efforts: &config.runtime_model_reasoning_efforts(),
             display_names: &config.runtime_catalog_display_names(),
         },
-        &config.codex_app_path,
+        context,
     )
     .map(|_| ())
 }
@@ -418,43 +459,93 @@ mod tests {
     }
 
     #[test]
-    fn custom_context_save_validates_user_catalog_before_mutating_runtime_files() {
-        let home = tempfile::tempdir().unwrap();
+    fn custom_context_save_validates_external_catalog_after_generating_current_models() {
         let config = config_with_custom_context();
-        std::fs::write(
-            home.path().join("config.toml"),
-            "model_catalog_json = 'custom.json'\n",
-        )
-        .unwrap();
-        let source = home.path().join("custom.json");
-        std::fs::write(&source, br#"{"models":[{"slug":"other-model"}]}"#).unwrap();
-        let runtime = home.path().join(model_catalog::relative_path());
-        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        std::fs::write(&runtime, b"previous catalog").unwrap();
-        let error = refresh_model_catalog_or_fallback_at(&config, home.path())
-            .err()
-            .unwrap();
-        assert!(error.contains("缺少已启用的预算模型"), "{error}");
-        assert_eq!(std::fs::read(&runtime).unwrap(), b"previous catalog");
-        assert!(
-            !home
-                .path()
-                .join("model-catalogs/context-overrides")
-                .exists()
-        );
-        let custom = br#"{"models":[{"slug":"gpt-5.6-sol","context_window":1000000}]}"#;
-        std::fs::write(&source, custom).unwrap();
-        std::fs::write(home.path().join("models_cache.json"), serde_json::to_vec(&json!({
-            "models": [{"slug": "gpt-5.6-sol", "description": "Test model", "base_instructions": "Test instructions"}]
-        })).unwrap()).unwrap();
-        assert!(refresh_model_catalog_or_fallback_at(&config, home.path()).is_ok());
-        assert_eq!(std::fs::read(&source).unwrap(), custom);
-        assert!(
-            !home
-                .path()
-                .join("model-catalogs/context-overrides")
-                .exists()
-        );
+        for previous in [None, Some(br#"{"models":[]}"#.as_slice())] {
+            let home = tempfile::tempdir().unwrap();
+            let config_bytes = b"model_catalog_json = 'custom.json'\n";
+            std::fs::write(home.path().join("config.toml"), config_bytes).unwrap();
+            let source = home.path().join("custom.json");
+            let custom = br#"{"models":[{"slug":"other-model"}]}"#;
+            std::fs::write(&source, custom).unwrap();
+            let runtime = home.path().join(model_catalog::relative_path());
+            if let Some(previous) = previous {
+                std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+                std::fs::write(&runtime, previous).unwrap();
+            }
+            std::fs::write(home.path().join("models_cache.json"), serde_json::to_vec(&json!({
+                "models": [{"slug": "gpt-5.6-sol", "description": "Test model", "base_instructions": "Test instructions"}]
+            })).unwrap()).unwrap();
+
+            assert!(refresh_model_catalog_or_fallback_at(&config, home.path()).is_ok());
+            let catalog: Value = serde_json::from_slice(&std::fs::read(&runtime).unwrap()).unwrap();
+            let model = catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.6-sol")
+                .unwrap();
+            assert_eq!(model["context_window"], 256_000);
+            assert_eq!(std::fs::read(&source).unwrap(), custom);
+            assert_eq!(
+                std::fs::read(home.path().join("config.toml")).unwrap(),
+                config_bytes
+            );
+            assert!(
+                !home
+                    .path()
+                    .join("model-catalogs/context-overrides")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn custom_context_save_rolls_back_generated_catalog_when_external_validation_fails() {
+        let config = config_with_custom_context();
+        for (custom, message) in [
+            (
+                b"invalid external catalog".as_slice(),
+                "解析自定义模型目录失败",
+            ),
+            (
+                br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":"GPT-5.6-SOL"}]}"#.as_slice(),
+                "预算模型重复",
+            ),
+        ] {
+            for previous in [None, Some(b"previous catalog".as_slice())] {
+                let home = tempfile::tempdir().unwrap();
+                let config_bytes = b"model_catalog_json = 'custom.json'\n";
+                std::fs::write(home.path().join("config.toml"), config_bytes).unwrap();
+                let source = home.path().join("custom.json");
+                std::fs::write(&source, custom).unwrap();
+                let runtime = home.path().join(model_catalog::relative_path());
+                if let Some(previous) = previous {
+                    std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+                    std::fs::write(&runtime, previous).unwrap();
+                }
+                std::fs::write(home.path().join("models_cache.json"), serde_json::to_vec(&json!({
+                    "models": [{"slug": "gpt-5.6-sol", "description": "Test model", "base_instructions": "Test instructions"}]
+                })).unwrap()).unwrap();
+
+                let error = refresh_model_catalog_or_fallback_at(&config, home.path())
+                    .err()
+                    .unwrap();
+                assert!(error.contains(message), "{error}");
+                assert_eq!(std::fs::read(&runtime).ok().as_deref(), previous);
+                assert_eq!(std::fs::read(&source).unwrap(), custom);
+                assert_eq!(
+                    std::fs::read(home.path().join("config.toml")).unwrap(),
+                    config_bytes
+                );
+                assert!(
+                    !home
+                        .path()
+                        .join("model-catalogs/context-overrides")
+                        .exists()
+                );
+            }
+        }
     }
 
     #[test]

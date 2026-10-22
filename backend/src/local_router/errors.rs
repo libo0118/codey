@@ -187,19 +187,77 @@ pub(crate) fn observe_upstream_stream_error(
     }
 }
 
+fn upstream_error_message_text(value: &Value, route: &RouteTarget) -> Option<String> {
+    if let Some(message) = value.as_str() {
+        return sanitize_upstream_error_text(message, route, 512);
+    }
+
+    let mut message = String::new();
+    // 验证错误可能附带原始输入和上下文，仅提取 msg，并沿用脱敏和总长度限制。
+    for detail in value.as_array()? {
+        let Some(part) = detail
+            .get("msg")
+            .and_then(Value::as_str)
+            .and_then(|part| sanitize_upstream_error_text(part, route, 512))
+        else {
+            continue;
+        };
+        if !message.is_empty() {
+            message.push('；');
+        }
+        message.push_str(&part);
+        if message.chars().count() > 512 {
+            break;
+        }
+    }
+    sanitize_upstream_error_text(&message, route, 512)
+}
+
+fn upstream_message_rejects_image_input(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.split([';', '；']).any(|part| {
+        let part = part.trim().trim_end_matches(['.', '!', '。']);
+        let part = part.strip_prefix("value error, ").unwrap_or(part);
+        // 只匹配完整的能力错误，避免把格式、尺寸和数量限制误判为模型不支持图片。
+        matches!(
+            part,
+            "image inputs are not supported for this model"
+                | "image inputs are not supported by this model"
+                | "image input is not supported for this model"
+                | "image input is not supported by this model"
+                | "this model does not support image inputs"
+                | "this model does not support image input"
+                | "this model does not support images"
+        )
+    })
+}
+
 pub(crate) fn upstream_error_summary(value: &Value, route: &RouteTarget) -> UpstreamErrorSummary {
-    let message = first_string_at(
-        value,
-        &[
-            "/response/error/message",
-            "/error/error/message",
-            "/error/message",
-            "/message",
-            "/detail",
-            "/error",
-        ],
-    )
-    .and_then(|message| sanitize_upstream_error_text(message, route, 512));
+    let message = [
+        "/response/error/message",
+        "/error/error/message",
+        "/error/message",
+        "/message",
+        "/detail",
+        "/error",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(|value| upstream_error_message_text(value, route))
+    })
+    .and_then(|message| {
+        if upstream_message_rejects_image_input(&message) {
+            sanitize_upstream_error_text(
+                &format!("当前模型不支持图片输入，请切换到支持图片的模型后重试；会话历史中的图片或截图也可能导致此错误。上游原因：{message}"),
+                route,
+                512,
+            )
+        } else {
+            Some(message)
+        }
+    });
     let error_type = first_string_at(
         value,
         &["/response/error/type", "/error/error/type", "/error/type"],
@@ -350,6 +408,212 @@ pub(crate) struct UpstreamHttpErrorResponse<'a> {
     pub(crate) body: &'a [u8],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum GatewayCompactionPhase {
+    GatewaySummary,
+    SourceRouteHandoff,
+    TargetRouteHandoff,
+}
+
+impl GatewayCompactionPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GatewaySummary => "gateway_summary",
+            Self::SourceRouteHandoff => "source_route_handoff",
+            Self::TargetRouteHandoff => "target_route_handoff",
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::GatewaySummary => "远程压缩摘要失败",
+            Self::SourceRouteHandoff => "切换线路前的源账号交接摘要失败",
+            Self::TargetRouteHandoff => "切换线路时的目标账号交接摘要失败",
+        }
+    }
+
+    fn append_context_length_hint(self, message: &mut String) {
+        if matches!(self, Self::TargetRouteHandoff) {
+            message.push_str("；目标线路上下文不足，下次重试将尝试由源账号生成交接摘要");
+        }
+    }
+}
+
+/// HTTP 200 也可能携带失败事件；只从明确状态或已知错误标识推导下游状态。
+fn gateway_compaction_failure_status(value: &Value, summary: &UpstreamErrorSummary) -> u16 {
+    for pointer in [
+        "/response/error/status",
+        "/response/error/status_code",
+        "/error/status",
+        "/error/status_code",
+        "/status",
+        "/status_code",
+    ] {
+        if let Some(status) = value
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .filter(|status| (400..600).contains(status))
+        {
+            return status as u16;
+        }
+    }
+    let identifiers = [summary.code.as_deref(), summary.error_type.as_deref()];
+    for (status, names) in [
+        (
+            429,
+            &[
+                "insufficient_quota",
+                "quota_exceeded",
+                "usage_limit_reached",
+                "billing_hard_limit_reached",
+                "credit_balance_too_low",
+                "rate_limit_exceeded",
+                "rate_limit_error",
+                "too_many_requests",
+            ][..],
+        ),
+        (
+            401,
+            &[
+                "authentication_error",
+                "authentication_failed",
+                "invalid_api_key",
+            ][..],
+        ),
+        (403, &["permission_error", "permission_denied"][..]),
+        (404, &["not_found_error", "model_not_found"][..]),
+        (413, &["request_too_large"][..]),
+        (
+            400,
+            &["invalid_prompt", "invalid_request_error", "invalid_request"][..],
+        ),
+    ] {
+        if identifiers
+            .iter()
+            .flatten()
+            .any(|identifier| names.contains(identifier))
+        {
+            return status;
+        }
+    }
+    502
+}
+
+pub(crate) fn gateway_compaction_response_failure(
+    error: &anyhow::Error,
+    route: &RouteTarget,
+    phase: GatewayCompactionPhase,
+    upstream_request_id: Option<&str>,
+    retry_advice: Option<ResponseRetryAdvice>,
+) -> ResponsesFailure {
+    let upstream = error
+        .downcast_ref::<UpstreamStreamFailure>()
+        .map(|error| &error.0);
+    let summary = upstream
+        .map(|value| upstream_error_summary(value, route))
+        .unwrap_or_default();
+    let (status, code) = if error.is::<ContextLengthExceeded>() {
+        (400, CONTEXT_LENGTH_EXCEEDED)
+    } else if is_upstream_timeout_error(error) {
+        (504, "compaction_timeout")
+    } else if let Some(value) = upstream {
+        let status = gateway_compaction_failure_status(value, &summary);
+        let structured_error = summary.code.is_some()
+            || summary.error_type.is_some()
+            || value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null());
+        (
+            status,
+            if structured_error || status != 502 {
+                "upstream_http_error"
+            } else {
+                "invalid_compaction_response"
+            },
+        )
+    } else {
+        (502, "invalid_compaction_response")
+    };
+    let request_id = upstream_request_id.or_else(|| {
+        upstream.and_then(|value| {
+            first_string_at(
+                value,
+                &[
+                    "/response/error/request_id",
+                    "/error/request_id",
+                    "/request_id",
+                ],
+            )
+        })
+    });
+    let request_id = request_id.and_then(|value| sanitize_upstream_error_text(value, route, 128));
+    let detail = if upstream.is_some() {
+        upstream_error_detail(&summary).unwrap_or_else(|| "上游返回失败或未完成响应".into())
+    } else {
+        sanitize_upstream_error_text(&format!("{error:#}"), route, 512)
+            .unwrap_or_else(|| "上游未返回可用的压缩摘要".into())
+    };
+    let mut message = format!(
+        "{}：Codey 线路「{}」：{detail}",
+        phase.failure_message(),
+        route_display_name(route)
+    );
+    if let Some(request_id) = request_id.as_deref() {
+        message.push_str(&format!("（上游请求 ID：{request_id}）"));
+    }
+    if code == CONTEXT_LENGTH_EXCEEDED {
+        phase.append_context_length_hint(&mut message);
+    }
+    let mut failure = ResponsesFailure::new(status, code, message, Some(route));
+    let metadata = &mut failure.event["response"]["error"]["codey"];
+    metadata["compactionPhase"] = phase.label().into();
+    if let Some(code) = summary.code {
+        metadata["upstreamCode"] = code.into();
+    }
+    if let Some(kind) = summary.error_type {
+        metadata["upstreamType"] = kind.into();
+    }
+    if let Some(request_id) = request_id {
+        metadata["upstreamRequestId"] = request_id.into();
+    }
+    if let Some(delay) = upstream.and_then(|value| {
+        [
+            "/response/error/retry_after_ms",
+            "/error/retry_after_ms",
+            "/retry_after_ms",
+        ]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
+    }) {
+        failure.event["response"]["error"]["retry_after_ms"] = delay.into();
+    }
+    failure.retry_advice = retry_advice;
+    failure
+}
+
+pub(crate) async fn write_gateway_compaction_response_error<D: ResponsesDownstream + ?Sized>(
+    downstream: &mut D,
+    error: anyhow::Error,
+    route: &RouteTarget,
+    phase: GatewayCompactionPhase,
+    upstream_request_id: Option<&str>,
+    retry_advice: Option<ResponseRetryAdvice>,
+) -> Result<()> {
+    if error.is::<DownstreamClosed>() || error.is::<DownstreamResponseInterrupt>() {
+        return Err(error);
+    }
+    observe_upstream_stream_error(downstream.request_log_probe(), &error, route);
+    let failure = gateway_compaction_response_failure(
+        &error,
+        route,
+        phase,
+        upstream_request_id,
+        retry_advice,
+    );
+    downstream.write_json_response_failure(&failure).await
+}
+
 /// SIWC 直连上游把凭据打回时标记账号的 SIWC 槽位失效：卡片出现「重新授权」，
 /// 下一次账号同步会把该线路切回 Codex backend-api 平面。限流、额度超限和
 /// 暂时性不可用不标失效——凭据本身仍然有效。
@@ -425,13 +689,36 @@ pub(crate) async fn write_upstream_http_error<D>(
 where
     D: ResponsesDownstream + ?Sized,
 {
+    write_upstream_http_error_with_compaction_phase(
+        downstream,
+        response,
+        resolved,
+        bridge,
+        request_kind,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_upstream_http_error_with_compaction_phase<D>(
+    downstream: &mut D,
+    response: UpstreamHttpErrorResponse<'_>,
+    resolved: &RouteSelection,
+    bridge: ProtocolBridge,
+    request_kind: ResponsesRequestKind,
+    compaction_phase: Option<GatewayCompactionPhase>,
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let UpstreamHttpErrorResponse {
         status,
         upstream_request_id,
         retry_advice,
         body,
     } = response;
-    let upstream_request_id = upstream_request_id.map(str::to_string);
+    let upstream_request_id = upstream_request_id
+        .and_then(|value| sanitize_upstream_error_text(value, &resolved.route, 128));
     let probe = downstream.request_log_probe().cloned();
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let context_exceeded = parsed.as_ref().is_some_and(is_context_length_error);
@@ -453,11 +740,17 @@ where
         route_display_name(&resolved.route),
         resolved.upstream_model
     );
+    if let Some(phase) = compaction_phase {
+        message = format!("{}：{message}", phase.failure_message());
+    }
     if let Some(detail) = detail.as_deref() {
         message.push_str(&format!("：{detail}"));
     }
     if let Some(request_id) = upstream_request_id.as_deref() {
         message.push_str(&format!("（上游请求 ID：{request_id}）"));
+    }
+    if context_exceeded && let Some(phase) = compaction_phase {
+        phase.append_context_length_hint(&mut message);
     }
     record_router_failure_nonblocking(
         "local_router_upstream_http_error",
@@ -479,6 +772,7 @@ where
             "upstreamProtocol": bridge.upstream_protocol().label(),
             "protocolBridge": bridge.label(),
             "requestKind": request_kind.label(),
+            "compactionPhase": compaction_phase.map(GatewayCompactionPhase::label),
             "requestId": current_router_request_id(),
         }),
     );
@@ -489,6 +783,9 @@ where
     };
     let mut failure = ResponsesFailure::new(status, code, message, Some(&resolved.route));
     let metadata = &mut failure.event["response"]["error"]["codey"];
+    if let Some(phase) = compaction_phase {
+        metadata["compactionPhase"] = phase.label().into();
+    }
     if let Some(code) = summary.code {
         metadata["upstreamCode"] = code.into();
     }
@@ -499,7 +796,11 @@ where
         metadata["upstreamRequestId"] = request_id.into();
     }
     failure.retry_advice = retry_advice;
-    downstream.write_response_failure(&failure).await
+    if compaction_phase.is_some() {
+        downstream.write_json_response_failure(&failure).await
+    } else {
+        downstream.write_response_failure(&failure).await
+    }
 }
 
 pub(crate) fn annotate_upstream_websocket_failure(

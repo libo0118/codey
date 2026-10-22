@@ -620,6 +620,176 @@ async fn gateway_compaction_rejects_truncated_summaries_on_all_protocols() {
 }
 
 #[tokio::test]
+async fn gateway_compaction_http_errors_preserve_status_retry_and_diagnostics() {
+    for protocol in [
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        for (status, code) in [
+            (401, "invalid_api_key"),
+            (403, "permission_denied"),
+            (429, "insufficient_quota"),
+            (429, "rate_limit_exceeded"),
+            (503, "server_error"),
+            (413, "context_length_exceeded"),
+        ] {
+            let (url, task, requests) = super::retry_contract_tests::error_upstream(
+                status,
+                json!({"error":{"code":code,"message":"summary failure sk-upstream"}}).to_string(),
+                "application/json",
+            )
+            .await;
+            let (mut config, provider, model) = router_config(url);
+            config.profiles[0].upstream_protocol = protocol.into();
+            config.profiles[0].supports_remote_compaction = false;
+            config.profiles[0].normalize();
+            let router = LocalRouter::start(&config).await.unwrap();
+            let endpoint = router.endpoint();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            for (path, stream, input) in [
+                ("responses/compact", false, json!("continue")),
+                (
+                    "responses",
+                    true,
+                    json!([{"role":"user","content":"continue"},{"type":"compaction_trigger"}]),
+                ),
+            ] {
+                let response = client
+                    .post(format!("{}/{path}", endpoint.base_url))
+                    .bearer_auth(&endpoint.token)
+                    .json(&json!({"model":model_alias(&provider,&model),"input":input,"stream":stream}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), status, "{protocol}: {code}");
+                assert_eq!(response.headers()["retry-after"], "1");
+                assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+                let body = response.text().await.unwrap();
+                for expected in [
+                    "远程压缩摘要失败",
+                    "Relay",
+                    "provider-model",
+                    "summary failure ***",
+                    "retry-contract",
+                    code,
+                ] {
+                    assert!(body.contains(expected), "{protocol}: {body}");
+                }
+                assert!(!body.contains("sk-upstream"), "{body}");
+                assert!(!body.contains("invalid_compaction_response"), "{body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    value["error"]["code"],
+                    if code == CONTEXT_LENGTH_EXCEEDED {
+                        CONTEXT_LENGTH_EXCEEDED
+                    } else {
+                        "upstream_http_error"
+                    }
+                );
+                assert_eq!(value["error"]["codey"]["httpStatus"], status);
+                assert_eq!(value["error"]["codey"]["upstreamCode"], code);
+                assert_eq!(
+                    value["error"]["codey"]["upstreamRequestId"],
+                    "retry-contract"
+                );
+                assert_eq!(value["error"]["codey"]["routeId"], provider);
+                assert_eq!(
+                    value["error"]["codey"]["compactionPhase"],
+                    "gateway_summary"
+                );
+            }
+            assert_eq!(requests.lock().unwrap().len(), 2, "{protocol}: {code}");
+            router.stop().await.unwrap();
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_compaction_websocket_failure_keeps_metadata_and_redacted_log() {
+    let logs = tempfile::tempdir().unwrap();
+    let (url, task, requests) = super::retry_contract_tests::error_upstream(
+        429,
+        json!({"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"summary failure sk-upstream"}}).to_string(),
+        "application/json",
+    ).await;
+    let (mut config, provider, model) = router_config(url);
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = crate::config::RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let mut websocket = super::tests::connect_router_websocket(&router.endpoint()).await;
+    websocket
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.create", "model":model_alias(&provider, &model),
+                "input":[{"role":"user","content":"continue"},{"type":"compaction_trigger"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = websocket.next().await {
+            if let WebSocketMessage::Text(text) = message.unwrap() {
+                let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                if responses_event_is_terminal(&event) {
+                    return event;
+                }
+            }
+        }
+        panic!("missing compaction failure event")
+    })
+    .await
+    .unwrap();
+    let error = &event["response"]["error"];
+    assert_eq!(error["code"], "rate_limit_exceeded");
+    assert_eq!(error["codey"]["compactionPhase"], "gateway_summary");
+    assert_eq!(error["codey"]["httpStatus"], 429);
+    assert_eq!(error["codey"]["routeId"], provider);
+    assert_eq!(error["codey"]["upstreamCode"], "rate_limit_exceeded");
+    assert_eq!(error["codey"]["upstreamType"], "rate_limit_error");
+    assert_eq!(error["codey"]["upstreamRequestId"], "retry-contract");
+    assert!(error["codey"]["retryAfterMs"].as_u64().unwrap() <= 1000);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("远程压缩摘要失败")
+    );
+    assert!(!event.to_string().contains("sk-upstream"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    websocket.close(None).await.unwrap();
+    router.stop().await.unwrap();
+    task.abort();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        crate::config::RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 1);
+    let entry = &page.items[0];
+    assert_eq!(entry.upstream_status_code, Some(429));
+    assert_eq!(entry.upstream_request_id.as_deref(), Some("retry-contract"));
+    let summary = entry.upstream_error_summary.as_deref().unwrap();
+    assert!(summary.contains("summary failure ***"));
+    assert!(!summary.contains("sk-upstream"));
+}
+
+#[tokio::test]
 async fn gateway_compaction_collects_native_sse_and_rejects_empty_or_failed_summaries() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (config, provider, model) =
@@ -666,7 +836,7 @@ async fn gateway_compaction_collects_native_sse_and_rejects_empty_or_failed_summ
         (200, ""),
         (502, "invalid_compaction_response"),
         (400, CONTEXT_LENGTH_EXCEEDED),
-        (502, "invalid_compaction_response"),
+        (500, "upstream_http_error"),
     ] {
         let response = reqwest::Client::new()
             .post(format!("{}/responses/compact", endpoint.base_url))
@@ -676,6 +846,7 @@ async fn gateway_compaction_collects_native_sse_and_rejects_empty_or_failed_summ
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         let body = response.json::<Value>().await.unwrap();
         if status == 200 {
             validate_compaction_result(&body, true).unwrap();
@@ -685,4 +856,383 @@ async fn gateway_compaction_collects_native_sse_and_rejects_empty_or_failed_summ
     }
     mock.await.unwrap();
     router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn gateway_compaction_http_200_failures_keep_upstream_diagnostics() {
+    for protocol in [
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        for (code, status) in [
+            ("rate_limit_exceeded", 429),
+            ("insufficient_quota", 429),
+            ("invalid_api_key", 401),
+        ] {
+            for sse in [false, true] {
+                let value = json!({"type":"error","error":{"code":code,"message":"embedded failure sk-upstream"}});
+                let (body, content_type) = if sse {
+                    (format!("data: {value}\n\n"), "text/event-stream")
+                } else {
+                    (value.to_string(), "application/json")
+                };
+                let (url, task, requests) =
+                    super::retry_contract_tests::error_upstream(200, body, content_type).await;
+                let (mut config, provider, model) = router_config(url);
+                config.profiles[0].upstream_protocol = protocol.into();
+                config.profiles[0].normalize();
+                let router = LocalRouter::start(&config).await.unwrap();
+                let endpoint = router.endpoint();
+                let response = reqwest::Client::new()
+                    .post(format!("{}/responses/compact", endpoint.base_url))
+                    .bearer_auth(&endpoint.token)
+                    .json(&json!({"model":model_alias(&provider,&model),"input":"continue"}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "{protocol}: {code}, sse={sse}"
+                );
+                assert_eq!(response.headers()["retry-after"], "1");
+                assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+                let body = response.text().await.unwrap();
+                for expected in [
+                    code,
+                    "embedded failure ***",
+                    "远程压缩摘要失败",
+                    "Relay",
+                    "retry-contract",
+                ] {
+                    assert!(body.contains(expected), "{protocol}: {body}");
+                }
+                assert!(!body.contains("sk-upstream"), "{body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["error"]["code"], "upstream_http_error");
+                assert_eq!(value["error"]["codey"]["httpStatus"], status);
+                assert_eq!(value["error"]["codey"]["upstreamCode"], code);
+                assert_eq!(
+                    value["error"]["codey"]["upstreamRequestId"],
+                    "retry-contract"
+                );
+                assert_eq!(value["error"]["codey"]["routeId"], provider);
+                assert_eq!(
+                    value["error"]["codey"]["compactionPhase"],
+                    "gateway_summary"
+                );
+                assert_eq!(requests.lock().unwrap().len(), 1);
+                router.stop().await.unwrap();
+                task.abort();
+            }
+        }
+    }
+}
+
+#[test]
+fn gateway_compaction_failures_preserve_handoff_phase_and_unavailable_details() {
+    let (config, provider, _) = router_config("http://127.0.0.1:9/v1".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    let route = &snapshot.routes[&provider];
+    for (phase, label, message) in [
+        (
+            GatewayCompactionPhase::GatewaySummary,
+            "gateway_summary",
+            "远程压缩摘要失败",
+        ),
+        (
+            GatewayCompactionPhase::SourceRouteHandoff,
+            "source_route_handoff",
+            "源账号交接摘要失败",
+        ),
+        (
+            GatewayCompactionPhase::TargetRouteHandoff,
+            "target_route_handoff",
+            "目标账号交接摘要失败",
+        ),
+    ] {
+        for (error, status, code) in [
+            (ContextLengthExceeded.into(), 400, CONTEXT_LENGTH_EXCEEDED),
+            (anyhow::Error::new(UpstreamReadIdleTimeout { operation: "读取压缩摘要响应失败" }), 504, "compaction_timeout"),
+            (anyhow::anyhow!("压缩摘要返回无效 JSON"), 502, "invalid_compaction_response"),
+            (anyhow::anyhow!("上游未返回可用的压缩摘要"), 502, "invalid_compaction_response"),
+            (UpstreamStreamFailure(json!({"type":"response.failed","response":{"error":{"status":429,"code":"rate_limit_exceeded","message":"limit sk-upstream","retry_after_ms":1234}}})).into(), 429, "rate_limit_exceeded"),
+            (UpstreamStreamFailure(json!({"status":"failed","error":{"code":"invalid_api_key","message":"auth failed"}})).into(), 401, "invalid_prompt"),
+            (UpstreamStreamFailure(json!({"type":"response.incomplete","response":{"output":[]}})).into(), 502, "invalid_compaction_response"),
+        ] {
+            let failure = gateway_compaction_response_failure(&error, route, phase, Some("req-sk-upstream"), None);
+            assert_eq!(failure.status, status);
+            let event = failure.normalized_event();
+            let error = &event["response"]["error"];
+            assert_eq!(error["code"], code);
+            assert_eq!(error["codey"]["compactionPhase"], label);
+            assert_eq!(error["codey"]["upstreamRequestId"], "req-***");
+            assert_eq!(error["codey"]["routeId"], provider);
+            assert!(error["message"].as_str().unwrap().contains(message));
+            assert!(error["message"].as_str().unwrap().contains("Relay"));
+            assert_eq!(error["message"].as_str().unwrap().contains("下次重试将尝试由源账号生成交接摘要"),
+                code == CONTEXT_LENGTH_EXCEEDED && label == "target_route_handoff");
+            assert!(!event.to_string().contains("sk-upstream"));
+            if status == 429 { assert_eq!(error["codey"]["retryAfterMs"], 1234); }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_compaction_http_200_response_failed_keeps_websocket_metadata_and_log() {
+    let logs = tempfile::tempdir().unwrap();
+    let value = json!({"type":"response.failed","response":{"status":"failed","error":{"status_code":429,"code":"rate_limit_exceeded","type":"rate_limit_error","message":"stream failure sk-upstream"}}});
+    let (url, task, requests) = super::retry_contract_tests::error_upstream(
+        200,
+        format!("data: {value}\n\n"),
+        "text/event-stream",
+    )
+    .await;
+    let (mut config, provider, model) = router_config(url);
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = crate::config::RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let mut websocket = super::tests::connect_router_websocket(&router.endpoint()).await;
+    websocket.send(WebSocketMessage::Text(json!({"type":"response.create","model":model_alias(&provider,&model),"input":[{"type":"compaction_trigger"}]}).to_string().into())).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = websocket.next().await {
+            if let WebSocketMessage::Text(text) = message.unwrap() {
+                let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                if responses_event_is_terminal(&event) {
+                    return event;
+                }
+            }
+        }
+        panic!("missing failure event")
+    })
+    .await
+    .unwrap();
+    let error = &event["response"]["error"];
+    assert_eq!(error["code"], "rate_limit_exceeded");
+    assert_eq!(error["codey"]["httpStatus"], 429);
+    assert_eq!(error["codey"]["compactionPhase"], "gateway_summary");
+    assert_eq!(error["codey"]["upstreamRequestId"], "retry-contract");
+    assert_eq!(error["codey"]["upstreamType"], "rate_limit_error");
+    assert!(error["codey"]["retryAfterMs"].as_u64().unwrap() <= 1000);
+    assert!(!event.to_string().contains("sk-upstream"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    websocket.close(None).await.unwrap();
+    router.stop().await.unwrap();
+    task.abort();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        crate::config::RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].upstream_status_code, Some(200));
+    let summary = page.items[0].upstream_error_summary.as_deref().unwrap();
+    assert!(summary.contains("stream failure ***"));
+    assert!(!summary.contains("sk-upstream"));
+}
+
+#[tokio::test]
+async fn gateway_compaction_handoff_failures_keep_json_and_stream_contracts() {
+    let (config, provider, model) = router_config("http://127.0.0.1:9/v1".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    let resolved = RouteSelection {
+        provider_id: provider.clone(),
+        protocol: UpstreamProtocol::OpenAiResponses,
+        requested_model: model_alias(&provider, &model),
+        route: Arc::clone(&snapshot.routes[&provider]),
+        upstream_model: model,
+        fallback_reason: None,
+    };
+    for (phase, label) in [
+        (
+            GatewayCompactionPhase::SourceRouteHandoff,
+            "source_route_handoff",
+        ),
+        (
+            GatewayCompactionPhase::TargetRouteHandoff,
+            "target_route_handoff",
+        ),
+    ] {
+        for (embedded, context_exceeded) in [(false, false), (true, false), (false, true)] {
+            for streaming in [false, true] {
+                let status = if context_exceeded { 400 } else { 429 };
+                let upstream_code = if context_exceeded {
+                    CONTEXT_LENGTH_EXCEEDED
+                } else {
+                    "rate_limit_exceeded"
+                };
+                let upstream_type = if context_exceeded {
+                    "invalid_request_error"
+                } else {
+                    "rate_limit_error"
+                };
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let request = client
+                    .get(format!("http://{}/", listener.local_addr().unwrap()))
+                    .send();
+                let write = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_http_request(&mut socket).await.unwrap();
+                    let mut downstream = HttpResponsesDownstream::new(socket);
+                    downstream.set_streaming_errors(streaming);
+                    let mut headers = HeaderMap::new();
+                    headers.insert("retry-after", HeaderValue::from_static("2"));
+                    let retry_advice = ResponseRetryAdvice::from_headers(&headers);
+                    let error = json!({"error":{"code":upstream_code,"type":upstream_type,"message":"handoff failure sk-upstream"}});
+                    if embedded {
+                        write_gateway_compaction_response_error(
+                            &mut downstream,
+                            UpstreamStreamFailure(error).into(),
+                            &resolved.route,
+                            phase,
+                            Some("handoff-request"),
+                            retry_advice,
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        write_gateway_compaction_http_error(
+                            &mut downstream,
+                            UpstreamHttpErrorResponse {
+                                status,
+                                upstream_request_id: Some("handoff-request"),
+                                retry_advice,
+                                body: &serde_json::to_vec(&error).unwrap(),
+                            },
+                            &resolved,
+                            ProtocolBridge::NativeResponses,
+                            ResponsesRequestKind::Compact,
+                            phase,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                };
+                let (response, ()) = tokio::join!(request, write);
+                let response = response.unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    if streaming { 200 } else { status }
+                );
+                if streaming {
+                    assert!(
+                        response.headers()[CONTENT_TYPE]
+                            .to_str()
+                            .unwrap()
+                            .starts_with("text/event-stream")
+                    );
+                } else {
+                    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+                    assert_eq!(response.headers()["retry-after"], "2");
+                }
+                let body = response.text().await.unwrap();
+                assert!(!body.contains("sk-upstream"), "{body}");
+                let error = if streaming {
+                    let events = parse_responses_websocket_sse_events(&body).unwrap();
+                    assert_eq!(events.last().unwrap()["type"], "response.failed");
+                    events.last().unwrap()["response"]["error"].clone()
+                } else {
+                    serde_json::from_str::<Value>(&body).unwrap()["error"].clone()
+                };
+                assert_eq!(
+                    error["code"],
+                    if context_exceeded {
+                        CONTEXT_LENGTH_EXCEEDED
+                    } else if streaming {
+                        "rate_limit_exceeded"
+                    } else {
+                        "upstream_http_error"
+                    }
+                );
+                assert_eq!(error["codey"]["httpStatus"], status);
+                assert_eq!(error["codey"]["compactionPhase"], label);
+                assert_eq!(error["codey"]["routeId"], provider);
+                assert_eq!(error["codey"]["upstreamCode"], upstream_code);
+                assert_eq!(error["codey"]["upstreamType"], upstream_type);
+                assert_eq!(error["codey"]["upstreamRequestId"], "handoff-request");
+                assert_eq!(
+                    error["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("下次重试将尝试由源账号生成交接摘要"),
+                    context_exceeded && label == "target_route_handoff"
+                );
+                if streaming && !context_exceeded {
+                    assert!(error["codey"]["retryAfterMs"].as_u64().unwrap() <= 2000);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_compaction_cancelled_errors_return_without_logging_or_writing() {
+    struct UntouchedDownstream;
+    #[async_trait]
+    impl ResponsesDownstream for UntouchedDownstream {
+        fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
+            panic!("cancelled requests must not be observed as upstream failures")
+        }
+        async fn write_error(
+            &mut self,
+            _: u16,
+            _: &str,
+            _: String,
+            _: Option<&RouteTarget>,
+        ) -> Result<()> {
+            panic!("cancelled requests must not write a failure")
+        }
+        async fn write_json(&mut self, _: u16, _: &Value) -> Result<()> {
+            panic!("unexpected JSON write")
+        }
+        async fn start_event_stream(&mut self) -> Result<()> {
+            panic!("unexpected stream")
+        }
+        async fn write_event(&mut self, _: &Value) -> Result<()> {
+            panic!("unexpected event")
+        }
+        async fn finish_event_stream(&mut self) -> Result<()> {
+            panic!("unexpected stream finish")
+        }
+        async fn proxy_response_with_probe(
+            &mut self,
+            _: reqwest::Response,
+            _: Option<&RouteRequestLogProbe>,
+        ) -> Result<()> {
+            panic!("unexpected proxy")
+        }
+    }
+    let (config, provider, _) = router_config("http://127.0.0.1:9/v1".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    for closed in [true, false] {
+        let error = if closed {
+            anyhow::Error::new(DownstreamClosed)
+        } else {
+            anyhow::Error::new(DownstreamResponseInterrupt)
+        }
+        .context("original cancellation context");
+        let returned = write_gateway_compaction_response_error(
+            &mut UntouchedDownstream,
+            error,
+            &snapshot.routes[&provider],
+            GatewayCompactionPhase::TargetRouteHandoff,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(returned.to_string(), "original cancellation context");
+        assert_eq!(returned.is::<DownstreamClosed>(), closed);
+        assert_eq!(returned.is::<DownstreamResponseInterrupt>(), !closed);
+    }
 }

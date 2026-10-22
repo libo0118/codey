@@ -61,7 +61,9 @@ test("tag-triggered Windows releases independently enforce Rust quality gates", 
   assert.match(workflow, /files: dist\/windows\/\*/);
   assert.doesNotMatch(workflow, /CLOUDFLARE|CODEY_RELEASE_ADMIN_URL|RELEASE_ADMIN_CALLBACK_SECRET/);
   assert.match(workflow, /import \{ releaseIdentity \} from/);
-  assert.match(workflow, /make_latest:.*outputs.prerelease == 'true' && 'false' \|\| 'true'/);
+  assert.match(workflow, /"make_latest=" \+ identity.makeLatest/);
+  assert.match(workflow, /make_latest:.*outputs.make_latest/);
+  assert.match(workflow, /- name: Publish Windows release\s+if: startsWith\(github.ref, 'refs\/tags\/v'\)/);
   assert.match(workflow, /prerelease:.*outputs.prerelease == 'true'/);
 });
 
@@ -78,6 +80,8 @@ test("local releases run the same locked Rust checks", () => {
   assert.match(releaseScript, /\["fmt", "--all", "--", "--check"\]/);
   assert.match(releaseScript, /\["test", "--workspace", "--locked"\]/);
   assert.match(releaseScript, /\["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"\]/);
+  assert.match(releaseScript, /\["update", "--workspace"\]/);
+  assert.doesNotMatch(releaseScript, /generate-lockfile/);
 });
 
 test("desktop builds generate embedded overlay assets before Cargo compiles", () => {

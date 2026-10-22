@@ -1,6 +1,15 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(windows, test))]
+mod windows_packages;
+
+#[derive(Default)]
+struct AppValidationContext {
+    #[cfg(windows)]
+    packages: windows_packages::NativeWindowsPackageSnapshot,
+}
+
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
@@ -99,7 +108,10 @@ fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn registered_codex_app_dirs() -> Option<Vec<PathBuf>> {
-    registered_codex_packages()?
+    AppValidationContext::default()
+        .packages
+        .codex_packages()
+        .ok()?
         .iter()
         .map(|package| normalize_codex_app_path(&package.install_location))
         .collect()
@@ -109,29 +121,6 @@ fn registered_codex_app_dirs() -> Option<Vec<PathBuf>> {
 struct RegisteredCodexPackage {
     package_full_name: String,
     install_location: PathBuf,
-}
-
-#[cfg(windows)]
-fn registered_codex_packages() -> Option<Vec<RegisteredCodexPackage>> {
-    let packages = registered_windows_package_values(|package| {
-        let identity = package.Id()?;
-        let name = identity.Name()?.to_string_lossy();
-        if !APP_PACKAGE_SPECS
-            .iter()
-            .any(|spec| spec.identity.eq_ignore_ascii_case(&name))
-        {
-            return Ok(None);
-        }
-        let package_full_name = identity.FullName()?.to_string_lossy();
-        let location =
-            windows_package_location(package.InstalledLocation().and_then(|folder| folder.Path()))?;
-        Ok(location.map(|install_location| RegisteredCodexPackage {
-            package_full_name,
-            install_location,
-        }))
-    })
-    .ok()?;
-    validate_registered_codex_packages(packages)
 }
 
 #[cfg(any(windows, test))]
@@ -145,39 +134,6 @@ fn validate_registered_codex_packages(
                 && package.install_location.is_absolute()
         })
         .then_some(packages)
-}
-
-#[cfg(windows)]
-fn registered_windows_package_values<T>(
-    mut read: impl FnMut(&windows::ApplicationModel::Package) -> anyhow::Result<Option<T>>,
-) -> anyhow::Result<Vec<T>> {
-    use anyhow::Context;
-    use windows::Management::Deployment::PackageManager;
-    use windows::core::HSTRING;
-
-    // An empty SID selects the current user, as Get-AppxPackage did. Query the
-    // live registration state without starting PowerShell or caching identities.
-    let manager = PackageManager::new().context("无法打开 Windows 包管理器")?;
-    let packages = manager
-        .FindPackagesByUserSecurityId(&HSTRING::new())
-        .context("无法查询当前用户的 Windows 包注册信息")?;
-    let iterator = packages.First().context("无法枚举 Windows 包注册信息")?;
-    let mut has_current = iterator
-        .HasCurrent()
-        .context("无法读取 Windows 包枚举状态")?;
-    let mut values = Vec::new();
-    // The bindings' IntoIterator drops iteration errors. Use the fallible
-    // methods so a partial enumeration can never authorize a standalone launch.
-    while has_current {
-        let package = iterator.Current().context("无法读取 Windows 包注册信息")?;
-        if let Some(value) = read(&package).context("无法读取 Windows 包安装信息")? {
-            values.push(value);
-        }
-        has_current = iterator
-            .MoveNext()
-            .context("无法继续枚举 Windows 包注册信息")?;
-    }
-    Ok(values)
 }
 
 #[cfg(windows)]
@@ -214,8 +170,10 @@ fn registered_package_full_name(
     let mut matches = packages
         .iter()
         .filter_map(|package| {
-            let root = std::fs::canonicalize(&package.install_location).ok()?;
-            let entry = normalize_codex_app_path(&root)?;
+            // The operation's package snapshot already verified and canonicalized
+            // this root; share that result with standalone classification.
+            let root = &package.install_location;
+            let entry = normalize_codex_app_path(root)?;
             let entry = std::fs::canonicalize(entry).ok()?;
             // 注册位置必须指向同一个入口，不能只按祖先目录匹配或跟随越界链接。
             (entry == app_dir && entry.starts_with(root)).then_some(&package.package_full_name)
@@ -346,9 +304,15 @@ pub fn resolve_codex_app_dir_with_saved_checked(
     }
     #[cfg(windows)]
     {
-        let mut paths = registered_codex_app_dirs().ok_or_else(|| {
-            anyhow::anyhow!("无法查询或解析 Windows Codex 包注册信息，请明确选择应用路径")
-        })?;
+        use anyhow::Context;
+        let context = AppValidationContext::default();
+        let mut required = context
+            .packages
+            .codex_packages()
+            .context("无法查询或解析 Windows Codex 包注册信息，请明确选择应用路径")?
+            .iter()
+            .map(|package| normalize_codex_app_path_checked(&package.install_location))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let (mut roots, mut diagnostics) = standalone_registry_roots();
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             let local = PathBuf::from(local);
@@ -359,20 +323,93 @@ pub fn resolve_codex_app_dir_with_saved_checked(
                 local.join("Programs/OpenAI/Codex"),
             ]);
         }
-        paths.extend(collect_automatic_app_roots(roots)?);
+        required.extend(collect_automatic_app_roots(roots)?);
+        let mut optional = Vec::new();
         add_optional_discovery_source(
-            &mut paths,
+            &mut optional,
             &mut diagnostics,
             "当前会话进程",
             running_codex_app_dirs(),
         );
-        for path in &paths {
-            validate_codex_app_dir(path)?;
-        }
+        let paths = validate_automatic_app_candidates(
+            required
+                .into_iter()
+                .map(|path| (path, true))
+                .chain(optional.into_iter().map(|path| (path, false))),
+            |path| validate_codex_app_dir_with_context(path, &context),
+        )?;
         finish_automatic_discovery(paths, diagnostics)
     }
     #[cfg(not(windows))]
     Ok(resolve_codex_app_dir(None))
+}
+
+/// Resolves an installation and validates its identity exactly once. Explicit
+/// selections never fall back to another installation if validation fails.
+pub fn resolve_validated_codex_app_dir_with_saved_checked(
+    app_dir: Option<&Path>,
+    saved_app_path: Option<&str>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let selected = app_dir.or_else(|| {
+        saved_app_path
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(Path::new)
+    });
+    if let Some(selected) = selected {
+        let app = normalize_codex_app_path_checked(selected)?;
+        validate_codex_app_dir(&app)?;
+        return Ok(Some(app));
+    }
+    let app = resolve_codex_app_dir_with_saved_checked(None, None)?;
+    // Windows discovery and macOS bundle discovery already validate candidates.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    if let Some(app) = &app {
+        validate_codex_app_dir(app)?;
+    }
+    Ok(app)
+}
+
+#[cfg(any(windows, test))]
+fn validate_automatic_app_candidates(
+    candidates: impl IntoIterator<Item = (PathBuf, bool)>,
+    mut validate: impl FnMut(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    use anyhow::Context;
+    let mut unique = Vec::<(PathBuf, bool)>::new();
+    for (path, required) in candidates {
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(canonical) => canonical,
+            Err(error) if required => {
+                return Err(error)
+                    .with_context(|| format!("无法访问 Codex 候选目录：{}", path.display()));
+            }
+            Err(_) => continue,
+        };
+        let existing = unique.iter_mut().find(|(known, _)| {
+            if cfg!(windows) {
+                known
+                    .as_os_str()
+                    .eq_ignore_ascii_case(canonical.as_os_str())
+            } else {
+                known == &canonical
+            }
+        });
+        if let Some((_, known_required)) = existing {
+            *known_required |= required;
+        } else {
+            unique.push((canonical, required));
+        }
+    }
+    let mut accepted = Vec::new();
+    for (path, required) in unique {
+        match validate(&path) {
+            Ok(()) => accepted.push(path),
+            Err(error) if required => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(accepted)
 }
 
 // Automatic roots can be data-only directories. Keep absence separate from
@@ -400,7 +437,6 @@ fn collect_automatic_app_roots(mut roots: Vec<PathBuf>) -> anyhow::Result<Vec<Pa
         } else {
             normalize_codex_app_path_checked(&root)?
         };
-        validate_codex_app_dir(&app)?;
         paths.push(app);
     }
     Ok(paths)
@@ -453,23 +489,25 @@ fn running_codex_app_dirs() -> anyhow::Result<Vec<PathBuf>> {
     use crate::windows_integration::{enumerate_processes, process_session_id};
     let session = process_session_id(std::process::id())
         .ok_or_else(|| anyhow::anyhow!("无法确定当前 Windows 会话"))?;
-    let mut paths = Vec::new();
+    let mut images = Vec::new();
     for process in enumerate_processes()? {
         if process.session_id != Some(session)
             || !is_supported_app_executable_name(&process.exe_file)
         {
             continue;
         }
-        // Process names are only a cheap filter. Resolve the OS-reported image
-        // path and require a complete supported application before accepting it.
-        if let Some(image) = process.executable_path
-            && let Ok(app) = normalize_codex_app_path_checked(&image)
-            && validate_codex_app_dir(&app).is_ok()
-        {
-            paths.push(app);
+        if let Some(image) = process.executable_path {
+            images.push(image);
         }
     }
-    Ok(paths)
+    images.sort();
+    images.dedup();
+    // Names only identify candidates. Identity validation happens after all
+    // sources have been combined and canonical directories deduplicated.
+    Ok(images
+        .iter()
+        .filter_map(|image| normalize_codex_app_path_checked(image).ok())
+        .collect())
 }
 
 #[cfg(windows)]
@@ -774,6 +812,13 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
 
 /// Identifies the application without replacing the OS signature checks.
 pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
+    validate_codex_app_dir_with_context(app_dir, &AppValidationContext::default())
+}
+
+fn validate_codex_app_dir_with_context(
+    app_dir: &Path,
+    context: &AppValidationContext,
+) -> anyhow::Result<()> {
     use anyhow::Context;
     anyhow::ensure!(app_dir.is_absolute(), "Codex 安装路径必须是绝对路径");
     let root = std::fs::canonicalize(app_dir).context("Codex 安装路径不存在或无法访问")?;
@@ -832,7 +877,7 @@ pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
                 == Some("com.openai.codex"),
             "macOS 应用标识不属于已支持的 Codex 客户端"
         );
-    } else if let Some(package_name) = packaged_app_full_name(&root) {
+    } else if let Some(package_name) = packaged_app_full_name_with_context(&root, context)? {
         anyhow::ensure!(
             supported_codex_package_identity(&package_name),
             "不支持的 Codex Windows 包身份或版本：{package_name}"
@@ -853,7 +898,7 @@ pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
                 .try_exists()
                 .context("无法检查 Codex 安装清单")?
             {
-                ensure_unregistered_windows_install(&root)?;
+                ensure_unregistered_windows_install(&root, context)?;
                 break;
             }
         }
@@ -861,19 +906,22 @@ pub fn validate_codex_app_dir(app_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_unregistered_windows_install(app_dir: &Path) -> anyhow::Result<()> {
+fn ensure_unregistered_windows_install(
+    app_dir: &Path,
+    _context: &AppValidationContext,
+) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         use anyhow::Context;
 
         // Include all identities: an unrecognized registered package must not
         // fall back to standalone launch just because its name is unfamiliar.
-        let locations = registered_windows_package_values(|package| {
-            windows_package_location(package.InstalledLocation().and_then(|folder| folder.Path()))
-        })
-        .context("无法查询 Windows 包注册信息，未按独立安装处理")?;
+        let locations = _context
+            .packages
+            .all_install_locations()
+            .context("无法查询 Windows 包注册信息，未按独立安装处理")?;
         anyhow::ensure!(
-            !app_dir_is_within_registered_package(app_dir, &locations)?,
+            !app_dir_is_within_canonical_package(app_dir, locations),
             "无法安全识别 Windows 打包安装，未按独立安装处理：{}",
             app_dir.display()
         );
@@ -886,7 +934,7 @@ fn ensure_unregistered_windows_install(app_dir: &Path) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn app_dir_is_within_registered_package(
     app_dir: &Path,
     locations: &[PathBuf],
@@ -897,15 +945,20 @@ fn app_dir_is_within_registered_package(
         anyhow::ensure!(location.is_absolute(), "Windows 包注册路径不是绝对路径");
         let package_root = std::fs::canonicalize(location)
             .with_context(|| format!("无法核实 Windows 包注册路径：{}", location.display()))?;
-        if app_dir.ancestors().any(|ancestor| {
-            ancestor
-                .as_os_str()
-                .eq_ignore_ascii_case(package_root.as_os_str())
-        }) {
+        if app_dir_is_within_canonical_package(app_dir, &[package_root]) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(any(windows, test))]
+fn app_dir_is_within_canonical_package(app_dir: &Path, locations: &[PathBuf]) -> bool {
+    locations.iter().any(|root| {
+        app_dir
+            .ancestors()
+            .any(|ancestor| ancestor.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
+    })
 }
 
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
@@ -1272,14 +1325,26 @@ pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
 
 /// 校验、Store 更新和激活共用包身份，非标准目录名由当前用户的注册信息确认。
 pub fn packaged_app_full_name(app_dir: &Path) -> Option<String> {
+    packaged_app_full_name_with_context(app_dir, &AppValidationContext::default())
+        .ok()
+        .flatten()
+}
+
+fn packaged_app_full_name_with_context(
+    app_dir: &Path,
+    _context: &AppValidationContext,
+) -> anyhow::Result<Option<String>> {
     if let Some(name) = package_name_from_app_dir(app_dir) {
-        return Some(name);
+        return Ok(Some(name));
     }
     #[cfg(windows)]
     if has_windows_package_marker(app_dir) {
-        return registered_package_full_name(app_dir, &registered_codex_packages()?);
+        return Ok(registered_package_full_name(
+            app_dir,
+            _context.packages.codex_packages()?,
+        ));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(any(windows, test))]
@@ -1779,10 +1844,141 @@ mod tests {
         write_windows_client(&healthy);
         std::fs::create_dir(&broken).unwrap();
         std::fs::write(broken.join("Codex.exe"), b"incomplete install").unwrap();
-        assert!(collect_automatic_app_roots(vec![healthy.clone(), broken.clone()]).is_err());
+        let roots = collect_automatic_app_roots(vec![healthy.clone(), broken.clone()]).unwrap();
+        assert!(
+            validate_automatic_app_candidates(
+                roots.into_iter().map(|path| (path, true)),
+                validate_codex_app_dir
+            )
+            .is_err()
+        );
         write_windows_client(&broken);
         write_windows_client(&broken.join("app"));
         assert!(collect_automatic_app_roots(vec![healthy, broken]).is_err());
+    }
+
+    #[test]
+    fn automatic_discovery_validates_one_install_for_nine_processes_and_fixed_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Codex");
+        write_windows_client(&app);
+        let mut candidates = vec![(app.clone(), true)];
+        candidates.extend((0..9).map(|_| (app.clone(), false)));
+        let mut validations = 0;
+        let paths = validate_automatic_app_candidates(candidates, |path| {
+            validations += 1;
+            validate_codex_app_dir(path)
+        })
+        .unwrap();
+        assert_eq!(validations, 1);
+        assert_eq!(paths, vec![std::fs::canonicalize(&app).unwrap()]);
+        assert_eq!(
+            finish_automatic_discovery(paths, vec![]).unwrap(),
+            Some(std::fs::canonicalize(&app).unwrap())
+        );
+    }
+
+    #[test]
+    fn required_source_wins_over_duplicate_optional_source_in_either_order() {
+        let temp = tempfile::tempdir().unwrap();
+        for required_first in [true, false] {
+            let mut validations = 0;
+            let candidates = [
+                (temp.path().to_path_buf(), required_first),
+                (temp.path().to_path_buf(), !required_first),
+            ];
+            let error = validate_automatic_app_candidates(candidates, |_| {
+                validations += 1;
+                anyhow::bail!("damaged required installation")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("damaged required installation"));
+            assert_eq!(validations, 1);
+        }
+    }
+
+    #[test]
+    fn optional_invalid_processes_do_not_hide_required_errors_or_ambiguity() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good");
+        let other = temp.path().join("other");
+        let bad = temp.path().join("bad");
+        write_windows_client(&good);
+        write_windows_client(&other);
+        std::fs::create_dir(&bad).unwrap();
+        let paths = validate_automatic_app_candidates(
+            [(bad.clone(), false), (good.clone(), true)],
+            validate_codex_app_dir,
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(
+            validate_automatic_app_candidates(
+                [(good.clone(), false), (bad, true)],
+                validate_codex_app_dir
+            )
+            .is_err()
+        );
+        let paths = validate_automatic_app_candidates(
+            [(good, true), (other, false)],
+            validate_codex_app_dir,
+        )
+        .unwrap();
+        assert!(
+            finish_automatic_discovery(paths, vec![])
+                .unwrap_err()
+                .to_string()
+                .contains("多个 Codex 安装")
+        );
+        let missing = temp.path().join("missing");
+        assert!(
+            validate_automatic_app_candidates([(missing.clone(), false)], validate_codex_app_dir)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            validate_automatic_app_candidates([(missing, true)], validate_codex_app_dir).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_discovery_deduplicates_canonical_installation_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Codex");
+        let alias = temp.path().join("alias");
+        write_windows_client(&app);
+        std::os::unix::fs::symlink(&app, &alias).unwrap();
+        let mut validations = 0;
+        let paths = validate_automatic_app_candidates([(app, true), (alias, false)], |path| {
+            validations += 1;
+            validate_codex_app_dir(path)
+        })
+        .unwrap();
+        assert_eq!(validations, 1);
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn validated_resolver_keeps_explicit_invalid_selection_and_saved_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good");
+        let damaged = temp.path().join("damaged");
+        write_windows_client(&good);
+        write_windows_client(&damaged);
+        std::fs::remove_file(damaged.join("resources/app.asar")).unwrap();
+        assert!(
+            resolve_validated_codex_app_dir_with_saved_checked(Some(&damaged), good.to_str())
+                .is_err()
+        );
+        assert!(
+            resolve_validated_codex_app_dir_with_saved_checked(None, damaged.to_str()).is_err()
+        );
+        assert_eq!(
+            resolve_validated_codex_app_dir_with_saved_checked(Some(&good), damaged.to_str())
+                .unwrap(),
+            Some(good)
+        );
     }
 
     #[test]
@@ -2082,7 +2278,7 @@ mod tests {
         let full_name = "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0";
         let mut packages = vec![RegisteredCodexPackage {
             package_full_name: full_name.into(),
-            install_location: location.clone(),
+            install_location: std::fs::canonicalize(&location).unwrap(),
         }];
         assert_eq!(
             registered_package_full_name(&app, &packages).as_deref(),
@@ -2095,7 +2291,7 @@ mod tests {
         assert!(registered_package_full_name(&unrelated, &packages).is_none());
         packages.push(RegisteredCodexPackage {
             package_full_name: full_name.into(),
-            install_location: location.clone(),
+            install_location: std::fs::canonicalize(&location).unwrap(),
         });
         assert_eq!(
             registered_package_full_name(&app, &packages).as_deref(),
@@ -2120,7 +2316,7 @@ mod tests {
         std::os::unix::fs::symlink(&external, &app).unwrap();
         let packages = [RegisteredCodexPackage {
             package_full_name: "OpenAI.Codex_26.924.22138.0_x64__2p2nqsd0c76g0".into(),
-            install_location: root,
+            install_location: std::fs::canonicalize(root).unwrap(),
         }];
         assert!(registered_package_full_name(&app, &packages).is_none());
         assert!(registered_package_full_name(&external, &packages).is_none());

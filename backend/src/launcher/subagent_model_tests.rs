@@ -182,7 +182,11 @@ fn subagent_model_validation_uses_the_preserved_user_catalog() {
     config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
     write_subagent_test_catalog(
         home.path(),
-        &["route-a/gpt-6-astra", "route-a/vendor/model"],
+        &[
+            "route-a/gpt-6-astra",
+            "route-a/gpt-5.6-terra",
+            "route-a/vendor/model",
+        ],
     );
     let generated = home.path().join(model_catalog::relative_path());
     let custom = home.path().join("custom-models.json");
@@ -204,9 +208,199 @@ fn subagent_model_validation_uses_the_preserved_user_catalog() {
     std::fs::write(&custom, "{\"models\":[]}").unwrap();
     write_subagent_test_catalog(
         home.path(),
-        &["route-a/gpt-6-astra", "route-a/vendor/model"],
+        &[
+            "route-a/gpt-6-astra",
+            "route-a/gpt-5.6-terra",
+            "old-route/vendor/model",
+        ],
     );
-    assert!(validated_router_subagent_runtime_config(&config, true, home.path()).is_err());
+    let error = validated_router_subagent_runtime_config(&config, true, home.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("route-a/vendor/model"),
+        "{error}"
+    );
+}
+
+#[test]
+fn subagent_catalog_overlay_survives_partial_and_complete_budget_reset() {
+    for clear_all in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = subagent_catalog_fallback_config();
+        config.subagent_roles.get_mut("codey_worker").unwrap().model =
+            "route-a/vendor/model".into();
+        let policy = crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        };
+        config.model_context_by_provider.insert(
+            "route-a".into(),
+            std::collections::BTreeMap::from([
+                ("vendor/model".into(), policy.clone()),
+                ("gpt-6-astra".into(), policy),
+            ]),
+        );
+        let catalog_path = home.path().join(model_catalog::relative_path());
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let models = [
+            "route-a/gpt-6-astra",
+            "route-a/gpt-5.6-terra",
+            "route-a/vendor/model",
+            "old-route/vendor/model",
+        ]
+        .map(|slug| {
+            serde_json::json!({
+                "slug": slug,
+                "description": "Test model",
+                "base_instructions": "Test instructions",
+                "context_window": 320_000,
+                "effective_context_window_percent": 95,
+                "codey_context_source": "official_catalog"
+            })
+        });
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_vec(&serde_json::json!({"models": models})).unwrap(),
+        )
+        .unwrap();
+        model_catalog::apply_catalog_overrides(
+            home.path(),
+            model_catalog::CatalogOverrides {
+                contexts: &config.runtime_enabled_model_contexts(),
+                plugin_contexts: &Default::default(),
+                reasoning_efforts: &Default::default(),
+                display_names: &Default::default(),
+            },
+        )
+        .unwrap();
+        let cached_catalog = std::fs::read(&catalog_path).unwrap();
+        let external_path = home.path().join("custom-models.json");
+        let external = br#"{"models":[{"slug":"external/model","description":"External model","base_instructions":"External instructions","custom":true}]}"#;
+        std::fs::write(&external_path, external).unwrap();
+        let codex_config = b"model_catalog_json = 'custom-models.json'\n";
+        std::fs::write(home.path().join("config.toml"), codex_config).unwrap();
+
+        let budget_catalog = crate::codex_config::runtime_model_catalog_path(
+            home.path(),
+            true,
+            Some(&config.runtime_enabled_model_contexts()),
+            &crate::codex_config::runtime_required_catalog_models(&config, home.path(), true),
+        )
+        .unwrap()
+        .unwrap();
+        let budget_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(budget_catalog).unwrap()).unwrap();
+        let budget_model = budget_value["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "route-a/vendor/model")
+            .unwrap();
+        assert_eq!(budget_model["context_window"], 128_000);
+        assert!(
+            validated_router_subagent_runtime_config(&config, true, home.path())
+                .unwrap()
+                .subagent_optimization
+        );
+
+        if clear_all {
+            config.model_context_by_provider.clear();
+        } else {
+            config
+                .model_context_by_provider
+                .get_mut("route-a")
+                .unwrap()
+                .remove("vendor/model");
+        }
+        let saved = config.clone();
+        let contexts = config.runtime_enabled_model_contexts();
+        let required =
+            crate::codex_config::runtime_required_catalog_models(&config, home.path(), true);
+        crate::codex_config::validate_runtime_model_contexts(home.path(), &contexts, &required)
+            .unwrap();
+        let runtime = validated_router_subagent_runtime_config(&config, true, home.path()).unwrap();
+        assert!(runtime.subagent_optimization);
+        assert_eq!(
+            runtime.subagent_roles["codey_worker"].model,
+            "route-a/vendor/model"
+        );
+        let startup = startup_router_subagent_runtime_config(&mut config, true, home.path());
+        assert!(startup.subagent_optimization);
+        assert!(config.subagent_optimization);
+        assert_eq!(
+            startup.subagent_roles["codey_worker"].model,
+            "route-a/vendor/model"
+        );
+        assert_eq!(config, saved);
+        let reset_catalog = crate::codex_config::runtime_model_catalog_path(
+            home.path(),
+            true,
+            Some(&contexts),
+            &required,
+        )
+        .unwrap()
+        .unwrap();
+        let reset_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reset_catalog).unwrap()).unwrap();
+        let models = reset_value["models"].as_array().unwrap();
+        let vendor = models
+            .iter()
+            .find(|model| model["slug"] == "route-a/vendor/model")
+            .unwrap();
+        assert_eq!(vendor["context_window"], 320_000);
+        assert_eq!(vendor["codey_context_source"], "official_catalog");
+        assert!(vendor["auto_compact_token_limit"].is_null());
+        let default = models
+            .iter()
+            .find(|model| model["slug"] == "route-a/gpt-6-astra")
+            .unwrap();
+        assert_eq!(
+            default["context_window"],
+            if clear_all { 320_000 } else { 128_000 }
+        );
+        assert_eq!(models.len(), 4);
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["slug"] == "old-route/vendor/model")
+        );
+        assert_eq!(std::fs::read(&external_path).unwrap(), external);
+        assert_eq!(
+            std::fs::read(home.path().join("config.toml")).unwrap(),
+            codex_config
+        );
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), cached_catalog);
+    }
+}
+
+#[test]
+fn subagent_required_catalog_models_skip_unavailable_official_models_only() {
+    for account_count in [1, 2] {
+        let home = tempfile::tempdir().unwrap();
+        let config = official_subagent_config(account_count);
+        let (_, selected) = config.runtime_catalog_models();
+        let available = selected[0].clone();
+        write_subagent_test_catalog(home.path(), &[&available]);
+        assert_eq!(
+            crate::codex_config::runtime_required_catalog_models(&config, home.path(), true),
+            vec![available]
+        );
+        assert!(
+            crate::codex_config::runtime_required_catalog_models(&config, home.path(), false)
+                .is_empty()
+        );
+        let mut disabled = config.clone();
+        disabled.local_router_enabled = false;
+        assert!(
+            crate::codex_config::runtime_required_catalog_models(&disabled, home.path(), true)
+                .is_empty()
+        );
+        let third_party = subagent_catalog_fallback_config();
+        assert_eq!(
+            crate::codex_config::runtime_required_catalog_models(&third_party, home.path(), true),
+            third_party.runtime_catalog_models().1
+        );
+    }
 }
 
 #[test]

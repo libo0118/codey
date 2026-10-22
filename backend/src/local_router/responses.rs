@@ -556,21 +556,22 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let (route_hint, body_mutated) = match take_codey_route_metadata(&mut request, &mut body) {
-            Ok(extracted) => extracted,
-            Err(error) => {
-                mark_error(400, "route_metadata_invalid");
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "route_metadata_invalid",
-                    format!("Codey 线路元数据无效：{error:#}"),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+        let (route_hint, body_mutated) =
+            match take_codey_route_metadata(&mut request, &mut body, None) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    mark_error(400, "route_metadata_invalid");
+                    write_error_response(
+                        &mut stream,
+                        400,
+                        "route_metadata_invalid",
+                        format!("Codey 线路元数据无效：{error:#}"),
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
         let snapshot = Arc::clone(
             &self
                 .snapshot
@@ -581,7 +582,19 @@ impl RouterServer {
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let route = match snapshot.route_for_image_request(image_model, route_hint.as_deref()) {
+        let mut route_decision = crate::route_request_log::RouteDecision::default();
+        let resolved = snapshot.route_for_image_request_observed(
+            image_model,
+            route_hint.as_deref(),
+            probe
+                .as_ref()
+                .filter(|probe| probe.records_diagnostics())
+                .map(|_| &mut route_decision),
+        );
+        if let Some(probe) = &probe {
+            probe.record_route_decision(route_decision);
+        }
+        let route = match resolved {
             Ok(route) => route,
             Err(error) => {
                 mark_error(404, "route_not_enabled");
@@ -697,11 +710,6 @@ impl RouterServer {
             } else {
                 RequestProtocol::Http
             });
-            probe.mark_upstream_send(if stream_requested {
-                UpstreamTransport::HttpSse
-            } else {
-                UpstreamTransport::Http
-            });
         }
         let mut headers = headers;
         // insert 保证只有一个 content-type；在 .headers() 之后用 .header() 会追加重复值。
@@ -739,6 +747,16 @@ impl RouterServer {
         } else {
             codey_plugin_sdk::transport::Operation::ImageGeneration
         };
+        if let Some(probe) = &probe {
+            probe.begin_upstream_attempt(
+                if stream_requested {
+                    UpstreamTransport::HttpSse
+                } else {
+                    UpstreamTransport::Http
+                },
+                crate::route_request_log::AttemptTrigger::Initial,
+            );
+        }
         let response = match send_route_response_headers(
             route.plugin_transport.as_ref(),
             operation,
@@ -754,6 +772,17 @@ impl RouterServer {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 let timeout = error.is_timeout();
+                if let Some(probe) = &probe {
+                    use crate::route_request_log::{AttemptOutcome, AttemptPhase};
+                    probe.finish_upstream_attempt(
+                        if timeout {
+                            AttemptOutcome::TimedOut
+                        } else {
+                            AttemptOutcome::Failed
+                        },
+                        AttemptPhase::ResponseHeaders,
+                    );
+                }
                 let (status, code, message) = if timeout {
                     (
                         504,
@@ -779,6 +808,12 @@ impl RouterServer {
             }
             Err(_) => {
                 mark_error(504, "upstream_header_timeout");
+                if let Some(probe) = &probe {
+                    probe.finish_upstream_attempt(
+                        crate::route_request_log::AttemptOutcome::TimedOut,
+                        crate::route_request_log::AttemptPhase::ResponseHeaders,
+                    );
+                }
                 write_text_error_response(
                     &mut stream,
                     504,
@@ -803,6 +838,12 @@ impl RouterServer {
         }
         let result = write_proxy_response(&mut stream, response, probe.as_ref(), false).await;
         if let Some(probe) = &probe {
+            if result.as_ref().err().is_some_and(is_upstream_timeout_error) {
+                probe.finish_upstream_attempt(
+                    crate::route_request_log::AttemptOutcome::TimedOut,
+                    crate::route_request_log::AttemptPhase::ResponseBody,
+                );
+            }
             if result.is_ok() {
                 probe.finish_success();
             } else if result
@@ -1582,10 +1623,23 @@ impl RouterServer {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let decision_probe = downstream
+            .request_log_probe()
+            .filter(|probe| probe.records_diagnostics())
+            .cloned();
+        let mut route_decision = crate::route_request_log::RouteDecision {
+            settings_revision: snapshot.settings_revision,
+            ..Default::default()
+        };
         let mut portable_attempt =
             match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
                 Ok(attempt) => attempt,
                 Err(error) => {
+                    if let Some(probe) = &decision_probe {
+                        route_decision.reason =
+                        crate::route_request_log::RouteDecisionReason::PortableHandoffUnavailable;
+                        probe.record_route_decision(route_decision);
+                    }
                     return downstream
                         .write_error(
                             409,
@@ -1597,12 +1651,17 @@ impl RouterServer {
                 }
             };
         let model_was_defaulted = requested_model.is_empty();
+        route_decision.defaulted_model = model_was_defaulted;
         let model = if model_was_defaulted {
             snapshot.default_model.trim().to_string()
         } else {
             requested_model
         };
         if model.is_empty() {
+            if let Some(probe) = &decision_probe {
+                route_decision.reason = crate::route_request_log::RouteDecisionReason::MissingModel;
+                probe.record_route_decision(route_decision);
+            }
             downstream
                 .write_error(
                     400,
@@ -1618,10 +1677,18 @@ impl RouterServer {
                 .expect("validated Responses body must remain an object")
                 .insert("model".to_string(), Value::String(model.clone()));
         }
+        let explicit_model_alias = (!model_was_defaulted)
+            .then(|| snapshot.active_model_alias(&model))
+            .flatten();
         let (route_hint, mut body_mutated) =
-            match take_codey_route_metadata(&mut request, &mut body) {
+            match take_codey_route_metadata(&mut request, &mut body, explicit_model_alias) {
                 Ok(extracted) => extracted,
                 Err(error) => {
+                    if let Some(probe) = &decision_probe {
+                        route_decision.reason =
+                            crate::route_request_log::RouteDecisionReason::InvalidMetadata;
+                        probe.record_route_decision(route_decision);
+                    }
                     downstream
                         .write_error(
                             400,
@@ -1634,6 +1701,26 @@ impl RouterServer {
                 }
             };
         body_mutated |= model_was_defaulted;
+        let portable_target_metadata = portable_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.target_metadata(&snapshot));
+        if let Some(attempt) = portable_attempt.as_mut() {
+            let cache = self
+                .portable_history_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot();
+            if attempt.prepare_target(
+                &mut body,
+                &cache,
+                portable_target_metadata.as_ref(),
+                &mut request._body_budget_permit,
+                &self.request_body_budget,
+            ) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+        }
         let subagent_request = request_is_subagent(&request);
         let binding_keys = request_binding_keys(&request);
         // Resolve against the current binding, but do not replace it until the
@@ -1645,19 +1732,35 @@ impl RouterServer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bound_route = bindings.route_for_keys(&binding_keys);
             let resolved = if let Some(attempt) = &portable_attempt {
+                route_decision.reason = if attempt.uses_target {
+                    crate::route_request_log::RouteDecisionReason::PortableTargetHandoff
+                } else {
+                    crate::route_request_log::RouteDecisionReason::PortableSourceHandoff
+                };
+                route_decision.candidate_count = 1;
                 Ok(RouteSelection {
-                    provider_id: attempt.source.provider_id.clone(),
-                    protocol: attempt.source.protocol,
+                    provider_id: attempt.route().provider_id.clone(),
+                    protocol: attempt.route().protocol,
                     requested_model: model.clone(),
-                    route: Arc::clone(&attempt.source),
-                    upstream_model: attempt.model.clone(),
+                    route: Arc::clone(attempt.route()),
+                    upstream_model: attempt.upstream_model().to_string(),
                     fallback_reason: None,
                 })
             } else {
-                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref())
+                snapshot.resolve_request_observed(
+                    RouteRequest {
+                        requested_model: &model,
+                        route_hint: route_hint.as_deref(),
+                        bound_route: bound_route.as_deref(),
+                    },
+                    decision_probe.as_ref().map(|_| &mut route_decision),
+                )
             };
             (resolved, bound_route)
         };
+        if let Some(probe) = decision_probe {
+            probe.record_route_decision(route_decision);
+        }
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1666,6 +1769,23 @@ impl RouterServer {
                     .await?;
                 return Ok(());
             }
+        };
+        // 只保留亲自观测到的完整输入；压缩响应校验成功后才建立对应关系。
+        let portable_checkpoint = if compacting
+            && portable_attempt.is_none()
+            && resolved.route.supports_remote_compaction
+            && resolved.protocol == UpstreamProtocol::OpenAiResponses
+        {
+            portable_request_key(&request).and_then(|key| {
+                let cache = self
+                    .portable_history_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .snapshot();
+                cache.capture(&key, &resolved.route, &resolved.upstream_model, &body)
+            })
+        } else {
+            None
         };
         let route_changed = previous_route
             .as_deref()
@@ -1754,6 +1874,11 @@ impl RouterServer {
             && portable_attempt.is_none()
             && resolved.route.supports_remote_compaction
             && bridge == ProtocolBridge::NativeResponses;
+        let compaction_phase = match portable_attempt.as_ref() {
+            Some(attempt) if attempt.uses_target => GatewayCompactionPhase::TargetRouteHandoff,
+            Some(_) => GatewayCompactionPhase::SourceRouteHandoff,
+            None => GatewayCompactionPhase::GatewaySummary,
+        };
         match restore_codey_compaction_summaries(&mut body) {
             Ok(true) => {
                 body_mutated = true;
@@ -1774,11 +1899,20 @@ impl RouterServer {
         if compacting && !native_compaction {
             let metadata =
                 crate::model_catalog::runtime_context_metadata(crate::codex_config::codex_home());
-            let model_metadata = gateway_compaction_model_metadata(
-                &metadata,
-                &resolved.provider_id,
-                &resolved.upstream_model,
-            );
+            let model_metadata = portable_target_metadata
+                .as_ref()
+                .filter(|_| {
+                    portable_attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.uses_target)
+                })
+                .or_else(|| {
+                    gateway_compaction_model_metadata(
+                        &metadata,
+                        &resolved.provider_id,
+                        &resolved.upstream_model,
+                    )
+                });
             if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
                 .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
             {
@@ -1971,96 +2105,37 @@ impl RouterServer {
             && !resolved.route.official_account
             && ensure_omitted_reasoning_output_limit(&mut body, bridge)
         {
+            // 原生透传的顶层改写包含输出上限，原始字节仍可复用。
             body_mutated = true;
-            if bridge == ProtocolBridge::NativeResponses {
-                // 原生透传只改写少数顶层字段，新增的输出上限必须整段重编码才会发出。
-                encoded_body = None;
-            }
         }
-        let mut tool_bridge = ResponsesToolBridge::default();
-        let offload_conversion = bridge != ProtocolBridge::NativeResponses
-            && encoded_body
-                .as_ref()
-                .is_some_and(|body| body.len() >= REQUEST_JSON_OFFLOAD_BYTES);
-        let (body, converted) = if offload_conversion {
-            let permit = request._body_budget_permit.take();
-            let encoded = encoded_body.take();
-            match tokio::task::spawn_blocking(move || {
-                let converted = bridge.convert_responses_body(&body);
-                (body, converted, encoded, permit)
-            })
-            .await
-            {
-                Ok((body, converted, encoded, permit)) => {
-                    encoded_body = encoded;
-                    request._body_budget_permit = permit;
-                    (body, converted)
-                }
-                Err(error) => {
-                    downstream
-                        .write_error(
-                            500,
-                            "request_conversion_failed",
-                            format!("等待 Responses 协议转换任务失败：{error}"),
-                            Some(&resolved.route),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-            }
-        } else {
-            let converted = bridge.convert_responses_body(&body);
-            (body, converted)
-        };
-        let mut chat_reasoning_summaries = Vec::new();
-        let mut upstream_body = match converted {
-            Ok(converted) => {
-                if let Some(converted) = converted {
-                    drop(body);
-                    tool_bridge = converted.tool_bridge;
-                    chat_reasoning_summaries = converted.chat_reasoning_summaries;
-                    converted.body
-                } else {
-                    body
-                }
-            }
+        let PreparedProtocolRequest {
+            body: mut upstream_body,
+            tool_bridge,
+            chat_reasoning_summaries,
+            anthropic_context_1m,
+        } = match PreparedProtocolRequest::prepare(
+            body,
+            bridge,
+            &resolved.route,
+            upstream_url,
+            &mut encoded_body,
+            &mut body_mutated,
+            &mut request._body_budget_permit,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
             Err(error) => {
-                downstream
+                return downstream
                     .write_error(
-                        400,
-                        "unsupported_responses_payload",
-                        format!(
-                            "线路「{}」选择了 {}，但当前请求无法转换：{error:#}",
-                            route_display_name(&resolved.route),
-                            bridge.upstream_protocol().label()
-                        ),
+                        error.status,
+                        error.code,
+                        error.message,
                         Some(&resolved.route),
                     )
-                    .await?;
-                return Ok(());
+                    .await;
             }
         };
-        if !resolved.route.official_account
-            && normalize_responses_tool_parameter_roots(&mut upstream_body)
-        {
-            body_mutated = true;
-            encoded_body = None;
-        }
-        // Codex Desktop 的工具 schema 会把 `$ref` 和 description/type 写在同一层。
-        // Moonshot、Kimi 的 Chat Completions 拒绝这种写法，收进 allOf 后语义不变。
-        if bridge == ProtocolBridge::ResponsesToChatCompletions
-            && upstream_rejects_ref_sibling_keywords(upstream_url)
-            && wrap_chat_tool_ref_siblings(&mut upstream_body)
-        {
-            body_mutated = true;
-            encoded_body = None;
-        }
-        let anthropic_context_1m = bridge == ProtocolBridge::ResponsesToAnthropicMessages
-            && strip_anthropic_context_1m_model_field(&mut upstream_body);
-        if anthropic_context_1m {
-            body_mutated = true;
-            encoded_body = None;
-        }
         let _official_permit = match self.admit_official(&resolved.route, downstream).await {
             Ok(permit) => permit,
             Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
@@ -2088,27 +2163,37 @@ impl RouterServer {
             }
             ensure_anthropic_context_1m_beta(&mut headers);
         }
-        // Commit the new binding only after the request's route compatibility,
-        // payload conversion, and credentials have passed local checks. A
-        // rejected switch must leave the prior route available for a retry.
+        // Ordinary requests commit after compatibility, conversion and credentials
+        // pass local checks. Native compaction waits for validated complete delivery;
+        // pending or rejected compaction must keep the original route identity.
         // 自动复核是独立请求，复用主会话标识时也不能更改主会话的线路。
         let auto_review_request =
             model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
                 || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
+        let mut native_compaction_binding = None;
         if !auto_review_request && portable_attempt.is_none() {
             let refresh_session_binding = !subagent_request
                 && incoming_header(&request, "x-codex-parent-thread-id").is_none()
                 && (route_hint.is_some() || incoming_header(&request, "thread-id").is_none());
-            self.bindings
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remember_resolved(
+            if native_compaction {
+                native_compaction_binding = Some(PendingNativeCompactionBinding::prepare(
+                    &self.bindings,
                     &binding_keys,
                     &resolved,
                     refresh_session_binding,
-                    native_compaction,
-                    history_portable,
-                );
+                ));
+            } else {
+                self.bindings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remember_resolved(
+                        &binding_keys,
+                        &resolved,
+                        refresh_session_binding,
+                        false,
+                        history_portable,
+                    );
+            }
         }
         let cache_key_deleted = resolved
             .route
@@ -2379,363 +2464,44 @@ impl RouterServer {
                     .await;
             }
         };
-        // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
-        // 回放历史时只保留加密字段。DeepSeek 官方地址在首次发送前还原已有摘要。
-        // 其它线路仍先按原样发送，只有上游明确报出明文缺失时才回填：有摘要用摘要，
-        // 没有摘要才补占位。Chat 重试使用转换时留下的摘要文本，不保留第二份正文。
-        // 官方线路沿用加密推理语义，不参与该回退。
-        let reasoning_text_retry_allowed = matches!(
+        let encoded = RequestEncoding {
             bridge,
-            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
-        ) && request_kind == ResponsesRequestKind::Create
-            && !compacting
-            && !resolved.route.official_account;
-        // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。
-        // 压缩请求不设置 reqwest 总期限:该期限从建连算到响应体读完,会把耗时较长的
-        // 压缩中途截断。等待响应头由 response_header_timeout 约束,响应体读取由
-        // PreparedUpstreamResponse 的总期限与空闲期限约束。
-        let encoded: Bytes = if bridge == ProtocolBridge::NativeResponses {
-            // Native HTTP requests keep large input/tool fields as their raw
-            // JSON slices. Only the small top-level fields that Codey can
-            // legitimately change are re-encoded, avoiding a full second
-            // serialization of long conversations.
-            let passthrough_body = match encoded_body.take() {
-                Some(body)
-                    if should_passthrough_native_responses(
-                        bridge,
-                        &model,
-                        resolved.upstream_model.as_str(),
-                        body_mutated,
-                    ) =>
-                {
-                    body
-                }
-                Some(body) => {
-                    let (body, permit) = rewrite_native_responses_encoded_body_offloaded(
-                        body,
-                        &upstream_body,
-                        request._body_budget_permit.take(),
-                    )
-                    .await?;
-                    request._body_budget_permit = permit;
-                    body
-                }
-                None => serde_json::to_vec(&upstream_body)
-                    .context("序列化 Responses WebSocket 上游请求失败")?,
-            };
-            if let Some(probe) = downstream.request_log_probe() {
-                probe.record_upstream_body(RequestBodySummary::from_responses_body(
-                    &upstream_body,
-                    Some(passthrough_body.len() as u64),
-                ));
-            }
-            passthrough_body.into()
-        } else {
-            drop(encoded_body.take());
-            serde_json::to_vec(&upstream_body).context("序列化转换后的上游请求失败")?.into()
-        };
-        // 重发只保留紧凑的编码副本。解析出的 JSON 树在发出前丢掉，
-        // 预算从 4 倍工作集收回到这一份正文。
-        let retryable_encoded = reasoning_text_retry_allowed.then(|| encoded.clone());
-        drop(upstream_body);
-        drop(std::mem::take(&mut request.body));
-        let mut admission = request._body_budget_permit.take();
-        retain_compact_request_budget(&mut admission, encoded.len());
-        let retained_after_upload = if retryable_encoded.is_some() || lifecycle.is_active() {
-            encoded.len()
-        } else {
-            0
-        };
-        let response_header_timeout = if compacting {
-            // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
-            // 响应头，两者的等待期限不同，都只约束响应头。
-            if upstream_stream_requested {
-                COMPACTION_RESPONSE_HEADER_TIMEOUT
-            } else {
-                UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
-            }
-        } else if upstream_stream_requested {
-            UPSTREAM_RESPONSE_HEADER_TIMEOUT
-        } else {
-            UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
-        };
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.mark_upstream_send(if upstream_stream_requested {
-                UpstreamTransport::HttpSse
-            } else {
-                UpstreamTransport::Http
-            });
-        }
-        let mut attempt = 0;
-        let response_result = send_lifecycle_http(
-            downstream, &mut lifecycle, &upstream_client, upstream_url,
-            &mut headers, encoded, &mut || {
-                retain_compact_request_budget(&mut admission, retained_after_upload);
-            }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
-        ).await?;
-        let Some(response) = Self::finish_upstream_http_send(
-            downstream,
-            response_result,
-            response_header_timeout,
-            &resolved,
+            requested_model: &model,
+            upstream_model: &resolved.upstream_model,
+            body_mutated,
+        }.encode(&mut request, upstream_body, encoded_body.take(), downstream.request_log_probe()).await?;
+        let execution = HttpExecution {
+            server: self,
+            resolved: &resolved,
             bridge,
             request_kind,
-            upstream_stream_requested,
             compacting,
-        )
-        .await?
-        else {
+            native_compaction,
+            compaction_phase,
+            upstream_url,
+            upstream_stream_requested,
+        };
+        let Some(received) = execution.send(
+            downstream, &mut lifecycle, &upstream_client, &mut headers, encoded,
+            chat_reasoning_summaries.as_deref().unwrap_or(&[]),
+        ).await? else {
             return Ok(());
         };
-        let mut upstream_status = response.status().as_u16();
-        let mut upstream_request_id = upstream_request_id_from_headers(response.headers());
-        let mut retry_advice = ResponseRetryAdvice::from_headers(response.headers());
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.set_upstream_response_headers(&format_upstream_response_headers(
-                response.headers(),
-            ));
-        }
-        let mut upstream_response = Some(response);
-        let mut preloaded_error_body = None;
-        if upstream_status == 400
-            && reasoning_text_retry_allowed && attempt == 0
-        {
-            let response = upstream_response
-                .take()
-                .expect("first upstream response is still held here");
-            let probe = downstream.request_log_probe().cloned();
-            // 错误正文与成功正文共用同一个总期限：只有每次读取的空闲期限时，
-            // 上游每隔不到期限发送少量数据就能永久占用请求与压缩会话锁。
-            let deadline = upstream_response_body_deadline();
-            let body = match await_upstream(
-                downstream,
-                read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
-            )
-            .await
-            {
-                Ok(Ok(body)) => body,
-                Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
-                    write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
-                        .await?;
-                    return Ok(());
-                }
-                Ok(Err(error)) | Err(error) => return Err(error),
-            };
-            let retryable_body = match retryable_encoded.as_deref() {
-                Some(encoded)
-                    if requires_reasoning_text_fallback(&body)
-                        && grow_request_body_budget(
-                            &mut admission,
-                            &self.request_body_budget,
-                            encoded.len(),
-                        )
-                        .is_ok() =>
-                {
-                    let mut retryable_body = serde_json::from_slice::<Value>(encoded)
-                        .context("解析 reasoning 回退请求失败")?;
-                    fill_missing_reasoning_text_with_chat_summaries(
-                        &mut retryable_body,
-                        chat_reasoning_summaries.as_deref().unwrap_or(&[]),
-                    )
-                    .then_some(retryable_body)
-                }
-                _ => None,
-            };
-            if let Some(retryable_body) = retryable_body {
-                let encoded = serde_json::to_vec(&retryable_body)
-                    .context("序列化补齐 reasoning 明文的 Responses 请求失败")?;
-                if let Some(probe) = downstream.request_log_probe() {
-                    probe.mark_fallback("reasoning_text_placeholder_retry");
-                    probe.mark_upstream_send(if upstream_stream_requested {
-                        UpstreamTransport::HttpSse
-                    } else {
-                        UpstreamTransport::Http
-                    });
-                    probe.record_upstream_body(RequestBodySummary::from_responses_body(
-                        &retryable_body,
-                        Some(encoded.len() as u64),
-                    ));
-                }
-                let retry_retained = if lifecycle.is_active() {
-                    encoded.len()
-                } else {
-                    0
-                };
-                attempt += 1;
-                let retry_result = send_lifecycle_http(
-                    downstream, &mut lifecycle, &upstream_client, upstream_url,
-                    &mut headers, encoded.into(), &mut || {
-                        retain_compact_request_budget(&mut admission, retry_retained);
-                    }, &mut attempt, response_header_timeout, resolved.route.plugin_transport.as_ref(),
-                ).await?;
-                let Some(retried) = Self::finish_upstream_http_send(
-                    downstream,
-                    retry_result,
-                    response_header_timeout,
-                    &resolved,
-                    bridge,
-                    request_kind,
-                    upstream_stream_requested,
-                    compacting,
-                )
-                .await?
-                else {
-                    return Ok(());
-                };
-                upstream_status = retried.status().as_u16();
-                upstream_request_id = upstream_request_id_from_headers(retried.headers());
-                retry_advice = ResponseRetryAdvice::from_headers(retried.headers());
-                if let Some(probe) = downstream.request_log_probe() {
-                    probe.set_upstream_response_headers(&format_upstream_response_headers(
-                        retried.headers(),
-                    ));
-                }
-                upstream_response = Some(retried);
-            } else {
-                preloaded_error_body = Some(body);
-            }
-        }
-        // 重发已经结束。工具名映射不保留请求正文，响应内存在另一份预算里。
-        drop(retryable_encoded);
-        drop(admission);
-        drop(std::mem::take(&mut request.body));
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
-        }
-        // 首次错误正文已经读完且没有重发时，直接把它写回下游。
-        let Some(response) = upstream_response else {
-            if compacting && !native_compaction {
-                return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
-            }
-            observe_siwc_upstream_rejection(
-                &resolved.route,
-                upstream_status,
-                preloaded_error_body.as_deref().unwrap_or_default(),
-            );
-            return write_upstream_http_error(
-                downstream,
-                UpstreamHttpErrorResponse {
-                    status: upstream_status,
-                    upstream_request_id: upstream_request_id.as_deref(),
-                    retry_advice,
-                    body: preloaded_error_body.as_deref().unwrap_or_default(),
-                },
-                &resolved,
-                bridge,
-                request_kind,
-            )
-            .await;
-        };
-        let result = match bridge {
-            _ if !response.status().is_success() => {
-                let probe = downstream.request_log_probe().cloned();
-                let deadline = upstream_response_body_deadline();
-                // 错误正文和成功正文共用同一个总期限；读取超时时返回结构化
-                // 504，语义与压缩路径一致，下游不会只看到连接断开。
-                match await_upstream(
-                    downstream,
-                    read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
-                )
-                .await
-                {
-                    Ok(Ok(body)) => {
-                        if compacting && !native_compaction {
-                            return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
-                        }
-                        observe_siwc_upstream_rejection(&resolved.route, upstream_status, &body);
-                        write_upstream_http_error(
-                            downstream,
-                            UpstreamHttpErrorResponse {
-                                status: upstream_status,
-                                upstream_request_id: upstream_request_id.as_deref(),
-                                retry_advice,
-                                body: &body,
-                            },
-                            &resolved,
-                            bridge,
-                            request_kind,
-                        )
-                        .await
-                    }
-                    Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
-                        write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
-                            .await
-                    }
-                    Ok(Err(error)) | Err(error) => Err(error),
-                }
-            }
-            _ if compacting => {
-                if !native_compaction {
-                    write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
-                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut()).await
-                } else {
-                write_validated_compaction(
-                    downstream,
-                    response,
-                    if compact_endpoint_compat {
-                        CompactionResponseFormat::CompactToResponses
-                    } else if request_kind == ResponsesRequestKind::Create {
-                        CompactionResponseFormat::Responses
-                    } else {
-                        CompactionResponseFormat::Compact
-                    },
-                    stream_requested,
-                    &resolved.route,
-                )
-                .await
-                }
-            }
-            ProtocolBridge::ResponsesToAnthropicMessages
-            | ProtocolBridge::ResponsesToChatCompletions => {
-                write_adapted_upstream_as_responses(
-                    downstream,
-                    response,
-                    bridge,
-                    &resolved.upstream_model,
-                    stream_requested,
-                    &resolved.route,
-                    &tool_bridge,
-                )
-                .await
-            }
-            _ => {
-                if let Some(fix) = xai_response_fix {
-                    XAI_RESPONSE_FIX
-                        .scope(fix, downstream.proxy_response(response))
-                        .await
-                } else {
-                    downstream.proxy_response(response).await
-                }
-            }
-        };
-        if let Err(error) = &result
-            && downstream_websocket
-            && !error.is::<DownstreamClosed>()
-        {
-            // A local WebSocket can relay an HTTP-only route. Report the
-            // upstream response failure before the socket-level fallback.
-            record_router_failure_nonblocking(
-                "local_router_upstream_response_failed",
-                "proxy_local_router_request",
-                format!("{error:#}"),
-                json!({ "routeId": resolved.provider_id, "requestId": current_router_request_id() }),
-            );
-            // 取完整错误链，最外层信息不足以定位传输层原因。
-            let detail = sanitize_upstream_error_text(&format!("{error:#}"), &resolved.route, 512)
-                .unwrap_or_else(|| "上游响应未能完成".to_string());
-            return downstream
-                .write_error(
-                    if is_upstream_timeout_error(error) { 504 } else { 502 },
-                    if is_upstream_timeout_error(error) { "upstream_timeout" } else { "upstream_response_failed" },
-                    format!(
-                        "Codey 线路「{}」处理上游 HTTP 响应失败：{detail}",
-                        route_display_name(&resolved.route)
-                    ),
-                    Some(&resolved.route),
-                )
-                .await;
-        }
-        result
+        ResponseDelivery {
+            resolved: &resolved,
+            bridge,
+            request_kind,
+            stream_requested,
+            compacting,
+            native_compaction,
+            compact_endpoint_compat,
+            compaction_phase,
+            tool_bridge: &tool_bridge,
+        }.deliver(
+            downstream, received, portable_attempt.as_mut(),
+            portable_checkpoint.map(|checkpoint| (checkpoint, Arc::clone(&self.portable_history_cache))),
+            xai_response_fix,
+        ).await
         }.await;
         (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
         })).await;
@@ -2760,147 +2526,16 @@ impl RouterServer {
             result => result,
         };
         observed.finish(&mut lifecycle, &result);
+        if result.is_ok()
+            && observed.error.is_none()
+            && observed
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+            && let Some(binding) = native_compaction_binding
+        {
+            binding.complete();
+        }
         result
-    }
-
-    /// 把上游 HTTP 发送结果转换成可用的响应；传输层失败会记录并写回下游，
-    /// 返回 None 表示调用方直接结束请求。
-    #[allow(clippy::too_many_arguments)]
-    async fn finish_upstream_http_send<D>(
-        downstream: &mut D,
-        response_result: std::result::Result<
-            std::result::Result<reqwest::Response, reqwest::Error>,
-            tokio::time::error::Elapsed,
-        >,
-        response_header_timeout: Duration,
-        resolved: &RouteSelection,
-        bridge: ProtocolBridge,
-        request_kind: ResponsesRequestKind,
-        upstream_stream_requested: bool,
-        compacting: bool,
-    ) -> Result<Option<reqwest::Response>>
-    where
-        D: ResponsesDownstream + ?Sized,
-    {
-        let response = match response_result {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) if compacting && error.is_timeout() => {
-                let detail = sanitize_upstream_error_text(
-                    &error.without_url().to_string(),
-                    &resolved.route,
-                    256,
-                )
-                .unwrap_or_else(|| "上游未在期限内返回响应头".to_string());
-                downstream
-                    .write_error(
-                        504,
-                        "compaction_timeout",
-                        format!(
-                            "远程压缩等待上游响应超时（{detail}），原始会话历史未被 Codey 修改，请稍后重试"
-                        ),
-                        Some(&resolved.route),
-                    )
-                    .await?;
-                return Ok(None);
-            }
-            Ok(Err(error)) => {
-                let timeout = error.is_timeout();
-                let connect = error.is_connect();
-                let sanitized_error = error.without_url().to_string();
-                record_router_failure_nonblocking(
-                    "local_router_upstream_failed",
-                    "proxy_local_router_request",
-                    sanitized_error,
-                    serde_json::json!({
-                        "routeId": resolved.provider_id.as_str(),
-                        "routeName": resolved.route.route_name.as_str(),
-                        "requestedModel": resolved.requested_model.as_str(),
-                        "model": resolved.upstream_model.as_str(),
-                        "timeout": timeout,
-                        "connect": connect,
-                        "upstream": resolved.route.upstream_authority.as_str(),
-                        "upstreamProtocol": bridge.upstream_protocol().label(),
-                        "protocolBridge": bridge.label(),
-                        "requestKind": request_kind.label(),
-                        "upstreamStream": upstream_stream_requested,
-                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
-                        "requestId": current_router_request_id(),
-                    }),
-                );
-                let route_name = route_display_name(&resolved.route);
-                let upstream = resolved.route.upstream_authority.as_str();
-                let (status, code, message) = if timeout {
-                    (
-                        504,
-                        "upstream_timeout",
-                        format!(
-                            "Codey 线路「{route_name}」请求上游 {upstream} 超时；请检查上游服务状态或网络连接"
-                        ),
-                    )
-                } else {
-                    (
-                        424,
-                        "upstream_unreachable",
-                        format!(
-                            "Codey 线路「{route_name}」无法连接上游 {upstream}；请确认上游服务已启动，并检查线路 URL、证书和网络设置"
-                        ),
-                    )
-                };
-                downstream.write_text_error(status, code, message).await?;
-                return Ok(None);
-            }
-            Err(_) => {
-                record_router_failure_nonblocking(
-                    "local_router_upstream_failed",
-                    "wait_for_local_router_upstream_headers",
-                    "等待上游响应头超时",
-                    serde_json::json!({
-                        "routeId": resolved.provider_id.as_str(),
-                        "routeName": resolved.route.route_name.as_str(),
-                        "requestedModel": resolved.requested_model.as_str(),
-                        "model": resolved.upstream_model.as_str(),
-                        "timeout": true,
-                        "stage": "response_headers",
-                        "upstream": resolved.route.upstream_authority.as_str(),
-                        "upstreamProtocol": bridge.upstream_protocol().label(),
-                        "protocolBridge": bridge.label(),
-                        "requestKind": request_kind.label(),
-                        "upstreamStream": upstream_stream_requested,
-                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
-                        "requestId": current_router_request_id(),
-                    }),
-                );
-                if compacting {
-                    // 压缩的等待期限与普通请求不同，失败保持压缩专用的结构化
-                    // 错误码，客户端据此显示可重试的压缩超时提示。
-                    downstream
-                        .write_error(
-                            504,
-                            "compaction_timeout",
-                            format!(
-                                "远程压缩等待上游 {} 返回响应头超时，原始会话历史未被 Codey 修改，请稍后重试",
-                                resolved.route.upstream_authority
-                            ),
-                            Some(&resolved.route),
-                        )
-                        .await?;
-                } else {
-                    downstream
-                        .write_text_error(
-                            504,
-                            "upstream_header_timeout",
-                            format!(
-                                "Codey 线路「{}」等待上游 {} 返回响应头超时",
-                                route_display_name(&resolved.route),
-                                resolved.route.upstream_authority
-                            ),
-                        )
-                        .await?;
-                }
-                return Ok(None);
-            }
-        };
-        Ok(Some(response))
     }
 }
 

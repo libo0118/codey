@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -348,6 +348,37 @@ test("fork builds require matching package, workspace and tag versions before pa
   assert.ok(workflow.indexOf("if ($cargoVersion -ne $version)") < workflow.indexOf("& $env:MAKENSIS"));
   assert.match(workflow, /if: startsWith\(github.ref, 'refs\/tags\/v'\)/);
   assert.doesNotMatch(workflow, /release\.mjs|generate-lockfile|git push|git commit/);
+});
+
+test("tag publication forwards explicit Latest and prerelease metadata", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8");
+  const metadataStep = workflow.slice(workflow.indexOf("- name: Resolve release identity"), workflow.indexOf("- name: Upload Windows package"));
+  const publish = workflow.slice(workflow.indexOf("- name: Publish Windows release"));
+  const script = metadataStep.match(/node --input-type=module -e '([^'\r\n]+)'/)?.[1];
+  assert.ok(script, "release metadata script must be present");
+  assert.ok(publish.includes("prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}"));
+  assert.ok(publish.includes("make_latest: ${{ steps.release-metadata.outputs.make_latest }}"));
+  const directory = await mkdtemp(join(tmpdir(), "codey-release-metadata-"));
+  try {
+    await mkdir(join(directory, "scripts"));
+    await writeFile(join(directory, "scripts/release-policy.mjs"), await readFile(new URL("../scripts/release-policy.mjs", import.meta.url)));
+    for (const [version, prerelease, makeLatest, name] of [
+      ["1.2.3", "false", "true", "正式版 v1.2.3"],
+      ["1.2.4-beta.1", "true", "false", "实验版 v1.2.4-beta.1"],
+      ["1.3.6-libo.1", "false", "true", "正式版 v1.3.6-libo.1"],
+    ]) {
+      const output = join(directory, version);
+      await writeFile(join(directory, "package.json"), JSON.stringify({ version }));
+      await promisify(execFile)(process.execPath, ["--input-type=module", "-e", script], {
+        cwd: directory,
+        env: { ...process.env, GITHUB_REF_NAME: `v${version}`, GITHUB_OUTPUT: output },
+      });
+      const metadata = Object.fromEntries((await readFile(output, "utf8")).trim().split(/\r?\n/).map(line => line.split("=")));
+      assert.deepEqual(metadata, { name, prerelease, make_latest: makeLatest, tag: `v${version}` });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("delete maintenance uses the same lock and has no R2 credentials", async () => {

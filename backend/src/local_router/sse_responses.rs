@@ -440,10 +440,12 @@ impl<'a> ResponsesSseState<'a> {
             if tool.name.is_empty() {
                 anyhow::bail!("流式 function_call 缺少 name");
             }
+            // 名称可能在已发出后继续收到后缀，收尾时仍须校验完整名称。
+            let response_name = self
+                .tool_bridge
+                .restore_stream_upstream_name(&tool.name, true)?;
             if tool.response_name.is_none() {
-                tool.response_name = self
-                    .tool_bridge
-                    .restore_stream_upstream_name(&tool.name, true)?;
+                tool.response_name = response_name;
             }
             if tool.call_id.is_empty() {
                 tool.call_id = format!("call_codey_{}", Uuid::new_v4());
@@ -693,11 +695,13 @@ pub(crate) async fn write_responses_sse_event(stream: &mut TcpStream, event: &Va
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("response.event");
-    let payload = format!(
-        "event: {event_type}\ndata: {}\n\n",
-        serde_json::to_string(event).context("序列化 Responses SSE 事件失败")?
-    );
-    write_chunked_frame(stream, payload.as_bytes(), "写入 Responses SSE 事件失败").await
+    let mut payload = Vec::with_capacity(256);
+    payload.extend_from_slice(b"event: ");
+    payload.extend_from_slice(event_type.as_bytes());
+    payload.extend_from_slice(b"\ndata: ");
+    serde_json::to_writer(&mut payload, event).context("序列化 Responses SSE 事件失败")?;
+    payload.extend_from_slice(b"\n\n");
+    write_chunked_frame(stream, &payload, "写入 Responses SSE 事件失败").await
 }
 
 pub(crate) async fn finish_chunked_response(stream: &mut TcpStream) -> Result<()> {

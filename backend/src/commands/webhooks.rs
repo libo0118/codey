@@ -1,14 +1,14 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
+
+mod delivery;
 
 use super::AppState;
 use crate::codex_config::codex_home;
@@ -29,66 +29,66 @@ struct WaitingNotificationLedger {
 
 const WEBHOOK_NOTIFICATION_HISTORY_LIMIT: usize = 2048;
 const MAX_CONCURRENT_WEBHOOK_DELIVERIES: usize = 4;
+const NOTIFICATION_TITLE_BUDGET: Duration = Duration::from_millis(200);
+const NOTIFICATION_TITLE_CACHE_LIMIT: usize = 256;
+const SLOW_SESSION_SCAN: Duration = Duration::from_millis(500);
 const WEBHOOK_TURN_HISTORY_LIMIT: usize =
     pending_approval::MAX_RECENT_SESSIONS * pending_approval::MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT;
 
-#[derive(Debug, Default)]
-pub(super) struct WebhookNotificationState {
-    in_flight: HashSet<String>,
-    settled: HashSet<String>,
-    settled_order: VecDeque<String>,
+/// 只保存经过 metadata 标题清理及占位内容过滤的结果。
+#[derive(Default)]
+pub(super) struct NotificationTitleCache {
+    titles: HashMap<String, String>,
+    order: VecDeque<String>,
 }
 
-impl WebhookNotificationState {
-    pub(super) fn from_settled(keys: impl IntoIterator<Item = String>) -> Self {
-        let mut state = Self::default();
-        state.extend_settled(keys);
-        state
+impl NotificationTitleCache {
+    fn get(&self, session_id: &str) -> String {
+        self.titles
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| "未命名会话".to_string())
     }
 
-    fn is_known(&self, key: &str) -> bool {
-        self.in_flight.contains(key) || self.settled.contains(key)
-    }
-
-    fn was_settled(&self, key: &str) -> bool {
-        self.settled.contains(key)
-    }
-
-    fn try_reserve(&mut self, key: String, mutually_exclusive_keys: &[&str]) -> bool {
-        if self.is_known(&key)
-            || mutually_exclusive_keys
-                .iter()
-                .any(|candidate| self.is_known(candidate))
-        {
-            return false;
+    fn insert_resolved(&mut self, session_id: String, title: String) {
+        if !self.titles.contains_key(&session_id) {
+            self.order.push_back(session_id.clone());
         }
-        self.in_flight.insert(key)
-    }
-
-    fn abandon(&mut self, key: &str) {
-        self.in_flight.remove(key);
-    }
-
-    fn settle(&mut self, key: String) {
-        self.in_flight.remove(&key);
-        self.remember_settled(key);
-    }
-
-    fn extend_settled(&mut self, keys: impl IntoIterator<Item = String>) {
-        for key in keys {
-            self.remember_settled(key);
-        }
-    }
-
-    fn remember_settled(&mut self, key: String) {
-        if self.settled.insert(key.clone()) {
-            self.settled_order.push_back(key);
-        }
-        while self.settled_order.len() > WEBHOOK_NOTIFICATION_HISTORY_LIMIT {
-            if let Some(oldest) = self.settled_order.pop_front() {
-                self.settled.remove(&oldest);
+        self.titles.insert(session_id, title);
+        while self.order.len() > NOTIFICATION_TITLE_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.titles.remove(&oldest);
             }
         }
+    }
+}
+
+fn notification_observation(_category: &'static str, _fields: Value) {
+    #[cfg(not(test))]
+    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(_category, _fields);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+#[derive(Default)]
+pub(super) struct WaitingNotificationSnapshot {
+    known_sessions: HashSet<String>,
+    active_keys: HashSet<String>,
+}
+
+impl WaitingNotificationSnapshot {
+    fn from_events(events: &RecentSessionEvents) -> Self {
+        Self {
+            known_sessions: events.session_statuses.keys().cloned().collect(),
+            active_keys: waiting_notification_keys(&events.pending_approvals),
+        }
+    }
+
+    fn is_obsolete(&self, session_id: &str, event_key: &str) -> bool {
+        // 扫描失败或会话超出索引范围时，缺少记录不能证明提问已结束。
+        self.known_sessions.contains(session_id) && !self.active_keys.contains(event_key)
     }
 }
 
@@ -118,6 +118,7 @@ impl WaitingLedgerState {
         self.keys.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn iter(&self) -> impl Iterator<Item = &String> {
         self.order.iter()
     }
@@ -136,15 +137,6 @@ impl WaitingLedgerState {
                 self.keys.remove(&oldest);
             }
         }
-        self.revision += 1;
-        true
-    }
-
-    fn remove(&mut self, key: &str) -> bool {
-        if !self.keys.remove(key) {
-            return false;
-        }
-        self.order.retain(|candidate| candidate != key);
         self.revision += 1;
         true
     }
@@ -204,7 +196,24 @@ type RecentSessionScanResult = (
     pending_approval::RecentSessionEventCache,
     Arc<RecentSessionEvents>,
 );
-pub(super) type RecentSessionScanTask = tokio::task::JoinHandle<RecentSessionScanResult>;
+pub(super) struct RecentSessionScanTask {
+    task: tokio::task::JoinHandle<(RecentSessionScanResult, Duration)>,
+    started_at: i64,
+}
+
+impl RecentSessionScanTask {
+    // 计时放在阻塞任务内：启动期的初始扫描要等 Codex 就绪后才被 await。
+    fn spawn(scan: impl FnOnce() -> RecentSessionScanResult + Send + 'static) -> Self {
+        Self {
+            started_at: unix_timestamp_seconds(),
+            task: tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = scan();
+                (result, started.elapsed())
+            }),
+        }
+    }
+}
 
 const ACTIVE_SESSION_SCAN_DELAY: Duration = Duration::from_secs(3);
 const IDLE_SESSION_SCAN_DELAYS: [Duration; 4] = [
@@ -298,6 +307,7 @@ fn session_event_state_changed(
 }
 
 impl WebhookTurnTracker {
+    #[cfg(test)]
     fn from_snapshot(events: &RecentSessionEvents) -> Self {
         Self::from_snapshot_at(events, unix_timestamp_seconds())
     }
@@ -463,53 +473,6 @@ async fn persist_waiting_ledger(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-async fn reserve_waiting_notification(
-    state: &Arc<AppState>,
-    notification_key: &str,
-) -> Result<bool, String> {
-    {
-        let mut persisted = state.persisted_waiting_notifications.lock().await;
-        if persisted.contains(notification_key) {
-            return Ok(false);
-        }
-        persisted.insert(notification_key.to_string());
-    }
-    // The write-ahead contract stays: the reservation must be durable before
-    // the caller sends. Failure rolls the key back; a concurrent duplicate
-    // that skipped on the in-flight key stays suppressed, which matches the
-    // documented at-most-once boundary.
-    if let Err(error) = persist_waiting_ledger(state).await {
-        state
-            .persisted_waiting_notifications
-            .lock()
-            .await
-            .remove(notification_key);
-        return Err(error);
-    }
-    Ok(true)
-}
-
-async fn release_waiting_notification(
-    state: &Arc<AppState>,
-    notification_key: &str,
-) -> Result<(), String> {
-    {
-        let mut persisted = state.persisted_waiting_notifications.lock().await;
-        if !persisted.remove(notification_key) {
-            return Ok(());
-        }
-    }
-    if let Err(error) = persist_waiting_ledger(state).await {
-        state
-            .persisted_waiting_notifications
-            .lock()
-            .await
-            .insert(notification_key.to_string());
-        return Err(error);
-    }
-    Ok(())
-}
-
 async fn baseline_waiting_notifications(
     state: &Arc<AppState>,
     pending_approvals: &[pending_approval::PendingApproval],
@@ -523,11 +486,6 @@ async fn baseline_waiting_notifications(
         let mut persisted = state.persisted_waiting_notifications.lock().await;
         persisted.extend(baseline.iter().cloned())
     };
-    state
-        .webhook_notifications
-        .lock()
-        .await
-        .extend_settled(baseline);
     if changed {
         let _ = persist_waiting_ledger(state).await;
     }
@@ -568,10 +526,38 @@ pub(super) async fn start_waiting_webhook_watcher(
     state: &Arc<AppState>,
     initial_scan_task: RecentSessionScanTask,
 ) {
+    state.notification_delivery_stop.send_replace(false);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let watcher_state = Arc::clone(state);
     let watcher_task = tokio::spawn(async move {
+        let home = notification_codex_home(&watcher_state);
+        let file_watcher = pending_approval::file_events::SessionFileWatcher::start(
+            home.clone(),
+            Arc::clone(&watcher_state.session_scan_wake),
+        )
+        .ok();
+        let mut was_healthy = file_watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.is_healthy());
+        notification_observation(
+            "notification.watcher_started",
+            json!({
+                "nativeWatcher": was_healthy,
+                "enabledChannels": watcher_state.config.read().await.webhook.channels.iter()
+                    .filter(|channel| channel.enabled && channel.is_configured()).count(),
+            }),
+        );
+        if !was_healthy {
+            notification_observation(
+                "notification.watcher_degraded",
+                json!({"reason":"initialization_failed"}),
+            );
+        }
+        let baseline_started_at = initial_scan_task.started_at;
         let (mut event_cache, baseline_events) = await_recent_session_scan(initial_scan_task).await;
+        if let Some(watcher) = &file_watcher {
+            watcher.sync_cache(&event_cache, true);
+        }
         if !matches!(
             shutdown_rx.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -581,75 +567,120 @@ pub(super) async fn start_waiting_webhook_watcher(
             return;
         }
         baseline_waiting_notifications(&watcher_state, &baseline_events.pending_approvals).await;
-        let mut turn_tracker = WebhookTurnTracker::from_snapshot(&baseline_events);
+        let mut queued_waiting = waiting_notification_keys(&baseline_events.pending_approvals);
+        // 先完成注册监听后的补查，再恢复队列，避免按预热期间的旧状态发送等待提示。
+        let mut worker: Option<tokio::task::JoinHandle<()>> = None;
+        let mut turn_tracker =
+            WebhookTurnTracker::from_snapshot_at(&baseline_events, baseline_started_at);
         let mut previous_events = baseline_events;
         let mut scan_schedule = SessionScanSchedule::default();
         let mut next_scan_delay = ACTIVE_SESSION_SCAN_DELAY;
+        let mut next_full_scan = tokio::time::Instant::now();
         let mut scan_immediately = true;
         loop {
             if !scan_immediately {
-                let woke = tokio::select! {
+                tokio::select! {
+                    biased;
                     _ = &mut shutdown_rx => break,
-                    _ = watcher_state.session_scan_wake.notified() => true,
-                    _ = tokio::time::sleep(next_scan_delay) => false,
-                };
-                if woke {
-                    scan_schedule.wake();
+                    _ = watcher_state.session_scan_wake.notified() => { scan_schedule.wake(); },
+                    _ = tokio::time::sleep(next_scan_delay) => {},
                 }
             }
             scan_immediately = false;
-
-            let (next_cache, events) = scan_recent_session_events(event_cache).await;
-            event_cache = next_cache;
-            // Deliveries to unreachable channels take seconds each; a shutdown
-            // request must interrupt them instead of waiting the batch out.
-            let stop_requested = tokio::select! {
-                _ = &mut shutdown_rx => true,
-                _ = notify_pending_approvals(&watcher_state, &events) => false,
-            };
-            if stop_requested {
+            if *watcher_state.notification_delivery_stop.borrow() {
                 break;
             }
-            let mut completion_delivery_pending = false;
-            let mut stop_requested = false;
+            if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+                if let Some(finished) = worker.take() {
+                    let _ = finished.await;
+                }
+                if let Ok(queue) = delivery::outbox(&watcher_state).await {
+                    let _ = queue.mark_inflight_uncertain(delivery::now_ms()).await;
+                }
+            }
+            let healthy = file_watcher
+                .as_ref()
+                .is_some_and(|watcher| watcher.is_healthy());
+            if was_healthy && !healthy {
+                notification_observation(
+                    "notification.watcher_degraded",
+                    json!({"reason":"native_watcher_failed"}),
+                );
+            }
+            was_healthy = healthy;
+            let changes = file_watcher.as_ref().map(|watcher| watcher.take_changes());
+            let full_scan = !healthy || tokio::time::Instant::now() >= next_full_scan;
+            let scan_started = Instant::now();
+            let (next_cache, events) = if full_scan {
+                next_full_scan = tokio::time::Instant::now() + Duration::from_secs(60);
+                scan_recent_session_events(event_cache, home.clone()).await
+            } else if let Some(changes) = changes {
+                if changes.is_empty() {
+                    // 页面和其他外部提示没有文件路径，也必须能够主动补查。
+                    next_full_scan = tokio::time::Instant::now() + Duration::from_secs(60);
+                    scan_recent_session_events(event_cache, home.clone()).await
+                } else {
+                    let home = home.clone();
+                    await_recent_session_scan(RecentSessionScanTask::spawn(move || {
+                        let events = event_cache.refresh_changes(&home, changes);
+                        (event_cache, events)
+                    }))
+                    .await
+                }
+            } else {
+                unreachable!("healthy watcher has a change buffer")
+            };
+            let scan_ms = elapsed_ms(scan_started);
+            event_cache = next_cache;
+            if let Some(watcher) = &file_watcher {
+                watcher.sync_cache(&event_cache, full_scan);
+            }
+            if *watcher_state.notification_delivery_stop.borrow() {
+                break;
+            }
+            *watcher_state.notification_waiting_snapshot.write().await =
+                WaitingNotificationSnapshot::from_events(&events);
+            if worker.is_none() {
+                worker = delivery::start(Arc::clone(&watcher_state)).await.ok();
+            }
+            // 扫描只等待本地入队，远端响应和重试由独立发送任务处理。
+            let mut enqueue_pending =
+                !notify_pending_approvals(&watcher_state, &events, &mut queued_waiting, scan_ms)
+                    .await;
             for completed in turn_tracker.completion_candidates(&events) {
+                if *watcher_state.notification_delivery_stop.borrow() {
+                    break;
+                }
                 let (model, reasoning_effort) =
                     webhook_turn_configuration(&events, &completed.session_id, &completed.turn_id);
                 let payload = json!({
-                    "sessionId": completed.session_id,
-                    "turnId": completed.turn_id,
-                    "durationMs": completed.duration_ms,
-                    "rolloutError": completed.error,
-                    "confirmedByRollout": true,
-                    "model": model,
-                    "reasoningEffort": reasoning_effort,
+                    "sessionId": completed.session_id, "turnId": completed.turn_id,
+                    "durationMs": completed.duration_ms, "rolloutError": completed.error,
+                    "confirmedByRollout": true, "model": model, "reasoningEffort": reasoning_effort,
+                    "scanMs": scan_ms,
                 });
-                let delivery = tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        stop_requested = true;
-                        break;
-                    }
-                    delivery = notify_webhook_completion(&watcher_state, &payload) => delivery,
-                };
-                match delivery {
+                match notify_webhook_completion(&watcher_state, &payload).await {
                     Ok(_) => turn_tracker.mark_settled(&completed),
-                    Err(error) => {
-                        // Keep the running edge so a transient delivery failure is retried.
-                        completion_delivery_pending = true;
-                        eprintln!("Codey 完成通知失败：{error}");
-                    }
+                    Err(_) => enqueue_pending = true,
                 }
             }
-            if stop_requested {
-                break;
-            }
-            next_scan_delay = if completion_delivery_pending {
-                scan_schedule.wake();
+            next_scan_delay = if enqueue_pending || worker.is_none() {
+                notification_observation(
+                    "notification.enqueue_error",
+                    json!({"retryScheduled":true}),
+                );
                 ACTIVE_SESSION_SCAN_DELAY
+            } else if healthy {
+                next_full_scan.saturating_duration_since(tokio::time::Instant::now())
             } else {
                 scan_schedule.delay_after_scan(&previous_events, &events)
             };
             previous_events = events;
+        }
+        drop(file_watcher);
+        watcher_state.notification_delivery_stop.send_replace(true);
+        if let Some(worker) = worker {
+            let _ = worker.await;
         }
         event_cache.release_database_connections();
         *watcher_state.recent_session_event_cache.lock().await = Some(event_cache);
@@ -658,8 +689,21 @@ pub(super) async fn start_waiting_webhook_watcher(
     *state.waiting_watcher_task.lock().await = Some(watcher_task);
 }
 
-async fn notify_pending_approvals(state: &Arc<AppState>, events: &RecentSessionEvents) {
+async fn notify_pending_approvals(
+    state: &Arc<AppState>,
+    events: &RecentSessionEvents,
+    queued_keys: &mut HashSet<String>,
+    scan_ms: u64,
+) -> bool {
+    let active_keys = waiting_notification_keys(&events.pending_approvals);
+    queued_keys.retain(|key| active_keys.contains(key));
+    let mut queued = true;
     for pending in &events.pending_approvals {
+        let key =
+            waiting_notification_key(&pending.session_id, &pending.turn_id, &pending.waiting_id);
+        if queued_keys.contains(&key) {
+            continue;
+        }
         let (model, reasoning_effort) =
             webhook_turn_configuration(events, &pending.session_id, &pending.turn_id);
         let payload = json!({
@@ -669,36 +713,68 @@ async fn notify_pending_approvals(state: &Arc<AppState>, events: &RecentSessionE
             "durationMs": pending.duration_ms,
             "model": model,
             "reasoningEffort": reasoning_effort,
+            "scanMs": scan_ms,
         });
-        if let Err(error) = notify_webhook_waiting(state, &payload).await {
-            eprintln!("Codey 等待通知失败：{error}");
+        if notify_webhook_waiting(state, &payload).await.is_err() {
+            queued = false;
+        } else {
+            queued_keys.insert(key);
         }
     }
+    queued
 }
 
 async fn scan_recent_session_events(
     cache: pending_approval::RecentSessionEventCache,
+    home: PathBuf,
 ) -> RecentSessionScanResult {
-    await_recent_session_scan(start_recent_session_scan(cache)).await
+    await_recent_session_scan(start_recent_session_scan_at(cache, home)).await
 }
 
 pub(super) fn start_recent_session_scan(
-    mut cache: pending_approval::RecentSessionEventCache,
+    cache: pending_approval::RecentSessionEventCache,
 ) -> RecentSessionScanTask {
-    let home = codex_home();
-    tokio::task::spawn_blocking(move || {
-        let events = cache.refresh(home);
+    start_recent_session_scan_at(cache, codex_home().to_path_buf())
+}
+
+fn start_recent_session_scan_at(
+    mut cache: pending_approval::RecentSessionEventCache,
+    home: PathBuf,
+) -> RecentSessionScanTask {
+    RecentSessionScanTask::spawn(move || {
+        let events = cache.refresh(&home);
         (cache, events)
     })
+}
+
+fn notification_codex_home(_state: &AppState) -> PathBuf {
+    #[cfg(test)]
+    if let Some(home) = &_state.notification_codex_home {
+        return home.clone();
+    }
+    codex_home().to_path_buf()
 }
 
 pub(super) async fn await_recent_session_scan(
     scan_task: RecentSessionScanTask,
 ) -> RecentSessionScanResult {
-    match scan_task.await {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("Codey 会话状态扫描任务异常退出：{error}");
+    match scan_task.task.await {
+        Ok((result, scan_time)) => {
+            if scan_time >= SLOW_SESSION_SCAN {
+                notification_observation(
+                    "notification.scan_slow",
+                    json!({
+                        "scanMs":scan_time.as_millis() as u64,
+                        "sessions":result.1.session_statuses.len(),
+                        "waiting":result.1.pending_approvals.len(),
+                        "completed":result.1.completed_turns.len(),
+                    }),
+                );
+            }
+            result
+        }
+        Err(_) => {
+            notification_observation("notification.scan_failed", json!({"reason":"task_failed"}));
             (
                 pending_approval::RecentSessionEventCache::default(),
                 Arc::new(RecentSessionEvents::default()),
@@ -708,15 +784,19 @@ pub(super) async fn await_recent_session_scan(
 }
 
 pub(super) async fn stop_waiting_webhook_watcher(state: &Arc<AppState>) {
+    state.notification_delivery_stop.send_replace(true);
     let shutdown = state.waiting_watcher_shutdown.lock().await.take();
     if let Some(shutdown) = shutdown {
         let _ = shutdown.send(());
     }
     let watcher_task = state.waiting_watcher_task.lock().await.take();
     if let Some(watcher_task) = watcher_task
-        && let Err(error) = watcher_task.await
+        && watcher_task.await.is_err()
     {
-        eprintln!("Codey 会话状态 watcher 异常退出：{error}");
+        notification_observation(
+            "notification.watcher_failed",
+            json!({"reason":"task_failed"}),
+        );
     }
     let mut event_cache = state.recent_session_event_cache.lock().await;
     if event_cache.is_none() {
@@ -841,314 +921,81 @@ fn webhook_turn_configuration(
     };
     webhook_session_configuration(&configuration.model, &configuration.reasoning_effort)
 }
-async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id: &str) -> String {
-    let requested_title = payload
-        .get("sessionName")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|title| !title.is_empty());
-    if let Some(title) = requested_title {
-        state
-            .session_titles
-            .write()
-            .await
-            .insert(session_id.to_string(), title.to_string());
-    }
-    let cached_title = state.session_titles.read().await.get(session_id).cloned();
-    let fallback_title = cached_title.clone();
-    let home = codex_home();
-    let session_id = session_id.to_string();
-    match super::resolve_session_name_cached(state, home.to_path_buf(), session_id, cached_title)
-        .await
-    {
-        Ok(session_name) => session_name,
-        Err(error) => {
-            eprintln!("读取通知会话名称任务异常退出：{error}");
-            fallback_title
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| "未命名会话".to_string())
-        }
-    }
-}
-
-fn terminal_notification_keys(session_id: &str, turn_id: &str) -> [String; 2] {
-    [
-        format!("completed:{session_id}:{turn_id}"),
-        format!("failed:{session_id}:{turn_id}"),
-    ]
-}
-
-async fn terminal_notification_was_sent(
-    state: &Arc<AppState>,
-    session_id: &str,
-    turn_id: &str,
-) -> bool {
-    let keys = terminal_notification_keys(session_id, turn_id);
-    let notifications = state.webhook_notifications.lock().await;
-    keys.iter().any(|key| notifications.is_known(key))
-}
-
-#[derive(Debug)]
-struct WebhookDispatchError {
-    detail: String,
-    settle_delivery: bool,
-}
-
-impl WebhookDispatchError {
-    fn should_settle_delivery(&self) -> bool {
-        self.settle_delivery
-    }
-}
-
-impl std::fmt::Display for WebhookDispatchError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
-
-async fn dispatch_webhook_channels(
-    state: &Arc<AppState>,
-    channels: Vec<NotificationChannelConfig>,
-    event: &NotificationEvent,
-    notification_key: &str,
-) -> Result<(), WebhookDispatchError> {
-    let mut deliveries = channels
-        .into_iter()
-        .filter(|channel| channel.enabled && channel.is_configured())
-        .map(|channel| {
-            let delivery_key = format!("channel:{}:{notification_key}", channel.id);
-            (channel, delivery_key)
-        })
-        .collect::<Vec<_>>();
-    {
-        let notifications = state.webhook_notifications.lock().await;
-        deliveries.retain(|(_, delivery_key)| !notifications.was_settled(delivery_key));
-    }
-    if deliveries.is_empty() {
-        return Ok(());
-    }
-    let client =
-        current_notification_http_client(state).map_err(|detail| WebhookDispatchError {
-            detail: format!("创建通知网络客户端失败：{detail}"),
-            settle_delivery: false,
-        })?;
-    let deliveries = deliveries.into_iter().map(|(channel, delivery_key)| {
-        let client = client.clone();
-        let event = event.clone();
+async fn webhook_session_name(state: &Arc<AppState>, session_id: &str) -> String {
+    let fallback = state
+        .notification_title_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id);
+    let started = Instant::now();
+    let query = async {
+        let permit = Arc::clone(&state.notification_title_query)
+            .try_acquire_owned()
+            .map_err(|_| "query_busy")?;
+        // 标题只取侧边栏同步和会话元数据，不采信通知载荷中的名称。
+        let preferred_title = state.session_titles.read().await.get(session_id).cloned();
+        let home = notification_codex_home(state);
+        let session_id = session_id.to_string();
         let state = Arc::clone(state);
-        async move {
-            (
-                delivery_key,
-                dispatch_webhook_channel(&state, client, channel, &event).await,
-            )
-        }
-    });
-    let results = collect_webhook_deliveries(deliveries).await;
-    let mut errors = Vec::new();
-    let mut settle_delivery = false;
-    let mut notifications = state.webhook_notifications.lock().await;
-    for (delivery_key, result) in results {
-        match result {
-            Ok(()) => {
-                notifications.remember_settled(delivery_key);
-            }
-            Err(error) => {
-                if error.should_settle_delivery() {
-                    settle_delivery = true;
-                    notifications.remember_settled(delivery_key);
-                }
-                errors.push(error.to_string());
-            }
-        }
-    }
-    drop(notifications);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(WebhookDispatchError {
-            detail: format!("部分通知渠道发送失败：{}", errors.join("；")),
-            settle_delivery,
+        tokio::task::spawn_blocking(move || {
+            // 超时不能取消已启动的阻塞查询，许可须保留到闭包退出。
+            let _permit = permit;
+            let mut metadata = match state.session_metadata_cache.try_lock() {
+                Ok(metadata) => metadata,
+                Err(std::sync::TryLockError::WouldBlock) => return Err("metadata_busy"),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            };
+            let title = metadata.resolve_session_name_with_preferred(
+                &home,
+                &session_id,
+                preferred_title.as_deref(),
+            );
+            state
+                .notification_title_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert_resolved(session_id, title.clone());
+            Ok(title)
         })
-    }
-}
-
-async fn dispatch_webhook_channel(
-    state: &Arc<AppState>,
-    client: reqwest::Client,
-    channel: NotificationChannelConfig,
-    event: &NotificationEvent,
-) -> Result<(), WebhookDispatchError> {
-    let channel = latest_channel_for_delivery(state, &channel).await;
-    if channel.kind == NotificationChannelKind::WechatClaw
-        && let Some(remaining) =
-            super::wechat_claw_notification_cooldown_remaining(state, &channel).await
-    {
-        return Err(WebhookDispatchError {
-            detail: wechat_claw_cooldown_message(remaining),
-            settle_delivery: false,
-        });
-    }
-    let dispatcher = NotificationDispatcher::with_client(client.clone(), channel.clone());
-    match dispatcher.send(event).await {
-        Ok(()) => Ok(()),
-        Err(error)
-            if channel.kind == NotificationChannelKind::WechatClaw
-                && error.indicates_stale_token() =>
-        {
-            let remaining = super::pause_wechat_claw_notification_channel(state, &channel)
-                .await
-                .unwrap_or_else(|| Duration::from_secs(60 * 60));
-            Err(WebhookDispatchError {
-                detail: format!("{error}（{}）", wechat_claw_cooldown_message(remaining)),
-                settle_delivery: false,
-            })
-        }
-        Err(error)
-            if channel.kind == NotificationChannelKind::WechatClaw
-                && error.should_retry_with_fresh_context() =>
-        {
-            let mut fresh_channel = latest_channel_for_delivery(state, &channel).await;
-            if !fresh_channel.enabled || !fresh_channel.is_configured() {
-                return Ok(());
-            }
-            if fresh_channel.context_token.trim() == channel.context_token.trim() {
-                let refresh_result =
-                    super::refresh_wechat_claw_channel_context(state, &channel).await;
-                fresh_channel = latest_channel_for_delivery(state, &channel).await;
-                if !fresh_channel.enabled || !fresh_channel.is_configured() {
-                    if let Err(refresh_error) = refresh_result {
-                        return Err(WebhookDispatchError {
-                            detail: format!("{error}（ClawBot 同步刷新失败：{refresh_error}）"),
-                            settle_delivery: false,
-                        });
-                    }
-                    return Ok(());
-                }
-                if let Err(refresh_error) = refresh_result {
-                    return Err(WebhookDispatchError {
-                        detail: format!("{error}（ClawBot 同步重建失败：{refresh_error}）"),
-                        settle_delivery: false,
-                    });
-                }
-            }
-            let dispatcher = NotificationDispatcher::with_client(client, fresh_channel);
-            match dispatcher.send(event).await {
-                Ok(()) => Ok(()),
-                Err(error) => Err(WebhookDispatchError {
-                    detail: error.to_string(),
-                    settle_delivery: error.should_settle_delivery(),
-                }),
-            }
-        }
-        Err(error) => Err(WebhookDispatchError {
-            detail: error.to_string(),
-            settle_delivery: error.should_settle_delivery(),
-        }),
-    }
-}
-
-fn wechat_claw_cooldown_message(remaining: Duration) -> String {
-    let minutes = (remaining.as_secs().saturating_add(59) / 60).max(1);
-    format!("微信 ClawBot 凭据暂时不可用，约 {minutes} 分钟后自动重试")
-}
-
-async fn latest_channel_for_delivery(
-    state: &Arc<AppState>,
-    channel: &NotificationChannelConfig,
-) -> NotificationChannelConfig {
-    if channel.kind != NotificationChannelKind::WechatClaw {
-        return channel.clone();
-    }
-    let mut delivery = channel.clone();
-    let config = state.config.read().await;
-    let Some(saved) =
-        config.webhook.channels.iter().find(|saved| {
-            saved.id == channel.id && saved.kind == NotificationChannelKind::WechatClaw
-        })
-    else {
-        delivery.enabled = false;
-        return delivery;
+        .await
+        .map_err(|_| "query_failed")?
     };
-    let same_binding = saved.enabled
-        && saved.bot_token.trim() == channel.bot_token.trim()
-        && saved.chat_id.trim() == channel.chat_id.trim()
-        && saved.wechat_claw_base_url().ok() == channel.wechat_claw_base_url().ok();
-    if !same_binding {
-        delivery.enabled = false;
-        return delivery;
-    }
-    delivery.context_token = saved.context_token.clone();
-    delivery.context_token_configured = saved.context_token_configured;
-    delivery.get_updates_buf = saved.get_updates_buf.clone();
-    delivery
+    let reason = match tokio::time::timeout(NOTIFICATION_TITLE_BUDGET, query).await {
+        Ok(Ok(title)) => return title,
+        Ok(Err(reason)) => reason,
+        Err(_) => "query_timeout",
+    };
+    notification_observation(
+        "notification.title_fallback",
+        json!({"reason": reason, "titleMs": elapsed_ms(started)}),
+    );
+    fallback
 }
 
-async fn collect_webhook_deliveries<F, T>(deliveries: impl IntoIterator<Item = F>) -> Vec<T>
-where
-    F: Future<Output = T>,
-{
-    let mut results: Vec<(usize, T)> = stream::iter(
-        deliveries
-            .into_iter()
-            .enumerate()
-            .map(|(index, delivery)| async move { (index, delivery.await) }),
-    )
-    .buffer_unordered(MAX_CONCURRENT_WEBHOOK_DELIVERIES)
-    .collect()
-    .await;
-    results.sort_unstable_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, result)| result).collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_settled_webhook_failure(
-    state: &Arc<AppState>,
+fn observe_notification_candidate(
+    key: &str,
+    kind: &'static str,
     payload: &Value,
-    session_id: String,
-    turn_id: String,
-    profile_id: String,
-    model: String,
-    reasoning_effort: String,
-    duration_ms: u128,
-    error: String,
-) -> Result<Value, String> {
-    let channels = state.config.read().await.webhook.channels.clone();
-    if !channels
-        .iter()
-        .any(|channel| channel.enabled && channel.is_configured())
-    {
-        return Ok(json!({"status":"skipped","reason":"disabled"}));
-    }
-
-    let [completed_key, failed_key] = terminal_notification_keys(&session_id, &turn_id);
-    {
-        let mut notifications = state.webhook_notifications.lock().await;
-        if !notifications.try_reserve(failed_key.clone(), &[&completed_key]) {
-            return Ok(json!({"status":"duplicate"}));
-        }
-    }
-    let session_name = webhook_session_name(state, payload, &session_id).await;
-    let event = NotificationEvent::new(
-        "session.failed",
-        session_id,
-        profile_id,
-        model,
-        duration_ms,
-        Some(error),
-    )
-    .with_session_name(session_name)
-    .with_reasoning_effort(reasoning_effort);
-    if let Err(error) = dispatch_webhook_channels(state, channels, &event, &failed_key).await {
-        let mut notifications = state.webhook_notifications.lock().await;
-        if error.should_settle_delivery() {
-            notifications.settle(failed_key);
-        } else {
-            notifications.abandon(&failed_key);
-        }
-        return Err(error.to_string());
-    }
-    state.webhook_notifications.lock().await.settle(failed_key);
-    Ok(json!({"status":"ok","eventId":event.event_id}))
+    title_ms: u64,
+    enqueue_started: Instant,
+    result: &Result<Value, String>,
+) {
+    let outcome = match result {
+        Ok(value) if value.get("status").and_then(Value::as_str) == Some("queued") => "queued",
+        Ok(_) => "duplicate",
+        Err(_) => "enqueue_failed",
+    };
+    notification_observation(
+        "notification.candidate",
+        json!({
+            "eventHash": crate::fs_util::sha256_hex_str(key),
+            "kind": kind,
+            "outcome": outcome,
+            "scanMs": payload.get("scanMs").and_then(Value::as_u64).unwrap_or_default(),
+            "titleMs": title_ms,
+            "enqueueMs": elapsed_ms(enqueue_started),
+        }),
+    );
 }
 
 async fn notify_webhook_completion(
@@ -1191,9 +1038,6 @@ async fn notify_webhook_completion(
         .map(str::trim)
         .filter(|error| !error.is_empty())
         .map(ToString::to_string);
-    if terminal_notification_was_sent(state, &session_id, &turn_id).await {
-        return Ok(json!({"status":"duplicate"}));
-    }
     let requested_model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1222,56 +1066,36 @@ async fn notify_webhook_completion(
     {
         return Ok(json!({"status":"skipped","reason":"disabled"}));
     }
-    if let Some(error) = rollout_error {
-        return dispatch_settled_webhook_failure(
-            state,
-            payload,
-            session_id,
-            turn_id,
-            profile_id,
-            model,
-            reasoning_effort,
-            requested_duration_ms,
-            error,
-        )
-        .await;
-    }
-
-    let notification_key = format!("completed:{session_id}:{turn_id}");
+    let key = format!("terminal:{session_id}:{turn_id}");
+    if delivery::outbox(state)
+        .await?
+        .has_event(key.clone())
+        .await?
     {
-        let mut notifications = state.webhook_notifications.lock().await;
-        let failed_key = format!("failed:{session_id}:{turn_id}");
-        if !notifications.try_reserve(notification_key.clone(), &[&failed_key]) {
-            return Ok(json!({"status":"duplicate"}));
-        }
+        return Ok(json!({"status":"duplicate"}));
     }
-    let session_name = webhook_session_name(state, payload, &session_id).await;
+    let title_started = Instant::now();
+    let session_name = webhook_session_name(state, &session_id).await;
+    let title_ms = elapsed_ms(title_started);
+    let enqueue_started = Instant::now();
+    let kind = if rollout_error.is_some() {
+        "session.failed"
+    } else {
+        "session.completed"
+    };
     let event = NotificationEvent::new(
-        "session.completed",
+        kind,
         session_id,
         profile_id,
         model,
         requested_duration_ms,
-        None,
+        rollout_error,
     )
     .with_session_name(session_name)
     .with_reasoning_effort(reasoning_effort);
-    if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
-    {
-        let mut notifications = state.webhook_notifications.lock().await;
-        if error.should_settle_delivery() {
-            notifications.settle(notification_key);
-        } else {
-            notifications.abandon(&notification_key);
-        }
-        return Err(error.to_string());
-    }
-    state
-        .webhook_notifications
-        .lock()
-        .await
-        .settle(notification_key);
-    Ok(json!({"status":"ok","eventId":event.event_id}))
+    let result = delivery::enqueue(state, key.clone(), event, channels).await;
+    observe_notification_candidate(&key, kind, payload, title_ms, enqueue_started, &result);
+    result
 }
 
 async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Result<Value, String> {
@@ -1329,35 +1153,23 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
     }
 
     let notification_key = waiting_notification_key(&session_id, turn_id, waiting_id);
+    // 旧账本只作为历史去重记录，新的等待通知由 outbox 原子入队。
+    if state
+        .persisted_waiting_notifications
+        .lock()
+        .await
+        .contains(&notification_key)
+        || delivery::outbox(state)
+            .await?
+            .has_event(notification_key.clone())
+            .await?
     {
-        let mut notifications = state.webhook_notifications.lock().await;
-        if !notifications.try_reserve(notification_key.clone(), &[]) {
-            return Ok(json!({"status":"duplicate"}));
-        }
+        return Ok(json!({"status":"duplicate"}));
     }
-    // Feishu and Telegram webhooks provide no usable idempotency key. Reserve
-    // on disk before sending so a crash after remote acceptance cannot resend
-    // the same waiting notification after restart.
-    match reserve_waiting_notification(state, &notification_key).await {
-        Ok(true) => {}
-        Ok(false) => {
-            state
-                .webhook_notifications
-                .lock()
-                .await
-                .abandon(&notification_key);
-            return Ok(json!({"status":"duplicate"}));
-        }
-        Err(error) => {
-            state
-                .webhook_notifications
-                .lock()
-                .await
-                .abandon(&notification_key);
-            return Err(error);
-        }
-    }
-    let session_name = webhook_session_name(state, payload, &session_id).await;
+    let title_started = Instant::now();
+    let session_name = webhook_session_name(state, &session_id).await;
+    let title_ms = elapsed_ms(title_started);
+    let enqueue_started = Instant::now();
     let event = NotificationEvent::new(
         "session.waiting",
         session_id,
@@ -1368,38 +1180,21 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
     )
     .with_session_name(session_name)
     .with_reasoning_effort(reasoning_effort);
-    if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
-    {
-        if error.should_settle_delivery() {
-            state
-                .webhook_notifications
-                .lock()
-                .await
-                .settle(notification_key);
-            return Err(error.to_string());
-        }
-        let rollback_error = release_waiting_notification(state, &notification_key)
-            .await
-            .err();
-        state
-            .webhook_notifications
-            .lock()
-            .await
-            .abandon(&notification_key);
-        if let Some(rollback_error) = rollback_error {
-            return Err(format!("{error}；等待通知预留回滚失败：{rollback_error}"));
-        }
-        return Err(error.to_string());
-    }
-    state
-        .webhook_notifications
-        .lock()
-        .await
-        .settle(notification_key.clone());
-    Ok(json!({"status":"ok","eventId":event.event_id}))
+    let result = delivery::enqueue(state, notification_key.clone(), event, channels).await;
+    observe_notification_candidate(
+        &notification_key,
+        "session.waiting",
+        payload,
+        title_ms,
+        enqueue_started,
+        &result,
+    );
+    result
 }
 #[cfg(test)]
 mod tests {
+    include!("webhooks/observation_tests.rs");
+    include!("webhooks/runtime_tests.rs");
     use std::collections::{HashMap, HashSet};
     use std::sync::{
         Arc,
@@ -1459,6 +1254,306 @@ mod tests {
         socket.write_all(response.as_bytes()).await.unwrap();
     }
 
+    struct MockWebhookServer {
+        url: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockWebhookServer {
+        async fn start(statuses: Vec<&'static str>) -> Self {
+            Self::start_with_body(statuses, r#"{"code":0}"#).await
+        }
+
+        async fn start_with_body(statuses: Vec<&'static str>, body: &'static str) -> Self {
+            use tokio::io::AsyncWriteExt;
+            use tokio::net::TcpListener;
+
+            assert!(!statuses.is_empty());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = read_http_request(&mut socket).await;
+                    let (_, request_body) = request.split_once("\r\n\r\n").unwrap();
+                    let status = {
+                        let mut requests = server_requests.lock().await;
+                        let status = statuses[requests.len().min(statuses.len() - 1)];
+                        requests.push(serde_json::from_str(request_body).unwrap());
+                        status
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            Self {
+                url,
+                requests,
+                task,
+            }
+        }
+
+        fn channel(&self, id: &str) -> NotificationChannelConfig {
+            NotificationChannelConfig {
+                id: id.to_string(),
+                kind: NotificationChannelKind::Feishu,
+                enabled: true,
+                url: self.url.clone(),
+                allow_insecure_test_url: true,
+                ..NotificationChannelConfig::default()
+            }
+        }
+    }
+
+    impl Drop for MockWebhookServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn isolated_test_state(directory: &Path) -> AppState {
+        let mut state = AppState::with_store(ConfigStore::new(directory.join("config.json")));
+        state.notification_codex_home = Some(directory.join("codex"));
+        state
+    }
+
+    fn channel_delivery_test_state(
+        directory: &Path,
+        channels: Vec<NotificationChannelConfig>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            store: ConfigStore::new(directory.join("config.json")),
+            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels,
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            webhook_http_client_override: Some(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(2))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+            ),
+            ..isolated_test_state(directory)
+        })
+    }
+
+    async fn drive_due(
+        state: &Arc<AppState>,
+    ) -> Vec<crate::notifications::outbox::DeliveryOutcome> {
+        let queue = delivery::outbox(state).await.unwrap();
+        let Some(due) = queue.next_due_ms(vec![]).await.unwrap() else {
+            return vec![];
+        };
+        let claimed = queue
+            .claim_due(due.max(delivery::now_ms()), 32, vec![])
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        for item in claimed {
+            let outcome = delivery::send_current(state, &item).await;
+            queue
+                .finish(&item, outcome, delivery::now_ms())
+                .await
+                .unwrap();
+            results.push(outcome);
+        }
+        results
+    }
+
+    async fn enqueue_test_event(
+        state: &Arc<AppState>,
+        channel: NotificationChannelConfig,
+        event: &NotificationEvent,
+    ) {
+        delivery::enqueue(
+            state,
+            "terminal:session:turn".into(),
+            event.clone(),
+            vec![channel],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn assert_terminal_delivery_retries_only_unsettled_channels(
+        rollout_error: Option<&str>,
+        settled_status: &'static str,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let settled_server = MockWebhookServer::start(vec![settled_status]).await;
+        let retry_server =
+            MockWebhookServer::start(vec!["503 Service Unavailable", "200 OK"]).await;
+        let channels = vec![
+            settled_server.channel("settled-channel"),
+            retry_server.channel("retry-channel"),
+        ];
+        let state = channel_delivery_test_state(directory.path(), channels.clone());
+        let payload = json!({"sessionId":"session-channel-retry","turnId":"turn-channel-retry",
+            "sessionName":"Channel retry regression","confirmedByRollout":true,"rolloutError":rollout_error});
+        assert_eq!(
+            notify_webhook_completion(&state, &payload).await.unwrap()["status"],
+            "queued"
+        );
+        assert!(settled_server.requests.lock().await.is_empty());
+        assert_eq!(drive_due(&state).await.len(), 2);
+        assert_eq!(
+            notify_webhook_completion(&state, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        drop(state);
+        let restarted = channel_delivery_test_state(directory.path(), channels);
+        assert_eq!(drive_due(&restarted).await.len(), 1);
+        assert!(drive_due(&restarted).await.is_empty());
+        assert_eq!(
+            notify_webhook_completion(&restarted, &payload)
+                .await
+                .unwrap()["status"],
+            "duplicate"
+        );
+        let settled_requests = settled_server.requests.lock().await;
+        let retry_requests = retry_server.requests.lock().await;
+        assert_eq!(settled_requests.len(), 1);
+        assert_eq!(retry_requests.len(), 2);
+        let title = if rollout_error.is_some() {
+            "Codex会话失败"
+        } else {
+            "Codex会话完成"
+        };
+        for request in settled_requests.iter().chain(retry_requests.iter()) {
+            assert_eq!(request["card"]["header"]["title"]["content"], title);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_feishu_notification_is_not_resent_after_an_uncertain_success_response() {
+        for body in ["not json", r#"{"msg":"success"}"#, r#"{"code":"0"}"#] {
+            let directory = tempfile::tempdir().unwrap();
+            let server = MockWebhookServer::start_with_body(vec!["200 OK"], body).await;
+            let state =
+                channel_delivery_test_state(directory.path(), vec![server.channel("feishu")]);
+            let payload = json!({
+                "sessionId": "session-ambiguous-response",
+                "turnId": "turn-ambiguous-response",
+                "sessionName": "Ambiguous response regression",
+                "confirmedByRollout": true,
+                "rolloutError": "turn failed",
+            });
+
+            assert_eq!(
+                notify_webhook_completion(&state, &payload).await.unwrap()["status"],
+                "queued"
+            );
+            assert!(matches!(
+                drive_due(&state).await.as_slice(),
+                [crate::notifications::outbox::DeliveryOutcome::Uncertain]
+            ));
+            assert!(drive_due(&state).await.is_empty());
+            let repeated_scan = notify_webhook_completion(&state, &payload).await.unwrap();
+            assert_eq!(repeated_scan["status"], "duplicate");
+            assert_eq!(server.requests.lock().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_notification_retries_after_mixed_channel_errors() {
+        assert_terminal_delivery_retries_only_unsettled_channels(
+            Some("turn failed"),
+            "401 Unauthorized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn completed_notification_retries_after_mixed_channel_errors() {
+        assert_terminal_delivery_retries_only_unsettled_channels(None, "401 Unauthorized").await;
+    }
+
+    #[tokio::test]
+    async fn failed_notification_does_not_resend_a_successful_channel() {
+        assert_terminal_delivery_retries_only_unsettled_channels(Some("turn failed"), "200 OK")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn completed_notification_does_not_resend_a_successful_channel() {
+        assert_terminal_delivery_retries_only_unsettled_channels(None, "200 OK").await;
+    }
+
+    #[tokio::test]
+    async fn terminal_notification_settles_when_all_channel_errors_are_permanent() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = MockWebhookServer::start(vec!["401 Unauthorized"]).await;
+        let second = MockWebhookServer::start(vec!["403 Forbidden"]).await;
+        let state = channel_delivery_test_state(
+            directory.path(),
+            vec![first.channel("first"), second.channel("second")],
+        );
+        let payload = json!({
+            "sessionId": "session-permanent",
+            "turnId": "turn-permanent",
+            "sessionName": "Permanent failures",
+            "confirmedByRollout": true,
+            "rolloutError": "turn failed",
+        });
+
+        notify_webhook_completion(&state, &payload).await.unwrap();
+        let outcomes = drive_due(&state).await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            crate::notifications::outbox::DeliveryOutcome::PermanentFailure
+        )));
+        let duplicate = notify_webhook_completion(&state, &payload).await.unwrap();
+        assert_eq!(duplicate["status"], "duplicate");
+        assert_eq!(first.requests.lock().await.len(), 1);
+        assert_eq!(second.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_waiting_channel_errors_retry_only_the_failed_channel_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let permanent = MockWebhookServer::start(vec!["401 Unauthorized"]).await;
+        let retryable = MockWebhookServer::start(vec!["503 Service Unavailable", "200 OK"]).await;
+        let channels = vec![
+            permanent.channel("permanent"),
+            retryable.channel("retryable"),
+        ];
+        let state = channel_delivery_test_state(directory.path(), channels.clone());
+        let payload = json!({"sessionId":"session-mixed-waiting","turnId":"turn-mixed-waiting",
+            "waitingId":"approval-mixed","sessionName":"Mixed waiting failures"});
+        assert_eq!(
+            notify_webhook_waiting(&state, &payload).await.unwrap()["status"],
+            "queued"
+        );
+        assert_eq!(drive_due(&state).await.len(), 2);
+        assert_eq!(
+            notify_webhook_waiting(&state, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        drop(state);
+        let restarted = channel_delivery_test_state(directory.path(), channels);
+        assert_eq!(
+            notify_webhook_waiting(&restarted, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        assert_eq!(drive_due(&restarted).await.len(), 1);
+        assert!(drive_due(&restarted).await.is_empty());
+        assert_eq!(permanent.requests.lock().await.len(), 1);
+        assert_eq!(retryable.requests.lock().await.len(), 2);
+    }
+
     fn lifecycle(started: &[(&str, &str)], completed: &[(&str, &str)]) -> RecentSessionEvents {
         RecentSessionEvents {
             started_turns: Arc::new(
@@ -1488,45 +1583,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_delivery_concurrency_is_bounded() {
-        let delivery_count = MAX_CONCURRENT_WEBHOOK_DELIVERIES + 3;
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(Semaphore::new(0));
-        let deliveries = (0..delivery_count)
-            .map(|_| {
-                let active = Arc::clone(&active);
-                let peak = Arc::clone(&peak);
-                let gate = Arc::clone(&gate);
-                async move {
-                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
-                    peak.fetch_max(current, Ordering::AcqRel);
-                    let permit = gate.acquire_owned().await.unwrap();
-                    permit.forget();
-                    active.fetch_sub(1, Ordering::AcqRel);
-                }
-            })
-            .collect::<Vec<_>>();
-        let delivery_task = tokio::spawn(collect_webhook_deliveries(deliveries));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while peak.load(Ordering::Acquire) < MAX_CONCURRENT_WEBHOOK_DELIVERIES {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the bounded delivery window should fill");
-        assert_eq!(
-            peak.load(Ordering::Acquire),
-            MAX_CONCURRENT_WEBHOOK_DELIVERIES
-        );
-
-        gate.add_permits(delivery_count);
-        delivery_task.await.unwrap();
-        assert_eq!(active.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
     async fn clawbot_delivery_uses_the_latest_saved_context_token() {
         use tokio::net::TcpListener;
 
@@ -1551,7 +1607,9 @@ mod tests {
         };
         let mut stale_channel = fresh_channel.clone();
         stale_channel.context_token = "stale-context".to_string();
+        let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(CodeyConfig {
                 webhook: crate::notifications::WebhookConfig {
                     channels: vec![fresh_channel],
@@ -1559,7 +1617,7 @@ mod tests {
                 },
                 ..CodeyConfig::default()
             }),
-            ..AppState::default()
+            ..isolated_test_state(directory.path())
         });
         let event = NotificationEvent::new(
             "session.completed",
@@ -1570,14 +1628,11 @@ mod tests {
             None,
         );
 
-        dispatch_webhook_channels(
-            &state,
-            vec![stale_channel],
-            &event,
-            "completed:session:turn",
-        )
-        .await
-        .unwrap();
+        enqueue_test_event(&state, stale_channel, &event).await;
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Delivered]
+        ));
 
         let request = server.await.unwrap();
         assert!(request.contains("POST /ilink/bot/sendmessage "));
@@ -1610,7 +1665,9 @@ mod tests {
             allow_insecure_test_url: true,
             ..NotificationChannelConfig::default()
         };
+        let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(CodeyConfig {
                 webhook: crate::notifications::WebhookConfig {
                     channels: vec![channel.clone()],
@@ -1618,7 +1675,7 @@ mod tests {
                 },
                 ..CodeyConfig::default()
             }),
-            ..AppState::default()
+            ..isolated_test_state(directory.path())
         });
         let event = NotificationEvent::new(
             "session.completed",
@@ -1629,25 +1686,17 @@ mod tests {
             None,
         );
 
-        let first = dispatch_webhook_channels(
-            &state,
-            vec![channel.clone()],
-            &event,
-            "completed:session:turn",
-        )
-        .await
-        .unwrap_err();
-        let second = dispatch_webhook_channels(
-            &state,
-            vec![channel.clone()],
-            &event,
-            "completed:session:turn",
-        )
-        .await
-        .unwrap_err();
-
-        assert!(first.to_string().contains("自动重试"));
-        assert!(second.to_string().contains("自动重试"));
+        enqueue_test_event(&state, channel.clone(), &event).await;
+        let first = drive_due(&state).await;
+        let second = drive_due(&state).await;
+        assert!(matches!(
+            first.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Retryable { .. }]
+        ));
+        assert!(matches!(
+            second.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Retryable { .. }]
+        ));
         assert!(
             crate::commands::wechat_claw_notification_cooldown_remaining(&state, &channel)
                 .await
@@ -1678,7 +1727,9 @@ mod tests {
             allow_insecure_test_url: true,
             ..NotificationChannelConfig::default()
         };
+        let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(CodeyConfig {
                 webhook: crate::notifications::WebhookConfig {
                     channels: vec![channel.clone()],
@@ -1686,7 +1737,7 @@ mod tests {
                 },
                 ..CodeyConfig::default()
             }),
-            ..AppState::default()
+            ..isolated_test_state(directory.path())
         });
         let server_state = Arc::clone(&state);
         let server = tokio::spawn(async move {
@@ -1714,9 +1765,15 @@ mod tests {
             None,
         );
 
-        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
-            .await
-            .unwrap();
+        enqueue_test_event(&state, channel, &event).await;
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Retryable { .. }]
+        ));
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Delivered]
+        ));
 
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -1759,7 +1816,7 @@ mod tests {
                 ..CodeyConfig::default()
             }),
             shutting_down: std::sync::atomic::AtomicBool::new(true),
-            ..AppState::default()
+            ..isolated_test_state(directory.path())
         });
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
@@ -1793,9 +1850,15 @@ mod tests {
             None,
         );
 
-        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
-            .await
-            .unwrap();
+        enqueue_test_event(&state, channel, &event).await;
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Retryable { .. }]
+        ));
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Delivered]
+        ));
 
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 4);
@@ -1887,28 +1950,6 @@ mod tests {
             "unknown-model"
         );
         assert_eq!(webhook_display_model(&config, ""), "Codex");
-    }
-
-    #[test]
-    fn bounded_notification_history_never_evicts_an_in_flight_reservation() {
-        let mut notifications = WebhookNotificationState::default();
-        let in_flight = "completed:active-session:active-turn".to_string();
-        assert!(notifications.try_reserve(in_flight.clone(), &[]));
-
-        for index in 0..=WEBHOOK_NOTIFICATION_HISTORY_LIMIT {
-            notifications.remember_settled(format!("completed:old-session:{index}"));
-        }
-
-        assert!(notifications.is_known(&in_flight));
-        assert!(!notifications.try_reserve(in_flight, &[]));
-        assert_eq!(
-            notifications.settled.len(),
-            WEBHOOK_NOTIFICATION_HISTORY_LIMIT
-        );
-        assert!(!notifications.was_settled("completed:old-session:0"));
-        assert!(notifications.was_settled(&format!(
-            "completed:old-session:{WEBHOOK_NOTIFICATION_HISTORY_LIMIT}"
-        )));
     }
 
     #[test]
@@ -2021,191 +2062,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_notification_is_reserved_on_disk_before_delivery() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+    async fn waiting_notification_is_durable_before_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockWebhookServer::start(vec!["200 OK"]).await;
+        let channels = vec![server.channel("waiting")];
+        let state = channel_delivery_test_state(directory.path(), channels.clone());
+        let payload = json!({"sessionId":"session-durable","turnId":"turn-durable",
+            "waitingId":"approval-durable","sessionName":"Durable waiting"});
+        assert_eq!(
+            notify_webhook_waiting(&state, &payload).await.unwrap()["status"],
+            "queued"
+        );
+        assert!(server.requests.lock().await.is_empty());
+        drop(state);
+        let restarted = channel_delivery_test_state(directory.path(), channels);
+        assert_eq!(
+            notify_webhook_waiting(&restarted, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        assert!(matches!(
+            drive_due(&restarted).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Delivered]
+        ));
+        assert_eq!(server.requests.lock().await.len(), 1);
+    }
 
+    #[tokio::test]
+    async fn failed_waiting_delivery_remains_durable_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockWebhookServer::start(vec!["503 Service Unavailable", "200 OK"]).await;
+        let state = channel_delivery_test_state(directory.path(), vec![server.channel("waiting")]);
+        let payload = json!({"sessionId":"session-retry","turnId":"turn-retry",
+            "waitingId":"approval-retry","sessionName":"Retry waiting"});
+        notify_webhook_waiting(&state, &payload).await.unwrap();
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Retryable { .. }]
+        ));
+        assert_eq!(
+            notify_webhook_waiting(&state, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Delivered]
+        ));
+        assert!(drive_due(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncertain_waiting_delivery_is_not_retried_after_restart() {
+        use tokio::net::TcpListener;
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (request_seen_tx, request_seen_rx) = oneshot::channel();
-        let (respond_tx, respond_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let bytes_read = socket.read(&mut request).await.unwrap();
-            assert!(bytes_read > 0);
-            request_seen_tx.send(()).unwrap();
-            respond_rx.await.unwrap();
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 10\r\nconnection: close\r\n\r\n{\"code\":0}",
-                )
-                .await
-                .unwrap();
+            read_http_request(&mut socket).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         });
-        let mut config = CodeyConfig::default();
-        config.webhook.channels = vec![NotificationChannelConfig {
-            id: "local-feishu".to_string(),
-            kind: NotificationChannelKind::Feishu,
-            enabled: true,
+        let channels = vec![NotificationChannelConfig {
+            id: "timeout".into(),
             url: format!("http://{address}"),
             allow_insecure_test_url: true,
             ..NotificationChannelConfig::default()
         }];
-        let state = Arc::new(AppState {
-            store: ConfigStore::new(directory.path().join("config.json")),
-            config: RwLock::new(config),
-            webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
-            ..AppState::default()
-        });
-        let notification_key =
-            waiting_notification_key("session-durable", "turn-durable", "approval-durable");
-        let payload = json!({
-            "sessionId": "session-durable",
-            "turnId": "turn-durable",
-            "waitingId": "approval-durable",
-            "sessionName": "Durable waiting notification",
-        });
-        let notify_state = Arc::clone(&state);
-        let notify_task =
-            tokio::spawn(async move { notify_webhook_waiting(&notify_state, &payload).await });
-
-        tokio::time::timeout(Duration::from_secs(2), request_seen_rx)
-            .await
-            .expect("notification request should reach the local server")
-            .unwrap();
-        assert!(
-            load_waiting_notification_ledger(&waiting_notification_ledger_path(&state.store))
-                .contains(&notification_key)
-        );
-
-        respond_tx.send(()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(2), notify_task)
-            .await
-            .expect("notification delivery should finish")
+        let mut state = channel_delivery_test_state(directory.path(), channels.clone());
+        Arc::get_mut(&mut state)
             .unwrap()
-            .unwrap();
-        assert_eq!(result["status"], "ok");
+            .webhook_http_client_override = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap(),
+        );
+        let payload = json!({"sessionId":"session-timeout","turnId":"turn-timeout",
+            "waitingId":"approval-timeout","sessionName":"Timeout waiting"});
+        notify_webhook_waiting(&state, &payload).await.unwrap();
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Uncertain]
+        ));
+        drop(state);
+        let restarted = channel_delivery_test_state(directory.path(), channels);
+        assert_eq!(
+            notify_webhook_waiting(&restarted, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        assert!(drive_due(&restarted).await.is_empty());
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn failed_waiting_delivery_releases_the_durable_reservation() {
-        use tokio::net::TcpListener;
-
+    async fn legacy_waiting_keys_are_tombstones_without_replay() {
         let directory = tempfile::tempdir().unwrap();
-        let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let unused_address = unused_listener.local_addr().unwrap();
-        drop(unused_listener);
-        let mut config = CodeyConfig::default();
-        config.webhook.channels = vec![NotificationChannelConfig {
-            id: "unreachable-feishu".to_string(),
-            kind: NotificationChannelKind::Feishu,
-            enabled: true,
-            url: format!("http://{unused_address}"),
-            allow_insecure_test_url: true,
-            ..NotificationChannelConfig::default()
-        }];
-        let state = Arc::new(AppState {
-            store: ConfigStore::new(directory.path().join("config.json")),
-            config: RwLock::new(config),
-            webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
-            ..AppState::default()
-        });
-        let notification_key =
-            waiting_notification_key("session-retry", "turn-retry", "approval-retry");
-        let payload = json!({
-            "sessionId": "session-retry",
-            "turnId": "turn-retry",
-            "waitingId": "approval-retry",
-            "sessionName": "Retry waiting notification",
-        });
-
-        assert!(notify_webhook_waiting(&state, &payload).await.is_err());
-
-        assert!(
-            !load_waiting_notification_ledger(&waiting_notification_ledger_path(&state.store))
-                .contains(&notification_key)
+        let server = MockWebhookServer::start(vec!["200 OK"]).await;
+        let state = channel_delivery_test_state(directory.path(), vec![server.channel("waiting")]);
+        let key = waiting_notification_key("legacy", "turn", "approval");
+        let path = waiting_notification_ledger_path(&state.store);
+        save_waiting_notification_ledger(&path, vec![key]).unwrap();
+        *state.persisted_waiting_notifications.lock().await =
+            initialize_waiting_notifications(&path, HashSet::new());
+        let payload = json!({"sessionId":"legacy","turnId":"turn","waitingId":"approval"});
+        assert_eq!(
+            notify_webhook_waiting(&state, &payload).await.unwrap()["status"],
+            "duplicate"
         );
-        assert!(
-            !state
-                .persisted_waiting_notifications
-                .lock()
-                .await
-                .contains(&notification_key)
-        );
-        assert!(
-            !state
-                .webhook_notifications
-                .lock()
-                .await
-                .is_known(&notification_key)
-        );
+        assert!(drive_due(&state).await.is_empty());
+        assert!(server.requests.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn uncertain_waiting_delivery_keeps_the_durable_reservation() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
+    async fn changed_channel_binding_cancels_queued_delivery() {
         let directory = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let server_request_count = Arc::clone(&request_count);
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let bytes_read = socket.read(&mut request).await.unwrap();
-            assert!(bytes_read > 0);
-            server_request_count.fetch_add(1, Ordering::AcqRel);
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
-        });
-        let mut config = CodeyConfig::default();
-        config.webhook.channels = vec![NotificationChannelConfig {
-            id: "timeout-feishu".to_string(),
-            kind: NotificationChannelKind::Feishu,
-            enabled: true,
-            url: format!("http://{address}"),
-            allow_insecure_test_url: true,
-            ..NotificationChannelConfig::default()
-        }];
-        let state = Arc::new(AppState {
-            store: ConfigStore::new(directory.path().join("config.json")),
-            config: RwLock::new(config),
-            webhook_http_client_override: Some(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_millis(500))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap(),
-            ),
-            webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
-            ..AppState::default()
-        });
-        let notification_key =
-            waiting_notification_key("session-uncertain", "turn-uncertain", "approval-uncertain");
-        let payload = json!({
-            "sessionId": "session-uncertain",
-            "turnId": "turn-uncertain",
-            "waitingId": "approval-uncertain",
-            "sessionName": "Uncertain waiting notification",
-        });
-
-        let error = notify_webhook_waiting(&state, &payload).await.unwrap_err();
-        assert!(error.contains("发送结果不确定"));
-        assert!(
-            load_waiting_notification_ledger(&waiting_notification_ledger_path(&state.store))
-                .contains(&notification_key)
-        );
-        let duplicate = notify_webhook_waiting(&state, &payload).await.unwrap();
-        assert_eq!(duplicate["status"], "duplicate");
-        server.await.unwrap();
-        assert_eq!(request_count.load(Ordering::Acquire), 1);
+        let original = MockWebhookServer::start(vec!["200 OK"]).await;
+        let replacement = MockWebhookServer::start(vec!["200 OK"]).await;
+        let state =
+            channel_delivery_test_state(directory.path(), vec![original.channel("channel")]);
+        let payload = json!({"sessionId":"session","turnId":"turn","sessionName":"Binding change","confirmedByRollout":true});
+        notify_webhook_completion(&state, &payload).await.unwrap();
+        state.config.write().await.webhook.channels[0] = replacement.channel("channel");
+        assert!(matches!(
+            drive_due(&state).await.as_slice(),
+            [crate::notifications::outbox::DeliveryOutcome::Cancelled]
+        ));
+        assert!(original.requests.lock().await.is_empty());
+        assert!(replacement.requests.lock().await.is_empty());
     }
 
     #[test]
@@ -2272,9 +2255,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState {
             store: ConfigStore::new(directory.path().join("config.json")),
-            webhook_notifications: Mutex::new(WebhookNotificationState::default()),
             persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
-            ..AppState::default()
+            ..isolated_test_state(directory.path())
         });
         let before_start = PendingApproval {
             session_id: "session-old".to_string(),
@@ -2291,13 +2273,13 @@ mod tests {
 
         baseline_waiting_notifications(&state, std::slice::from_ref(&before_start)).await;
 
-        let baseline = state.webhook_notifications.lock().await;
-        assert!(baseline.is_known(&waiting_notification_key(
+        let baseline = state.persisted_waiting_notifications.lock().await;
+        assert!(baseline.contains(&waiting_notification_key(
             &before_start.session_id,
             &before_start.turn_id,
             &before_start.waiting_id,
         )));
-        assert!(!baseline.is_known(&waiting_notification_key(
+        assert!(!baseline.contains(&waiting_notification_key(
             &during_start.session_id,
             &during_start.turn_id,
             &during_start.waiting_id,
@@ -2306,11 +2288,12 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_registration_does_not_wait_for_initial_session_scan() {
-        let state = Arc::new(AppState::default());
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(isolated_test_state(directory.path()));
         *state.recent_session_event_cache.lock().await = None;
         let (release_scan_tx, release_scan_rx) = oneshot::channel();
-        let initial_scan_task = tokio::spawn(async move {
-            let _ = release_scan_rx.await;
+        let initial_scan_task = RecentSessionScanTask::spawn(move || {
+            let _ = release_scan_rx.blocking_recv();
             (
                 pending_approval::RecentSessionEventCache::default(),
                 Arc::new(RecentSessionEvents::default()),
@@ -2341,7 +2324,8 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_waiting_watcher_waits_for_task_and_cache_handoff() {
-        let state = Arc::new(AppState::default());
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(isolated_test_state(directory.path()));
         *state.recent_session_event_cache.lock().await = None;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (shutdown_seen_tx, shutdown_seen_rx) = oneshot::channel();
@@ -2374,15 +2358,39 @@ mod tests {
         assert!(state.recent_session_event_cache.lock().await.is_some());
     }
 
-    #[test]
-    fn terminal_notification_keys_cover_success_and_failure() {
+    #[tokio::test]
+    async fn terminal_event_key_is_shared_by_success_and_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockWebhookServer::start(vec!["200 OK"]).await;
+        let state = channel_delivery_test_state(directory.path(), vec![server.channel("terminal")]);
+        let mut payload = json!({"sessionId":"session","turnId":"turn","sessionName":"Terminal", "confirmedByRollout":true,"rolloutError":"failed"});
         assert_eq!(
-            terminal_notification_keys("session-1", "turn-1"),
-            [
-                "completed:session-1:turn-1".to_string(),
-                "failed:session-1:turn-1".to_string(),
-            ]
+            notify_webhook_completion(&state, &payload).await.unwrap()["status"],
+            "queued"
         );
+        payload["rolloutError"] = Value::Null;
+        assert_eq!(
+            notify_webhook_completion(&state, &payload).await.unwrap()["status"],
+            "duplicate"
+        );
+        drive_due(&state).await;
+        assert_eq!(server.requests.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn startup_gap_uses_the_initial_scan_timestamp_and_only_baselines_its_snapshot() {
+        let baseline = lifecycle(&[("running", "turn")], &[("old", "turn")]);
+        let mut tracker = WebhookTurnTracker::from_snapshot_at(&baseline, 100);
+        let mut after_registration = lifecycle(
+            &[("running", "turn"), ("new", "turn")],
+            &[("old", "turn"), ("running", "turn"), ("new", "turn")],
+        );
+        Arc::make_mut(&mut after_registration.completed_turns)
+            .iter_mut()
+            .for_each(|turn| turn.completed_at = Some(101));
+        let candidates = tracker.completion_candidates(&after_registration);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|turn| turn.session_id != "old"));
     }
 
     #[test]
@@ -2536,7 +2544,8 @@ mod tests {
 
     #[tokio::test]
     async fn renderer_completion_hint_cannot_send_without_rollout_confirmation() {
-        let state = Arc::new(AppState::default());
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(isolated_test_state(directory.path()));
         let result = notify_webhook_completion(
             &state,
             &json!({

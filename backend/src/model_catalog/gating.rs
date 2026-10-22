@@ -20,9 +20,25 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     remote_compaction_models: &[String],
     codex_app_path: &str,
 ) -> Result<bool> {
-    if !read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
-        snapshot_matches_runtime_source(&value, catalog_source_for_app(codex_app_path).as_ref())
-    }) {
+    prepare_cached_catalog_in_context(
+        home,
+        native_web_search_models,
+        image_detail_original_models,
+        remote_compaction_models,
+        &CatalogContext::new(codex_app_path),
+    )
+}
+
+pub(crate) fn prepare_cached_catalog_in_context(
+    home: &Path,
+    native_web_search_models: &[String],
+    image_detail_original_models: &[String],
+    remote_compaction_models: &[String],
+    context: &CatalogContext<'_>,
+) -> Result<bool> {
+    if !read_catalog_value(&home.join(relative_path()))
+        .is_some_and(|value| snapshot_matches_runtime_source(&value, context.source()))
+    {
         return Ok(false);
     }
     if !is_available(home) {
@@ -46,6 +62,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         gate_cached_native_web_search(model, &allowed_model_keys);
         gate_cached_image_detail_original(model, &image_detail_original_model_keys);
         prepare_cached_context_window(model);
+        normalize_third_party_compaction_identity(model);
         changed |= *model != previous;
     }
     if changed {
@@ -59,6 +76,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         gate_cached_native_web_search(model, &allowed_model_keys);
         gate_cached_image_detail_original(model, &image_detail_original_model_keys);
         prepare_cached_context_window(model);
+        normalize_third_party_compaction_identity(model);
     }
     if safely_gated_models != written_models {
         bail!("复用的 Codey 模型目录仍包含与当前线路不匹配的模型能力");

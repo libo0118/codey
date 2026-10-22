@@ -42,19 +42,21 @@ pub(super) fn release_snapshot_sync_slot<T: PartialEq>(
 /// to render its catalog and keep the output as a Codey-owned snapshot that
 /// `read_official_entries` picks up like any other source.
 #[cfg(not(test))]
-pub(super) fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
-    let candidates = codex_cli_candidates_for(codex_app_path);
-    let Some(source) = runtime_catalog_source(&candidates) else {
+pub(super) fn sync_runtime_catalog_snapshot(
+    home: &Path,
+    context: &CatalogContext<'_>,
+) -> Result<bool> {
+    let Some(source) = context.source() else {
         eprintln!("无法确认所选 Codex 的命令行来源，跳过模型清单探测");
         return Ok(false);
     };
     if !claim_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, Some(source.clone())) {
         return Ok(false);
     }
-    let Some(models) = debug_model_entries(home, &candidates) else {
+    let Some(models) = debug_model_entries(home, context.candidates()) else {
         eprintln!("本机 Codex 命令行未产出可用的模型清单快照");
         // Nothing was captured, so a later launch in this process may retry.
-        release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, Some(source));
+        release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, Some(source.clone()));
         return Ok(false);
     };
     let catalog = serde_json::to_vec_pretty(&json!({
@@ -70,14 +72,17 @@ pub(super) fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -
 
 /// Explicit model synchronization must be allowed to observe account changes
 /// even when the installed Codex binary has not changed since the last launch.
-pub(crate) fn refresh_account_runtime_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
+pub(crate) fn refresh_account_runtime_snapshot_in_context(
+    home: &Path,
+    context: &CatalogContext<'_>,
+) -> Result<bool> {
     #[cfg(not(test))]
     {
         if let Ok(mut attempted) = RUNTIME_SNAPSHOT_SYNC_ATTEMPTED.lock() {
             *attempted = None;
         }
     }
-    sync_runtime_catalog_snapshot(home, codex_app_path)
+    sync_runtime_catalog_snapshot(home, context)
 }
 
 /// Merges the account-specific model response into the Codey-owned runtime
@@ -92,12 +97,20 @@ pub(crate) fn merge_account_runtime_models(
     models: &[Value],
     codex_app_path: &str,
 ) -> Result<()> {
+    merge_account_runtime_models_in_context(home, models, &CatalogContext::new(codex_app_path))
+}
+
+pub(crate) fn merge_account_runtime_models_in_context(
+    home: &Path,
+    models: &[Value],
+    context: &CatalogContext<'_>,
+) -> Result<()> {
     let path = home.join(DEBUG_CATALOG_RELATIVE_PATH);
-    let source = catalog_source_for_app(codex_app_path);
+    let source = context.source();
     let mut catalog = fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|value| snapshot_matches_runtime_source(value, source.as_ref()))
+        .filter(|value| snapshot_matches_runtime_source(value, source))
         .unwrap_or_else(|| json!({"models": [], "codey_account_snapshot": true}));
     let entries = catalog
         .get_mut("models")
@@ -149,7 +162,11 @@ pub(crate) fn merge_account_runtime_models(
 /// them: the render is slow, needs account state, and would write a real
 /// snapshot. The surrounding logic is covered through the pure helpers below.
 #[cfg(test)]
-pub(super) fn sync_runtime_catalog_snapshot(_home: &Path, _codex_app_path: &str) -> Result<bool> {
+pub(super) fn sync_runtime_catalog_snapshot(
+    _home: &Path,
+    _context: &CatalogContext<'_>,
+) -> Result<bool> {
+    record_snapshot_probe();
     Ok(false)
 }
 

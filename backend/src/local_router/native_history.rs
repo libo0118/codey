@@ -420,7 +420,60 @@ pub(crate) fn native_item_requires_http(item: &Value) -> bool {
         // 完整密文与可见推理都可由原生 Responses 重放，不应仅因包含
         // encrypted_content 就把后续请求固定为 HTTP。
         Some("reasoning") => !replayable_reasoning_item(item),
+        // 这些客户端条目自带正文或工具定义，不依赖上游持久化的历史状态。
+        Some("additional_tools") => {
+            item.get("role").and_then(Value::as_str) != Some("developer")
+                || !replayable_native_tool_definitions(item)
+        }
+        Some("agent_message") => !replayable_native_agent_message(item),
+        Some(kind @ ("tool_search_call" | "tool_search_output")) => {
+            item.get("execution").and_then(Value::as_str) != Some("client")
+                || !nonempty_native_history_string(item.get("call_id"))
+                || if kind == "tool_search_call" {
+                    !item.get("arguments").is_some_and(Value::is_object)
+                } else {
+                    !replayable_native_tool_definitions(item)
+                }
+        }
         _ => true,
+    }
+}
+
+fn nonempty_native_history_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn replayable_native_tool_definitions(item: &Value) -> bool {
+    item.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|tool| nonempty_native_history_string(tool.get("type")))
+        })
+}
+
+fn replayable_native_agent_message(item: &Value) -> bool {
+    fn complete_part(part: &Value) -> bool {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => {
+                nonempty_native_history_string(part.get("text"))
+            }
+            // 原生标准化保留令牌形态的密文，并把其余非空正文转成文本。
+            Some("encrypted_content") => {
+                nonempty_native_history_string(part.get("encrypted_content"))
+            }
+            _ => false,
+        }
+    }
+    match item.get("content") {
+        None | Some(Value::Null) => nonempty_native_history_string(item.get("message")),
+        Some(content @ Value::String(_)) => nonempty_native_history_string(Some(content)),
+        Some(Value::Array(parts)) => !parts.is_empty() && parts.iter().all(complete_part),
+        Some(part @ Value::Object(_)) => complete_part(part),
+        _ => false,
     }
 }
 
@@ -498,7 +551,9 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
             "item_reference" | "compaction" if restoring => {
                 anyhow::bail!("历史包含无法在协议切换时展开的引用，请重新发送完整上下文");
             }
-            "function_call" | "custom_tool_call" => {
+            "function_call" | "custom_tool_call" | "tool_search_call"
+                if kind != "tool_search_call" || item["execution"] == "client" =>
+            {
                 let id = item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -515,11 +570,13 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                     );
                 }
             }
-            "function_call_output" | "custom_tool_call_output" => {
-                let call_kind = if kind == "function_call_output" {
-                    "function_call"
-                } else {
-                    "custom_tool_call"
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+                if kind != "tool_search_output" || item["execution"] == "client" =>
+            {
+                let call_kind = match kind {
+                    "function_call_output" => "function_call",
+                    "custom_tool_call_output" => "custom_tool_call",
+                    _ => "tool_search_call",
                 };
                 // Client-side tools (Codex app thread messaging, for example) emit
                 // results that carry no call id because no model call exists for
@@ -530,6 +587,9 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                 else {
+                    if kind == "tool_search_output" {
+                        anyhow::bail!("工具结果缺少 call_id（{kind}），请重新发送完整上下文");
+                    }
                     continue;
                 };
                 if !calls.remove(&(call_kind, id)) {
@@ -568,6 +628,171 @@ mod tests {
         json!({"type":"response.completed","response":{"id":id,"object":"response","status":"completed","output":output}})
     }
 
+    fn native_client_items() -> Vec<Value> {
+        use base64::Engine as _;
+
+        let mut token = vec![0x80];
+        token.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        token.extend_from_slice(&[0x11; 16]);
+        token.extend_from_slice(&[0x33; 16]);
+        token.extend_from_slice(&[0x22; 32]);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token);
+        vec![
+            json!({"type":"additional_tools","role":"developer","tools":[{
+                "type":"namespace","name":"filesystem","tools":[{
+                    "type":"function","name":"read_file","parameters":{"type":"object"}
+                }]
+            }]}),
+            json!({"type":"agent_message","author":"/root","recipient":"/root/worker","content":[
+                {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                {"type":"encrypted_content","encrypted_content":token}
+            ]}),
+            json!({"type":"tool_search_call","execution":"client","call_id":"search-1","arguments":{"goal":"read files"}}),
+            json!({"type":"tool_search_output","execution":"client","call_id":"search-1","tools":[{
+                "type":"function","name":"read_file","parameters":{"type":"object"}
+            }]}),
+        ]
+    }
+
+    #[test]
+    fn native_client_items_allow_initial_continuation_and_cached_replay() {
+        let mut items = native_client_items();
+        items.extend([
+            json!({"type":"additional_tools","role":"developer","tools":[]}),
+            json!({"type":"agent_message","message":"worker report"}),
+            json!({"type":"agent_message","content":"worker report"}),
+            json!({"type":"agent_message","content":{"type":"output_text","text":"worker report"}}),
+            json!({"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"plaintext task"}]}),
+            json!({"type":"tool_search_output","execution":"client","call_id":"search-empty","tools":[]}),
+        ]);
+        for item in items {
+            let owner = [1; 32];
+            let cache = Arc::new(Mutex::new(NativeHistoryCache::default()));
+            let headers = vec![("session-id".into(), "client-history".into())];
+            let mut history = NativeResponsesHistory::with_cache(Arc::clone(&cache), &headers);
+            let mut input = Vec::new();
+            if item["type"] == "tool_search_output" {
+                input.push(json!({
+                    "type":"tool_search_call","execution":"client",
+                    "call_id":item["call_id"],"arguments":{}
+                }));
+            }
+            input.push(item.clone());
+            let mut first = json!({"input":input});
+            history.prepare(owner, &mut first);
+            assert!(
+                !history.requires_http_for_websocket(&first, false),
+                "{item}"
+            );
+            history.observe(&completed("resp-client", vec![]));
+            let mut next = json!({"previous_response_id":"resp-client","input":"next"});
+            history.prepare(owner, &mut next);
+            assert!(!history.requires_http_for_websocket(&next, true), "{item}");
+            let mut reconnected = NativeResponsesHistory::with_cache(cache, &headers);
+            reconnected.prepare(owner, &mut next);
+            assert!(
+                !reconnected.requires_http_for_websocket(&next, false),
+                "{item}"
+            );
+            assert!(reconnected.restore(owner, &mut next).unwrap());
+            input.push(json!({"role":"user","content":"next"}));
+            assert_eq!(next["input"], json!(input));
+            assert!(next.get("previous_response_id").is_none());
+        }
+    }
+
+    #[test]
+    fn incomplete_or_unknown_native_client_items_still_require_http() {
+        for item in [
+            json!({"type":"additional_tools","tools":[]}),
+            json!({"type":"additional_tools","role":"user","tools":[]}),
+            json!({"type":"additional_tools","role":"developer"}),
+            json!({"type":"additional_tools","role":"developer","tools":[{}]}),
+            json!({"type":"agent_message","id":"amsg-reference"}),
+            json!({"type":"agent_message","content":[]}),
+            json!({"type":"agent_message","content":" "}),
+            json!({"type":"agent_message","content":{"type":"encrypted_content","encrypted_content":""}}),
+            json!({"type":"agent_message","content":{"type":"encrypted_content","encrypted_content":null}}),
+            json!({"type":"agent_message","message":"fallback","content":[
+                {"type":"input_text","text":"visible"},{"type":"item_reference","id":"hidden"}
+            ]}),
+            json!({"type":"agent_message","content":[{"type":"future_content","text":"unknown"}]}),
+            json!({"type":"tool_search_call","execution":"server","call_id":"search","arguments":{}}),
+            json!({"type":"tool_search_call","call_id":"search","arguments":{}}),
+            json!({"type":"tool_search_call","execution":"client","arguments":{}}),
+            json!({"type":"tool_search_call","execution":"client","call_id":"search"}),
+            json!({"type":"tool_search_call","execution":"client","call_id":"search","arguments":"{}"}),
+            json!({"type":"tool_search_output","execution":"server","call_id":"search","tools":[]}),
+            json!({"type":"tool_search_output","execution":"client","call_id":"search"}),
+            json!({"type":"tool_search_output","execution":"client","call_id":"search","tools":[null]}),
+            json!({"type":"item_reference","id":"persisted"}),
+            json!({"type":"compaction","encrypted_content":"opaque"}),
+            json!({"type":"reasoning","summary":[]}),
+            json!({"type":"future_item","content":"unknown"}),
+        ] {
+            let owner = [1; 32];
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(owner, &mut json!({"input":"task"}));
+            history.observe(&completed("resp-before", vec![]));
+            let mut next = json!({"previous_response_id":"resp-before","input":[item.clone()]});
+            history.prepare(owner, &mut next);
+            assert!(history.requires_http_for_websocket(&next, true), "{item}");
+            assert!(history.requires_http_for_websocket(&next, false), "{item}");
+            let mut first = json!({"input":[item.clone()]});
+            history.prepare(owner, &mut first);
+            assert!(history.requires_http_for_websocket(&first, false), "{item}");
+        }
+    }
+
+    #[test]
+    fn restored_client_tool_search_history_requires_matching_calls() {
+        let items = native_client_items();
+        let search = items[2].clone();
+        let output = items[3].clone();
+        for (input, expected_error) in [
+            (vec![output.clone()], "工具结果缺少对应的完整调用历史"),
+            (
+                vec![search.clone(), search.clone()],
+                "历史中工具调用 ID 重复",
+            ),
+            (
+                vec![search.clone(), output.clone(), output.clone()],
+                "工具结果缺少对应的完整调用历史",
+            ),
+            (
+                vec![call(false, "search-1"), output],
+                "工具结果缺少对应的完整调用历史",
+            ),
+            (
+                vec![json!({"type":"tool_search_call","execution":"client","arguments":{}})],
+                "工具调用缺少 call_id",
+            ),
+            (
+                vec![json!({"type":"tool_search_output","execution":"client","tools":[]})],
+                "工具结果缺少 call_id",
+            ),
+        ] {
+            let owner = [1; 32];
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(owner, &mut json!({"input":input}));
+            history.observe(&completed("resp-search", vec![]));
+            let mut next = json!({"previous_response_id":"resp-search","input":"next"});
+            history.prepare(owner, &mut next);
+            let original = next.clone();
+            let error = history.restore(owner, &mut next).unwrap_err().to_string();
+            assert!(error.contains(expected_error), "{error}");
+            assert_eq!(next, original);
+        }
+        for execution in [json!("server"), Value::Null] {
+            let input = vec![
+                json!({"type":"tool_search_call","execution":execution}),
+                json!({"type":"tool_search_output","execution":execution}),
+            ];
+            assert!(input.iter().all(native_item_requires_http));
+            assert!(validate_native_tool_history(&input, true).is_ok());
+        }
+    }
+
     async fn terminal(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -582,6 +807,188 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn official_native_client_history_reuses_ws_and_restores_http_after_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","account_id":"test-account"}}"#,
+        )
+        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let items = native_client_items();
+        let first_input = json!([
+            {"role":"user","content":"original task"}, items[0], items[1]
+        ]);
+        let first_expected = first_input.clone();
+        let search_output = items[3].clone();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for round in 0..2 {
+                let WebSocketMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    panic!("expected response.create");
+                };
+                let body: Value = serde_json::from_str(&text).unwrap();
+                if round == 0 {
+                    assert!(body.get("previous_response_id").is_none());
+                    assert_eq!(body["input"], first_expected);
+                } else {
+                    assert_eq!(body["previous_response_id"], "resp-first");
+                    assert_eq!(body["input"], json!([items[3]]));
+                }
+                ws.send(WebSocketMessage::Text(
+                    completed(
+                        if round == 0 {
+                            "resp-first"
+                        } else {
+                            "resp-second"
+                        },
+                        if round == 0 {
+                            vec![items[2].clone()]
+                        } else {
+                            vec![]
+                        },
+                    )
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
+            ws.close(None).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .unwrap();
+            closed_tx.send(()).unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let WebSocketMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected restored response.create");
+            };
+            let body: Value = serde_json::from_str(&text).unwrap();
+            let mut restored = first_expected.as_array().unwrap().clone();
+            restored.extend([
+                items[2].clone(),
+                items[3].clone(),
+                json!({"role":"user","content":"continue after reconnect"}),
+            ]);
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(body["input"], json!(restored));
+            ws.send(WebSocketMessage::Text(
+                completed("resp-reconnected", vec![]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let WebSocketMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected incremental response.create");
+            };
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["previous_response_id"], "resp-reconnected");
+            assert_eq!(body["input"], "after rejection");
+            ws.send(WebSocketMessage::Text(
+                json!({"type":"error","error":{
+                    "type":"invalid_request_error","code":"unsupported_persisted_item_context",
+                    "message":"Persisted context cannot be replayed"
+                }})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut http).await.unwrap();
+            assert_eq!(request.method, "POST");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            restored.push(json!({"role":"user","content":"after rejection"}));
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(body["input"], json!(restored));
+            let response = format!("data: {}\n\n", completed("resp-http", vec![]));
+            http.write_all(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::make_mut(snapshot.routes.get_mut(&provider).unwrap());
+        route.official_account = true;
+        route.official_auth = Some(OfficialRouteAuth {
+            account_id: "test-account".into(),
+            email: None,
+            record_path: auth_path.clone(),
+            path: auth_path,
+            siwc_path: None,
+            accepts_incoming_authorization: false,
+        });
+        *router.snapshot.write().unwrap() = Arc::new(snapshot);
+        let model = model_alias(&provider, &model);
+        let headers = [("session-id", "native-client-history")];
+        let mut client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
+        for (request, expected) in [
+            (
+                json!({"type":"response.create","model":model,"input":first_input}),
+                "resp-first",
+            ),
+            (
+                json!({"type":"response.create","model":model,"previous_response_id":"resp-first","input":[search_output]}),
+                "resp-second",
+            ),
+        ] {
+            client
+                .send(WebSocketMessage::Text(request.to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut client).await["response"]["id"], expected);
+        }
+        closed_rx.await.unwrap();
+        client.close(None).await.unwrap();
+        let mut client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create","model":model,"previous_response_id":"resp-second",
+                    "input":"continue after reconnect"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal(&mut client).await["response"]["id"],
+            "resp-reconnected"
+        );
+        let rejected = json!({
+            "type":"response.create","model":model,"previous_response_id":"resp-reconnected",
+            "input":"after rejection"
+        });
+        client
+            .send(WebSocketMessage::Text(rejected.to_string().into()))
+            .await
+            .unwrap();
+        let error = terminal(&mut client).await;
+        assert_eq!(
+            error["response"]["error"]["codey"]["originalCode"],
+            "unsupported_persisted_item_context"
+        );
+        client
+            .send(WebSocketMessage::Text(rejected.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(terminal(&mut client).await["response"]["id"], "resp-http");
+        upstream.await.unwrap();
+        client.close(None).await.unwrap();
+        router.stop().await.unwrap();
     }
 
     #[tokio::test]

@@ -150,7 +150,7 @@ jobs:
         id: release-metadata
         shell: pwsh
         run: |
-          node --input-type=module -e 'import fs from "node:fs"; import { releaseIdentity } from "./scripts/release-policy.mjs"; const identity = releaseIdentity(JSON.parse(fs.readFileSync("package.json", "utf8")).version); for (const key of ["name", "tag", "prerelease"]) fs.appendFileSync(process.env.GITHUB_OUTPUT, key + "=" + identity[key] + "\n");'
+          node --input-type=module -e 'import fs from "node:fs"; import { releaseIdentity } from "./scripts/release-policy.mjs"; const identity = releaseIdentity(JSON.parse(fs.readFileSync("package.json", "utf8")).version); for (const key of ["name", "tag", "prerelease"]) fs.appendFileSync(process.env.GITHUB_OUTPUT, key + "=" + identity[key] + "\n"); fs.appendFileSync(process.env.GITHUB_OUTPUT, "make_latest=" + identity.makeLatest + "\n");'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Windows package
@@ -167,6 +167,6 @@ jobs:
           generate_release_notes: true
           name: ${{ steps.release-metadata.outputs.name }}
           tag_name: ${{ steps.release-metadata.outputs.tag }}
-          make_latest: ${{ steps.release-metadata.outputs.prerelease == 'true' && 'false' || 'true' }}
+          make_latest: ${{ steps.release-metadata.outputs.make_latest }}
           prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}
           files: dist/windows/*

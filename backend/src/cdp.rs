@@ -28,21 +28,17 @@ const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
 // 列表的 loopback 请求，远低于此值。
 const DISCOVERY_RETRY_COST_BUDGET: Duration = Duration::from_millis(100);
 const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
-// 模型请求入口校验降级条件：桥已存活的页面连续不就绪超过这个时长仍拿不到
-// request client，说明当前 Codex 构建不支持或补丁锚点已漂移。请求路由另有
-// CLI 包装层的 stdin 改写兜底，此时让注入以降级状态完成而不是永久轮询。
-const REQUEST_GATE_DEGRADE_AFTER: Duration = Duration::from_secs(10);
-const REQUEST_GATE_DEGRADE_MIN_FAILURES: u32 = 3;
-
-/// 请求入口连续不就绪达到阈值后放行本轮注入：无限重装只会拖长启动并在同一
-/// target 上反复叠加补丁会话，而模型路由仍有 CLI 包装层的 stdin 改写兜底。
-fn should_degrade_request_gate(not_ready_count: u32, not_ready_for: Option<Duration>) -> bool {
-    not_ready_count >= REQUEST_GATE_DEGRADE_MIN_FAILURES
-        && not_ready_for.is_some_and(|elapsed| elapsed >= REQUEST_GATE_DEGRADE_AFTER)
-}
-/// 校验 evaluate 的 CDP 层超时：页内等待最多跑满降级预算，外加页面被挂起等
-/// 开销余量；超时按桥不可用处理，走整轮重装而不是无限等下去。
-const REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
+// 门禁要等 Codex 自己建好 request client（实测导航后 6-9 秒）。注入只确认补丁
+// 在位，就绪交给后台轮询；未就绪期间请求路由由 CLI 包装层的 stdin 改写兜底。
+const REQUEST_GATE_SETTLE_ROUNDS: u32 = 3;
+const REQUEST_GATE_CDP_MARGIN: Duration = Duration::from_secs(1);
+const REQUEST_GATE_MIN_WAIT: Duration = Duration::from_millis(200);
+const VERIFY_OVERLAY_RESERVED: Duration = Duration::from_secs(3);
+const INJECTION_FINISH_MARGIN: Duration = Duration::from_millis(100);
+const MINIMUM_VERIFICATION_BUDGET: Duration = REQUEST_GATE_MIN_WAIT
+    .saturating_add(REQUEST_GATE_CDP_MARGIN)
+    .saturating_add(VERIFY_OVERLAY_RESERVED)
+    .saturating_add(INJECTION_FINISH_MARGIN);
 const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -588,20 +584,11 @@ pub async fn retry_inject_with_scripts(
     let mut delay = INITIAL_RETRY_INTERVAL;
     let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
     let mut previous_error = None;
-    let mut previous_detail = None;
     let mut stats = InjectionRetryStats::default();
     // 校验失败时桥接本身仍然可用：把它跨轮保留，下一轮只在原 WebSocket 上
     // 重跑校验，不再重连并重放全部注入脚本。
     let mut retained_bridge: Option<EstablishedInjection> = None;
-    // 模型请求入口校验依赖页面侧补丁或会话工具能拿到 request client；页面已
-    // 应答却始终拿不到时（例如 Codex 更新后源补丁锚点漂移、注入脚本根本没落
-    // 到当前文档），不能无限重装——重装只会不断叠加新的补丁会话。只按"校验
-    // 阶段连续不就绪"计时，超过预算就降级接受本次注入；请求路由另有 CLI 包装
-    // 层的 stdin 改写兜底。
-    let mut gate_not_ready_since: Option<tokio::time::Instant> = None;
-    let mut gate_not_ready_count: u32 = 0;
-    let mut degrade_request_gate = false;
-    let last_error = loop {
+    let (last_error, detail) = loop {
         stats.attempts += 1;
         let attempt_started = tokio::time::Instant::now();
         match tokio::time::timeout_at(
@@ -613,7 +600,7 @@ pub async fn retry_inject_with_scripts(
                 handler.clone(),
                 scripts,
                 &phase,
-                degrade_request_gate,
+                deadline,
             ),
         )
         .await
@@ -622,42 +609,29 @@ pub async fn retry_inject_with_scripts(
                 stats.report(source, "injected", started.elapsed(), None);
                 return Ok(target);
             }
-            Ok(AttemptOutcome::Retry {
-                error,
-                retained,
-                request_gate_unready,
-            }) => {
+            Ok(AttemptOutcome::Retry { error, retained }) => {
                 retained_bridge = retained;
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
                 let failure_cost = attempt_started.elapsed();
                 stats.record_failure(current_phase, failure_cost);
-                if matches!(current_phase, InjectionPhase::VerifyRequestGate)
-                    && request_gate_unready
-                {
-                    gate_not_ready_count += 1;
-                    gate_not_ready_since.get_or_insert(attempt_started);
+                let detail = injection_failure_detail(&error);
+                let retry_budget = if matches!(
+                    current_phase,
+                    InjectionPhase::VerifyRequestGate | InjectionPhase::VerifyOverlay
+                ) {
+                    delay + MINIMUM_VERIFICATION_BUDGET
                 } else {
-                    gate_not_ready_count = 0;
-                    gate_not_ready_since = None;
-                }
-                // 至少确认过两次页面应答后再考虑降级，避免把启动早期的瞬态
-                // "尚未就绪"误判成永久不可用。
-                degrade_request_gate = should_degrade_request_gate(
-                    gate_not_ready_count,
-                    gate_not_ready_since.map(|since| since.elapsed()),
-                );
-                previous_detail = Some(injection_failure_detail(&error));
-                if tokio::time::Instant::now() + delay > deadline {
-                    stats.report(
-                        source,
-                        "noRetryBudget",
-                        started.elapsed(),
-                        previous_detail.as_deref(),
-                    );
-                    break anyhow::anyhow!(
-                        "Codex CDP bridge 注入失败（阶段：{}；{}）",
-                        current_phase.label(),
-                        safe_injection_error_summary(&error)
+                    delay
+                };
+                if tokio::time::Instant::now() + retry_budget > deadline {
+                    stats.report(source, "noRetryBudget", started.elapsed(), Some(&detail));
+                    break (
+                        anyhow::anyhow!(
+                            "Codex CDP bridge 注入失败（阶段：{}；{}）",
+                            current_phase.label(),
+                            safe_injection_error_summary(&error)
+                        ),
+                        detail,
                     );
                 }
                 previous_error = Some(safe_injection_error_summary(&error));
@@ -666,28 +640,33 @@ pub async fn retry_inject_with_scripts(
             }
             Err(_) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
-                stats.report(
-                    source,
-                    "deadlineExceeded",
+                stats.record_failure(current_phase, attempt_started.elapsed());
+                let detail = injection_deadline_detail(
+                    current_phase,
                     started.elapsed(),
-                    previous_detail.as_deref(),
+                    attempt_started.elapsed(),
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
                 );
+                stats.report(source, "deadlineExceeded", started.elapsed(), Some(&detail));
                 let previous_error = previous_error
                     .as_deref()
                     .map(|error| format!("；最近一次失败：{error}"))
                     .unwrap_or_default();
-                break anyhow::anyhow!(
-                    "等待 Codex CDP bridge 注入超时（{} ms，阶段：{}{}）",
-                    CDP_INJECTION_TIMEOUT.as_millis(),
-                    current_phase.label(),
-                    previous_error
+                break (
+                    anyhow::anyhow!(
+                        "等待 Codex CDP bridge 注入超时（{} ms，阶段：{}{}）",
+                        CDP_INJECTION_TIMEOUT.as_millis(),
+                        current_phase.label(),
+                        previous_error
+                    ),
+                    detail,
                 );
             }
         }
     };
     Err(InjectionRetryFailure {
         error: last_error,
-        detail: previous_detail,
+        detail: Some(detail),
         final_phase: InjectionPhase::from_raw(phase.load(Ordering::Acquire)),
         reached_bridge_stage: stats.bridge_failures(),
     })
@@ -899,6 +878,21 @@ fn injection_failure_detail(error: &anyhow::Error) -> String {
     truncate_chars(&format!("{error:#}"), MAX_INJECTION_DETAIL_CHARS)
 }
 
+fn injection_deadline_detail(
+    phase: InjectionPhase,
+    total: Duration,
+    attempt: Duration,
+    remaining: Duration,
+) -> String {
+    format!(
+        "injection deadline exceeded: phase={}; totalMs={}; attemptMs={}; remainingMs={}",
+        phase.key(),
+        total.as_millis(),
+        attempt.as_millis(),
+        remaining.as_millis(),
+    )
+}
+
 /// CDP 命令错误响应形如 `{"code":-32601,"message":"..."}`，摘出方法与
 /// 协议消息比笼统的"内部注入尝试失败"更能定位是哪一步被拒绝。
 fn cdp_command_failure_summary(message: &str) -> Option<String> {
@@ -955,10 +949,9 @@ struct EstablishedInjection {
 
 /// 校验阶段的失败需要区分恢复方式：页面端报告 Codex 尚未就绪时只要保留桥接
 /// 继续轮询；注入脚本缺失、桥接被替换或 CDP 连接失效时才需要整轮重装。
+#[derive(Debug)]
 struct VerifyFailure {
     reinstall: bool,
-    /// 失败发生在请求入口校验阶段且页面已应答：只有这种形态参与降级预算。
-    request_gate_unready: bool,
     error: anyhow::Error,
 }
 
@@ -966,7 +959,7 @@ struct VerifyFailure {
 /// 装上」，宿主据此决定轮询还是重装。waitedMs/polls/sourceGate 是页内等待的
 /// 运行画像：门禁通常要等 Codex 自己把 request client 建好，逐次 evaluate +
 /// 指数退避只会放大检出延迟，所以等待被放进单次 evaluate 里完成。
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestGateVerdict {
     ready: bool,
@@ -981,12 +974,12 @@ struct RequestGateVerdict {
     source_gate: bool,
     #[serde(default)]
     module_gate: bool,
+    #[serde(default)]
+    patch_present: bool,
 }
 
-/// 页内等待的默认预算与降级阈值一致：等待耗尽即视为「页面持续应答却长期拿不
-/// 到 request client」，宿主据此直接降级。测试或诊断可用
-/// `window.__codeyRequestGateWaitMs` 缩短。
-const REQUEST_GATE_WAIT_BUDGET_MS: u64 = REQUEST_GATE_DEGRADE_AFTER.as_millis() as u64;
+/// 后台每轮的页内等待上限。测试或诊断可用 `window.__codeyRequestGateWaitMs` 再缩短。
+const REQUEST_GATE_WAIT_BUDGET: Duration = Duration::from_secs(10);
 /// 单次 ensureRequestGate 调用的页内上限：会话工具加载与模块探测各有自己的
 /// 预算，卡住的调用不拖累整轮等待的终止判定。
 const REQUEST_GATE_POLL_STEP_MS: u64 = 200;
@@ -997,28 +990,32 @@ const REQUEST_GATE_POLL_CALL_MS: u64 = 2_000;
 // 页面默认值与降级阈值由 request_gate_verify_script() 统一保持同步。
 const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
   const started = Date.now();
+  const hostBudgetMs = __CODEY_GATE_BUDGET_MS__;
   const overrideBudget = Number(window.__codeyRequestGateWaitMs);
   const budgetMs = Number.isFinite(overrideBudget) && overrideBudget >= 0
-    ? Math.min(overrideBudget, 60_000)
-    : __CODEY_GATE_BUDGET_MS__;
+    ? Math.min(overrideBudget, hostBudgetMs)
+    : hostBudgetMs;
   const deadline = started + budgetMs;
+  const patch = window.__codeyModelWhitelistPatch;
+  const patchPresent = () => !!patch && typeof patch.ensureRequestGate === "function"
+    && window.__codeyModelWhitelistPatch === patch;
   let polls = 0;
   let lastMessage = "";
-  const verdict = (ready, reinstall, message) => JSON.stringify({
+  const verdict = (ready, reinstall, message, budgetExhausted = false) => JSON.stringify({
     ready, reinstall, message,
+    patchPresent: patchPresent(), budgetExhausted,
     waitedMs: Date.now() - started,
     polls,
     sourceGate: window.__codeyModelRequestSourceGateInstalled === true,
     moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
   });
   for (;;) {
+    if (!patchPresent()) {
+      return verdict(false, true, "模型请求补丁缺失或已替换");
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      return verdict(false, false, lastMessage || "模型请求校验未就绪");
-    }
-    const patch = window.__codeyModelWhitelistPatch;
-    if (!patch || typeof patch.ensureRequestGate !== "function") {
-      return verdict(false, true, "模型请求补丁未注入");
+      return verdict(false, false, lastMessage || "模型请求校验未就绪", true);
     }
     polls += 1;
     const timedOut = Symbol("timeout");
@@ -1032,6 +1029,10 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
         Math.min(__CODEY_GATE_CALL_MS__, remaining),
       )),
     ]);
+    // 任一返回路径都要确认补丁仍是本轮检查的实例，包括成功和探测超时。
+    if (!patchPresent()) {
+      return verdict(false, true, "模型请求补丁缺失或已替换");
+    }
     if (outcome === timedOut) {
       // 单次调用超时不覆盖已拿到的真实失败原因——耗尽预算时诊断更需要后者。
       lastMessage = lastMessage || "模型请求校验探测超时";
@@ -1039,10 +1040,6 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
       lastMessage = String(
         (outcome.error && outcome.error.message) || outcome.error || "模型请求校验失败",
       );
-      // 等待期间补丁对象被脚本重放替换：旧实例只会持续拒绝，必须整轮重装。
-      if (window.__codeyModelWhitelistPatch !== patch) {
-        return verdict(false, true, lastMessage);
-      }
     } else if (outcome.ready === true) {
       return verdict(true, false, "");
     } else {
@@ -1055,12 +1052,9 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
   }
 })()"#;
 
-fn request_gate_verify_script() -> String {
+fn request_gate_verify_script(wait_budget_ms: u64) -> String {
     REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE
-        .replace(
-            "__CODEY_GATE_BUDGET_MS__",
-            &REQUEST_GATE_WAIT_BUDGET_MS.to_string(),
-        )
+        .replace("__CODEY_GATE_BUDGET_MS__", &wait_budget_ms.to_string())
         .replace(
             "__CODEY_GATE_CALL_MS__",
             &REQUEST_GATE_POLL_CALL_MS.to_string(),
@@ -1071,13 +1065,176 @@ fn request_gate_verify_script() -> String {
         )
 }
 
+#[derive(Debug)]
+struct RequestGateBudget {
+    deadline: tokio::time::Instant,
+    call_timeout: Duration,
+    wait_ms: u64,
+}
+
+impl RequestGateBudget {
+    fn with_wait(wait: Duration) -> Self {
+        let call_timeout = wait + REQUEST_GATE_CDP_MARGIN;
+        Self {
+            deadline: tokio::time::Instant::now() + call_timeout,
+            call_timeout,
+            wait_ms: wait.as_millis() as u64,
+        }
+    }
+
+    /// 注入关键路径上只确认页面应答、补丁未被替换，不等 request client。
+    fn startup(deadline: tokio::time::Instant) -> Result<Self> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining < MINIMUM_VERIFICATION_BUDGET {
+            anyhow::bail!(
+                "模型请求校验未通过：剩余注入预算不足（remainingMs={}；requiredMs={}）",
+                remaining.as_millis(),
+                MINIMUM_VERIFICATION_BUDGET.as_millis(),
+            );
+        }
+        Ok(Self::with_wait(REQUEST_GATE_MIN_WAIT))
+    }
+
+    fn settle() -> Self {
+        Self::with_wait(REQUEST_GATE_WAIT_BUDGET)
+    }
+
+    fn cdp_failure(&self, error: anyhow::Error) -> VerifyFailure {
+        // 两层超时可能在同一次轮询中到期，诊断不能依赖定时器的返回顺序。
+        let error = if error.is::<tokio::time::error::Elapsed>() {
+            error.context(format!(
+                "模型请求校验未通过：CDP 调用未在响应预算内完成（callBudgetMs={}；pageBudgetMs={}）",
+                self.call_timeout.as_millis(),
+                self.wait_ms,
+            ))
+        } else {
+            error.context("校验模型请求入口失败")
+        };
+        VerifyFailure {
+            reinstall: true,
+            error,
+        }
+    }
+}
+
+async fn verify_request_gate(
+    websocket_url: &str,
+    budget: RequestGateBudget,
+) -> std::result::Result<RequestGateVerdict, VerifyFailure> {
+    let script = request_gate_verify_script(budget.wait_ms);
+    // runtime 的命令超时不含连接阶段；这里对握手、发送与响应统一限时，确保
+    // 先返回明确的 CDP 失败，再由调用方处理重试。
+    let response = tokio::time::timeout_at(
+        budget.deadline,
+        codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+            websocket_url,
+            &script,
+            true,
+            budget.call_timeout,
+        ),
+    )
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|response| response)
+    .map_err(|error| budget.cdp_failure(error))?;
+    let payload = runtime_value(&response)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VerifyFailure {
+            reinstall: true,
+            error: anyhow::anyhow!("模型请求校验未通过：校验响应不可解析"),
+        })?;
+    let verdict: RequestGateVerdict =
+        serde_json::from_str(payload).map_err(|error| VerifyFailure {
+            reinstall: true,
+            error: anyhow::anyhow!("模型请求校验未通过：校验结果反序列化失败（{error}）"),
+        })?;
+    if !verdict.patch_present || verdict.polls == 0 || verdict.reinstall {
+        let message = verdict
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .unwrap_or("未取得有效的模型请求校验结果");
+        return Err(VerifyFailure {
+            reinstall: verdict.reinstall || !verdict.patch_present,
+            error: anyhow::anyhow!("模型请求校验未通过：{message}"),
+        });
+    }
+    Ok(verdict)
+}
+
+fn record_request_gate_verdict(
+    event: &str,
+    target_id: &str,
+    websocket_url: &str,
+    verdict: &RequestGateVerdict,
+    settle_ms: Option<u64>,
+) {
+    // sourceGate/moduleGate 区分源码补丁、模块级 DI 直取与 React 遍历三条
+    // 就绪路径；patchSession 的 pausedRequests/entryDocuments 为零说明 Fetch
+    // 在该构建上没拦到资产流，与「补丁落地但探测不到 client」是两种故障。
+    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+        event,
+        serde_json::json!({
+            "targetId": target_id,
+            "message": verdict.message.as_deref().filter(|message| !message.is_empty()),
+            "waitedMs": verdict.waited_ms,
+            "polls": verdict.polls,
+            "settleMs": settle_ms,
+            "sourceGate": verdict.source_gate,
+            "moduleGate": verdict.module_gate,
+            "patchSession": crate::renderer_asset_patch::session_stats(websocket_url),
+        }),
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestGateSettle {
+    Ready,
+    Exhausted,
+    Abandoned,
+}
+
+/// 页面消失或补丁被替换时放弃：重新注入由看门狗负责，并会带来新的后台轮询。
+async fn settle_request_gate(
+    websocket_url: &str,
+) -> (RequestGateSettle, Option<RequestGateVerdict>) {
+    let mut last = None;
+    for _ in 0..REQUEST_GATE_SETTLE_ROUNDS {
+        match verify_request_gate(websocket_url, RequestGateBudget::settle()).await {
+            Ok(verdict) if verdict.ready => return (RequestGateSettle::Ready, Some(verdict)),
+            Ok(verdict) => last = Some(verdict),
+            Err(_) => return (RequestGateSettle::Abandoned, None),
+        }
+    }
+    (RequestGateSettle::Exhausted, last)
+}
+
+fn spawn_request_gate_settle(target_id: String, websocket_url: Arc<str>) {
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let (settle, verdict) = settle_request_gate(&websocket_url).await;
+        let event = match settle {
+            RequestGateSettle::Ready => "cdp.request_gate_ready",
+            RequestGateSettle::Exhausted => "cdp.request_gate_degraded",
+            RequestGateSettle::Abandoned => return,
+        };
+        if let Some(verdict) = verdict {
+            record_request_gate_verdict(
+                event,
+                &target_id,
+                &websocket_url,
+                &verdict,
+                Some(started.elapsed().as_millis() as u64),
+            );
+        }
+    });
+}
+
 enum AttemptOutcome {
     Injected(InjectedTarget),
     Retry {
         error: anyhow::Error,
         retained: Option<EstablishedInjection>,
-        /// 本轮失败发生在请求入口校验且页面已应答，参与降级预算计次。
-        request_gate_unready: bool,
     },
 }
 
@@ -1088,7 +1245,7 @@ async fn run_injection_attempt(
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
     phase: &AtomicU8,
-    degrade_request_gate: bool,
+    deadline: tokio::time::Instant,
 ) -> AttemptOutcome {
     let bridge = match retained.filter(|bridge| !bridge.pump.is_finished()) {
         Some(bridge) => bridge,
@@ -1101,32 +1258,40 @@ async fn run_injection_attempt(
                     return AttemptOutcome::Retry {
                         error,
                         retained: None,
-                        request_gate_unready: false,
                     };
                 }
             }
         }
     };
-    match verify_injection(&bridge, scripts, phase, degrade_request_gate).await {
-        Ok(injection_statuses) => AttemptOutcome::Injected(InjectedTarget {
-            websocket_url: bridge.websocket_url,
-            pump: bridge.pump,
-            injection_statuses,
-        }),
+    match verify_injection(&bridge, scripts, phase, deadline).await {
+        Ok((injection_statuses, request_gate_ready)) => {
+            if !request_gate_ready {
+                spawn_request_gate_settle(bridge.target_id, bridge.websocket_url.clone());
+            }
+            AttemptOutcome::Injected(InjectedTarget {
+                websocket_url: bridge.websocket_url,
+                pump: bridge.pump,
+                injection_statuses,
+            })
+        }
         Err(failure) if failure.reinstall => {
             // 校验端明确要求重建：显式关掉这条会话，下一轮从头装桥。
-            let request_gate_unready = failure.request_gate_unready;
-            bridge.pump.close().await;
+            if deadline.saturating_duration_since(tokio::time::Instant::now())
+                >= VERIFY_OVERLAY_RESERVED
+            {
+                bridge.pump.close().await;
+            } else {
+                // 临近整轮截止时直接释放泵，避免关闭握手吞掉已取得的校验错误。
+                drop(bridge.pump);
+            }
             AttemptOutcome::Retry {
                 error: failure.error,
                 retained: None,
-                request_gate_unready,
             }
         }
         Err(failure) => AttemptOutcome::Retry {
             error: failure.error,
             retained: Some(bridge),
-            request_gate_unready: failure.request_gate_unready,
         },
     }
 }
@@ -1175,7 +1340,7 @@ async fn establish_injection(
     phase.store(InjectionPhase::InstallBridge as u8, Ordering::Release);
     // 渲染资产补丁先于 bridge：会话内部的覆盖 reload 会重建文档上下文，
     // 先让它完成，bridge 直接装在新文档上，校验拿到的就是补丁后的资产。
-    // 补丁会话失败不阻断注入——请求入口校验会决定降级是否可接受。
+    // 补丁会话失败不阻断注入：请求入口门禁仍可由会话工具的运行时遍历装上。
     let paused_start = hold.is_some();
     let patch_result = crate::renderer_asset_patch::install_renderer_asset_patch(
         &websocket_url,
@@ -1234,110 +1399,52 @@ async fn verify_injection(
     bridge: &EstablishedInjection,
     scripts: &PreparedInjectionScripts,
     phase: &AtomicU8,
-    degrade_request_gate: bool,
-) -> std::result::Result<Arc<[InjectionScriptStatus]>, VerifyFailure> {
-    // 请求入口 gate 由渲染资产补丁（源码级）或会话工具（运行时遍历）安装；
-    // 两者都缺失时按页面侧裁决继续轮询，超过降级预算后放行本轮注入。校验脚本
-    // 自身在页面内有界等待，一次等待耗尽预算即等价于旧版「连续多轮不就绪」。
+    deadline: tokio::time::Instant,
+) -> std::result::Result<(Arc<[InjectionScriptStatus]>, bool), VerifyFailure> {
+    // 请求入口 gate 由渲染资产补丁（源码级）或会话工具（运行时遍历）安装。
+    // 这里只要求补丁在位、页面应答；补丁缺失、校验未开始或 CDP 未应答才重试。
     phase.store(InjectionPhase::VerifyRequestGate as u8, Ordering::Release);
-    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
-        &bridge.websocket_url,
-        &request_gate_verify_script(),
-        true,
-        REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT,
-    )
-    .await
-    .map_err(|error| VerifyFailure {
-        // CDP 层失败（连接断开、evaluate 自身异常）意味着这条桥已不可用。
-        reinstall: true,
-        request_gate_unready: false,
-        error: error.context("校验模型请求入口失败"),
+    let budget = RequestGateBudget::startup(deadline).map_err(|error| VerifyFailure {
+        reinstall: false,
+        error,
     })?;
-    let payload = runtime_value(&response)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| VerifyFailure {
-            reinstall: true,
-            request_gate_unready: false,
-            error: anyhow::anyhow!("模型请求校验未通过：校验响应不可解析"),
-        })?;
-    let verdict: RequestGateVerdict =
-        serde_json::from_str(payload).map_err(|error| VerifyFailure {
-            reinstall: true,
-            request_gate_unready: false,
-            error: anyhow::anyhow!("模型请求校验未通过：校验结果反序列化失败（{error}）"),
-        })?;
+    let verdict = verify_request_gate(&bridge.websocket_url, budget).await?;
     if verdict.ready {
-        // 成功路径的画像与补丁会话统计一并落盘：sourceGate/moduleGate 区分源
-        // 码补丁、模块级 DI 直取与 React 遍历三条就绪路径，entryDocuments 区分
-        // 覆盖重载是否发生，是后续启动优化「省掉的是哪一段」的依据。
-        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+        record_request_gate_verdict(
             "cdp.request_gate_ready",
-            serde_json::json!({
-                "targetId": bridge.target_id,
-                "waitedMs": verdict.waited_ms,
-                "polls": verdict.polls,
-                "sourceGate": verdict.source_gate,
-                "moduleGate": verdict.module_gate,
-                "patchSession": crate::renderer_asset_patch::session_stats(
-                    bridge.websocket_url.as_ref()
-                ),
-            }),
+            &bridge.target_id,
+            &bridge.websocket_url,
+            &verdict,
+            None,
         );
-    } else {
-        let message = verdict
-            .message
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| "模型请求校验未就绪".to_string());
-        // 页内等待耗尽预算等价于「页面持续应答却长期拿不到 client」；重装裁决
-        // 永远走整轮重建，不参与降级。
-        let in_page_wait_exhausted =
-            !verdict.reinstall && verdict.waited_ms >= REQUEST_GATE_WAIT_BUDGET_MS;
-        if !verdict.reinstall && (degrade_request_gate || in_page_wait_exhausted) {
-            // 页面持续应答却长期拿不到 request client：按降级完成注入。
-            // 页面侧补丁或会话工具之后若就位，gate 仍会自行装上；当前则让
-            // CLI 包装层的 stdin 改写继续承担模型路由。
-            // 附上补丁会话的拦截统计：pausedRequests/entryDocuments 为零说明
-            // Fetch 在该构建上根本没拦到资产流，与「补丁落地但探测不到
-            // client」是两种不同故障。
-            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                "cdp.request_gate_degraded",
-                serde_json::json!({
-                    "targetId": bridge.target_id,
-                    "reinstall": verdict.reinstall,
-                    "message": message,
-                    "waitedMs": verdict.waited_ms,
-                    "polls": verdict.polls,
-                    "patchSession": crate::renderer_asset_patch::session_stats(
-                        bridge.websocket_url.as_ref()
-                    ),
-                }),
-            );
-        } else {
-            return Err(VerifyFailure {
-                reinstall: verdict.reinstall,
-                request_gate_unready: true,
-                error: anyhow::anyhow!("模型请求校验未通过：{message}"),
-            });
-        }
     }
     phase.store(InjectionPhase::VerifyOverlay as u8, Ordering::Release);
-    ensure_settings_overlay_ready(&bridge.websocket_url)
-        .await
-        .map_err(|error| VerifyFailure {
-            // 浮层由加载器脚本同步生成，缺失说明注入脚本执行失败，只能重装。
-            reinstall: true,
-            error: error.context(format!(
-                "验证 Codex renderer {} 的 Codey 浮层失败",
-                bridge.target_id
-            )),
-            request_gate_unready: false,
-        })?;
+    tokio::time::timeout_at(
+        deadline - INJECTION_FINISH_MARGIN,
+        ensure_settings_overlay_ready(&bridge.websocket_url),
+    )
+    .await
+    .map_err(|_| VerifyFailure {
+        reinstall: true,
+        error: anyhow::anyhow!("验证 Codey 浮层超时：剩余注入预算已耗尽"),
+    })?
+    .map_err(|error| VerifyFailure {
+        // 浮层由加载器脚本同步生成，缺失说明注入脚本执行失败，只能重装。
+        reinstall: true,
+        error: error.context(format!(
+            "验证 Codex renderer {} 的 Codey 浮层失败",
+            bridge.target_id
+        )),
+    })?;
     // Status probing is diagnostic-only. Keep it out of the critical startup
     // path: the bridge and overlay checks above prove injection is usable, and
     // the existing refresh_injection_statuses command fills in the real state
     // once the UI asks for it.
     phase.store(InjectionPhase::ReadStatuses as u8, Ordering::Release);
-    Ok(scripts.statuses_with_error("启动后复核注入状态"))
+    Ok((
+        scripts.statuses_with_error("启动后复核注入状态"),
+        verdict.ready,
+    ))
 }
 
 impl PreparedInjectionScripts {
@@ -2217,23 +2324,234 @@ assert.equal(nextPage.window.attempts, 1);
         assert!(!failure(InjectionPhase::VerifyRequestGate, 2).debug_endpoint_unreachable());
     }
 
+    async fn mock_request_gate(
+        reply: Option<serde_json::Value>,
+        stall_handshake: bool,
+    ) -> (String, tokio::task::JoinHandle<u64>) {
+        let (url, server) = mock_request_gate_sequence(vec![reply], stall_handshake).await;
+        (
+            url,
+            tokio::spawn(async move { server.await.unwrap().pop().unwrap() }),
+        )
+    }
+
+    /// 每个回复对应一次独立连接；`None` 表示接受校验后不再应答。
+    async fn mock_request_gate_sequence(
+        replies: Vec<Option<serde_json::Value>>,
+        stall_handshake: bool,
+    ) -> (String, tokio::task::JoinHandle<Vec<u64>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut budgets = Vec::new();
+            for reply in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                if stall_handshake {
+                    std::future::pending::<()>().await;
+                }
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let message = socket.next().await.unwrap().unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "Runtime.evaluate");
+                assert_eq!(request["params"]["awaitPromise"], true);
+                let script = request["params"]["expression"].as_str().unwrap();
+                budgets.push(
+                    script
+                        .split_once("const hostBudgetMs = ")
+                        .unwrap()
+                        .1
+                        .split_once(';')
+                        .unwrap()
+                        .0
+                        .parse()
+                        .unwrap(),
+                );
+                let Some(reply) = reply else {
+                    std::future::pending::<()>().await;
+                    drop(socket);
+                    return budgets;
+                };
+                let value = if reply.is_object() {
+                    json!(reply.to_string())
+                } else {
+                    reply
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":{"result":{"value":value}}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            budgets
+        });
+        (format!("ws://{address}"), server)
+    }
+
     #[test]
-    fn request_gate_degrades_only_after_sustained_unreadiness() {
-        assert!(!should_degrade_request_gate(0, None));
-        assert!(!should_degrade_request_gate(
-            REQUEST_GATE_DEGRADE_MIN_FAILURES,
-            Some(Duration::from_millis(1))
-        ));
-        assert!(!should_degrade_request_gate(
-            REQUEST_GATE_DEGRADE_MIN_FAILURES - 1,
-            Some(REQUEST_GATE_DEGRADE_AFTER * 4)
-        ));
-        // 补丁根本没注入（reinstall）时同样计入连续不就绪：否则会一路重装到
-        // deadline，并在同一 target 上反复叠加补丁会话。
-        assert!(should_degrade_request_gate(
-            REQUEST_GATE_DEGRADE_MIN_FAILURES,
-            Some(REQUEST_GATE_DEGRADE_AFTER)
-        ));
+    fn startup_gate_check_never_waits_for_the_request_client() {
+        let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
+        assert_eq!(
+            RequestGateBudget::startup(deadline).unwrap().wait_ms,
+            REQUEST_GATE_MIN_WAIT.as_millis() as u64
+        );
+        let settle = RequestGateBudget::settle();
+        assert_eq!(settle.wait_ms, REQUEST_GATE_WAIT_BUDGET.as_millis() as u64);
+        assert_eq!(
+            settle.call_timeout,
+            REQUEST_GATE_WAIT_BUDGET + REQUEST_GATE_CDP_MARGIN
+        );
+    }
+
+    #[tokio::test]
+    async fn request_gate_settles_in_background_until_ready_or_abandoned() {
+        use serde_json::json;
+        let not_ready = json!({"ready":false,"patchPresent":true,"polls":3,"budgetExhausted":true});
+        let ready = json!({"ready":true,"patchPresent":true,"polls":1});
+        let (url, server) =
+            mock_request_gate_sequence(vec![Some(not_ready.clone()), Some(ready)], false).await;
+        assert_eq!(settle_request_gate(&url).await.0, RequestGateSettle::Ready);
+        assert_eq!(
+            server.await.unwrap(),
+            vec![REQUEST_GATE_WAIT_BUDGET.as_millis() as u64; 2]
+        );
+
+        let (url, server) = mock_request_gate_sequence(
+            vec![Some(not_ready.clone()); REQUEST_GATE_SETTLE_ROUNDS as usize],
+            false,
+        )
+        .await;
+        assert_eq!(
+            settle_request_gate(&url).await.0,
+            RequestGateSettle::Exhausted
+        );
+        server.await.unwrap();
+
+        // 补丁被替换说明页面已重载，重新注入归看门狗，后台不再轮询。
+        let (url, server) = mock_request_gate_sequence(
+            vec![Some(
+                json!({"ready":false,"patchPresent":false,"polls":1,"reinstall":true}),
+            )],
+            false,
+        )
+        .await;
+        assert_eq!(
+            settle_request_gate(&url).await.0,
+            RequestGateSettle::Abandoned
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_gate_ready_is_immediate_and_invalid_verdicts_require_retry() {
+        use serde_json::json;
+        for (reply, expected_success) in [
+            (json!({"ready":true,"patchPresent":true,"polls":1}), true),
+            (json!({"ready":false,"patchPresent":true,"polls":1}), true),
+            (
+                json!({"ready":false,"patchPresent":false,"polls":1,"budgetExhausted":true}),
+                false,
+            ),
+            (
+                json!({"ready":true,"patchPresent":true,"polls":1,"reinstall":true}),
+                false,
+            ),
+            (
+                json!({"ready":false,"patchPresent":true,"polls":0,"budgetExhausted":true}),
+                false,
+            ),
+            (json!(true), false),
+            (json!("invalid JSON"), false),
+        ] {
+            let (url, server) = mock_request_gate(Some(reply), false).await;
+            let budget =
+                RequestGateBudget::startup(tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT)
+                    .unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), verify_request_gate(&url, budget))
+                    .await
+                    .expect("an immediate renderer response must not wait for the gate budget");
+            assert_eq!(result.is_ok(), expected_success, "{result:?}");
+            assert_eq!(
+                server.await.unwrap(),
+                REQUEST_GATE_MIN_WAIT.as_millis() as u64
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_gate_classifies_both_timeout_layers_without_losing_the_cause() {
+        let budget =
+            RequestGateBudget::startup(tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT)
+                .unwrap();
+        for inner_timeout in [false, true] {
+            let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .unwrap_err();
+            let mut error = anyhow::Error::from(elapsed);
+            if inner_timeout {
+                error = error.context("timed out waiting for CDP command Runtime.evaluate");
+            }
+            let failure = budget.cdp_failure(error);
+            assert!(failure.reinstall);
+            assert!(failure.error.is::<tokio::time::error::Elapsed>());
+            let detail = failure.error.to_string();
+            assert!(detail.contains("CDP 调用未在响应预算内完成"), "{detail}");
+            assert!(
+                detail.contains("callBudgetMs=1200；pageBudgetMs=200"),
+                "{detail}"
+            );
+        }
+
+        let failure = budget.cdp_failure(anyhow::anyhow!("connection refused"));
+        assert!(failure.reinstall);
+        assert_eq!(failure.error.to_string(), "校验模型请求入口失败");
+        assert_eq!(failure.error.root_cause().to_string(), "connection refused");
+    }
+
+    #[tokio::test]
+    async fn request_gate_unresponsive_cdp_never_degrades_including_handshake() {
+        for stall_handshake in [false, true] {
+            let (url, server) = mock_request_gate(None, stall_handshake).await;
+            let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
+            let failure = tokio::time::timeout(
+                Duration::from_secs(3),
+                verify_request_gate(&url, RequestGateBudget::startup(deadline).unwrap()),
+            )
+            .await
+            .expect("the whole CDP call must finish before the injection deadline")
+            .unwrap_err();
+            server.abort();
+            assert!(failure.reinstall);
+            let detail = failure.error.to_string();
+            assert!(detail.contains("CDP 调用未在响应预算内完成"), "{detail}");
+            assert!(detail.contains("pageBudgetMs=200"), "{detail}");
+            assert!(deadline - tokio::time::Instant::now() >= VERIFY_OVERLAY_RESERVED);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_gate_insufficient_budget_fails_before_connecting() {
+        let error = RequestGateBudget::startup(
+            tokio::time::Instant::now() + MINIMUM_VERIFICATION_BUDGET - Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("剩余注入预算不足"));
+        let detail = injection_deadline_detail(
+            InjectionPhase::VerifyRequestGate,
+            CDP_INJECTION_TIMEOUT,
+            CDP_INJECTION_TIMEOUT,
+            Duration::ZERO,
+        );
+        assert!(detail.contains("phase=verifyRequestGate"));
+        assert!(detail.contains("attemptMs=30000"));
+        assert!(detail.contains("remainingMs=0"));
     }
 
     #[test]
@@ -2242,25 +2560,56 @@ assert.equal(nextPage.window.attempts, 1);
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const script = JSON.parse(process.argv[1]);
-const run = async (patch, waitMs = 40) => {
-  // 脚本在页内自轮询：vm 里补 setTimeout，并用 __codeyRequestGateWaitMs 把
-  // 等待预算压到几十毫秒，避免测试干等真实降级预算。
-  const context = vm.createContext({ window: {}, console, setTimeout });
+const hostBudgetMs = Number(process.argv[2]);
+const run = async (patch, waitMs = 40, onPending = () => {}) => {
+  // 只在触发下一个定时器时推进时钟，避免 CI 调度延迟耗尽测试预算。
+  let now = 0;
+  const timers = [];
+  const context = vm.createContext({
+    window: {}, console, Date: { now: () => now },
+    setTimeout(callback, delay) { timers.push({ at: now + delay, callback }); },
+  });
   context.window.__codeyRequestGateWaitMs = waitMs;
   context.window.__codeyModelWhitelistPatch = patch;
-  // 判定以 JSON 字符串返回（Runtime.evaluate 未开 returnByValue 时对象不回传）。
-  return JSON.parse(await vm.runInContext(script, context));
+  let settled = false;
+  let result;
+  let failure;
+  const pending = vm.runInContext(script, context);
+  onPending(context);
+  Promise.resolve(pending).then(
+    (value) => { result = JSON.parse(value); settled = true; },
+    (error) => { failure = error; settled = true; },
+  );
+  while (!settled) {
+    // 先让所有 Promise 回调完成，再运行最近的定时器。
+    await new Promise(setImmediate);
+    if (settled) break;
+    timers.sort((left, right) => left.at - right.at);
+    const timer = timers.shift();
+    assert.ok(timer, 'request-gate verification stalled without a timer');
+    now = timer.at;
+    timer.callback();
+  }
+  if (failure) throw failure;
+  return result;
 };
 (async () => {
-  // 补丁未注入：只有整轮重装能修复。
-  for (const patch of [null, undefined, {}]) {
-    const verdict = await run(patch);
-    assert.equal(verdict.ready, false);
-    assert.equal(verdict.reinstall, true);
+  // 补丁未注入时，即使等待预算已耗尽，也必须要求重装。
+  for (const waitMs of [0, 40]) {
+    for (const patch of [null, undefined, {}]) {
+      const verdict = await run(patch, waitMs);
+      assert.equal(verdict.ready, false);
+      assert.equal(verdict.reinstall, true);
+      assert.equal(verdict.polls, 0);
+      assert.equal(verdict.patchPresent, false);
+    }
   }
   const ready = await run({ ensureRequestGate: () => Promise.resolve(true) });
   assert.equal(ready.ready, true);
   assert.equal(ready.polls, 1);
+  assert.equal(ready.waitedMs, 0);
+  assert.equal(ready.patchPresent, true);
+  assert.equal(ready.budgetExhausted, false);
   // 门禁在等待窗口内就绪：页内检出即返回，不必等宿主下一轮探测。
   let calls = 0;
   const lateReady = await run({
@@ -2274,23 +2623,45 @@ const run = async (patch, waitMs = 40) => {
   assert.equal(polled.ready, false);
   assert.equal(polled.reinstall, false);
   assert.equal(polled.message, "当前 Codex 暂不支持模型请求校验");
-  assert.ok(polled.waitedMs >= 40);
-  // 校验等待期间补丁被脚本重放替换：旧实例的失败必须按重装处理。
-  const context = vm.createContext({ window: {}, console, setTimeout });
-  context.window.__codeyRequestGateWaitMs = 40;
-  context.window.__codeyModelWhitelistPatch = {
-    ensureRequestGate: () => Promise.reject(new Error("模型请求校验已重新加载")),
-  };
-  const pending = vm.runInContext(script, context);
-  context.window.__codeyModelWhitelistPatch = { ensureRequestGate: () => Promise.resolve(true) };
-  assert.equal(JSON.parse(await pending).reinstall, true);
+  assert.equal(polled.waitedMs, 40);
+  assert.equal(polled.budgetExhausted, true);
+  // 页面配置只能缩短等待，不能延长宿主为本轮分配的预算。
+  for (const override of [hostBudgetMs * 10, undefined, NaN, -1]) {
+    const capped = await run(notReady, override);
+    assert.ok(capped.waitedMs <= hostBudgetMs);
+  }
+  const capped = await run(notReady, hostBudgetMs * 10);
+  assert.equal(capped.waitedMs, hostBudgetMs);
+  const notAttempted = await run(notReady, 0);
+  assert.equal(notAttempted.polls, 0);
+  // 调用一直挂起时，也必须在预算耗尽后返回。
+  const timedOut = await run({ ensureRequestGate: () => new Promise(() => {}) });
+  assert.equal(timedOut.ready, false);
+  assert.equal(timedOut.reinstall, false);
+  assert.equal(timedOut.waitedMs, 40);
+  assert.equal(timedOut.message, "模型请求校验探测超时");
+  // 补丁在成功、失败或超时返回前被替换，都不能降级或误报就绪。
+  for (const ensureRequestGate of [
+    () => Promise.reject(new Error("模型请求校验已重新加载")),
+    () => Promise.resolve(true),
+    () => Promise.resolve(false),
+    () => new Promise(() => {}),
+  ]) {
+    const replaced = await run({ ensureRequestGate }, 40, (context) => {
+      context.window.__codeyModelWhitelistPatch = { ensureRequestGate: () => Promise.resolve(true) };
+    });
+    assert.equal(replaced.reinstall, true);
+    assert.equal(replaced.ready, false);
+    assert.equal(replaced.patchPresent, false);
+  }
 })().catch((error) => { console.error(error); process.exit(1); });
 "#;
         let output = std::process::Command::new("node")
             .args([
                 "-e",
                 harness,
-                &serde_json::to_string(&request_gate_verify_script()).unwrap(),
+                &serde_json::to_string(&request_gate_verify_script(1_000)).unwrap(),
+                "1000",
             ])
             .output()
             .expect("Node should run the request-gate verify script harness");

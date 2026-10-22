@@ -3,17 +3,19 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use codey_runtime_core::codex_sqlite::CodexSessionDbDiscoveryCache;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 
+pub(crate) mod file_events;
 mod parser;
 
 use parser::RolloutParseState;
 
 const RECENT_SESSION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const UNKNOWN_PATH_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MAX_RECENT_SESSIONS: usize = 64;
 pub(crate) const MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT: usize = 256;
 
@@ -207,6 +209,9 @@ pub struct RecentSessionEventCache {
     database_discovery: CodexSessionDbDiscoveryCache,
     database_connections: HashMap<PathBuf, CachedDatabaseConnection>,
     last_snapshot: Option<Arc<RecentSessionEvents>>,
+    unknown_path_discovery_after: Option<Instant>,
+    #[cfg(test)]
+    discovery_count: usize,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -225,7 +230,38 @@ impl RecentSessionEventCache {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default();
         let rollouts = self.recent_codey_rollouts(home, recent_after);
-        self.refresh_rollouts(rollouts)
+        let snapshot = self.refresh_rollouts(rollouts);
+        self.unknown_path_discovery_after = Some(Instant::now() + UNKNOWN_PATH_DISCOVERY_INTERVAL);
+        snapshot
+    }
+
+    /// File events are hints: unknown paths and database changes still use the
+    /// authoritative session index. Repeated unknown paths share a short discovery
+    /// interval; explicit database hints and full refreshes always bypass it.
+    /// Known paths reuse every unaffected parser.
+    pub(crate) fn refresh_changes(
+        &mut self,
+        home: &Path,
+        changes: file_events::SessionFileChanges,
+    ) -> Arc<RecentSessionEvents> {
+        let unknown_path_due = self
+            .unknown_path_discovery_after
+            .is_none_or(|deadline| Instant::now() >= deadline)
+            && changes
+                .rollout_paths
+                .iter()
+                .any(|path| !self.rollouts.contains_key(path));
+        if self.last_snapshot.is_none() || changes.discovery_required || unknown_path_due {
+            return self.refresh(home);
+        }
+        let mut rollouts = self
+            .rollouts
+            .iter()
+            .map(|(path, cached)| (cached.session_id.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        rollouts.sort();
+        let dirty_paths = changes.rollout_paths.into_iter().collect::<HashSet<_>>();
+        self.refresh_selected_rollouts(rollouts, Some(&dirty_paths))
     }
 
     pub(crate) fn release_database_connections(&mut self) {
@@ -233,6 +269,10 @@ impl RecentSessionEventCache {
     }
 
     fn recent_codey_rollouts(&mut self, home: &Path, recent_after: i64) -> Vec<(String, PathBuf)> {
+        #[cfg(test)]
+        {
+            self.discovery_count += 1;
+        }
         let database_paths = self.session_database_paths(home);
         let mut rollouts = Vec::new();
         for database_path in database_paths {
@@ -302,6 +342,14 @@ impl RecentSessionEventCache {
     }
 
     fn refresh_rollouts(&mut self, rollouts: Vec<(String, PathBuf)>) -> Arc<RecentSessionEvents> {
+        self.refresh_selected_rollouts(rollouts, None)
+    }
+
+    fn refresh_selected_rollouts(
+        &mut self,
+        rollouts: Vec<(String, PathBuf)>,
+        dirty_paths: Option<&HashSet<PathBuf>>,
+    ) -> Arc<RecentSessionEvents> {
         let active_paths = rollouts
             .iter()
             .map(|(_, path)| path.clone())
@@ -315,6 +363,9 @@ impl RecentSessionEventCache {
         self.rollouts.retain(|path, _| active_paths.contains(path));
 
         for (session_id, rollout_path) in &rollouts {
+            if dirty_paths.is_some_and(|paths| !paths.contains(rollout_path)) {
+                continue;
+            }
             let Ok(metadata) = fs::metadata(rollout_path) else {
                 snapshot_changed = true;
                 self.rollouts.remove(rollout_path);
@@ -565,15 +616,35 @@ fn query_recent_codey_rollouts(
     recent_after: i64,
 ) -> rusqlite::Result<Vec<(String, PathBuf)>> {
     let mut rollouts = Vec::new();
+    let has_thread_source = {
+        let mut statement = connection.prepare_cached("PRAGMA table_info(threads)")?;
+        let mut columns = statement.query([])?;
+        let mut found = false;
+        while let Some(column) = columns.next()? {
+            if column.get::<_, String>(1)? == "thread_source" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
     // SQLite columns can contain values that violate their declared affinity.
     // Ignore only malformed rows here; prepare/query failures still invalidate
     // the cached connection so a replaced database is reopened next poll.
-    let mut statement = connection.prepare_cached(
+    // 明确的子代理不能占用用户会话的数量上限；旧索引和未知来源仍由 rollout 核验。
+    let query = if has_thread_source {
         "SELECT id, rollout_path FROM threads \
          WHERE archived=0 AND updated_at >= ?1 \
            AND typeof(id)='text' AND typeof(rollout_path)='text' \
-         ORDER BY updated_at DESC LIMIT ?2",
-    )?;
+           AND (thread_source IS NULL OR thread_source <> 'subagent') \
+         ORDER BY updated_at DESC LIMIT ?2"
+    } else {
+        "SELECT id, rollout_path FROM threads \
+         WHERE archived=0 AND updated_at >= ?1 \
+           AND typeof(id)='text' AND typeof(rollout_path)='text' \
+         ORDER BY updated_at DESC LIMIT ?2"
+    };
+    let mut statement = connection.prepare_cached(query)?;
     let rows = statement.query_map(params![recent_after, MAX_RECENT_SESSIONS], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -638,6 +709,97 @@ mod tests {
 
         connection.execute_batch("DROP TABLE threads;").unwrap();
         assert!(query_recent_codey_rollouts(&connection, home, 0).is_err());
+    }
+
+    #[test]
+    fn recent_rollout_query_excludes_explicit_subagents_before_the_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE threads(id TEXT, rollout_path TEXT, archived INTEGER, updated_at INTEGER, thread_source TEXT);",
+        ).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for index in 0..=MAX_RECENT_SESSIONS {
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 0, ?3, 'subagent')",
+                    params![
+                        format!("child-{index}"),
+                        format!("child-{index}.jsonl"),
+                        now
+                    ],
+                )
+                .unwrap();
+        }
+        for (id, source) in [
+            ("root", Some("user")),
+            ("legacy", None),
+            ("unknown", Some("future-source")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 0, ?3, ?4)",
+                    params![id, format!("{id}.jsonl"), now - 60, source],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('archived', 'archived.jsonl', 1, ?1, 'user')",
+                [now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('old', 'old.jsonl', 0, ?1, 'user')",
+                [now - 90_000],
+            )
+            .unwrap();
+
+        let ids = query_recent_codey_rollouts(&connection, Path::new("home"), now - 86_400)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids,
+            HashSet::from(["root".into(), "legacy".into(), "unknown".into()])
+        );
+    }
+
+    #[test]
+    fn recent_session_cache_keeps_nine_roots_among_fifty_five_subagents() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = create_session_database(temp.path());
+        database
+            .execute_batch("ALTER TABLE threads ADD COLUMN thread_source TEXT;")
+            .unwrap();
+        for index in 0..64 {
+            let id = format!("session-{index}");
+            let path = temp.path().join(format!("{id}.jsonl"));
+            let source = if index < 55 { "subagent" } else { "user" };
+            fs::write(&path, format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"thread_source\":\"{source}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}}}\n"
+            )).unwrap();
+            index_rollout(&database, &id, &path);
+            database
+                .execute(
+                    "UPDATE threads SET thread_source=?1 WHERE id=?2",
+                    params![source, id],
+                )
+                .unwrap();
+        }
+        let snapshot = RecentSessionEventCache::default().refresh(temp.path());
+        assert_eq!(snapshot.session_statuses.len(), 9);
+        assert_eq!(snapshot.completed_turns.len(), 9);
+        assert!(
+            snapshot
+                .completed_turns
+                .iter()
+                .all(|turn| turn.session_id[8..].parse::<usize>().unwrap() >= 55)
+        );
     }
 
     #[test]
@@ -982,5 +1144,207 @@ mod tests {
 
         cache.release_database_connections();
         assert!(cache.database_connections.is_empty());
+    }
+
+    #[test]
+    fn dirty_rollouts_preserve_other_cached_sessions_without_database_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("first.jsonl");
+        let second_path = temp.path().join("second.jsonl");
+        for path in [&first_path, &second_path] {
+            fs::write(path, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn\"}}\n").unwrap();
+        }
+        let rollouts = || {
+            vec![
+                ("first".to_string(), first_path.clone()),
+                ("second".to_string(), second_path.clone()),
+            ]
+        };
+        let mut cache = RecentSessionEventCache::default();
+        cache.refresh_rollouts(rollouts());
+        for path in [&first_path, &second_path] {
+            writeln!(fs::OpenOptions::new().append(true).open(path).unwrap(),
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}}}")
+                .unwrap();
+        }
+        let snapshot = cache.refresh_changes(
+            temp.path(),
+            file_events::SessionFileChanges {
+                rollout_paths: vec![first_path.clone()],
+                discovery_required: false,
+            },
+        );
+        assert_eq!(cache.parse_count, 3);
+        assert_eq!(cache.incremental_parse_count, 1);
+        assert_eq!(cache.database_open_count, 0);
+        assert_eq!(
+            snapshot.session_statuses["first"],
+            SessionLifecycleStatus::Idle
+        );
+        assert_eq!(
+            snapshot.session_statuses["second"],
+            SessionLifecycleStatus::Running
+        );
+        assert_eq!(snapshot.started_turns.len(), 2);
+        let unchanged =
+            cache.refresh_changes(temp.path(), file_events::SessionFileChanges::default());
+        assert!(Arc::ptr_eq(&snapshot, &unchanged));
+        let snapshot = cache.refresh_rollouts(rollouts());
+        assert_eq!(
+            snapshot.session_statuses["second"],
+            SessionLifecycleStatus::Idle
+        );
+    }
+
+    fn create_session_database(home: &Path) -> Connection {
+        let database = Connection::open(home.join("state_5.sqlite")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        database
+    }
+
+    fn index_rollout(database: &Connection, id: &str, path: &Path) {
+        let updated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        database
+            .execute(
+                "INSERT INTO threads (id, rollout_path, archived, updated_at)
+                 VALUES (?1, ?2, 0, ?3)",
+                params![id, path.to_string_lossy(), updated_at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unknown_path_discovery_is_throttled_without_delaying_known_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = create_session_database(temp.path());
+        let known = temp.path().join("known.jsonl");
+        let unknown = [
+            temp.path().join("unknown-a.jsonl"),
+            temp.path().join("unknown-b.jsonl"),
+        ];
+        for path in std::iter::once(&known).chain(unknown.iter()) {
+            fs::write(path, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn\"}}\n").unwrap();
+        }
+        index_rollout(&database, "known", &known);
+        let mut cache = RecentSessionEventCache::default();
+        cache.refresh(temp.path());
+        // Keep the deadline deterministic even if the test process is paused.
+        cache.unknown_path_discovery_after = Some(Instant::now() + Duration::from_secs(60));
+        for index in 0..20 {
+            cache.refresh_changes(
+                temp.path(),
+                file_events::SessionFileChanges {
+                    rollout_paths: vec![unknown[index % unknown.len()].clone()],
+                    discovery_required: false,
+                },
+            );
+        }
+        assert_eq!(cache.discovery_count, 1);
+        assert_eq!(cache.parse_count, 1);
+
+        writeln!(fs::OpenOptions::new().append(true).open(&known).unwrap(),
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}}}")
+            .unwrap();
+        let snapshot = cache.refresh_changes(
+            temp.path(),
+            file_events::SessionFileChanges {
+                rollout_paths: vec![unknown[0].clone(), known],
+                discovery_required: false,
+            },
+        );
+        assert_eq!(cache.discovery_count, 1);
+        assert_eq!(cache.incremental_parse_count, 1);
+        assert_eq!(
+            snapshot.session_statuses["known"],
+            SessionLifecycleStatus::Idle
+        );
+        assert_eq!(snapshot.session_statuses.len(), 1);
+
+        index_rollout(&database, "unknown-a", &unknown[0]);
+        cache.unknown_path_discovery_after = Some(Instant::now());
+        let snapshot = cache.refresh_changes(
+            temp.path(),
+            file_events::SessionFileChanges {
+                rollout_paths: vec![unknown[0].clone()],
+                discovery_required: false,
+            },
+        );
+        assert_eq!(cache.discovery_count, 2);
+        assert_eq!(
+            snapshot.session_statuses["unknown-a"],
+            SessionLifecycleStatus::Running
+        );
+        assert!(!snapshot.session_statuses.contains_key("unknown-b"));
+    }
+
+    #[test]
+    fn database_hints_and_full_refresh_bypass_unknown_path_throttling() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = create_session_database(temp.path());
+        let mut cache = RecentSessionEventCache::default();
+        cache.refresh(temp.path());
+        for (index, id) in ["database-hint", "fallback"].into_iter().enumerate() {
+            let path = temp.path().join(format!("{id}.jsonl"));
+            fs::write(&path, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}\n").unwrap();
+            cache.unknown_path_discovery_after = Some(Instant::now() + Duration::from_secs(60));
+            cache.refresh_changes(
+                temp.path(),
+                file_events::SessionFileChanges {
+                    rollout_paths: vec![path.clone()],
+                    discovery_required: false,
+                },
+            );
+            assert_eq!(cache.discovery_count, index + 1);
+            index_rollout(&database, id, &path);
+
+            let snapshot = if index == 0 {
+                cache.refresh_changes(
+                    temp.path(),
+                    file_events::SessionFileChanges {
+                        rollout_paths: Vec::new(),
+                        discovery_required: true,
+                    },
+                )
+            } else {
+                cache.refresh(temp.path())
+            };
+            assert_eq!(cache.discovery_count, index + 2);
+            assert!(
+                snapshot
+                    .completed_turns
+                    .iter()
+                    .any(|turn| turn.session_id == id)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_file_hints_do_not_bypass_the_session_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let unknown = temp.path().join("unknown.jsonl");
+        fs::write(&unknown, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}\n").unwrap();
+        let mut cache = RecentSessionEventCache::default();
+        cache.refresh(temp.path());
+        let snapshot = cache.refresh_changes(
+            temp.path(),
+            file_events::SessionFileChanges {
+                rollout_paths: vec![unknown],
+                discovery_required: false,
+            },
+        );
+        assert!(snapshot.completed_turns.is_empty());
+        assert_eq!(cache.parse_count, 0);
     }
 }

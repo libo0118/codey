@@ -78,6 +78,20 @@ pub(crate) fn native_model_state_for_provider(
     provider: &codex_provider::CurrentProvider,
     home: &std::path::Path,
 ) -> Result<model_catalog::ModelSelectionState, String> {
+    native_model_state_for_provider_in_context(
+        config,
+        provider,
+        home,
+        &model_catalog::CatalogContext::new(&config.codex_app_path),
+    )
+}
+
+pub(crate) fn native_model_state_for_provider_in_context(
+    config: &CodeyConfig,
+    provider: &codex_provider::CurrentProvider,
+    home: &std::path::Path,
+    context: &model_catalog::CatalogContext<'_>,
+) -> Result<model_catalog::ModelSelectionState, String> {
     if config.provider_is_disabled(&provider.id) {
         return Ok(model_catalog::ModelSelectionState::default());
     }
@@ -120,7 +134,7 @@ pub(crate) fn native_model_state_for_provider(
             .model_reasoning_efforts_by_provider
             .get(provider.id.as_str())
     };
-    model_catalog::selection_state_with_manual_models(
+    model_catalog::selection_state_in_context(
         home,
         provider.official,
         upstream_models,
@@ -128,7 +142,7 @@ pub(crate) fn native_model_state_for_provider(
         manual_third_party_models,
         reasoning_efforts,
         Some(&requested_default),
-        &config.codex_app_path,
+        context,
     )
     .map(|state| {
         state.with_upstream_reasoning(Some(

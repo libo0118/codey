@@ -824,12 +824,12 @@ fn windows_package_resume_target(
     }))
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
 /// 包装器向启动器汇报进度的两条通道：回环握手连接和记录文件。任一到达即可确认。
 #[cfg(any(windows, target_os = "macos", test))]
 struct CliWrapperReadiness {
     stream: Option<std::net::TcpStream>,
     marker: Option<std::path::PathBuf>,
+    tcp_deferred: bool,
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -837,20 +837,27 @@ impl CliWrapperReadiness {
     fn begin() -> Self {
         let started = std::time::Instant::now();
         let marker = cli_wrapper_marker_path_from_env(std::env::var_os(CLI_WRAPPER_MARKER_ENV));
-        Self::begin_with_diagnostics(marker, started, connect_cli_wrapper_handshake)
+        Self::begin_with_diagnostics(
+            marker,
+            started,
+            cfg!(windows),
+            connect_cli_wrapper_handshake,
+        )
     }
 
     #[cfg(test)]
     fn begin_with(
         marker: Option<std::path::PathBuf>,
+        prefer_marker: bool,
         connect: impl FnOnce() -> Result<std::net::TcpStream>,
     ) -> Self {
-        Self::begin_with_diagnostics(marker, std::time::Instant::now(), connect)
+        Self::begin_with_diagnostics(marker, std::time::Instant::now(), prefer_marker, connect)
     }
 
     fn begin_with_diagnostics(
         marker: Option<std::path::PathBuf>,
         started: std::time::Instant,
+        prefer_marker: bool,
         connect: impl FnOnce() -> Result<std::net::TcpStream>,
     ) -> Self {
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
@@ -863,28 +870,14 @@ impl CliWrapperReadiness {
         let readiness = Self {
             stream: None,
             marker,
+            tcp_deferred: false,
         };
-        readiness.mark(CliWrapperMarkerStatus::Launching, None);
-        let tcp_available = handshake_tcp_channel_available();
-        let stream = if tcp_available {
-            match connect() {
-                Ok(stream) => Some(stream),
-                Err(error) => {
-                    // 端口被拒绝说明启动器已不再监听（例如 app-server 重启），属正常情况。
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_none_or(|error| error.kind() != std::io::ErrorKind::ConnectionRefused)
-                    {
-                        crate::error_log::record_failure(
-                            "compatibility_fallback",
-                            "connect_cli_wrapper_handshake",
-                            format!("{error:#}"),
-                            serde_json::json!({ "markerPresent": readiness.marker.is_some() }),
-                        );
-                    }
-                    None
-                }
-            }
+        let marker_written = readiness.mark(CliWrapperMarkerStatus::Launching, None);
+        // Windows 回环连接可能受网络隔离影响。只有本次记录写入成功才跳过 TCP，
+        // 启动器仍须等到 Executed 或 Failed；路径已配置不代表文件通道可用。
+        let tcp_required = !prefer_marker || !marker_written;
+        let stream = if tcp_required {
+            readiness.connect_with_diagnostics(marker_written, connect)
         } else {
             None
         };
@@ -892,19 +885,49 @@ impl CliWrapperReadiness {
             "launcher.cli_wrapper_handshake_connect",
             serde_json::json!({
                 "connected": stream.is_some(),
-                "tcpChannelAvailable": tcp_available,
+                "tcpAttempted": tcp_required,
+                "markerWritten": marker_written,
                 "elapsedMs": started.elapsed().as_millis(),
             }),
         );
         Self {
             stream,
+            tcp_deferred: !tcp_required,
             ..readiness
         }
     }
 
-    fn mark(&self, status: CliWrapperMarkerStatus, failure: Option<&CliWrapperFailure>) {
+    fn connect_with_diagnostics(
+        &self,
+        marker_written: bool,
+        connect: impl FnOnce() -> Result<std::net::TcpStream>,
+    ) -> Option<std::net::TcpStream> {
+        match connect() {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                // 端口被拒绝说明启动器已不再监听（例如 app-server 重启），属正常情况。
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_none_or(|error| error.kind() != std::io::ErrorKind::ConnectionRefused)
+                {
+                    crate::error_log::record_failure(
+                        "compatibility_fallback",
+                        "connect_cli_wrapper_handshake",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "markerPresent": self.marker.is_some(),
+                            "markerWritten": marker_written,
+                        }),
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn mark(&self, status: CliWrapperMarkerStatus, failure: Option<&CliWrapperFailure>) -> bool {
         let Some(path) = self.marker.as_deref() else {
-            return;
+            return false;
         };
         let mut marker = CliWrapperMarker::new(status);
         if let Some(failure) = failure {
@@ -918,67 +941,53 @@ impl CliWrapperReadiness {
                 format!("{error:#}"),
                 serde_json::json!({ "marker": path, "status": status }),
             );
+            return false;
         }
+        true
     }
 
-    fn mark_executed(&self) {
-        self.mark(CliWrapperMarkerStatus::Executed, None);
+    fn mark_executed(&self) -> bool {
+        self.mark(CliWrapperMarkerStatus::Executed, None)
     }
 
-    fn fail(mut self, failure: &CliWrapperFailure) {
-        self.mark(CliWrapperMarkerStatus::Failed, Some(failure));
-        if let Some(mut stream) = self.stream.take() {
-            let _ = stream.write_all(b"!");
-            let _ = serde_json::to_writer(&mut stream, failure);
-        }
+    fn fail(self, failure: &CliWrapperFailure) {
+        self.finish_with(Some(failure), connect_cli_wrapper_handshake);
     }
 
     /// 记录已执行；随后 drop 关闭握手连接，启动器以 EOF 作为执行确认。
     fn executed(self) {
-        self.mark_executed();
+        self.finish_with(None, connect_cli_wrapper_handshake);
     }
-}
 
-/// Windows 打包（MSIX/商店版）Codex 派生的子进程继承 AppContainer 令牌：
-/// 回环 TCP 出站被网络隔离拦死，握手注定烧满连接预算后超时，且每次启动
-/// 都往错误日志记一条假失败。检测到自己跑在 AppContainer 里就跳过 TCP
-/// 通道，汇报只剩 marker 文件——文件写不受这条隔离影响。
-#[cfg(windows)]
-fn handshake_tcp_channel_available() -> bool {
-    !running_in_app_container()
-}
-
-#[cfg(all(not(windows), any(target_os = "macos", test)))]
-fn handshake_tcp_channel_available() -> bool {
-    true
-}
-
-#[cfg(windows)]
-fn running_in_app_container() -> bool {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token = HANDLE::default();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
-        return false;
+    fn finish_with(
+        mut self,
+        failure: Option<&CliWrapperFailure>,
+        connect: impl FnOnce() -> Result<std::net::TcpStream>,
+    ) {
+        let marker_written = match failure {
+            Some(failure) => self.mark(CliWrapperMarkerStatus::Failed, Some(failure)),
+            None => self.mark_executed(),
+        };
+        // 初次写入成功后，文件仍可能被占用。仅在此前没有尝试 TCP 时补一次有界连接，
+        // 避免丢失最终状态，也不会叠加两次连接重试预算。
+        if !marker_written && self.tcp_deferred {
+            let started = std::time::Instant::now();
+            self.stream = self.connect_with_diagnostics(false, connect);
+            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                "launcher.cli_wrapper_handshake_fallback",
+                serde_json::json!({
+                    "connected": self.stream.is_some(),
+                    "elapsedMs": started.elapsed().as_millis(),
+                }),
+            );
+        }
+        if let Some(failure) = failure
+            && let Some(mut stream) = self.stream.take()
+        {
+            let _ = stream.write_all(b"!");
+            let _ = serde_json::to_writer(&mut stream, failure);
+        }
     }
-    // 让 OwnedHandle 负责关闭；查不到令牌信息时按非隔离进程处理，不影响握手。
-    let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
-    let mut value = 0u32;
-    let mut returned = 0u32;
-    unsafe {
-        GetTokenInformation(
-            HANDLE(token.as_raw_handle()),
-            TokenIsAppContainer,
-            Some((&mut value as *mut u32).cast()),
-            std::mem::size_of::<u32>() as u32,
-            &mut returned,
-        )
-    }
-    .is_ok()
-        && value != 0
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1426,16 +1435,173 @@ mod tests {
     }
 
     #[test]
+    fn windows_cli_wrapper_confirms_execution_and_failure_through_written_marker() {
+        for failure in [None, Some(false), Some(true)] {
+            let temporary = tempfile::tempdir().unwrap();
+            let marker_path = temporary.path().join("wrapper.json");
+            assert!(!marker_path.exists());
+            let readiness =
+                CliWrapperReadiness::begin_with(Some(marker_path.clone()), true, || {
+                    panic!("a successfully written Windows marker must avoid the TCP connection")
+                });
+            assert!(readiness.stream.is_none());
+            assert_eq!(
+                CliWrapperMarker::read(&marker_path)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                CliWrapperMarkerStatus::Launching
+            );
+            if let Some(retryable) = failure {
+                readiness.fail(&CliWrapperFailure {
+                    message: "CLI process creation failed".into(),
+                    retryable,
+                });
+            } else {
+                readiness.executed();
+            }
+            let marker = CliWrapperMarker::read(&marker_path).unwrap().unwrap();
+            assert_eq!(marker.retryable, failure);
+            if failure.is_some() {
+                assert_eq!(marker.status, CliWrapperMarkerStatus::Failed);
+                assert_eq!(
+                    marker.message.as_deref(),
+                    Some("CLI process creation failed")
+                );
+            } else {
+                assert_eq!(marker.status, CliWrapperMarkerStatus::Executed);
+                assert_eq!(marker.message, None);
+            }
+        }
+    }
+
+    #[test]
+    fn windows_cli_wrapper_keeps_tcp_confirmation_when_marker_missing_or_unwritable() {
+        use std::io::Read;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked_destination = temporary.path().join("directory.json");
+        std::fs::create_dir(&blocked_destination).unwrap();
+        let blocked_parent = temporary.path().join("file");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        for marker in [
+            None,
+            Some(blocked_destination),
+            Some(blocked_parent.join("wrapper.json")),
+        ] {
+            for failure in [None, Some(false), Some(true)] {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let readiness = CliWrapperReadiness::begin_with(marker.clone(), true, || {
+                    Ok(std::net::TcpStream::connect(listener.local_addr()?)?)
+                });
+                assert!(readiness.stream.is_some());
+                let (mut receiver, _) = listener.accept().unwrap();
+                receiver
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                if let Some(retryable) = failure {
+                    readiness.fail(&CliWrapperFailure {
+                        message: "CLI process creation failed".into(),
+                        retryable,
+                    });
+                } else {
+                    readiness.executed();
+                }
+                let mut received = Vec::new();
+                receiver.read_to_end(&mut received).unwrap();
+                if let Some(retryable) = failure {
+                    assert_eq!(received.first(), Some(&b'!'));
+                    let failure: CliWrapperFailure =
+                        serde_json::from_slice(&received[1..]).unwrap();
+                    assert_eq!(failure.message, "CLI process creation failed");
+                    assert_eq!(failure.retryable, retryable);
+                } else {
+                    assert!(received.is_empty(), "execution is confirmed by EOF");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_cli_wrapper_falls_back_to_tcp_if_final_marker_write_fails() {
+        use std::io::Read;
+
+        for retryable in [None, Some(false), Some(true)] {
+            let temporary = tempfile::tempdir().unwrap();
+            let marker_path = temporary.path().join("wrapper.json");
+            let readiness =
+                CliWrapperReadiness::begin_with(Some(marker_path.clone()), true, || {
+                    panic!("the initial marker write succeeded")
+                });
+            assert_eq!(
+                CliWrapperMarker::read(&marker_path)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                CliWrapperMarkerStatus::Launching
+            );
+            std::fs::remove_file(&marker_path).unwrap();
+            std::fs::create_dir(&marker_path).unwrap();
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let failure = retryable.map(|retryable| CliWrapperFailure {
+                message: "CLI process creation failed".into(),
+                retryable,
+            });
+            let mut attempted = false;
+            readiness.finish_with(failure.as_ref(), || {
+                attempted = true;
+                Ok(std::net::TcpStream::connect(listener.local_addr()?)?)
+            });
+            assert!(
+                attempted,
+                "the failed final write must use the deferred TCP channel"
+            );
+            let (mut receiver, _) = listener.accept().unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut received = Vec::new();
+            receiver.read_to_end(&mut received).unwrap();
+            if let Some(retryable) = retryable {
+                assert_eq!(received.first(), Some(&b'!'));
+                let failure: CliWrapperFailure = serde_json::from_slice(&received[1..]).unwrap();
+                assert_eq!(failure.message, "CLI process creation failed");
+                assert_eq!(failure.retryable, retryable);
+            } else {
+                assert!(received.is_empty(), "execution is confirmed by EOF");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_wrapper_does_not_repeat_an_exhausted_tcp_connect_budget() {
+        for prefer_marker in [false, true] {
+            let readiness = CliWrapperReadiness::begin_with(None, prefer_marker, || {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+            });
+            readiness.finish_with(None, || {
+                panic!("the connection budget was already used before launching")
+            });
+        }
+    }
+
+    #[test]
     fn cli_wrapper_readiness_writes_marker_even_when_handshake_is_refused() {
         let temporary = tempfile::tempdir().unwrap();
         let marker_path = temporary.path().join("wrapper.json");
-        let readiness = CliWrapperReadiness::begin_with(Some(marker_path.clone()), || {
+        let mut attempted = false;
+        let readiness = CliWrapperReadiness::begin_with(Some(marker_path.clone()), false, || {
+            attempted = true;
             Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "listener already gone",
             )
             .into())
         });
+        assert!(
+            attempted,
+            "other platforms keep TCP even after the marker was written"
+        );
         assert!(readiness.stream.is_none());
         assert_eq!(
             CliWrapperMarker::read(&marker_path)

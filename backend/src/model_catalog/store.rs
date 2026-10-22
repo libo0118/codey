@@ -2,6 +2,75 @@ use super::*;
 
 pub(super) const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 
+/// 同一次操作复用已验证的运行时来源；后续操作重新检查安装切换和程序更新。
+pub(crate) struct CatalogContext<'a> {
+    codex_app_path: &'a str,
+    runtime: std::sync::OnceLock<(Vec<PathBuf>, Option<RuntimeCatalogSource>)>,
+}
+
+impl<'a> CatalogContext<'a> {
+    pub(crate) fn new(codex_app_path: &'a str) -> Self {
+        Self {
+            codex_app_path,
+            runtime: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn runtime(&self) -> &(Vec<PathBuf>, Option<RuntimeCatalogSource>) {
+        self.runtime.get_or_init(|| {
+            #[cfg(not(test))]
+            {
+                let candidates = codex_cli_candidates_for(self.codex_app_path);
+                let source = runtime_catalog_source(&candidates);
+                (candidates, source)
+            }
+            #[cfg(test)]
+            {
+                record_catalog_resolution();
+                let source = catalog_source_for_app(self.codex_app_path);
+                let candidates = source.iter().map(|source| source.path.clone()).collect();
+                (candidates, source)
+            }
+        })
+    }
+
+    pub(super) fn source(&self) -> Option<&RuntimeCatalogSource> {
+        self.runtime().1.as_ref()
+    }
+
+    pub(super) fn candidates(&self) -> &[PathBuf] {
+        &self.runtime().0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CATALOG_OPERATION_COUNTS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+pub(super) fn catalog_operation_counts() -> (usize, usize) {
+    CATALOG_OPERATION_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_catalog_resolution() {
+    CATALOG_OPERATION_COUNTS.with(|counts| {
+        let (resolutions, probes) = counts.get();
+        counts.set((resolutions + 1, probes));
+    });
+}
+
+#[cfg(test)]
+pub(super) fn record_snapshot_probe() {
+    CATALOG_OPERATION_COUNTS.with(|counts| {
+        let (resolutions, probes) = counts.get();
+        counts.set((resolutions, probes + 1));
+    });
+}
+
 /// Only exact catalog IDs carry route capabilities. A raw model name may exist
 /// on several routes and must never inherit capability from a matching suffix.
 pub(crate) fn remote_compaction_models_from_catalog(path: &Path) -> HashSet<String> {
@@ -90,26 +159,34 @@ fn catalog_signature(paths: &[PathBuf]) -> CatalogSignature {
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn read_official_entries(
     home: &Path,
     codex_app_path: &str,
 ) -> Result<std::sync::Arc<Vec<Value>>> {
-    let source = catalog_source_for_app(codex_app_path);
+    read_official_entries_in_context(home, &CatalogContext::new(codex_app_path))
+}
+
+pub(super) fn read_official_entries_in_context(
+    home: &Path,
+    context: &CatalogContext<'_>,
+) -> Result<std::sync::Arc<Vec<Value>>> {
+    let source = context.source();
     let paths = ordered_catalog_sources(home);
     let signature = catalog_signature(&paths);
     let cache = OFFICIAL_ENTRIES_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock()
         && let Some((cached_signature, cached_source, entries)) = guard.as_ref()
         && *cached_signature == signature
-        && *cached_source == source
+        && cached_source.as_ref() == source
     {
         // 缓存命中只递增引用计数；下游要么只读、要么本来就会拷贝出自己的
         // 工作副本，无需整目录深拷贝。
         return Ok(std::sync::Arc::clone(entries));
     }
-    let entries = std::sync::Arc::new(read_official_entries_uncached(&paths, source.as_ref())?);
+    let entries = std::sync::Arc::new(read_official_entries_uncached(&paths, source)?);
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some((signature, source, std::sync::Arc::clone(&entries)));
+        *guard = Some((signature, source.cloned(), std::sync::Arc::clone(&entries)));
     }
     Ok(entries)
 }
@@ -311,14 +388,12 @@ pub(super) fn write_verified_catalog(home: &Path, models: &[Value]) -> Result<us
     verify_written_catalog(home, models, &written)
 }
 
-pub(super) fn write_verified_catalog_for_app(
+pub(super) fn write_verified_catalog_in_context(
     home: &Path,
     models: &[Value],
-    codex_app_path: &str,
+    context: &CatalogContext<'_>,
 ) -> Result<usize> {
-    let source = catalog_source_for_app(codex_app_path)
-        .map(serde_json::to_value)
-        .transpose()?;
+    let source = context.source().map(serde_json::to_value).transpose()?;
     let written = write_catalog_with_source(home, models, source)?;
     verify_written_catalog(home, models, &written)
 }

@@ -671,6 +671,11 @@ fn validated_router_subagent_runtime_config(
         home,
         route_catalog_installed,
         Some(&config.runtime_enabled_model_contexts()),
+        &crate::codex_config::runtime_required_catalog_models(
+            config,
+            home,
+            route_catalog_installed,
+        ),
     )?;
     let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
     if let Some(path) = catalog_path {
@@ -964,6 +969,8 @@ async fn prepare_codex_startup_state(
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
+    let required_catalog_models =
+        crate::codex_config::runtime_required_catalog_models(config, home, use_official_catalog);
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
@@ -986,6 +993,7 @@ async fn prepare_codex_startup_state(
                 remote_compaction_models: Some(&remote_compaction_models),
                 use_official_catalog,
                 model_contexts: Some(&runtime_model_contexts),
+                required_catalog_models: &required_catalog_models,
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
@@ -1564,20 +1572,34 @@ struct RuntimeWatcherInputs {
 
 /// Accumulates per-stage durations for `CodeyRuntime::start` and writes one
 /// `launcher.startup_timings` diagnostic record with the total.
-#[derive(Default)]
 struct StartupStageTimings {
-    started: Option<Instant>,
-    previous: Option<Instant>,
+    started: Instant,
+    previous: Instant,
     stages: Vec<(&'static str, u64)>,
+}
+
+impl Default for StartupStageTimings {
+    fn default() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            previous: started,
+            stages: Vec::new(),
+        }
+    }
 }
 
 impl StartupStageTimings {
     fn mark(&mut self, stage: &'static str) {
         let now = Instant::now();
-        let started = *self.started.get_or_insert(now);
-        let previous = self.previous.replace(now).unwrap_or(started);
         self.stages
-            .push((stage, now.duration_since(previous).as_millis() as u64));
+            .push((stage, now.duration_since(self.previous).as_millis() as u64));
+        self.previous = now;
+    }
+
+    /// Records a branch that ran concurrently inside the current stage.
+    fn branch(&mut self, stage: &'static str, elapsed: std::time::Duration) {
+        self.stages.push((stage, elapsed.as_millis() as u64));
     }
 
     fn report(&self) {
@@ -1585,12 +1607,10 @@ impl StartupStageTimings {
         for (stage, millis) in &self.stages {
             detail.insert((*stage).to_string(), serde_json::json!(millis));
         }
-        if let Some(started) = self.started {
-            detail.insert(
-                "totalMs".to_string(),
-                serde_json::json!(started.elapsed().as_millis() as u64),
-            );
-        }
+        detail.insert(
+            "totalMs".to_string(),
+            serde_json::json!(self.started.elapsed().as_millis() as u64),
+        );
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "launcher.startup_timings",
             serde_json::Value::Object(detail),
@@ -1662,25 +1682,40 @@ async fn prepare_startup_storage(
     guards: InitialStorageGuards,
     trace_log_write_protection_active: &AtomicBool,
     crashpad_pending_stats: &CrashpadPendingStatsHandle,
+    stage_timings: &mut StartupStageTimings,
 ) -> Result<(StartupStorageState, Option<StartupModelCatalog>)> {
+    let started = Instant::now();
+    let mut stop_codex_done = None;
+    let mut session_maintenance_done = None;
+    let mut model_catalog_done = None;
+    let mut storage_guards_done = None;
     let preparation = async {
         let app_dir = resolve_configured_codex_app_dir(config).await?;
         // Session repair must never race a live Codex writer. Stopping the old
         // runtime first also gives SQLite and rollout buffers a chance to flush
         // before any permanent maintenance is applied.
         prepare_codex_for_launch(&app_dir).await?;
+        stop_codex_done = Some(started.elapsed());
 
         // Session repair and catalog use other files. Run them together only
         // after the old Codex writer stops.
-        let (session_maintenance, startup_catalog) =
-            tokio::join!(run_startup_session_maintenance(home), async {
-                match current_profile {
+        let (session_maintenance, startup_catalog) = tokio::join!(
+            async {
+                let result = run_startup_session_maintenance(home).await;
+                session_maintenance_done = Some(started.elapsed());
+                result
+            },
+            async {
+                let result = match current_profile {
                     Some(profile) => prepare_startup_model_catalog(config, profile, home, &app_dir)
                         .await
                         .map(Some),
                     None => Ok(None),
-                }
-            });
+                };
+                model_catalog_done = Some(started.elapsed());
+                result
+            }
+        );
         Ok::<_, anyhow::Error>((
             StartupStorageState {
                 app_dir,
@@ -1689,17 +1724,33 @@ async fn prepare_startup_storage(
             startup_catalog?,
         ))
     };
-    let storage_guards = await_initial_storage_guards(
-        guards.trace,
-        config.disable_trace_log_writes,
-        trace_log_write_protection_active,
-        guards.crashpad,
-        config.protect_crashpad_pending,
-        crashpad_pending_stats,
-    );
+    let storage_guards = async {
+        let result = await_initial_storage_guards(
+            guards.trace,
+            config.disable_trace_log_writes,
+            trace_log_write_protection_active,
+            guards.crashpad,
+            config.protect_crashpad_pending,
+            crashpad_pending_stats,
+        )
+        .await;
+        storage_guards_done = Some(started.elapsed());
+        result
+    };
     // A failed preparation must still finish the already-started blocking
     // guards and publish their status before the caller can retry or exit.
     let (preparation, storage_guards) = tokio::join!(preparation, storage_guards);
+    // Offsets from the stage start: the branches overlap.
+    for (stage, done) in [
+        ("storage.stopCodexDoneMs", stop_codex_done),
+        ("storage.sessionMaintenanceDoneMs", session_maintenance_done),
+        ("storage.modelCatalogDoneMs", model_catalog_done),
+        ("storage.guardsDoneMs", storage_guards_done),
+    ] {
+        if let Some(done) = done {
+            stage_timings.branch(stage, done);
+        }
+    }
     let prepared = preparation?;
     storage_guards?;
     Ok(prepared)
@@ -1811,6 +1862,7 @@ async fn prepare_native_runtime_state(
                 remote_compaction_models: None,
                 use_official_catalog: false,
                 model_contexts: None,
+                required_catalog_models: &[],
                 default_model: None,
                 fast_context_tools,
                 subagent_optimization,
@@ -2199,6 +2251,7 @@ impl CodeyRuntime {
         crashpad_pending_stats: CrashpadPendingStatsHandle,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
+        let mut stage_timings = StartupStageTimings::default();
         if !crate::codex_config::runtime_router_platform_supported() {
             return Err(anyhow::anyhow!(
                 crate::codex_config::unsupported_runtime_platform_message()
@@ -2217,9 +2270,7 @@ impl CodeyRuntime {
             .local_router_enabled
             .then(|| resolve_startup_profile(config))
             .transpose()?;
-        // Stage timings go to the diagnostic log so a slow launch can be
-        // attributed without a debugger; values are milliseconds.
-        let mut stage_timings = StartupStageTimings::default();
+        stage_timings.mark("startupPreparationMs");
         // apply_runtime_router_config installs the live loopback table before
         // Codex starts, so saved codey_router tasks need no provider rewrite.
         if config.local_router_enabled {
@@ -2234,6 +2285,7 @@ impl CodeyRuntime {
             initial_storage_guards,
             trace_log_write_protection_active,
             &crashpad_pending_stats,
+            &mut stage_timings,
         )
         .await?;
         stage_timings.mark("storageAndCatalogMs");

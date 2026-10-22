@@ -41,6 +41,15 @@ impl NotificationChannelAdapter for FeishuChannel<'_> {
         validate_feishu_response(body)
     }
 
+    fn settle_on_success_status_error(&self, body: &str) -> bool {
+        // HTTP 已成功但缺少可识别的业务状态时，消息可能已经送达。
+        // 保留明确拒绝的重试行为，避免对不确定结果重复发送。
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| feishu_response_code(&value))
+            .is_none()
+    }
+
     fn sanitize_error(&self, error: &str) -> String {
         redact_url(error, &self.config.url)
     }
@@ -113,14 +122,18 @@ fn feishu_body(event: &NotificationEvent) -> Result<Value> {
     Ok(body)
 }
 
-fn validate_feishu_response(body: &str) -> std::result::Result<(), String> {
-    let value = serde_json::from_str::<Value>(body)
-        .map_err(|_| "飞书机器人返回了无法解析的响应".to_string())?;
-    let code = value
+fn feishu_response_code(value: &Value) -> Option<i64> {
+    value
         .get("code")
         .or_else(|| value.get("StatusCode"))
         .and_then(Value::as_i64)
-        .ok_or_else(|| "飞书机器人响应缺少状态码".to_string())?;
+}
+
+fn validate_feishu_response(body: &str) -> std::result::Result<(), String> {
+    let value = serde_json::from_str::<Value>(body)
+        .map_err(|_| "飞书机器人返回了无法解析的响应".to_string())?;
+    let code =
+        feishu_response_code(&value).ok_or_else(|| "飞书机器人响应缺少状态码".to_string())?;
     if code == 0 {
         return Ok(());
     }
@@ -232,6 +245,17 @@ mod tests {
         );
         assert!(validate_feishu_response("not json").is_err());
         assert!(validate_feishu_response(r#"{"msg":"success"}"#).is_err());
+    }
+
+    #[test]
+    fn explicit_feishu_rejections_remain_retryable() {
+        let config = NotificationChannelConfig::default();
+        let channel = FeishuChannel::new(&config);
+        for body in [r#"{"code":19021}"#, r#"{"StatusCode":9499}"#] {
+            assert!(channel.validate_response(body).is_err());
+            assert!(!channel.settle_on_success_status_error(body));
+        }
+        assert!(channel.validate_response(r#"{"StatusCode":0}"#).is_ok());
     }
 
     #[test]

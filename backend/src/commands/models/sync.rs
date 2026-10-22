@@ -132,11 +132,12 @@ pub(crate) async fn sync_native_current_provider_models(
         Some(fetch) => Some(fetch.await?),
         None => None,
     };
+    let catalog_context = model_catalog::CatalogContext::new(&previous.codex_app_path);
     if let Some(entries) = official_account_models.as_deref() {
-        model_catalog::merge_account_runtime_models(
+        model_catalog::merge_account_runtime_models_in_context(
             codex_home(),
             entries,
-            &previous.codex_app_path,
+            &catalog_context,
         )
         .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
     }
@@ -176,10 +177,17 @@ pub(crate) async fn sync_native_current_provider_models(
     if let Some((_, expected_revision)) = expected_route.as_ref() {
         ensure_route_revision(&latest, *expected_revision)?;
     }
+    let catalog_context = if latest.codex_app_path == previous.codex_app_path {
+        catalog_context
+    } else {
+        model_catalog::CatalogContext::new(&latest.codex_app_path)
+    };
 
     if context.provider.official && official_account_models.is_none() {
-        let _ =
-            model_catalog::refresh_account_runtime_snapshot(codex_home(), &latest.codex_app_path);
+        let _ = model_catalog::refresh_account_runtime_snapshot_in_context(
+            codex_home(),
+            &catalog_context,
+        );
     }
 
     let mut next = latest.clone();
@@ -211,7 +219,12 @@ pub(crate) async fn sync_native_current_provider_models(
             .insert(context.provider.id.clone(), cached_models.clone());
         next.retain_model_contexts(&context.provider.id, &cached_models);
     }
-    let mut model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+    let mut model_state = native_model_state_for_provider_in_context(
+        &next,
+        &context.provider,
+        codex_home(),
+        &catalog_context,
+    )?;
     if context.provider.official {
         // Persist the account-backed catalog on the route so configuration
         // normalization can recognize newly released official model IDs.
@@ -226,7 +239,12 @@ pub(crate) async fn sync_native_current_provider_models(
                     .insert(context.provider.id.clone(), account_models);
             }
             next = next.normalize();
-            model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+            model_state = native_model_state_for_provider_in_context(
+                &next,
+                &context.provider,
+                codex_home(),
+                &catalog_context,
+            )?;
         }
     }
     let visible_models = if context.provider.official {

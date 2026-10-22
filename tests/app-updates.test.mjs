@@ -254,6 +254,27 @@ test("detecting an update with an asset prompts the confirmation dialog", async 
   assert.match(confirmation.title, /1\.2\.0/);
 });
 
+test("自动检查在其他操作进行中发现更新时，等操作结束再弹出下载确认", async () => {
+  const h = harness(true);
+  let confirmation = null;
+  h.options.setConfirmation = value => { confirmation = value; };
+  h.options.isBusy = true;
+  h.render();
+  h.requests[0].resolve({
+    ...available,
+    selectedAsset: { fileName: "Codey-1.2.0.dmg", size: 1048576, url: "https://example.com" },
+  });
+  await settle();
+  h.render();
+  assert.equal(confirmation, null, "忙碌时不应弹出确认");
+  h.options.isBusy = false;
+  h.render();
+  assert.equal(confirmation?.action, "download-update");
+  confirmation = null;
+  h.render();
+  assert.equal(confirmation, null, "同一次发现只提示一次");
+});
+
 test("发布更新日志会同时显示在检查结果和下载确认中", async () => {
   const h = harness(false);
   let confirmation = null;
@@ -434,7 +455,7 @@ for (const deferred of ['rollback:rollback-1', 'rollback:older-rollback', '1.0.0
     const h = harness(false); let confirmation = null;
     h.options.setConfirmation = value => { confirmation = value; };
     h.sessionStorage.setItem('codey.deferredUpdateVersion', deferred); h.options.embedded = false; h.render();
-    h.requests[0].resolve(rollbackUpdate); await settle();
+    h.requests[0].resolve(rollbackUpdate); await settle(); h.render();
     assert.equal(confirmation !== null, deferred !== 'rollback:rollback-1');
   });
 }

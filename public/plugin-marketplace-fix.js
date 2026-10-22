@@ -63,6 +63,7 @@
     depth = 0,
     seen = new WeakMap(),
     budget = { remaining: 512 },
+    key = null,
   ) => {
     if (!value || typeof value !== "object") return value;
     if (seen.has(value)) return seen.get(value);
@@ -78,6 +79,9 @@
         budget.remaining -= 1;
         current.push(mergePlugins(child, depth + 1, seen, budget));
       }
+      // Only plugin lists receive local entries; string arrays such as
+      // capabilities or screenshots and the marketplace list stay intact.
+      if (depth > 0 && key !== "plugins") return current;
       const existing = new Set(current.filter(pluginLike).map((plugin) => plugin.id || `${plugin.name}@${plugin.marketplaceName || ""}`));
       for (const plugin of window.__codeyLocalPlugins || []) {
         const normalized = normalizePlugin(plugin);
@@ -88,11 +92,11 @@
     }
     const output = normalizePlugin(value);
     seen.set(value, output);
-    for (const [key, child] of Object.entries(output)) {
+    for (const [childKey, child] of Object.entries(output)) {
       if (!child || typeof child !== "object") continue;
       if (budget.remaining <= 0) break;
       budget.remaining -= 1;
-      output[key] = mergePlugins(child, depth + 1, seen, budget);
+      output[childKey] = mergePlugins(child, depth + 1, seen, budget, childKey);
     }
     return output;
   };

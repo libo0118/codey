@@ -219,6 +219,7 @@ pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub remote_compaction_models: Option<&'a [String]>,
     pub use_official_catalog: bool,
     pub model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
+    pub required_catalog_models: &'a [String],
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
     pub subagent_optimization: bool,
@@ -278,6 +279,7 @@ struct RouterApplyOptions<'a> {
     stream_max_retries: u32,
     use_official_catalog: bool,
     model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
+    required_catalog_models: &'a [String],
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
     subagent_optimization: bool,
@@ -339,6 +341,7 @@ pub(crate) fn apply_runtime_router_config(
             stream_max_retries: options.stream_max_retries,
             use_official_catalog,
             model_contexts: options.model_contexts,
+            required_catalog_models: options.required_catalog_models,
             default_model,
             fastctx_command: fastctx_command.as_deref(),
             subagent_optimization,
@@ -421,6 +424,7 @@ fn apply_isolated_runtime_router_config(
         stream_max_retries,
         use_official_catalog,
         model_contexts,
+        required_catalog_models,
         default_model,
         fastctx_command,
         subagent_optimization,
@@ -594,6 +598,11 @@ fn apply_isolated_runtime_router_config(
         &effective_document,
         home,
         local_router.and(model_contexts),
+        if local_router.is_some() && use_official_catalog {
+            required_catalog_models
+        } else {
+            &[]
+        },
     )? {
         effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
@@ -750,6 +759,7 @@ fn apply_isolated_test_runtime_config(
             stream_max_retries: 5,
             use_official_catalog,
             model_contexts: None,
+            required_catalog_models: &[],
             default_model: None,
             fastctx_command,
             subagent_optimization,
@@ -3217,6 +3227,7 @@ pub(crate) fn runtime_model_catalog_path(
     home: &Path,
     use_codey_catalog: bool,
     contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
+    required_models: &[String],
 ) -> Result<Option<PathBuf>> {
     let config_path = home.join("config.toml");
     let source = read_optional(&config_path)?.unwrap_or_default();
@@ -3224,37 +3235,100 @@ pub(crate) fn runtime_model_catalog_path(
     let mut document = parse_document(&source)?;
     let desired = use_codey_catalog.then(|| home.join(crate::model_catalog::relative_path()));
     update_model_catalog_reference(&mut document, &config_path, desired.as_deref());
-    resolved_runtime_model_catalog_path(&document, home, contexts)
+    resolved_runtime_model_catalog_path(
+        &document,
+        home,
+        contexts,
+        if use_codey_catalog {
+            required_models
+        } else {
+            &[]
+        },
+    )
 }
 
 fn resolved_runtime_model_catalog_path(
     document: &DocumentMut,
     home: &Path,
     contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
+    required_models: &[String],
 ) -> Result<Option<PathBuf>> {
     let Some(source) = resolved_model_catalog_path(document, home) else {
         return Ok(None);
     };
-    let Some(contexts) = contexts.filter(|contexts| !contexts.is_empty()) else {
+    let empty = BTreeMap::new();
+    let contexts = contexts.unwrap_or(&empty);
+    if contexts.is_empty() && required_models.is_empty() {
         return Ok(Some(source));
-    };
+    }
     if is_codey_owned_model_catalog_path(&source.to_string_lossy(), &home.join("config.toml")) {
         return Ok(Some(source));
     }
-    crate::model_catalog::prepare_context_catalog_overlay(home, &source, contexts).map(Some)
+    crate::model_catalog::prepare_context_catalog_overlay(home, &source, contexts, required_models)
+        .map(Some)
 }
 
-/// 保存前只验证，不写入目录副本；失败时配置和当前运行时均保持原样。
+/// 已启用模型与预算分别处理；生成器合法省略的官方模型不强制补入。
+pub(crate) fn runtime_required_catalog_models(
+    config: &crate::config::CodeyConfig,
+    home: &Path,
+    use_codey_catalog: bool,
+) -> Vec<String> {
+    if !config.local_router_enabled || !use_codey_catalog {
+        return Vec::new();
+    }
+    let (_, mut required) = config.runtime_catalog_models();
+    let official = config
+        .runtime_model_targets()
+        .into_iter()
+        .filter(|target| target.official)
+        .map(|target| crate::model_id::key(&config.runtime_catalog_id_for_target(&target)))
+        .collect::<std::collections::HashSet<_>>();
+    if official.is_empty() {
+        return required;
+    }
+    let available = fs::read(home.join(crate::model_catalog::relative_path()))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|catalog| {
+            catalog
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .or_else(|| catalog.as_array())
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.get("slug").and_then(serde_json::Value::as_str))
+                        .map(crate::model_id::key)
+                        .collect::<std::collections::HashSet<_>>()
+                })
+        });
+    if let Some(available) = available {
+        required.retain(|model| {
+            let key = crate::model_id::key(model);
+            !official.contains(&key) || available.contains(&key)
+        });
+    }
+    required
+}
+
+/// 用本次生成的 Codey 目录验证兼容副本，不写入副本或用户配置。
 pub(crate) fn validate_runtime_model_contexts(
     home: &Path,
     contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+    required_models: &[String],
 ) -> Result<()> {
-    if contexts.is_empty() {
+    if contexts.is_empty() && required_models.is_empty() {
         return Ok(());
     }
     // 关闭 Codey 目录选择后，只会剩下用户自定义的目录引用。
-    if let Some(source) = runtime_model_catalog_path(home, false, None)? {
-        crate::model_catalog::render_context_catalog_overlay(&source, contexts)?;
+    if let Some(source) = runtime_model_catalog_path(home, false, None, &[])? {
+        crate::model_catalog::render_context_catalog_overlay(
+            home,
+            &source,
+            contexts,
+            required_models,
+        )?;
     }
     Ok(())
 }
