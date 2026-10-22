@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "76";
+  const patchVersion = "77";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -1749,8 +1749,8 @@
     window.__codeySharedRuntime.reactInternalKeys(element, { includeContainer: true });
 
   const restoreNativeFastPermissions = () => {
-    for (const [permission, allowed] of nativeFastPermissions) {
-      try { permission.isServiceTierAllowed = allowed; } catch {}
+    for (const [permission, original] of nativeFastPermissions) {
+      try { Object.assign(permission, original); } catch {}
     }
     nativeFastPermissions.clear();
   };
@@ -1763,6 +1763,7 @@
     }
     let picker;
     const permissions = new Set();
+    const accessPermissions = new Set();
     for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
       const props = fiber.memoizedProps;
       if (!picker && typeof props?.model === "string"
@@ -1773,9 +1774,12 @@
       for (const node of [fiber, fiber.alternate]) {
         for (const cells of node?.updateQueue?.memoCache?.data || []) {
           if (!Array.isArray(cells)) continue;
+          const apiKeyAuth = cells.some((value) => value?.authMethod === "apikey");
           for (const value of cells) {
             if (value && typeof value.isServiceTierAllowed === "boolean"
               && typeof value.isLoading === "boolean") permissions.add(value);
+            if (apiKeyAuth && value && Object.hasOwn(value, "serviceTierAccess")
+              && typeof value.isLoading === "boolean") accessPermissions.add(value);
           }
         }
       }
@@ -1791,7 +1795,22 @@
       if (permission.isServiceTierAllowed || nativeFastPermissions.size >= 64) continue;
       try {
         permission.isServiceTierAllowed = true;
-        if (permission.isServiceTierAllowed) nativeFastPermissions.set(permission, false);
+        if (permission.isServiceTierAllowed) nativeFastPermissions.set(permission, { isServiceTierAllowed: false });
+      } catch {
+        // An incompatible immutable renderer result must not break the menu.
+      }
+    }
+    const tiers = picker.models.find((model) => model?.model === picker.model)?.serviceTiers;
+    const access = {
+      fast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "priority" || tier?.id === "fast"),
+      ultrafast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "ultrafast"),
+    };
+    for (const permission of accessPermissions) {
+      if (nativeFastPermissions.size >= 64) break;
+      const original = permission.serviceTierAccess;
+      try {
+        permission.serviceTierAccess = access;
+        if (permission.serviceTierAccess === access) nativeFastPermissions.set(permission, { serviceTierAccess: original });
       } catch {
         // An incompatible immutable renderer result must not break the menu.
       }

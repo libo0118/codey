@@ -333,6 +333,139 @@ test(`Fast stays available across routes and models (native selection: ${nativeS
 });
 }
 
+function nativeAccessPicker(models, { frozen = false } = {}) {
+  const body = new FakeElementCore("body", { connected: true });
+  const trigger = body.appendChild(new FakeElementCore("button", {
+    attributes: { "aria-haspopup": "menu" },
+  }));
+  const caches = [[], [], []];
+  const state = { authMethod: "apikey", loading: false, selectedTier: null };
+  const officialAccess = { fast: false, ultrafast: true };
+  // Keep the compiled native hook's input keys separate from its cached result.
+  const nativePermission = (cells) => {
+    if (cells[0] !== "local" || cells[1] !== state.authMethod) {
+      cells[0] = "local";
+      cells[1] = state.authMethod;
+      cells[2] = { authMethod: state.authMethod, hostId: "local" };
+    }
+    const access = ["chatgpt", "personalAccessToken"].includes(state.authMethod)
+      && !state.loading ? officialAccess : null;
+    if (cells[7] !== state.loading || cells[8] !== access) {
+      cells[7] = state.loading;
+      cells[8] = access;
+      const result = { serviceTierAccess: access, isLoading: state.loading };
+      cells[9] = frozen ? Object.freeze(result) : result;
+    }
+    return cells[9];
+  };
+  const picker = {
+    model: models[0].model,
+    models,
+    onSelectServiceTier(tier) { state.selectedTier = tier; },
+  };
+  const composer = {
+    memoizedProps: { conversationId: "thread", hideLabel: false },
+    updateQueue: { memoCache: { data: caches.slice(0, 2) } },
+    alternate: { updateQueue: { memoCache: { data: [caches[2]] } } },
+  };
+  trigger.__reactFiber$accessTest = { memoizedProps: picker, return: composer };
+  const renderNative = () => {
+    const permissions = caches.map(nativePermission);
+    const model = picker.models.find((model) => model.model === picker.model);
+    const allowed = (tier, access) => tier === null || (tier === "ultrafast"
+      ? access?.ultrafast === true : access?.fast === true);
+    const availableOptions = [null, ...(model?.serviceTiers || []).map((tier) => tier.id)]
+      .filter((tier) => allowed(tier, permissions[0].serviceTierAccess));
+    const serviceTierForRequest = availableOptions.includes(state.selectedTier)
+      && allowed(state.selectedTier, permissions[1].serviceTierAccess) ? state.selectedTier : null;
+    return { availableOptions, serviceTierForRequest };
+  };
+  return { body, trigger, caches, composer, picker, state, officialAccess, renderNative };
+}
+
+for (const nativeSelectionOnly of [false, true]) {
+test(`API-key Fast cache fallback follows current model tiers (native selection: ${nativeSelectionOnly})`, async () => {
+  const models = [
+    { model: "fast-model", serviceTiers: [{ id: "priority", name: "Fast" }] },
+    { model: "plain-model", serviceTiers: [] },
+    { model: "speed-model", serviceTiers: [{ id: "fast" }, { id: "ultrafast" }] },
+  ];
+  const fixture = nativeAccessPicker(models);
+  const { picker, trigger, caches, state, renderNative } = fixture;
+  const runtime = await loadPatch({
+    status: "ok", native_selection_only: nativeSelectionOnly,
+    models: models.map((model) => model.model), default_model: models[0].model,
+  }, [statsigClient()], { documentBody: fixture.body, nativeSelectionOnly });
+  assert.deepEqual(renderNative(), { availableOptions: [null], serviceTierForRequest: null });
+  runtime.dispatchDocumentEvent("pointerdown", { target: trigger });
+  assert.deepEqual(renderNative(), { availableOptions: [null, "priority"], serviceTierForRequest: null });
+  for (const cache of caches) {
+    assert.deepEqual(cache[9].serviceTierAccess, { fast: true, ultrafast: false });
+    assert.equal(cache[8], null, "leave the native account-derived cache key unchanged");
+  }
+  picker.onSelectServiceTier("priority");
+  assert.equal(renderNative().serviceTierForRequest, "priority");
+
+  picker.model = "plain-model";
+  runtime.dispatchDocumentEvent("focusin", { target: trigger });
+  assert.deepEqual(renderNative(), { availableOptions: [null], serviceTierForRequest: null });
+  assert.deepEqual(caches[0][9].serviceTierAccess, { fast: false, ultrafast: false });
+  picker.model = "speed-model";
+  runtime.dispatchDocumentEvent("keydown", { target: trigger, key: "Enter" });
+  assert.deepEqual(renderNative().availableOptions, [null, "fast", "ultrafast"]);
+  picker.onSelectServiceTier("ultrafast");
+  assert.equal(renderNative().serviceTierForRequest, "ultrafast");
+  picker.model = "missing-model";
+  runtime.dispatchDocumentEvent("pointerdown", { target: trigger });
+  assert.deepEqual(renderNative(), { availableOptions: [null], serviceTierForRequest: null });
+
+  picker.model = "fast-model";
+  state.loading = true;
+  renderNative();
+  runtime.dispatchDocumentEvent("pointerdown", { target: trigger });
+  assert.equal(caches[0][9].isLoading, true);
+  runtime.patch.dispose();
+  for (const cache of caches) assert.equal(cache[9].serviceTierAccess, null);
+});
+}
+
+test("Fast cache fallback preserves official and unknown account access", async () => {
+  const fixture = nativeAccessPicker([{ model: "fast-model", serviceTiers: [{ id: "priority" }] }]);
+  const runtime = await loadPatch({ status: "ok", native_selection_only: true,
+    models: ["fast-model"], default_model: "fast-model" }, [statsigClient()],
+  { documentBody: fixture.body, nativeSelectionOnly: true });
+  for (const authMethod of ["chatgpt", "personalAccessToken", "bedrock", "unknown", null]) {
+    fixture.state.authMethod = authMethod;
+    fixture.renderNative();
+    const permissions = fixture.caches.map((cache) => cache[9].serviceTierAccess);
+    runtime.dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
+    fixture.renderNative();
+    fixture.caches.forEach((cache, index) => assert.equal(cache[9].serviceTierAccess, permissions[index], authMethod));
+  }
+  runtime.patch.dispose();
+});
+
+test("Fast cache fallback tolerates frozen results and restores its bounded cache", async () => {
+  for (const frozen of [false, true]) {
+    const fixture = nativeAccessPicker([{ model: "fast-model", serviceTiers: [{ id: "priority" }] }], { frozen });
+    fixture.renderNative();
+    const extras = Array.from({ length: 70 }, () => [
+      { authMethod: "apikey", hostId: "local" },
+      { serviceTierAccess: null, isLoading: false },
+    ]);
+    fixture.composer.updateQueue.memoCache.data.push(...extras);
+    const runtime = await loadPatch({ status: "ok", native_selection_only: true,
+      models: ["fast-model"], default_model: "fast-model" }, [statsigClient()],
+    { documentBody: fixture.body, nativeSelectionOnly: true });
+    assert.doesNotThrow(() => runtime.dispatchDocumentEvent("pointerdown", { target: fixture.trigger }));
+    const results = [...fixture.caches.map((cache) => cache[9]), ...extras.map((row) => row[1])];
+    assert.equal(results.filter((result) => result.serviceTierAccess?.fast).length, 64);
+    if (frozen) assert.equal(fixture.caches[0][9].serviceTierAccess, null);
+    runtime.patch.dispose();
+    for (const result of results) assert.equal(result.serviceTierAccess, null);
+  }
+});
+
 async function loadPatch(
   catalogResponse,
   clients,
