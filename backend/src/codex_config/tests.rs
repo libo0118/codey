@@ -1623,6 +1623,7 @@ async fn native_stats_overrides_keep_direct_provider_and_user_monitoring_unchang
                 stream_max_retries: 5,
                 use_official_catalog: false,
                 model_contexts: None,
+                required_catalog_models: &[],
                 default_model: None,
                 fastctx_command: None,
                 subagent_optimization: false,
