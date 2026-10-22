@@ -644,6 +644,81 @@ fn native_renderer_catalog_and_hot_reload_do_not_require_local_routes() {
 }
 
 #[test]
+fn native_renderer_catalog_adds_ultrafast_only_for_supported_models_without_changing_membership() {
+    let models = [
+        ("gpt-6.1-sol", true),
+        ("gpt-6-astra", true),
+        ("route-x/gpt-6.1-sol", true),
+        ("gpt-6-astra-wm", true),
+        ("gpt-6.1-sol-priority", true),
+        ("gpt-6-astra-ultrafast", true),
+        ("gpt-6-sol", false),
+        ("gpt-6-astra-max", false),
+        ("unknown-model", false),
+    ];
+    for official in [true, false] {
+        let mut state = model_catalog::ModelSelectionState {
+            default_model: "gpt-6-sol".into(),
+            ..Default::default()
+        };
+        if official {
+            state.official_models = models
+                .iter()
+                .map(|(slug, _)| model_catalog::OfficialModelAvailability {
+                    slug: (*slug).into(),
+                    display_name: format!("Display {slug}"),
+                    supported: true,
+                    supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                    default_reasoning_effort: "high".into(),
+                })
+                .collect();
+            let mut unchecked = state.official_models[0].clone();
+            unchecked.slug = "gpt-6.1-sol-ultrafast".into();
+            unchecked.supported = false;
+            state.official_models.push(unchecked);
+        } else {
+            state.third_party_models = models.iter().map(|(slug, _)| (*slug).into()).collect();
+            state.third_party_models.push("CODEX-AUTO-REVIEW".into());
+        }
+        let catalog = renderer_native_model_catalog_value(&state);
+        assert_eq!(catalog["native_selection_only"], true);
+        assert_eq!(catalog["default_model"], "gpt-6-sol");
+        assert_eq!(
+            catalog["models"],
+            json!(models.iter().map(|(slug, _)| *slug).collect::<Vec<_>>())
+        );
+        assert!(catalog.get("model_provider").is_none());
+        for (entry, (slug, ultrafast)) in catalog["model_metadata"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(models)
+        {
+            assert_eq!(entry["model"], slug);
+            assert!(entry.get("provider_id").is_none());
+            if official {
+                assert_eq!(entry["display_name"], format!("Display {slug}"));
+                assert_eq!(entry["supported_reasoning_efforts"], json!(["low", "high"]));
+                assert_eq!(entry["default_reasoning_effort"], "high");
+            } else {
+                assert_eq!(entry["display_name"], slug);
+                assert!(entry.get("supported_reasoning_efforts").is_none());
+            }
+            if ultrafast {
+                assert_eq!(entry["service_tiers"][0]["id"], "ultrafast");
+                assert_eq!(entry["additional_speed_tiers"], json!(["ultrafast"]));
+            } else {
+                assert!(entry.get("service_tiers").is_none(), "{slug}: {entry}");
+                assert!(
+                    entry.get("additional_speed_tiers").is_none(),
+                    "{slug}: {entry}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn native_third_party_gpt_selection_keeps_raw_ids_and_does_not_restore_unchecked_models() {
     let home = tempfile::tempdir().unwrap();
     let provider = codex_provider::CurrentProvider {

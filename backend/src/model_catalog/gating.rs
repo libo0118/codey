@@ -2,10 +2,9 @@ use super::*;
 
 pub(super) const FAST_SERVICE_TIER_ID: &str = "priority";
 pub(super) const FAST_SPEED_TIER_ID: &str = "fast";
-/// Ultrafast 是 Fast 之上的速度档。上游目录目前只声明 Fast，所以这一档由 Codey
-/// 本地合成。开放的判据是上游对 Fast 的描述：账号快照里只有 6.1 Sol 和 6 Astra
-/// 标成 “2x speed”，其余模型是 “1.5x speed”。客户端同时要求 `service_tiers`
-/// 里出现该档，只补 `additional_speed_tiers` 会被 Codex 判定为“未声明”并丢弃。
+/// 官方 Ultrafast API 支持 6.1 Sol 和 6 Astra，上游目录目前只声明 Fast，由 Codey
+/// 补齐 Ultrafast 能力。客户端要求 `service_tiers`
+/// 和 `additional_speed_tiers` 同时声明该档，否则会将其丢弃。
 pub(super) const ULTRAFAST_SERVICE_TIER_ID: &str = "ultrafast";
 pub(super) const ULTRAFAST_SPEED_TIER_ID: &str = "ultrafast";
 const ULTRAFAST_MODEL_SLUGS: [&str; 2] = ["gpt-6.1-sol", "gpt-6-astra"];
@@ -156,13 +155,13 @@ pub(super) fn add_fast_speed_controls(model: &mut Value) {
 }
 
 /// 上游会为同一个模型下发多个 slug：`-wm` 是 Work 模式，`-priority` 是 Fast 档，
-/// `-ultrafast` 是预留的 Ultrafast 档。只认这几种后缀，免得把 `gpt-6-astra-max`
+/// `-ultrafast` 是 Ultrafast 档。只认这几种后缀，免得把 `gpt-6-astra-max`
 /// 这类无关变体也当成同族。
 const SPEED_VARIANT_SUFFIXES: [&str; 3] = ["-wm", "-priority", "-ultrafast"];
 
-/// 只有上游标成 “2x speed” 的模型补 Ultrafast。路由前缀和后缀先归一化再比较，
+/// 只有官方支持的模型补 Ultrafast。路由前缀和后缀先归一化再比较，
 /// 否则 `route-x/gpt-6.1-sol` 和 `gpt-6.1-sol-wm` 都会漏掉。
-pub(super) fn supports_ultrafast_speed(model: &Value) -> bool {
+pub(crate) fn supports_ultrafast_speed(model: &Value) -> bool {
     let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
     let upstream = route_scoped_upstream_model_id(slug)
         .trim()
@@ -186,7 +185,7 @@ fn ultrafast_service_tier() -> Value {
     })
 }
 
-pub(super) fn add_ultrafast_speed_controls(model: &mut Value) {
+pub(crate) fn add_ultrafast_speed_controls(model: &mut Value) {
     let service_tier = ultrafast_service_tier();
     let service_tiers = model.get_mut("service_tiers").and_then(Value::as_array_mut);
     if let Some(service_tiers) = service_tiers {

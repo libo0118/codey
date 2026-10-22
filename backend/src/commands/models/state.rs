@@ -332,6 +332,11 @@ pub(crate) fn renderer_native_model_catalog_value(
         }
         metadata.push(entry);
     }
+    for entry in &mut metadata {
+        if model_catalog::supports_ultrafast_speed(&json!({ "slug": entry["model"] })) {
+            model_catalog::add_ultrafast_speed_controls(entry);
+        }
+    }
     let models = metadata
         .iter()
         .map(|entry| entry["model"].clone())

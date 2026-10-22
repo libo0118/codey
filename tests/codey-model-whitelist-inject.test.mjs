@@ -429,6 +429,32 @@ test(`API-key Fast cache fallback follows current model tiers (native selection:
 });
 }
 
+test("native picker refreshes Ultrafast tiers without a query cache reload", async () => {
+  const tiers = [{ id: "priority", name: "Fast" }];
+  const speeds = ["fast"];
+  const model = { model: "gpt-6.1-sol", serviceTiers: tiers, additionalSpeedTiers: speeds };
+  const fixture = nativeAccessPicker([model]);
+  const nativeTiers = [...tiers];
+  const nativeModel = { ...model, serviceTiers: nativeTiers };
+  fixture.composer.updateQueue.memoCache.data.push([{ models: [nativeModel] }]);
+  const runtime = await loadPatch({ status: "ok", native_selection_only: true,
+    models: [model.model], default_model: model.model,
+    model_metadata: [{ model: model.model,
+      service_tiers: [{ id: "ultrafast", name: "Ultrafast" }],
+      additional_speed_tiers: ["ultrafast"] }],
+  }, [statsigClient()], { documentBody: fixture.body, nativeSelectionOnly: true });
+  fixture.renderNative();
+  runtime.dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
+  assert.deepEqual(fixture.renderNative().availableOptions, [null, "priority", "ultrafast"]);
+  assert.deepEqual(nativeModel.serviceTiers.map((tier) => tier.id), ["priority", "ultrafast"]);
+  fixture.picker.onSelectServiceTier("ultrafast");
+  assert.equal(fixture.renderNative().serviceTierForRequest, "ultrafast");
+  runtime.patch.dispose();
+  assert.equal(model.serviceTiers, tiers);
+  assert.equal(model.additionalSpeedTiers, speeds);
+  assert.equal(nativeModel.serviceTiers, nativeTiers);
+});
+
 test("Fast cache fallback preserves official and unknown account access", async () => {
   const fixture = nativeAccessPicker([{ model: "fast-model", serviceTiers: [{ id: "priority" }] }]);
   const runtime = await loadPatch({ status: "ok", native_selection_only: true,
@@ -443,6 +469,113 @@ test("Fast cache fallback preserves official and unknown account access", async 
     fixture.caches.forEach((cache, index) => assert.equal(cache[9].serviceTierAccess, permissions[index], authMethod));
   }
   runtime.patch.dispose();
+});
+
+test("native Ultrafast metadata augments only declared models and preserves native tiers", async () => {
+  const models = ["declared-model", "native-model", "unknown-model"];
+  const queryClient = activeModelQueryClient(models);
+  const declared = queryClient.model(models[0]);
+  declared.id = "native-id";
+  declared.serviceTiers = [{ id: "priority", name: "Native Fast", description: "Native description" }];
+  declared.additionalSpeedTiers = ["fast"];
+  declared.defaultServiceTier = "priority";
+  const native = queryClient.model(models[1]);
+  const nativeUltrafast = { id: "ultrafast", name: "Native Ultrafast", description: "Native capability" };
+  native.serviceTiers = [nativeUltrafast];
+  native.additionalSpeedTiers = ["ultrafast"];
+  const ultrafast = { id: "ultrafast", name: "Ultrafast", description: "Backend capability" };
+  const metadata = models.slice(0, 2).map((model) => ({ model, supported_reasoning_efforts: ["medium"],
+    service_tiers: [ultrafast, ultrafast, { id: "unrelated" }],
+    additional_speed_tiers: ["ultrafast", "ultrafast", "unrelated"],
+  }));
+  const catalog = { status: "ok", native_selection_only: true, models, default_model: models[2], model_metadata: metadata };
+  const { patch } = await loadPatch(catalog, [statsigClient()], { queryClient, nativeSelectionOnly: true });
+  const augmented = queryClient.model(models[0]);
+  assert.deepEqual(augmented.serviceTiers, [...declared.serviceTiers, ultrafast]);
+  assert.deepEqual(augmented.additionalSpeedTiers, ["fast", "ultrafast"]);
+  assert.equal(augmented.id, "native-id");
+  assert.equal(augmented.isDefault, true, "keep the native default rather than the catalog default");
+  assert.equal(augmented.defaultServiceTier, "priority");
+  assert.deepEqual(declared.additionalSpeedTiers, ["fast"], "leave shared native data unchanged");
+  assert.equal(queryClient.model(models[1]).serviceTiers.find(tier => tier.id === "ultrafast"), nativeUltrafast);
+  assert.equal(queryClient.model(models[1]).serviceTiers.filter(tier => tier.id === "ultrafast").length, 1);
+  assert.equal(queryClient.model(models[2]).serviceTiers.some(tier => tier.id === "ultrafast"), false);
+  assert.equal(queryClient.model(models[2]).additionalSpeedTiers.includes("ultrafast"), false);
+  await patch.setCatalog(structuredClone(catalog));
+  assert.equal(queryClient.model(models[0]), augmented, "repeat delivery must reuse an unchanged descriptor");
+  assert.equal(patch.delivery().pendingQueryEntries, 0);
+  await patch.setCatalog({ ...catalog, model_metadata: metadata.map(({ model, supported_reasoning_efforts }) => ({ model, supported_reasoning_efforts })) });
+  assert.deepEqual(queryClient.model(models[0]).serviceTiers, declared.serviceTiers);
+  assert.deepEqual(queryClient.model(models[0]).additionalSpeedTiers, ["fast"]);
+  assert.equal(queryClient.model(models[1]).serviceTiers.find(tier => tier.id === "ultrafast"), nativeUltrafast,
+    "withdrawing injected capabilities must preserve native declarations");
+  assert.ok(queryClient.model(models[1]).additionalSpeedTiers.includes("ultrafast"));
+  patch.dispose();
+});
+
+test("native Ultrafast metadata refreshes tiers independently without changing model IDs", async () => {
+  const model = "metadata-model";
+  const queryClient = activeModelQueryClient([model]);
+  const metadata = { model, supported_reasoning_efforts: ["medium"] };
+  const catalog = { status: "ok", native_selection_only: true, models: [model], default_model: model, model_metadata: [metadata] };
+  const { patch } = await loadPatch(catalog, [statsigClient()], { queryClient, nativeSelectionOnly: true });
+  let revision = patch.delivery().revision;
+  const speedMetadata = { ...metadata, additional_speed_tiers: ["ultrafast"] };
+  await patch.setCatalog({ ...catalog, model_metadata: [speedMetadata] });
+  assert.ok(patch.delivery().revision > revision);
+  assert.deepEqual(queryClient.model(model).additionalSpeedTiers, ["fast", "ultrafast"]);
+  revision = patch.delivery().revision;
+  const tier = { id: "ultrafast", name: "Ultrafast", description: "Backend description" };
+  await patch.setCatalog({ ...catalog, model_metadata: [{ ...speedMetadata, service_tiers: [tier] }] });
+  assert.ok(patch.delivery().revision > revision);
+  assert.deepEqual(queryClient.model(model).serviceTiers.at(-1), tier);
+  const updated = { ...tier, description: "Updated backend description" };
+  await patch.setCatalog({ ...catalog, model_metadata: [{ ...speedMetadata, service_tiers: [updated] }] });
+  assert.deepEqual(queryClient.model(model).serviceTiers.at(-1), updated);
+  await patch.setCatalog(catalog);
+  assert.equal(queryClient.model(model).serviceTiers.some(tier => tier.id === "ultrafast"), false);
+  assert.deepEqual(queryClient.model(model).additionalSpeedTiers, ["fast"]);
+  assert.deepEqual(queryClient.models(), [model]);
+  patch.dispose();
+});
+
+test("native Ultrafast metadata reaches API-key picker options and request selection", async () => {
+  const model = "capability-model";
+  const queryClient = activeModelQueryClient([model]);
+  const fixture = nativeAccessPicker(queryClient.result().data);
+  queryClient.subscribe(result => { fixture.picker.models = result.data; });
+  const { patch, dispatchDocumentEvent } = await loadPatch({
+    status: "ok", native_selection_only: true, models: [model], default_model: model,
+    model_metadata: [{ model, service_tiers: [{ id: "ultrafast", name: "Ultrafast", description: "Backend capability" }],
+      additional_speed_tiers: ["ultrafast"] }],
+  }, [statsigClient()], { queryClient, documentBody: fixture.body, nativeSelectionOnly: true });
+  fixture.renderNative();
+  dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
+  assert.deepEqual(fixture.renderNative().availableOptions, [null, "priority", "ultrafast"]);
+  fixture.picker.onSelectServiceTier("ultrafast");
+  assert.equal(fixture.renderNative().serviceTierForRequest, "ultrafast");
+  for (const authMethod of ["chatgpt", "personalAccessToken", "bedrock", "unknown"]) {
+    fixture.state.authMethod = authMethod;
+    fixture.renderNative();
+    const permissions = fixture.caches.map(cache => cache[9].serviceTierAccess);
+    dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
+    fixture.caches.forEach((cache, index) => assert.equal(cache[9].serviceTierAccess, permissions[index], authMethod));
+  }
+  patch.dispose();
+});
+
+test("native Ultrafast metadata can be withdrawn after a patch reload", async () => {
+  const model = "reload-model";
+  const queryClient = activeModelQueryClient([model]);
+  const catalog = { status: "ok", native_selection_only: true, models: [model], default_model: model,
+    model_metadata: [{ model, service_tiers: [{ id: "ultrafast", name: "Ultrafast" }], additional_speed_tiers: ["ultrafast"] }] };
+  const runtime = await loadPatch(catalog, [statsigClient()], { queryClient, nativeSelectionOnly: true });
+  runtime.patch.version = "previous";
+  const reloaded = await runtime.reload();
+  await reloaded.setCatalog({ ...catalog, model_metadata: [] });
+  assert.equal(queryClient.model(model).serviceTiers.some(tier => tier.id === "ultrafast"), false);
+  assert.deepEqual(queryClient.model(model).additionalSpeedTiers, ["fast"]);
+  reloaded.dispose();
 });
 
 test("Fast cache fallback tolerates frozen results and restores its bounded cache", async () => {
@@ -1076,7 +1209,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "76");
+  assert.equal(patch.version, "80");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],

@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "77";
+  const patchVersion = "80";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -695,6 +695,21 @@
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 
+  const nativeUltrafastTierSource = Symbol.for("codey.nativeUltrafastTierSource");
+  const isUltrafastTier = (tier) => tier === "ultrafast" || tier?.id === "ultrafast";
+  const nativeUltrafastTiers = (tiers, declaredTiers) => {
+    if (!nativeSelectionOnly) return tiers;
+    // Retain native declarations when backend-injected capabilities are withdrawn.
+    const previous = tiers[nativeUltrafastTierSource];
+    const nativeTiers = previous?.nativeTiers || tiers;
+    const ultrafast = (Array.isArray(declaredTiers) ? declaredTiers : []).find(isUltrafastTier);
+    if (!ultrafast || nativeTiers.some(isUltrafastTier)) return nativeTiers;
+    if (previous && JSON.stringify(previous.ultrafast) === JSON.stringify(ultrafast)) return tiers;
+    const nextTiers = [...nativeTiers, ultrafast];
+    Object.defineProperty(nextTiers, nativeUltrafastTierSource, { value: { nativeTiers, ultrafast } });
+    return nextTiers;
+  };
+
   const generatedRouteProviderId = (providerId) => {
     const key = modelKey(providerId);
     return key.startsWith("codey-official-account-") || key.startsWith("route-");
@@ -776,8 +791,8 @@
   const modelDescriptor = (modelName, current = null) => {
     const metadata = catalog.modelMetadata[modelName];
     const descriptorMetadata = {
-      serviceTiers: nativeFastServiceTiers(current?.serviceTiers),
-      additionalSpeedTiers: nativeFastSpeedTiers(current?.additionalSpeedTiers),
+      serviceTiers: nativeUltrafastTiers(nativeFastServiceTiers(current?.serviceTiers), metadata?.service_tiers),
+      additionalSpeedTiers: nativeUltrafastTiers(nativeFastSpeedTiers(current?.additionalSpeedTiers), metadata?.additional_speed_tiers),
       defaultServiceTier: Object.hasOwn(current || {}, "defaultServiceTier")
         ? current.defaultServiceTier
         : null,
@@ -902,6 +917,8 @@
       && leftMetadata.route_provider_id === rightMetadata.route_provider_id
       && leftMetadata.official_account === rightMetadata.official_account
       && leftMetadata.upstream_model === rightMetadata.upstream_model
+      && JSON.stringify(leftMetadata.service_tiers) === JSON.stringify(rightMetadata.service_tiers)
+      && JSON.stringify(leftMetadata.additional_speed_tiers) === JSON.stringify(rightMetadata.additional_speed_tiers)
       && sameReasoningEffortNames(
         leftMetadata.supported_reasoning_efforts,
         rightMetadata.supported_reasoning_efforts,
@@ -1764,6 +1781,7 @@
     let picker;
     const permissions = new Set();
     const accessPermissions = new Set();
+    const nativeModels = new Set();
     for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
       const props = fiber.memoizedProps;
       if (!picker && typeof props?.model === "string"
@@ -1776,6 +1794,11 @@
           if (!Array.isArray(cells)) continue;
           const apiKeyAuth = cells.some((value) => value?.authMethod === "apikey");
           for (const value of cells) {
+            const models = Array.isArray(value) ? value : value?.models;
+            if (Array.isArray(models) && nativeModels.size < 64) {
+              const model = models.find((model) => model?.model === picker.model);
+              if (model) nativeModels.add(model);
+            }
             if (value && typeof value.isServiceTierAllowed === "boolean"
               && typeof value.isLoading === "boolean") permissions.add(value);
             if (apiKeyAuth && value && Object.hasOwn(value, "serviceTierAccess")
@@ -1800,7 +1823,27 @@
         // An incompatible immutable renderer result must not break the menu.
       }
     }
-    const tiers = picker.models.find((model) => model?.model === picker.model)?.serviceTiers;
+    const model = picker.models.find((model) => model?.model === picker.model);
+    if (model) nativeModels.add(model);
+    for (const model of nativeSelectionOnly ? nativeModels : []) {
+      if (nativeFastPermissions.size >= 64) break;
+      const original = {};
+      // Jotai-based renderers may retain this model without a discoverable QueryClient.
+      for (const [key, metadataKey] of [["serviceTiers", "service_tiers"], ["additionalSpeedTiers", "additional_speed_tiers"]]) {
+        const previous = model[key];
+        if (!Array.isArray(previous)) continue;
+        const next = nativeUltrafastTiers(previous, catalog.modelMetadata[picker.model]?.[metadataKey]);
+        if (next === previous) continue;
+        try {
+          model[key] = next;
+          if (model[key] === next) original[key] = previous;
+        } catch {
+          // Immutable model data keeps its native capability declaration.
+        }
+      }
+      if (Object.keys(original).length) nativeFastPermissions.set(model, original);
+    }
+    const tiers = model?.serviceTiers;
     const access = {
       fast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "priority" || tier?.id === "fast"),
       ultrafast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "ultrafast"),
