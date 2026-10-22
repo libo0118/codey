@@ -429,6 +429,24 @@ test(`API-key Fast cache fallback follows current model tiers (native selection:
 });
 }
 
+test("API-key Fast fallback reaches the request owner above the composer", async () => {
+  const fixture = nativeAccessPicker([{ model: "fast-model", serviceTiers: [{ id: "priority" }] }]);
+  const legacyPermission = { isServiceTierAllowed: false, isLoading: false };
+  fixture.composer.updateQueue.memoCache.data.splice(1, 1);
+  fixture.composer.return = { memoizedProps: {},
+    updateQueue: { memoCache: { data: [fixture.caches[1], [legacyPermission]] } } };
+  const runtime = await loadPatch({ status: "ok", native_selection_only: true,
+    models: ["fast-model"], default_model: "fast-model" }, [statsigClient()],
+  { documentBody: fixture.body, nativeSelectionOnly: true });
+  fixture.renderNative();
+  runtime.dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
+  fixture.picker.onSelectServiceTier("priority");
+  assert.equal(fixture.renderNative().serviceTierForRequest, "priority");
+  assert.equal(legacyPermission.isServiceTierAllowed, false);
+  runtime.patch.dispose();
+  assert.equal(fixture.caches[1][9].serviceTierAccess, null);
+});
+
 test("native picker refreshes Ultrafast tiers without a query cache reload", async () => {
   const tiers = [{ id: "priority", name: "Fast" }];
   const speeds = ["fast"];
@@ -437,6 +455,9 @@ test("native picker refreshes Ultrafast tiers without a query cache reload", asy
   const nativeTiers = [...tiers];
   const nativeModel = { ...model, serviceTiers: nativeTiers };
   fixture.composer.updateQueue.memoCache.data.push([{ models: [nativeModel] }]);
+  fixture.composer.updateQueue.memoCache.data.splice(1, 1);
+  fixture.composer.return = { memoizedProps: {},
+    updateQueue: { memoCache: { data: [fixture.caches[1]] } } };
   const runtime = await loadPatch({ status: "ok", native_selection_only: true,
     models: [model.model], default_model: model.model,
     model_metadata: [{ model: model.model,
@@ -1209,7 +1230,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "80");
+  assert.equal(patch.version, "81");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],

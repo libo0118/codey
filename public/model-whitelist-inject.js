@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "80";
+  const patchVersion = "81";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -1779,6 +1779,7 @@
       fiber = reactFiberKeys(node).map((key) => node[key]).find(Boolean);
     }
     let picker;
+    let pastComposer = false;
     const permissions = new Set();
     const accessPermissions = new Set();
     const nativeModels = new Set();
@@ -1799,14 +1800,15 @@
               const model = models.find((model) => model?.model === picker.model);
               if (model) nativeModels.add(model);
             }
-            if (value && typeof value.isServiceTierAllowed === "boolean"
+            if (!pastComposer && value && typeof value.isServiceTierAllowed === "boolean"
               && typeof value.isLoading === "boolean") permissions.add(value);
             if (apiKeyAuth && value && Object.hasOwn(value, "serviceTierAccess")
               && typeof value.isLoading === "boolean") accessPermissions.add(value);
           }
         }
       }
-      if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) break;
+      // The request owner can live above the composer; keep the legacy boolean repair local.
+      if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) pastComposer = true;
     }
     if (!picker) return;
     // Windows builds can disable the main-process Inspector. Repair only the
