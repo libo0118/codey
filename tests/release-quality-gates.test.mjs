@@ -76,7 +76,7 @@ test("Linux x64 independently passes the same gates before both platform package
   const releaseJob = workflow.slice(workflow.indexOf("\n  release:"));
   assert.match(linuxJob, /runs-on: ubuntu-24\.04/);
   assert.match(linuxJob, /apt-get install -y --no-install-recommends build-essential pkg-config/);
-  assert.match(linuxJob, /dpkg-dev rpm cpio/);
+  assert.match(linuxJob, /dpkg-dev rpm rpm2cpio cpio/);
   assert.match(linuxJob, /CODEY_REQUIRE_LINUX_PACKAGING_TOOLS: "1"/);
   assertRustQualityGates(linuxJob);
   for (const command of ["pnpm run check", "pnpm run test:js", "pnpm run vite:build", "node scripts/build.mjs", "node scripts/package-linux.mjs"]) assert.ok(linuxJob.includes(command), command);

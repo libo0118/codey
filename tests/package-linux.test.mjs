@@ -120,7 +120,7 @@ test("Linux installation layout provides a command and desktop entry without use
 });
 
 const nativeTools = ["cc", "dpkg-deb", "dpkg-shlibdeps", "rpmbuild", "rpm", "rpm2cpio", "cpio", "bash"];
-const missingNativeTools = process.platform === "linux" ? nativeTools.filter(command => spawnSync(command, ["--version"], { stdio: "ignore" }).status !== 0) : ["Linux"];
+const missingNativeTools = process.platform === "linux" ? nativeTools.filter(command => spawnSync("sh", ["-c", 'command -v "$1"', "codey-tool-check", command], { stdio: "ignore" }).status !== 0) : ["Linux"];
 test("Linux native package tools are present when required by CI", () => {
   if (process.env.CODEY_REQUIRE_LINUX_PACKAGING_TOOLS === "1") assert.deepEqual(missingNativeTools, []);
 });
