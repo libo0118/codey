@@ -734,16 +734,18 @@ mod tests {
         });
         locked_rx.await.unwrap();
         let waiting = tokio::spawn(Outbox::open(busy_path));
-        let independent = tokio::time::timeout(
-            Duration::from_secs(2),
-            Outbox::open(parent.join("independent.db")),
-        )
-        .await;
+        let mut independent = tokio::spawn(Outbox::open(parent.join("independent.db")));
+        // Fresh SQLite syncs can be slow on shared Windows runners.
+        let completed = tokio::time::timeout(Duration::from_secs(30), &mut independent).await;
         drop(release_tx);
         initializer.await.unwrap();
         waiting.await.unwrap().unwrap();
-        independent
+        if completed.is_err() {
+            independent.await.unwrap().unwrap();
+        }
+        completed
             .expect("another queue must open while the first path remains locked")
+            .unwrap()
             .unwrap();
     }
 

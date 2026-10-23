@@ -248,6 +248,7 @@ jobs:
             --volume "$node_home:/opt/node:ro" \
             --env DEBIAN_FRONTEND=noninteractive --env GITHUB_REF_TYPE --env GITHUB_REF_NAME \
             debian:11 bash -euo pipefail -c '
+              find /etc/apt -type f \( -name "*.list" -o -name "*.sources" \) -exec sed -i "s|deb[.]debian[.]org/debian-security|archive.debian.org/debian-security|g" {} +
               apt-get update
               apt-get install -y --no-install-recommends dpkg-dev rpm rpm2cpio cpio libstdc++6 binutils
               /opt/node/bin/node scripts/package-linux.mjs
@@ -258,6 +259,7 @@ jobs:
           version=$(node -p "require('./package.json').version")
           docker run --rm --platform linux/amd64 --volume "$PWD/dist/linux:/packages:ro" \
             --env CODEY_VERSION="$version" debian:11 bash -euo pipefail -c '
+              find /etc/apt -type f \( -name "*.list" -o -name "*.sources" \) -exec sed -i "s|deb[.]debian[.]org/debian-security|archive.debian.org/debian-security|g" {} +
               apt-get update
               apt-get install -y --no-install-recommends "/packages/Codey-$CODEY_VERSION-linux-x64.deb"
               ps -p $$ -o pid= > /dev/null

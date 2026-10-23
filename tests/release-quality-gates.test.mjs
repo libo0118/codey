@@ -107,6 +107,10 @@ test("Linux x64 independently passes the same gates before both platform package
   assert.ok(linuxPackageStep.includes('--volume "$node_home:/opt/node:ro"'));
   assert.match(linuxPackageStep, /--env DEBIAN_FRONTEND=noninteractive/);
   assert.match(linuxPackageStep, /--env GITHUB_REF_TYPE --env GITHUB_REF_NAME/);
+  for (const step of [linuxPackageStep, debianInstallStep]) {
+    const archive = step.indexOf("archive.debian.org/debian-security");
+    assert.ok(archive >= 0 && archive < step.indexOf("apt-get update"));
+  }
   assert.match(linuxPackageStep, /debian:11 bash -euo pipefail -c '[\s\S]*?apt-get update[\s\S]*?apt-get install -y --no-install-recommends dpkg-dev rpm rpm2cpio cpio libstdc\+\+6 binutils[\s\S]*?\/opt\/node\/bin\/node scripts\/package-linux\.mjs/);
   assert.match(debianInstallStep, /debian:11 bash[\s\S]*?apt-get install[^\n]*linux-x64\.deb[\s\S]*?dpkg --remove codey/);
   assert.match(rpmInstallStep, /registry\.access\.redhat\.com\/ubi8\/ubi:8\.10 bash[\s\S]*?dnf install[^\n]*linux-x64\.rpm[\s\S]*?rpm --erase codey/);
