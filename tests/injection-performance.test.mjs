@@ -155,8 +155,10 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   const sessionObserverBody = sessionTools.match(
     /const handleSessionToolMutationsImpl = \(mutations\) => \{([\s\S]*?)\n  \};\n  const sessionToolMutationOptions/,
   )?.[1] ?? "";
-  assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
-  assert.match(sessionObserverBody, /reconcileStaleCompletedTask/);
+  assert.match(sessionObserverBody, /pendingMutationTargets\.get\(target\)/);
+  assert.match(sessionObserverBody, /scheduleIncrementalScan\(null\)/);
+  assert.doesNotMatch(sessionObserverBody, /querySelector|\.closest|\.matches|getSessionId\(|reconcileStaleCompletedTask\(/);
+  assert.match(sessionTools, /codeyTimed\("codey-inject\.sessionToolDrain"/);
   assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
   assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
   assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);
@@ -590,7 +592,7 @@ test("adjacent selected turns render as one continuous outline", async () => {
 
 test("selection changes resynchronize adjacent-turn grouping", async () => {
   const source = await readSource("public/codey-inject.js");
-  assert.match(source, /const syncSelectionGroups = \(\) => \{/);
+  assert.match(source, /const syncSelectionGroups = \(visibleRows = null\) => \{/);
   assert.match(source, /lastSelectedRow = anchor;\s*syncSelectionGroups\(\);/s);
   assert.match(source, /row\.dataset\.codeySelectedPrevious = "true"/);
   assert.match(source, /row\.dataset\.codeySelectedNext = "true"/);

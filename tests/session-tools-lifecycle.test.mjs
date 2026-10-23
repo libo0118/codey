@@ -205,6 +205,82 @@ test("dispose cancels scan, watcher, sidebar tooltip and running recheck timers"
   assert.equal(runtime.queries(), queries);
 });
 
+test("coalesced status mutations preserve an earlier old class value", () => {
+  const runtime = fixture();
+  const { row, spinner } = thread(runtime.document, "thread-status", true);
+  runtime.load();
+  runtime.window.__codeyInstallThreadUpdatedTimes(row);
+  spinner.className = "plain";
+  let queries = 0;
+  const original = row.querySelectorAll.bind(row);
+  row.querySelectorAll = (...args) => { queries += 1; return original(...args); };
+  runtime.observers[0].callback([
+    { type: "attributes", target: spinner, attributeName: "class", oldValue: "animate-spin" },
+    { type: "attributes", target: spinner, attributeName: "class", oldValue: "plain" },
+  ]);
+  assert.equal(queries, 0);
+  runtime.runTimeout(60);
+  assert.ok(queries > 0, "the vanished native status class must still rescan its thread");
+  runtime.window.__codeySessionToolsInstall.dispose();
+});
+
+test("overflow keeps header invalidation and cancellation of later drain chunks", () => {
+  const runtime = fixture();
+  const targets = Array.from({ length: 90 }, () => {
+    const target = new FakeElement();
+    runtime.document.body.appendChild(target);
+    return target;
+  });
+  const header = new FakeElement("header");
+  runtime.document.body.appendChild(header);
+  const invalidated = [];
+  runtime.window.__codeyRendererInvalidateHeaderMount = (root) => invalidated.push(root);
+  runtime.load();
+  runtime.observers[0].callback([...targets, header].map((target) => ({
+    type: "childList", target, addedNodes: [], removedNodes: [],
+  })));
+  runtime.runTimeout(60);
+  assert.ok([...runtime.timeouts.values()].some(({ delay }) => delay === 0), "overflow must yield");
+  let chunks = 0;
+  while ([...runtime.timeouts.values()].some(({ delay }) => delay === 0)) {
+    assert.ok(++chunks < 100, "overflow must catch up");
+    runtime.runTimeout(0);
+  }
+  assert.ok(invalidated.includes(header), "header discovery cannot be dropped at the target budget");
+  runtime.observers[0].callback(targets.map((target) => ({
+    type: "childList", target, addedNodes: [], removedNodes: [],
+  })));
+  runtime.runTimeout(60);
+  const stale = [...runtime.timeouts.values()].filter(({ delay }) => delay === 0);
+  assert.ok(stale.length);
+  runtime.window.__codeySessionToolsInstall.dispose();
+  const queries = runtime.queries();
+  stale.forEach(({ callback }) => callback());
+  assert.equal(runtime.queries(), queries);
+  assert.equal(runtime.timeouts.size + runtime.idleCallbacks.size + runtime.intervals.size, 0);
+});
+
+test("a throwing scan cannot leave subsequent mutations without a drain timer", () => {
+  const runtime = fixture();
+  const { row } = thread(runtime.document, "throwing-thread");
+  runtime.load();
+  const queryAll = row.querySelectorAll.bind(row);
+  row.querySelectorAll = () => { throw new Error("injected row scan failure"); };
+  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: row }]);
+  try { runtime.runTimeout(60); } catch (error) { assert.match(error.message, /injected row scan failure/); }
+  row.querySelectorAll = queryAll;
+  const next = thread(runtime.document, "next-thread").row;
+  let queries = 0;
+  const nextQueryAll = next.querySelectorAll.bind(next);
+  next.querySelectorAll = (...args) => { queries += 1; return nextQueryAll(...args); };
+  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: next }]);
+  const drainDelay = [...runtime.timeouts.values()].find(({ delay }) => delay === 60 || delay === 0)?.delay;
+  assert.notEqual(drainDelay, undefined, "an exception must release or reschedule the active drain");
+  runtime.runTimeout(drainDelay);
+  assert.ok(queries > 0, "the next valid boundary must still be scanned");
+  runtime.window.__codeySessionToolsInstall.dispose();
+});
+
 test("retained action buttons use the current tooltip installation after reload", () => {
   const runtime = fixture();
   const { row } = thread(runtime.document, "thread-1");

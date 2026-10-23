@@ -80,6 +80,7 @@
   const messageSelectButtons = new WeakMap();
   const messageLogicalAnchorByRow = new WeakMap();
   const messageLogicalRowsByAnchor = new WeakMap();
+  const messageSelectionSessionByRow = new WeakMap();
   const messageLogicalGroupIdsByKey = new Map();
   const selectedLogicalMessageIdsByKey = new Map();
   const conversationTurnSelector = [
@@ -2960,15 +2961,19 @@
     });
   };
 
-  const updateToolbar = () => {
+  const updateToolbar = (visibleRows = null) => {
     const toolbar = document.getElementById(toolbarId);
     if (!toolbar) return;
     const sessionId = selectedLogicalMessageIdsByKey.size ? getSessionId() : "";
     const persistedCount = sessionId ? logicalMessageSelectionGroups(sessionId).length : 0;
-    const count = persistedCount || selectedRows().length;
-    toolbar.hidden = count === 0;
+    const count = persistedCount || (visibleRows
+      ? visibleRows.filter((row) => row.dataset.codeyLogicalTurn !== "continuation"
+        && row.classList.contains(selectedClass)).length
+      : selectedRows().length);
+    if (toolbar.hidden !== (count === 0)) toolbar.hidden = count === 0;
     const label = toolbar.querySelector("[data-codey-count]");
-    if (label) label.textContent = `已选 ${count} 轮`;
+    const text = `已选 ${count} 轮`;
+    if (label && label.textContent !== text) label.textContent = text;
   };
 
   const updateSelectionButton = (row) => {
@@ -2977,8 +2982,10 @@
     const button = messageSelectButtons.get(anchor)
       || anchor.querySelector("[data-codey-message-select]");
     if (!button) return;
-    button.setAttribute("aria-pressed", selected ? "true" : "false");
-    button.textContent = selected ? "✓" : "○";
+    const pressed = selected ? "true" : "false";
+    const text = selected ? "✓" : "○";
+    if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+    if (button.textContent !== text) button.textContent = text;
   };
 
   const setLogicalRowSelected = (row, selected) => {
@@ -2995,23 +3002,22 @@
     updateSelectionButton(anchor);
   };
 
-  const syncSelectionGroups = () => {
-    const rows = [...document.querySelectorAll("[data-codey-message-id]")]
+  const syncSelectionGroups = (visibleRows = null) => {
+    const rows = visibleRows || [...document.querySelectorAll("[data-codey-message-id]")]
       .filter(isRenderedSessionElement);
     rows.forEach((row, index) => {
-      delete row.dataset.codeySelectedPrevious;
-      delete row.dataset.codeySelectedNext;
-      if (!row.classList?.contains(selectedClass)) return;
-      if (rows[index - 1]?.classList?.contains(selectedClass)) {
-        row.dataset.codeySelectedPrevious = "true";
-      }
-      if (rows[index + 1]?.classList?.contains(selectedClass)) {
-        row.dataset.codeySelectedNext = "true";
-      }
+      const selected = row.classList?.contains(selectedClass);
+      const previous = selected && rows[index - 1]?.classList?.contains(selectedClass);
+      const next = selected && rows[index + 1]?.classList?.contains(selectedClass);
+      if (previous && row.dataset.codeySelectedPrevious !== "true") row.dataset.codeySelectedPrevious = "true";
+      else if (!previous && row.dataset.codeySelectedPrevious) delete row.dataset.codeySelectedPrevious;
+      if (next && row.dataset.codeySelectedNext !== "true") row.dataset.codeySelectedNext = "true";
+      else if (!next && row.dataset.codeySelectedNext) delete row.dataset.codeySelectedNext;
     });
   };
 
   const selectRow = (row, event) => {
+    refreshMessageSelection([row], true);
     const anchor = logicalAnchorForMessageRow(row);
     const rows = logicalSelectionRows();
     if (event?.shiftKey && lastSelectedRow && rows.includes(lastSelectedRow)) {
@@ -3030,6 +3036,7 @@
 
   const deleteSelected = async () => {
     if (messageDeleteInFlight) return;
+    refreshMessageSelection([document], true);
     const rows = selectedRows();
     const sessionId = String(getSessionId() || "").replace(/^local:/, "").trim();
     const selectedGroupsByAnchor = new Map();
@@ -3139,6 +3146,7 @@
     toolbar.innerHTML = '<span data-codey-count>已选 0 轮</span><button type="button" data-codey-delete data-danger>删除</button><button type="button" data-codey-clear>取消</button>';
     toolbar.querySelector("[data-codey-delete]")?.addEventListener("click", () => void deleteSelected());
     toolbar.querySelector("[data-codey-clear]")?.addEventListener("click", () => {
+      refreshMessageSelection([document], true);
       clearLogicalMessageSelections(getSessionId());
       selectedRows().forEach((row) => {
         setLogicalRowSelected(row, false);
@@ -3369,50 +3377,47 @@
     return { button, installed: true };
   };
 
-  const installMessageSelection = (root = document) => {
+  let selectionScanRoots = null;
+  const refreshMessageSelection = (roots, forceRefresh = false) => {
     mountToolbar();
     if (lastSelectedRow?.isConnected === false) lastSelectedRow = null;
-    let rows = messageSelectionRowsWithin(root);
+    let rows = [...new Set(roots.flatMap(messageSelectionRowsWithin))];
+    let completeConversationSnapshot = roots.includes(document);
     let installed = false;
-    const directCanonicalRow = (
-      rows.length === 1
-      && rows[0] === root
-      && root instanceof HTMLElement
-      && root.matches?.(canonicalConversationTurnSelector)
-    );
+    const canonicalRoots = new Set(roots.filter((root) => (
+      root instanceof HTMLElement && root.matches?.(canonicalConversationTurnSelector)
+    )));
     let sessionId = "";
-    if (directCanonicalRow) {
-      const record = messageSelectionRecord(root);
-      const cachedButton = messageSelectButtons.get(root);
-      const cachedButtonMounted = (
-        cachedButton
-        && cachedButton.isConnected !== false
-        && cachedButton.parentElement === root
-      );
-      const previousLogicalAnchor = logicalAnchorForMessageRow(root);
-      const logicalTopologyChanged = (
-        previousLogicalAnchor !== root
-        && previousLogicalAnchor.isConnected === false
-      );
+    if (rows.some((row) => canonicalRoots.has(row))) {
       sessionId = hardDeletedMessageKeys.size ? getSessionId() : "";
-      if (record && isHardDeletedMessage(sessionId, record.messageId)) {
-        root.remove();
+      const stable = rows.every((row) => {
+        if (!canonicalRoots.has(row)) return false;
+        const record = messageSelectionRecord(row);
+        const cachedButton = messageSelectButtons.get(row);
+        const previousLogicalAnchor = logicalAnchorForMessageRow(row);
+        if (record && isHardDeletedMessage(sessionId, record.messageId)) {
+          row.remove();
+          installed = true;
+          return true;
+        }
+        return !forceRefresh && record && cachedButton
+          && cachedButton.isConnected !== false && cachedButton.parentElement === row
+          && row.dataset.codeySelectionSignature === record.signature
+          && (previousLogicalAnchor === row || previousLogicalAnchor.isConnected !== false);
+      });
+      if (stable) {
+        if (!installed) return;
         syncSelectionGroups();
         updateToolbar();
         return;
       }
-      if (
-        record
-        && cachedButtonMounted
-        && root.dataset.codeySelectionSignature === record.signature
-        && !logicalTopologyChanged
-      ) return;
-      // A new, hydrated, completed, or virtualized physical row can change its
-      // relationship with the immediately preceding turn. Recompute the
-      // mounted conversation once for those bounded transitions; stable
-      // streaming scans retain the direct-row fast path above.
+      // Identity/topology changes need neighboring turns. Share this snapshot
+      // only inside one synchronous drain, never across later DOM updates.
       const documentRows = messageSelectionRowsWithin(document);
-      if (documentRows.includes(root)) rows = documentRows;
+      if (documentRows.some((row) => canonicalRoots.has(row))) {
+        rows = documentRows;
+        completeConversationSnapshot = true;
+      }
     }
     // Stable scans return through the direct-row signature fast path above.
     // Resolve the session only for rows whose identity or logical grouping may
@@ -3426,6 +3431,15 @@
         installed = true;
         return null;
       }
+      const previousSessionId = messageSelectionSessionByRow.get(row);
+      if (previousSessionId && previousSessionId !== sessionId) {
+        row.classList.remove(selectedClass);
+        messageLogicalAnchorByRow.delete(row);
+        messageLogicalRowsByAnchor.delete(row);
+        delete row.dataset.codeyMessageIds;
+        if (lastSelectedRow === row) lastSelectedRow = null;
+      }
+      messageSelectionSessionByRow.set(row, sessionId);
       const previousMessageId = row.dataset.codeyMessageId || "";
       if (previousMessageId !== record.messageId) {
         const previousNormalizedMessageId = normalizeMessageId(previousMessageId);
@@ -3452,7 +3466,7 @@
         row.dataset.codeyMessageId = record.messageId;
         installed = true;
       }
-      row.dataset.codeyMessageRow = "true";
+      if (row.dataset.codeyMessageRow !== "true") row.dataset.codeyMessageRow = "true";
       const buttonResult = installMessageSelectButton(row);
       record.button = buttonResult.button;
       installed = installed || buttonResult.installed;
@@ -3479,24 +3493,36 @@
         const logicalTurn = index === 0 ? "anchor" : "continuation";
         if (row.dataset.codeyLogicalTurn !== logicalTurn) installed = true;
         messageLogicalAnchorByRow.set(row, anchor);
-        row.dataset.codeyLogicalTurn = logicalTurn;
-        row.dataset.codeySelectionSignature = record.signature;
-        if (groupSelected) row.classList.add(selectedClass);
-        else row.classList.remove(selectedClass);
-        button.hidden = index !== 0;
-        button.tabIndex = index === 0 ? 0 : -1;
-        if (index === 0) button.removeAttribute("aria-hidden");
-        else button.setAttribute("aria-hidden", "true");
+        if (row.dataset.codeyLogicalTurn !== logicalTurn) row.dataset.codeyLogicalTurn = logicalTurn;
+        if (row.dataset.codeySelectionSignature !== record.signature) row.dataset.codeySelectionSignature = record.signature;
+        if (groupSelected !== row.classList.contains(selectedClass)) {
+          if (groupSelected) row.classList.add(selectedClass);
+          else row.classList.remove(selectedClass);
+        }
+        if (button.hidden !== (index !== 0)) button.hidden = index !== 0;
+        const tabIndex = index === 0 ? 0 : -1;
+        if (button.tabIndex !== tabIndex) button.tabIndex = tabIndex;
+        if (index === 0 && button.hasAttribute("aria-hidden")) button.removeAttribute("aria-hidden");
+        else if (index !== 0 && button.getAttribute("aria-hidden") !== "true") button.setAttribute("aria-hidden", "true");
         if (lastSelectedRow === row && index !== 0) lastSelectedRow = anchor;
-        if (index === 0) row.dataset.codeyMessageIds = JSON.stringify(groupedMessageIds);
-        else delete row.dataset.codeyMessageIds;
+        const messageIds = index === 0 ? JSON.stringify(groupedMessageIds) : "";
+        if (messageIds && row.dataset.codeyMessageIds !== messageIds) row.dataset.codeyMessageIds = messageIds;
+        else if (!messageIds && row.dataset.codeyMessageIds) delete row.dataset.codeyMessageIds;
       });
       updateSelectionButton(anchor);
     });
     if (installed || records.some(Boolean)) {
-      syncSelectionGroups();
-      updateToolbar();
+      const visibleRows = completeConversationSnapshot
+        ? records.filter(Boolean).map((record) => record.row)
+        : [...document.querySelectorAll("[data-codey-message-id]")].filter(isRenderedSessionElement);
+      syncSelectionGroups(visibleRows);
+      updateToolbar(visibleRows);
     }
+  };
+
+  const installMessageSelection = (root = document) => {
+    if (selectionScanRoots) selectionScanRoots.add(root);
+    else refreshMessageSelection([root]);
   };
 
   const scan = (root = document, syncTitles = true) => {
@@ -3569,11 +3595,31 @@
     "input",
     "label",
   ].join(", ");
-  const relevantAddedSelector = [
-    scanBoundarySelector,
-    interactiveControlSelector,
-  ].join(", ");
   const pendingScanRoots = new Set();
+  const pendingMutationTargets = new Map();
+  let overflowMutationRoot = null;
+  let mutationWalk = null;
+  let mutationDrainActive = false;
+  let completionMutationPending = false;
+  const maxDrainRoots = 8;
+  const maxDrainNodes = 64;
+  const drainBudgetMs = 4;
+  const codeyControlIds = new Set([
+    "codey-settings-button", toolbarId, toastId, sidebarActionTooltipId, styleId,
+  ]);
+  const codeyControlAttributes = [
+    sessionExportAttribute, tasksImportAttribute, projectImportAttribute, sessionDeleteAttribute,
+    threadUpdatedAtAttribute, "data-codey-message-select", "data-codey-prompt-optimize",
+  ];
+  const isCodeyControl = (element) => element instanceof HTMLElement && (
+    codeyControlIds.has(element.id)
+    || element.dataset.codeyMessageSelect === "true"
+    || codeyControlAttributes.some((attribute) => element.hasAttribute(attribute))
+  );
+  const nodesAreCodeyControls = (nodes) => {
+    for (const node of nodes || []) if (!isCodeyControl(node)) return false;
+    return true;
+  };
 
   const isCodeyOwned = (element) => (
     element instanceof HTMLElement
@@ -3582,33 +3628,33 @@
       || element.closest?.(codeyOwnedSelector)
     )
   );
-  const containsRelevantElement = (element) => (
-    element instanceof HTMLElement
-    && (
-      element.matches?.(relevantAddedSelector)
-      || element.querySelector?.(relevantAddedSelector)
-    )
-  );
   const nearestScanRoot = (element) => {
     if (!(element instanceof HTMLElement)) return null;
     return element.closest?.(scanBoundarySelector)
       || element.querySelector?.(scanBoundarySelector)
       || null;
   };
-  const addedSubtreeScanRoot = (element) => {
-    if (!(element instanceof HTMLElement)) return null;
-    const enclosingBoundary = element.closest?.(scanBoundarySelector);
-    if (enclosingBoundary) return enclosingBoundary;
-    // Keep the whole newly-added wrapper when it contains several sibling
-    // boundaries. nearestScanRoot() intentionally returns only one node and is
-    // still appropriate for attribute/removal mutations.
-    return element.querySelector?.(scanBoundarySelector) ? element : null;
-  };
   const threadClassMutationMayAffectStatus = (target, threadRow, oldClassName) => (
     target === threadRow
     || nativeThreadStatusClassPattern.test(String(oldClassName || ""))
     || nativeThreadStatusClassPattern.test(String(target?.className || ""))
   );
+  const queueOverflowRoot = (root) => {
+    if (!(root instanceof HTMLElement)) return;
+    if (!overflowMutationRoot) {
+      overflowMutationRoot = root;
+      return;
+    }
+    const ancestors = new Set();
+    for (let node = overflowMutationRoot; node; node = node.parentElement) ancestors.add(node);
+    for (let node = root; node; node = node.parentElement) {
+      if (ancestors.has(node)) {
+        overflowMutationRoot = node;
+        return;
+      }
+    }
+    overflowMutationRoot = document.documentElement;
+  };
   const addPendingScanRoot = (root) => {
     if (!(root instanceof HTMLElement)) return;
     // Header mounts must stay fresh even while the root budget is saturated,
@@ -3616,32 +3662,120 @@
     if (root.matches?.("header, nav")) {
       window.__codeyRendererInvalidateHeaderMount?.(root);
     }
-    // Unknown/new Codex DOM shapes must degrade by skipping optional controls,
-    // not by turning a burst of virtualized rows into a synchronous full-page
-    // scan on the renderer thread.
-    if (pendingScanRoots.size >= maxPendingScanRoots) return;
+    if (pendingScanRoots.size >= maxPendingScanRoots) {
+      queueOverflowRoot(root);
+      return;
+    }
     for (const pendingRoot of pendingScanRoots) {
       if (pendingRoot === root || pendingRoot.contains?.(root)) return;
       if (root.contains?.(pendingRoot)) pendingScanRoots.delete(pendingRoot);
     }
     pendingScanRoots.add(root);
   };
+  const nextMutationWalkNode = (node, root, skipChildren = false) => {
+    if (!skipChildren && node.children?.length) return node.children[0];
+    while (node && node !== root) {
+      if (node.nextElementSibling) return node.nextElementSibling;
+      node = node.parentElement;
+    }
+    return null;
+  };
+  const collectMutationScanRoots = (target, dirty) => {
+    if (target.isConnected === false || isCodeyOwned(target)) return;
+    const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
+    if (!dirty.children) {
+      if (
+        dirty.attributes
+        || (threadRow && (dirty.oldStatusClass || threadClassMutationMayAffectStatus(target, threadRow, "")))
+      ) addPendingScanRoot(threadRow || nearestScanRoot(target));
+      return;
+    }
+    const root = threadRow
+      || target.closest?.(scanBoundarySelector)
+      || target.closest?.(interactiveControlSelector);
+    if (root) {
+      if (dirty.removed) {
+        messageSelectionRowsWithin(root).forEach((row) => { delete row.dataset.codeySelectionSignature; });
+      }
+      addPendingScanRoot(root);
+    } else {
+      mutationWalk = { root: target, node: target, removed: dirty.removed };
+    }
+  };
+  const mutationWorkPending = () => pendingScanRoots.size
+    || pendingMutationTargets.size || mutationWalk || overflowMutationRoot;
   const flushIncrementalScans = () => {
     if (disposed) return;
     scanTimer = 0;
     scanDeadline = 0;
-    const roots = [...pendingScanRoots]
-      .filter((root) => root.isConnected !== false)
-      .filter((root, index, candidates) => !candidates.some((
-        candidate,
-        candidateIndex,
-      ) => candidateIndex !== index && candidate.contains?.(root)));
-    pendingScanRoots.clear();
-    roots.forEach((root) => scan(root, true));
+    mutationDrainActive = true;
+    try {
+      codeyTimed("codey-inject.sessionToolDrain", pendingMutationTargets.size, () => {
+        const now = () => typeof performance === "object" && typeof performance.now === "function"
+          ? performance.now() : Date.now();
+        const startedAt = now();
+        let scanned = 0;
+        let visited = 0;
+        if (completionMutationPending) {
+          completionMutationPending = false;
+          void reconcileStaleCompletedTask();
+        }
+        selectionScanRoots = new Set();
+        try {
+          while (mutationWorkPending() && scanned < maxDrainRoots && visited < maxDrainNodes) {
+            if (visited && now() - startedAt >= drainBudgetMs) break;
+            if (pendingScanRoots.size) {
+              const root = pendingScanRoots.values().next().value;
+              pendingScanRoots.delete(root);
+              // shortcut: one existing DOM scan is not preemptible; split that
+              // installer too if a single boundary still produces long tasks.
+              if (root.isConnected !== false) scan(root, true);
+              scanned += 1;
+            } else if (mutationWalk) {
+              const walk = mutationWalk;
+              const node = walk.node;
+              const skip = node.isConnected === false || isCodeyOwned(node);
+              const boundary = !skip && node.matches?.(scanBoundarySelector);
+              walk.node = nextMutationWalkNode(node, walk.root, skip || boundary);
+              if (!walk.node || walk.root.isConnected === false) mutationWalk = null;
+              if (boundary) {
+                if (walk.removed) {
+                  messageSelectionRowsWithin(node).forEach((row) => { delete row.dataset.codeySelectionSignature; });
+                }
+                addPendingScanRoot(node);
+              }
+            } else if (pendingMutationTargets.size) {
+              const [target, dirty] = pendingMutationTargets.entries().next().value;
+              pendingMutationTargets.delete(target);
+              collectMutationScanRoots(target, dirty);
+            } else {
+              const root = overflowMutationRoot;
+              overflowMutationRoot = null;
+              if (root.isConnected !== false) mutationWalk = { root, node: root, removed: true };
+            }
+            visited += 1;
+          }
+        } finally {
+          const roots = selectionScanRoots;
+          selectionScanRoots = null;
+          // shortcut: this one conversation reconciliation is not preemptible;
+          // split its grouping pass if a single batch still produces long tasks.
+          if (roots.size) refreshMessageSelection([...roots]);
+        }
+      });
+    } catch (error) {
+      window.__codeySessionToolsError = error instanceof Error
+        ? `${error.name}: ${error.message}` : String(error);
+      console.error("[Codey] incremental session tools scan failed", error);
+    } finally {
+      if (!disposed && mutationWorkPending()) scanTimer = window.setTimeout(flushIncrementalScans, 0);
+      else mutationDrainActive = false;
+    }
   };
   const scheduleIncrementalScan = (root) => {
     if (disposed) return;
     addPendingScanRoot(root);
+    if (mutationDrainActive) return;
     const now = Date.now();
     if (!scanDeadline) scanDeadline = now + maxScanLatencyMs;
     // The debounce restarts on every batch, so a sustained mutation stream
@@ -3704,80 +3838,34 @@
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
         : mutation.target?.parentElement;
+      if (!target || isCodeyControl(target)) continue;
+      if (mutation.type === "attributes" && mutation.attributeName === "class"
+        && !target.hasAttribute?.(sidebarThreadRowSelector.slice(1, -1))
+        && !nativeThreadStatusClassPattern.test(String(mutation.oldValue || ""))
+        && !nativeThreadStatusClassPattern.test(String(target.className || ""))) continue;
+      if (mutation.type === "childList"
+        && (mutation.addedNodes?.length || mutation.removedNodes?.length)
+        && nodesAreCodeyControls(mutation.addedNodes)
+        && nodesAreCodeyControls(mutation.removedNodes)) continue;
+      let dirty = pendingMutationTargets.get(target);
+      if (!dirty) {
+        if (pendingMutationTargets.size >= maxPendingScanRoots) {
+          queueOverflowRoot(target);
+          continue;
+        }
+        dirty = { attributes: false, oldStatusClass: false, children: false, removed: false };
+        pendingMutationTargets.set(target, dirty);
+      }
       if (mutation.type === "attributes") {
-        if (target && !isCodeyOwned(target)) {
-          const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
-          const relevantThreadClassChange = threadRow
-            && mutation.attributeName === "class"
-            && threadClassMutationMayAffectStatus(target, threadRow, mutation.oldValue);
-          if (relevantThreadClassChange || mutation.attributeName !== "class") {
-            addPendingScanRoot(threadRow || nearestScanRoot(target));
-          }
-        }
-        continue;
-      }
-      // Depends only on mutation.target, so it is identical for every node in
-      // this record; streaming appends many text nodes per record.
-      let interactiveRoot;
-      const interactiveRootFor = () => {
-        if (interactiveRoot === undefined) {
-          interactiveRoot = target?.closest?.(interactiveControlSelector) || null;
-        }
-        return interactiveRoot;
-      };
-      for (const node of mutation.addedNodes || []) {
-        const element = node instanceof HTMLElement ? node : null;
-        if (!element) {
-          if (node?.nodeType !== Node.TEXT_NODE) continue;
-          const root = interactiveRootFor();
-          if (root && !isCodeyOwned(root)) {
-            addPendingScanRoot(root);
-          }
-          continue;
-        }
-        if (isCodeyOwned(element)) continue;
-        const threadRow = element.closest?.(sidebarThreadRowSelector)
-          || target?.closest?.(sidebarThreadRowSelector)
-          || null;
-        if (threadRow) {
-          addPendingScanRoot(threadRow);
-          continue;
-        }
-        if (!containsRelevantElement(element)) continue;
-        addPendingScanRoot(addedSubtreeScanRoot(element));
-      }
-      for (const node of mutation.removedNodes || []) {
-        const element = node instanceof HTMLElement ? node : null;
-        if (!element) continue;
-        const threadRow = target?.closest?.(sidebarThreadRowSelector) || null;
-        if (threadRow && !isCodeyOwned(target)) {
-          addPendingScanRoot(threadRow);
-          continue;
-        }
-        if (!containsRelevantElement(element)) continue;
-        if (target && !isCodeyOwned(target)) {
-          const topologyRoot = addedSubtreeScanRoot(target) || nearestScanRoot(target);
-          messageSelectionRowsWithin(topologyRoot).forEach((row) => {
-            delete row.dataset.codeySelectionSignature;
-          });
-          addPendingScanRoot(topologyRoot);
-        }
+        dirty.attributes ||= mutation.attributeName !== "class";
+        dirty.oldStatusClass ||= nativeThreadStatusClassPattern.test(String(mutation.oldValue || ""));
+      } else if (mutation.type === "childList") {
+        dirty.children = true;
+        dirty.removed ||= Boolean(mutation.removedNodes?.length);
       }
     }
-    if (pendingScanRoots.size) {
-      scheduleIncrementalScan(null);
-    }
-    const sessionId = getSessionId();
-    if (
-      sessionId
-      && !completionReconcileInFlight
-      && (
-        sessionId !== completionReconcileSessionId
-        || Date.now() >= completionNextReconcileAt
-      )
-    ) {
-      void reconcileStaleCompletedTask();
-    }
+    completionMutationPending = true;
+    scheduleIncrementalScan(null);
   };
   const sessionToolMutationOptions = {
     attributes: true,
@@ -3829,6 +3917,11 @@
     for (const id of threadRunningRecheckTimers.values()) window.clearTimeout(id);
     threadRunningRecheckTimers.clear();
     pendingScanRoots.clear();
+    pendingMutationTargets.clear();
+    overflowMutationRoot = null;
+    mutationWalk = null;
+    completionMutationPending = false;
+    mutationDrainActive = false;
     pendingThreadUpdatedAtRefs.clear();
     threadUpdatedAtRows.clear();
     // Native-operation timeout promises must still settle after disposal.
