@@ -241,7 +241,17 @@ jobs:
             '
 
       - name: Package and verify Linux tar, Debian, and RPM packages
-        run: node scripts/package-linux.mjs
+        run: |
+          node_home=$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")
+          docker run --rm --platform linux/amd64 \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" --workdir "$GITHUB_WORKSPACE" \
+            --volume "$node_home:/opt/node:ro" \
+            --env DEBIAN_FRONTEND=noninteractive --env GITHUB_REF_TYPE --env GITHUB_REF_NAME \
+            debian:11 bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends dpkg-dev rpm rpm2cpio cpio libstdc++6 binutils
+              /opt/node/bin/node scripts/package-linux.mjs
+            '
 
       - name: Verify Debian 11 package installation and removal
         run: |

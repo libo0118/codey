@@ -73,6 +73,18 @@ test("Linux x64 independently passes the same gates before both platform package
     "- name: Check and build Linux executables on glibc 2.28",
     "- name: Package and verify Linux tar, Debian, and RPM packages",
   );
+  const linuxPackageStep = workflowStep(
+    "- name: Package and verify Linux tar, Debian, and RPM packages",
+    "- name: Verify Debian 11 package installation and removal",
+  );
+  const debianInstallStep = workflowStep(
+    "- name: Verify Debian 11 package installation and removal",
+    "- name: Verify EL8 RPM installation and removal",
+  );
+  const rpmInstallStep = workflowStep(
+    "- name: Verify EL8 RPM installation and removal",
+    "- name: Upload Linux package",
+  );
   const releaseJob = workflow.slice(workflow.indexOf("\n  release:"));
   assert.match(linuxJob, /runs-on: ubuntu-24\.04/);
   assert.match(linuxJob, /apt-get install -y --no-install-recommends build-essential pkg-config/);
@@ -89,8 +101,15 @@ test("Linux x64 independently passes the same gates before both platform package
   assert.match(linuxJob, /key: linux-el8-x64\s+workspaces: "\. -> target\/linux-el8"/);
   assert.match(linuxBuildStep, /codey-linux-x64-builder bash -euo pipefail -c '[\s\S]*?cargo fmt --all -- --check[\s\S]*?cargo test --workspace --locked[\s\S]*?cargo clippy --workspace --all-targets --locked -- -D warnings[\s\S]*?node scripts\/build\.mjs[\s\S]*?ldd "target\/linux-el8\/release\/\$binary"/);
   assert.match(macBuildScript, /"cargo",\s+\[\s+"build",\s+"--release",\s+"--locked",/);
-  assert.match(linuxJob, /debian:11 bash[\s\S]*?apt-get install[^\n]*linux-x64\.deb[\s\S]*?dpkg --remove codey/);
-  assert.match(linuxJob, /registry\.access\.redhat\.com\/ubi8\/ubi:8\.10 bash[\s\S]*?dnf install[^\n]*linux-x64\.rpm[\s\S]*?rpm --erase codey/);
+  assert.ok(linuxPackageStep.includes('node_home=$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")'));
+  assert.match(linuxPackageStep, /docker run --rm --platform linux\/amd64/);
+  assert.ok(linuxPackageStep.includes('--volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" --workdir "$GITHUB_WORKSPACE"'));
+  assert.ok(linuxPackageStep.includes('--volume "$node_home:/opt/node:ro"'));
+  assert.match(linuxPackageStep, /--env DEBIAN_FRONTEND=noninteractive/);
+  assert.match(linuxPackageStep, /--env GITHUB_REF_TYPE --env GITHUB_REF_NAME/);
+  assert.match(linuxPackageStep, /debian:11 bash -euo pipefail -c '[\s\S]*?apt-get update[\s\S]*?apt-get install -y --no-install-recommends dpkg-dev rpm rpm2cpio cpio libstdc\+\+6 binutils[\s\S]*?\/opt\/node\/bin\/node scripts\/package-linux\.mjs/);
+  assert.match(debianInstallStep, /debian:11 bash[\s\S]*?apt-get install[^\n]*linux-x64\.deb[\s\S]*?dpkg --remove codey/);
+  assert.match(rpmInstallStep, /registry\.access\.redhat\.com\/ubi8\/ubi:8\.10 bash[\s\S]*?dnf install[^\n]*linux-x64\.rpm[\s\S]*?rpm --erase codey/);
   assert.match(linuxJob, /name: codey-linux-x64-package/);
   assert.match(releaseJob, /needs: \[windows, linux\]/);
   assert.doesNotMatch(releaseJob, /always\(\)|continue-on-error/);
