@@ -22,7 +22,11 @@ struct AppPackageSpec {
 }
 
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
-const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
+const STANDALONE_CODEX_EXECUTABLES: &[&str] = if cfg!(target_os = "linux") {
+    &["ChatGPT", "Codex", "codex", "ChatGPT.exe", "Codex.exe"]
+} else {
+    &["ChatGPT.exe", "Codex.exe"]
+};
 const CODEX_APP_ENTRY_DIRS: &[&str] = &["app", "bin", "current", "versions/current"];
 
 /// `package.json` names the Codex desktop client has shipped under. The client
@@ -235,6 +239,20 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     }
     if cfg!(target_os = "macos") {
         return find_macos_codex_app_default();
+    }
+    if cfg!(target_os = "linux") {
+        return unique_installation(
+            [
+                "/usr/lib/chatgpt",
+                "/opt/chatgpt",
+                "/opt/Codex",
+                "/opt/codex",
+            ]
+            .iter()
+            .filter_map(|path| normalize_codex_app_path(Path::new(path)))
+            .filter(|path| validate_codex_app_dir(path).is_ok())
+            .collect(),
+        );
     }
     #[cfg(windows)]
     {
@@ -807,7 +825,11 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
     if let Some(spec) = package_spec_from_path(app_dir) {
         return app_dir.join(spec.executable_names[0]);
     }
-    app_dir.join("Codex.exe")
+    app_dir.join(if cfg!(target_os = "linux") {
+        "ChatGPT"
+    } else {
+        "Codex.exe"
+    })
 }
 
 /// Identifies the application without replacing the OS signature checks.
@@ -1270,6 +1292,11 @@ pub fn codex_runtime_executable_candidates(app_dir: &Path) -> Vec<PathBuf> {
         candidates.push(app_dir.join("Contents").join("MacOS").join("codex"));
     } else {
         let resources = app_dir.join("resources");
+        if cfg!(target_os = "linux") {
+            candidates.push(resources.join("codex"));
+            candidates.push(resources.join("codex-cli").join("bin").join("codex"));
+            candidates.push(resources.join("bin").join("codex"));
+        }
         candidates.push(resources.join("codex.exe"));
         candidates.push(app_dir.join("Resources").join("codex.exe"));
         candidates.push(resources.join("bin").join("codex.exe"));
@@ -1549,6 +1576,32 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_layout_resolves_gui_and_embedded_cli_and_validates_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("chatgpt");
+        let resources = app.join("resources");
+        std::fs::create_dir_all(resources.join("app")).unwrap();
+        std::fs::write(app.join("ChatGPT"), "desktop").unwrap();
+        std::fs::write(resources.join("codex"), "CLI").unwrap();
+        let package = resources.join("app/package.json");
+        std::fs::write(
+            &package,
+            r#"{"name":"openai-codex-electron","productName":"Codex","version":"26.1016.61520"}"#,
+        )
+        .unwrap();
+        assert_eq!(normalize_codex_app_path(&app), Some(app.clone()));
+        assert_eq!(build_codex_executable(&app), app.join("ChatGPT"));
+        assert_eq!(
+            codex_runtime_executable(&app),
+            Some(resources.join("codex"))
+        );
+        validate_codex_app_dir(&app).unwrap();
+        std::fs::write(&package, r#"{"name":"other","version":"26.1016.61520"}"#).unwrap();
+        assert!(validate_codex_app_dir(&app).is_err());
+    }
 
     #[test]
     fn package_discovery_skips_incomplete_newer_installations() {

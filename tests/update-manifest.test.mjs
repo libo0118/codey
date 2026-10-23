@@ -13,9 +13,12 @@ const manifestScript = fileURLToPath(new URL("../scripts/generate-update-manifes
 const artifacts = [
   ["Codey-1.2.3-macos-arm64-unsigned.zip", "macos-arm64"],
   ["Codey-1.2.3-windows-x64-setup.exe", "windows-setup"],
+  ["Codey-1.2.3-linux-x64.tar.gz", "linux-x64"],
+  ["Codey-1.2.3-linux-x64.deb", "linux-deb"],
+  ["Codey-1.2.3-linux-x64.rpm", "linux-rpm"],
 ];
 
-for (const selectedArtifacts of [artifacts, [artifacts[1]]]) {
+for (const selectedArtifacts of [artifacts, [artifacts[1]], artifacts.slice(1)]) {
 test(`generates a public update manifest with ${selectedArtifacts.length} checksummed platform assets`, async () => {
   const directory = await mkdtemp(join(tmpdir(), "codey-update-manifest-"));
   const paths = [];
@@ -59,6 +62,22 @@ test(`generates a public update manifest with ${selectedArtifacts.length} checks
       size: "windows-setup".length,
     },
   );
+  if (selectedArtifacts.some(([name]) => name.endsWith("linux-x64.tar.gz"))) {
+    assert.deepEqual(manifest.assets.find(asset => asset.platform === "linux"), {
+      platform: "linux", arch: "x64", package_type: "tar-gz",
+      file_name: "Codey-1.2.3-linux-x64.tar.gz",
+      url: "https://updates.example.com/releases/v1.2.3/Codey-1.2.3-linux-x64.tar.gz",
+      sha256: createHash("sha256").update("linux-x64").digest("hex"), size: "linux-x64".length,
+    });
+  }
+  for (const type of ["deb", "rpm"]) {
+    if (selectedArtifacts.some(([name]) => name.endsWith(`linux-x64.${type}`))) assert.deepEqual(manifest.assets.find(asset => asset.package_type === type), {
+      platform: "linux", arch: "x64", package_type: type,
+      file_name: `Codey-1.2.3-linux-x64.${type}`,
+      url: `https://updates.example.com/releases/v1.2.3/Codey-1.2.3-linux-x64.${type}`,
+      sha256: createHash("sha256").update(`linux-${type}`).digest("hex"), size: `linux-${type}`.length,
+    });
+  }
 });
 }
 

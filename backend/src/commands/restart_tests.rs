@@ -1039,7 +1039,7 @@ async fn shutdown_cancels_a_restart_waiting_for_the_runtime_lock() {
     assert!(state.restart_task.lock().await.is_none());
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 #[tokio::test]
 async fn restart_rejects_unsupported_runtime_platform() {
     let state = Arc::new(AppState::default());

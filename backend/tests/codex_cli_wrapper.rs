@@ -1,4 +1,4 @@
-#![cfg(any(windows, target_os = "macos"))]
+#![cfg(any(windows, target_os = "macos", target_os = "linux"))]
 
 use std::path::Path;
 use std::process::Stdio;
@@ -30,7 +30,7 @@ fn wrapper_command(home: &Path, target: &Path, port: u16, overrides: &str) -> Co
     command
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn detached_browser_cli_uses_saved_target_without_wrapper_environment() {
     use std::os::unix::fs::PermissionsExt;
@@ -41,14 +41,25 @@ async fn detached_browser_cli_uses_saved_target_without_wrapper_environment() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "macos")]
     let app = temp.path().join("Codex.app");
+    #[cfg(target_os = "linux")]
+    let app = temp.path().join("chatgpt");
+    #[cfg(target_os = "macos")]
     let target = app.join("Contents/Resources/codex");
+    #[cfg(target_os = "linux")]
+    let target = app.join("resources/codex");
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    #[cfg(target_os = "linux")]
+    std::fs::write(app.join("ChatGPT"), "test desktop").unwrap();
     std::fs::write(&target, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 17\n").unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(target_os = "macos")]
     let config = temp
         .path()
         .join("Library/Application Support/com.Codey.Codey/config.json");
+    #[cfg(target_os = "linux")]
+    let config = temp.path().join(".config/codey/config.json");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
         &config,
@@ -61,7 +72,13 @@ async fn detached_browser_cli_uses_saved_target_without_wrapper_environment() {
         "--",
     ];
     for cli_args in [
-        vec!["sandbox", "macos", "--", "node", "argument with spaces"],
+        vec![
+            "sandbox",
+            std::env::consts::OS,
+            "--",
+            "node",
+            "argument with spaces",
+        ],
         vec![
             "app-server",
             "--analytics-default-enabled",
@@ -126,7 +143,7 @@ async fn managed_app_server_never_starts_without_its_runtime_configuration() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("缺少本次启动配置"));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn router_wrapper_rewrites_stdin_without_inspector_and_preserves_exec_exit_status() {
     use std::os::unix::fs::PermissionsExt;
@@ -180,7 +197,7 @@ async fn router_wrapper_rewrites_stdin_without_inspector_and_preserves_exec_exit
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn wrapper_confirms_exec_and_forwards_arguments_without_leaking_its_environment() {
     use std::os::unix::fs::PermissionsExt;

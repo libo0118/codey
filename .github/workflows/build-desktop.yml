@@ -1,4 +1,4 @@
-name: Build Windows package
+name: Build desktop packages
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: codey-release-automation
@@ -121,7 +121,7 @@ jobs:
           CODEY_UPDATE_BASE_URL: https://github.com/libo0118/codey/releases/latest/download
         run: pnpm run build
 
-      - name: Build Windows installer and update manifest
+      - name: Build Windows installer
         shell: pwsh
         run: |
           $version = node -p "require('./package.json').version"
@@ -143,25 +143,200 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $installer = "dist/windows/Codey-$version-windows-x64-setup.exe"
           if (-not (Test-Path $installer)) { throw "Windows installer is missing" }
-          node scripts/generate-update-manifest.mjs --version $version --tag "v$version" --download-base-url "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version" --output dist/windows/latest.json $installer
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Resolve release identity
-        id: release-metadata
-        shell: pwsh
-        run: |
-          node --input-type=module -e 'import fs from "node:fs"; import { releaseIdentity } from "./scripts/release-policy.mjs"; const identity = releaseIdentity(JSON.parse(fs.readFileSync("package.json", "utf8")).version); for (const key of ["name", "tag", "prerelease"]) fs.appendFileSync(process.env.GITHUB_OUTPUT, key + "=" + identity[key] + "\n"); fs.appendFileSync(process.env.GITHUB_OUTPUT, "make_latest=" + identity.makeLatest + "\n");'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
           name: codey-windows-x64-installer
-          path: dist/windows/*
+          path: dist/windows/*-windows-x64-setup.exe
           if-no-files-found: error
 
-      - name: Publish Windows release
-        if: startsWith(github.ref, 'refs/tags/v')
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CODEY_REQUIRE_LINUX_PACKAGING_TOOLS: "1"
+
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config dpkg-dev rpm cpio
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.2"
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: linux-el8-x64
+          workspaces: ". -> target/linux-el8"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript check
+        run: pnpm run check
+
+      - name: JavaScript tests
+        run: pnpm run test:js
+
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
+      - name: Build EL8 x64 toolchain image
+        run: docker build --platform linux/amd64 --tag codey-linux-x64-builder scripts/installer/linux
+
+      - name: Check and build Linux executables on glibc 2.28
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
+          CODEY_UPDATE_BASE_URL: https://github.com/libo0118/codey/releases/latest/download
+        run: |
+          node_home=$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")
+          docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" --workdir "$GITHUB_WORKSPACE" \
+            --volume "$HOME/.cargo:/opt/cargo" --volume "$HOME/.rustup:/opt/rustup:ro" \
+            --volume "$node_home:/opt/node:ro" \
+            --env HOME=/tmp/codey-build-home --env CARGO_HOME=/opt/cargo --env RUSTUP_HOME=/opt/rustup \
+            --env PATH=/opt/node/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --env CARGO_TARGET_DIR=target/linux-el8 --env CARGO_BUILD_BUILD_DIR=target/linux-el8/build \
+            --env RUSTFLAGS --env CARGO_TERM_COLOR --env CARGO_PROFILE_RELEASE_LTO --env CARGO_PROFILE_RELEASE_CODEGEN_UNITS \
+            --env CODEY_SKIP_OVERLAY_BUILD --env CODEY_UPDATE_BASE_URL \
+            codey-linux-x64-builder bash -euo pipefail -c '
+              mkdir -p "$HOME"
+              cargo fmt --all -- --check
+              cargo test --workspace --locked
+              cargo clippy --workspace --all-targets --locked -- -D warnings
+              node scripts/build.mjs
+              mkdir -p target/release
+              for binary in codey codey-fastctx; do
+                dependencies=$(ldd "target/linux-el8/release/$binary")
+                printf "%s\n" "$dependencies"
+                if grep -q "not found" <<< "$dependencies"; then exit 1; fi
+                cp "target/linux-el8/release/$binary" "target/release/$binary"
+              done
+            '
+
+      - name: Package and verify Linux tar, Debian, and RPM packages
+        run: node scripts/package-linux.mjs
+
+      - name: Verify Debian 11 package installation and removal
+        run: |
+          version=$(node -p "require('./package.json').version")
+          docker run --rm --platform linux/amd64 --volume "$PWD/dist/linux:/packages:ro" \
+            --env CODEY_VERSION="$version" debian:11 bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends "/packages/Codey-$CODEY_VERSION-linux-x64.deb"
+              test "$(command -v codey)" = /usr/bin/codey
+              test -x /usr/lib/codey/codey
+              test -x /usr/lib/codey/codey-fastctx
+              test -f /usr/share/applications/codey.desktop
+              mkdir -p "$HOME/.codey"
+              printf preserved > "$HOME/.codey/package-removal-test"
+              dpkg --remove codey
+              test ! -e /usr/bin/codey
+              test "$(cat "$HOME/.codey/package-removal-test")" = preserved
+            '
+
+      - name: Verify EL8 RPM installation and removal
+        run: |
+          version=$(node -p "require('./package.json').version")
+          docker run --rm --platform linux/amd64 --volume "$PWD/dist/linux:/packages:ro" \
+            --env CODEY_VERSION="$version" registry.access.redhat.com/ubi8/ubi:8.10 bash -euo pipefail -c '
+              dnf install -y "/packages/Codey-$CODEY_VERSION-linux-x64.rpm"
+              test "$(command -v codey)" = /usr/bin/codey
+              test -x /usr/lib/codey/codey
+              test -x /usr/lib/codey/codey-fastctx
+              test -f /usr/share/applications/codey.desktop
+              mkdir -p "$HOME/.codey"
+              printf preserved > "$HOME/.codey/package-removal-test"
+              rpm --erase codey
+              test ! -e /usr/bin/codey
+              test "$(cat "$HOME/.codey/package-removal-test")" = preserved
+            '
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: codey-linux-x64-package
+          path: |
+            dist/linux/*-linux-x64.tar.gz
+            dist/linux/*-linux-x64.deb
+            dist/linux/*-linux-x64.rpm
+          if-no-files-found: error
+
+  release:
+    name: Assemble packages and release
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: codey-windows-x64-installer
+          path: release-assets
+
+      - name: Download Linux package
+        uses: actions/download-artifact@v4
+        with:
+          name: codey-linux-x64-package
+          path: release-assets
+
+      - name: Resolve release identity
+        id: release-metadata
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; import { releaseIdentity } from "./scripts/release-policy.mjs"; import { readSourceVersion } from "./scripts/prepare-release-version.mjs"; const identity = releaseIdentity(await readSourceVersion()); if (process.env.GITHUB_REF_TYPE === "tag" && process.env.GITHUB_REF_NAME !== identity.tag) throw new Error("Release tag must match package.json version"); for (const key of ["name", "tag", "prerelease"]) fs.appendFileSync(process.env.GITHUB_OUTPUT, key + "=" + identity[key] + "\n"); fs.appendFileSync(process.env.GITHUB_OUTPUT, "make_latest=" + identity.makeLatest + "\n");'
+
+      - name: Generate unified update manifest
+        run: |
+          version=$(node -p "require('./package.json').version")
+          node scripts/generate-update-manifest.mjs --version "$version" --tag "v$version" --download-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$version" --output release-assets/latest.json "release-assets/Codey-$version-windows-x64-setup.exe" "release-assets/Codey-$version-linux-x64.tar.gz" "release-assets/Codey-$version-linux-x64.deb" "release-assets/Codey-$version-linux-x64.rpm"
+
+      - name: Upload update manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: codey-update-manifest
+          path: release-assets/latest.json
+          if-no-files-found: error
+
+      - name: Publish desktop release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -169,4 +344,5 @@ jobs:
           tag_name: ${{ steps.release-metadata.outputs.tag }}
           make_latest: ${{ steps.release-metadata.outputs.make_latest }}
           prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}
-          files: dist/windows/*
+          files: release-assets/*
+          fail_on_unmatched_files: true

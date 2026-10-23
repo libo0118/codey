@@ -333,7 +333,7 @@ for (const [lineEndingName, lineEnding] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
     const workflow = (await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8")).replace(/\r?\n/g, lineEnding);
     assert.doesNotMatch(workflow, /copilot-requests|RELEASE_ADMIN_CALLBACK_SECRET|CLOUDFLARE|release-automation\.mjs/);
     assert.match(workflow, /persist-credentials: false/);
-    const publish = workflow.indexOf("- name: Publish Windows release");
+    const publish = workflow.indexOf("- name: Publish desktop release");
     assert.notEqual(publish, -1);
     for (const gate of ["go test ./...", "pnpm run check", "pnpm run test:js", "cargo fmt --all -- --check", "cargo test --workspace --locked", "cargo clippy --workspace --all-targets --locked -- -D warnings"]) {
       assert.ok(workflow.indexOf(gate) >= 0 && workflow.indexOf(gate) < publish);
@@ -346,14 +346,14 @@ test("fork builds require matching package, workspace and tag versions before pa
   assert.match(workflow, /Release tag must match package\.json version/);
   assert.match(workflow, /if \(\$cargoVersion -ne \$version\)/);
   assert.ok(workflow.indexOf("if ($cargoVersion -ne $version)") < workflow.indexOf("& $env:MAKENSIS"));
-  assert.match(workflow, /if: startsWith\(github.ref, 'refs\/tags\/v'\)/);
+  assert.match(workflow, /if: github.event_name == 'push' && startsWith\(github.ref, 'refs\/tags\/v'\)/);
   assert.doesNotMatch(workflow, /release\.mjs|generate-lockfile|git push|git commit/);
 });
 
 test("tag publication forwards explicit Latest and prerelease metadata", async () => {
   const workflow = await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8");
-  const metadataStep = workflow.slice(workflow.indexOf("- name: Resolve release identity"), workflow.indexOf("- name: Upload Windows package"));
-  const publish = workflow.slice(workflow.indexOf("- name: Publish Windows release"));
+  const metadataStep = workflow.slice(workflow.indexOf("- name: Resolve release identity"), workflow.indexOf("- name: Generate unified update manifest"));
+  const publish = workflow.slice(workflow.indexOf("- name: Publish desktop release"));
   const script = metadataStep.match(/node --input-type=module -e '([^'\r\n]+)'/)?.[1];
   assert.ok(script, "release metadata script must be present");
   assert.ok(publish.includes("prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}"));
@@ -362,6 +362,7 @@ test("tag publication forwards explicit Latest and prerelease metadata", async (
   try {
     await mkdir(join(directory, "scripts"));
     await writeFile(join(directory, "scripts/release-policy.mjs"), await readFile(new URL("../scripts/release-policy.mjs", import.meta.url)));
+    await writeFile(join(directory, "scripts/prepare-release-version.mjs"), await readFile(new URL("../scripts/prepare-release-version.mjs", import.meta.url)));
     for (const [version, prerelease, makeLatest, name] of [
       ["1.2.3", "false", "true", "正式版 v1.2.3"],
       ["1.2.4-beta.1", "true", "false", "实验版 v1.2.4-beta.1"],
@@ -369,13 +370,20 @@ test("tag publication forwards explicit Latest and prerelease metadata", async (
     ]) {
       const output = join(directory, version);
       await writeFile(join(directory, "package.json"), JSON.stringify({ version }));
+      await writeFile(join(directory, "Cargo.toml"), `[workspace.package]\nversion = "${version}"\n`);
       await promisify(execFile)(process.execPath, ["--input-type=module", "-e", script], {
         cwd: directory,
-        env: { ...process.env, GITHUB_REF_NAME: `v${version}`, GITHUB_OUTPUT: output },
+        env: { ...process.env, GITHUB_REF_TYPE: "tag", GITHUB_REF_NAME: `v${version}`, GITHUB_OUTPUT: output },
       });
       const metadata = Object.fromEntries((await readFile(output, "utf8")).trim().split(/\r?\n/).map(line => line.split("=")));
       assert.deepEqual(metadata, { name, prerelease, make_latest: makeLatest, tag: `v${version}` });
     }
+    const executeMetadata = (tag) => promisify(execFile)(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: directory, env: { ...process.env, GITHUB_REF_TYPE: "tag", GITHUB_REF_NAME: tag, GITHUB_OUTPUT: join(directory, "invalid-output") },
+    });
+    await assert.rejects(executeMetadata("v9.0.0"), /Release tag must match/);
+    await writeFile(join(directory, "Cargo.toml"), '[workspace.package]\nversion = "9.0.0"\n');
+    await assert.rejects(executeMetadata("v1.3.6-libo.1"), /版本必须一致/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

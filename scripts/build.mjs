@@ -28,6 +28,7 @@ const cargo = spawnSync(
   [
     "build",
     "--release",
+    "--locked",
     "-p",
     "codey",
     "--bins",

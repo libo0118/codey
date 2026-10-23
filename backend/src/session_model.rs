@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ fn confirmed_model(home: &Path, thread_id: &str) -> Result<Option<ConfirmedModel
 }
 
 // 仅接收 app-server 已确认的设置通知，未发送消息的模型选择也能跨重启保留。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn remember_settings(
     home: &Path,
     thread_id: &str,

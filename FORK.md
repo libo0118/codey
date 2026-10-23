@@ -18,9 +18,11 @@
 
 ## 发布
 
-`Build Windows package` 工作流只构建 Windows x64，对 `custom` 手动运行可生成安装包。版本号使用 `上游版本-libo.序号` 区分，例如 `1.1.1-libo.2`；版本标签触发构建，检查通过后自动发布安装包和更新清单。发布前运行 `pnpm run check`、`pnpm run test:js`、`cargo test --workspace --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --workspace --all-targets --locked -- -D warnings`。
+`Build desktop packages` 工作流分别构建 Windows x64 安装包，以及 Linux x64 的 `.tar.gz`、Debian 系 `.deb`、红帽系 `.rpm`；暂不构建 ARM。对 `custom` 手动运行只上传构建产物，不发布 Release。版本号使用 `上游版本-libo.序号` 区分，例如 `1.1.1-libo.2`；版本标签触发构建，两平台检查和打包都成功后，统一发布安装包与更新清单。发布前运行 `pnpm run check`、`pnpm run test:js`、`cargo test --workspace --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --workspace --all-targets --locked -- -D warnings`。
 
-构建时将更新地址设为本 fork 的 `https://github.com/libo0118/codey/releases/latest/download`，不会自动替换为上游包。指定自定义更新地址后，仅在同时显式配置发布管理服务时使用该服务。工作流使用 `scripts/generate-update-manifest.mjs` 生成并上传 `latest.json`，清单包含 Windows 安装包地址、大小及 SHA-256；无需 R2 密钥或存储。
+构建时将更新地址设为本 fork 的 `https://github.com/libo0118/codey/releases/latest/download`，不会自动替换为上游包。指定自定义更新地址后，仅在同时显式配置发布管理服务时使用该服务。工作流使用 `scripts/generate-update-manifest.mjs` 生成统一 `latest.json`，包含两平台各格式包的地址、大小及 SHA-256；无需 R2 密钥或存储。Linux 安装包将 `codey` 与 `codey-fastctx` 放在 `/usr/lib/codey`，提供 `codey` 命令和桌面入口；使用 `apt install ./Codey-版本-linux-x64.deb` 或 `dnf install ./Codey-版本-linux-x64.rpm` 安装，压缩包也可解压后运行 `./codey`。需系统已安装官方 Codex 桌面端；Linux 自动安装更新暂不支持。卸载仅删除包文件，不删除用户数据，不配置开机自启。
+
+Linux ELF 在 UBI 8.10（glibc 2.28）x64 容器中完成 Rust 检查和构建，使用独立的 `target/linux-el8`，避免引入 Ubuntu 构建机较新的 glibc 依赖。同一组 ELF 生成三个 Linux 包，Debian 依赖由 `dpkg-shlibdeps` 计算，RPM 保留自动 ELF 依赖；CI 读回元数据、解包比对内容，并在 Debian 11 与 UBI 8 容器中验证安装和卸载。系统 ABI 基线为 Debian 11／Ubuntu 20.04／RHEL 8 或更新版本；这些容器检查不替代 Codex 桌面 GUI 的实机验收。
 
 供日常更新的自定义 Release 应标记为 Latest，不能标记为 GitHub Pre-release，否则 `releases/latest` 不会选中它。初次从官方版切换需手动安装自定义包；版本后缀仅用于区分分支，不代表已经安装。
 

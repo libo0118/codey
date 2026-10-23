@@ -6,6 +6,9 @@ import { basename, dirname, resolve } from "node:path";
 const artifactDefinitions = [
   { platform: "macos", arch: "arm64", package_type: "app-zip", suffix: "macos-arm64-unsigned.zip" },
   { platform: "windows", arch: "x64", package_type: "nsis", suffix: "windows-x64-setup.exe" },
+  { platform: "linux", arch: "x64", package_type: "tar-gz", suffix: "linux-x64.tar.gz" },
+  { platform: "linux", arch: "x64", package_type: "deb", suffix: "linux-x64.deb" },
+  { platform: "linux", arch: "x64", package_type: "rpm", suffix: "linux-x64.rpm" },
 ];
 
 function fail(message) {

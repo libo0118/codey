@@ -1,13 +1,16 @@
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#![cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 
 use anyhow::Result;
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 use anyhow::Context;
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 use std::ffi::{OsStr, OsString};
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 use std::io::Write;
 
 /// 单次启动尝试等待 CLI 包装器确认的上限。进程退出、明确失败或确认成功都会提前结束；
@@ -16,38 +19,38 @@ use std::io::Write;
 pub(crate) const STARTUP_CLI_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_TARGET_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TARGET";
 /// 启动器实际发现的原始 CLI；Windows 商店版的执行目标可能是用户目录副本。
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_SOURCE_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SOURCE";
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_OVERRIDES_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_OVERRIDES";
 /// 本次启动具备 stdin relay 的包装器路径，供主进程核对实际启动入口。
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_STDIN_RELAY_ENV: &str = "CODEY_CODEX_CLI_STDIN_RELAY";
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_SUBAGENT_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SUBAGENT";
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) const CLI_WRAPPER_PORT_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_PORT";
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) const CLI_WRAPPER_TOKEN_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TOKEN";
 /// 包装器执行记录文件的绝对路径；回环握手丢失时启动器据此确认目标已执行。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) const CLI_WRAPPER_MARKER_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_MARKER";
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 const CLI_WRAPPER_HANDSHAKE_CONNECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
 /// 单次回连最多 500ms；被安全软件或高负载拖慢时在 3 秒内重试，端口被拒绝则立即放弃。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 const CLI_WRAPPER_HANDSHAKE_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 const CLI_WRAPPER_HANDSHAKE_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(100);
 #[cfg(any(windows, test))]
 pub(crate) const WINDOWS_PACKAGE_RESUME_ARGUMENT: &str = "--codey-resume-packaged-app";
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn is_retryable_startup_io_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -57,32 +60,32 @@ pub(crate) fn is_retryable_startup_io_error(error: &std::io::Error) -> bool {
     ) || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CliWrapperFailure {
     pub message: String,
     pub retryable: bool,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 impl std::fmt::Display for CliWrapperFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Codex CLI 兼容执行器启动失败：{}", self.message)
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 impl std::error::Error for CliWrapperFailure {}
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const MAX_CLI_WRAPPER_FAILURE_BYTES: usize = 8 * 1024;
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) const MAX_CLI_WRAPPER_MARKER_BYTES: u64 = 16 * 1024;
 
 /// 包装器在握手端口之外留下的文件记录。回环连接被拖慢或丢失时，启动器仍能确认目标已执行，
 /// 不会因为一次握手丢失就杀掉健康的 Codex。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CliWrapperMarkerStatus {
@@ -91,7 +94,7 @@ pub(crate) enum CliWrapperMarkerStatus {
     Failed,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CliWrapperMarker {
     pub status: CliWrapperMarkerStatus,
@@ -103,7 +106,7 @@ pub(crate) struct CliWrapperMarker {
     pub retryable: Option<bool>,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 impl CliWrapperMarker {
     pub(crate) fn new(status: CliWrapperMarkerStatus) -> Self {
         Self {
@@ -136,7 +139,7 @@ impl CliWrapperMarker {
 }
 
 /// 只接受启动器传入的绝对 JSON 路径，避免包装器把记录写到不可预期的位置。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn cli_wrapper_marker_path_from_env(
     value: Option<OsString>,
 ) -> Option<std::path::PathBuf> {
@@ -173,7 +176,7 @@ impl std::fmt::Display for StartupProcessExited {
 
 impl std::error::Error for StartupProcessExited {}
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn cli_wrapper_target(
     arguments: &[OsString],
     target: Option<OsString>,
@@ -204,7 +207,7 @@ fn cli_wrapper_target(
     .context("找不到有效的 Codex 桌面应用，无法转发 CLI 调用")?;
     #[cfg(windows)]
     let target = crate::launcher::windows_cli_wrapper_target(&app_dir)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let target =
         codey_runtime_core::app_paths::codex_runtime_executable(&app_dir).with_context(|| {
             codey_runtime_core::app_paths::codex_runtime_executable_missing(&app_dir)
@@ -212,7 +215,7 @@ fn cli_wrapper_target(
     Ok(Some(target))
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     if std::env::args_os().nth(1).as_deref()
         == Some(OsStr::new("--codey-observe-app-server-output"))
@@ -339,7 +342,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             }
         }
         if app_server && local_router_runtime_enabled(&runtime_overrides) {
-            // Keep macOS exec/PID semantics. The helper owns only the input pipe;
+            // Keep Unix exec/PID semantics. The helper owns only the input pipe;
             // Desktop closing stdin ends it, including when app-server restarts.
             let mut relay = std::process::Command::new(std::env::current_exe()?);
             relay
@@ -371,7 +374,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             command.stdout(observer.stdin.take().context("Codex 会话响应管道不可用")?);
             output_observer = Some(observer);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             use std::os::unix::process::CommandExt;
             // exec 成功后不再有机会写文件：先记录已执行，exec 失败时随后改写为失败。
@@ -414,7 +417,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             return Err(error);
         }
     };
-    // macOS exec 成功由 CLOEXEC 关闭连接；Windows 只在 spawn 成功后关闭。
+    // Unix exec 成功由 CLOEXEC 关闭连接；Windows 只在 spawn 成功后关闭。
     if let Some(readiness) = readiness {
         readiness.executed();
     }
@@ -433,7 +436,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn observe_local_app_server_output(
     mut input: impl std::io::Read,
     mut output: impl std::io::Write,
@@ -472,7 +475,7 @@ fn observe_local_app_server_output(
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn remember_app_server_settings(line: &[u8], home: &std::path::Path) {
     let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
         return;
@@ -519,7 +522,7 @@ fn remember_app_server_settings(line: &[u8], home: &std::path::Path) {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn route_local_app_server_input(
     mut input: impl std::io::BufRead,
     mut output: impl std::io::Write,
@@ -646,7 +649,7 @@ fn route_local_app_server_input(
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn restored_resume_settings(
     home: &std::path::Path,
     thread_id: &str,
@@ -666,7 +669,7 @@ fn restored_resume_model(
     Ok(restored_resume_settings(home, thread_id, overrides)?.map(|(model, _)| model))
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn resolve_resume_model(saved: &serde_json::Value, overrides: &[String]) -> Result<Option<String>> {
     let Some(model) = saved.get("model").and_then(serde_json::Value::as_str) else {
         return Ok(None);
@@ -716,7 +719,7 @@ fn resolve_resume_model(saved: &serde_json::Value, overrides: &[String]) -> Resu
     })
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     Ok(false)
 }
@@ -825,14 +828,14 @@ fn windows_package_resume_target(
 }
 
 /// 包装器向启动器汇报进度的两条通道：回环握手连接和记录文件。任一到达即可确认。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 struct CliWrapperReadiness {
     stream: Option<std::net::TcpStream>,
     marker: Option<std::path::PathBuf>,
     tcp_deferred: bool,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 impl CliWrapperReadiness {
     fn begin() -> Self {
         let started = std::time::Instant::now();
@@ -990,7 +993,7 @@ impl CliWrapperReadiness {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn connect_cli_wrapper_handshake() -> Result<std::net::TcpStream> {
     let port = std::env::var(CLI_WRAPPER_PORT_ENV)
         .context("Codex CLI 缺少兼容校验端口")?
@@ -1018,7 +1021,7 @@ fn connect_cli_wrapper_handshake() -> Result<std::net::TcpStream> {
 }
 
 /// 被拒绝立即返回；超时等暂时性错误在预算内重试，避免单次 500ms 连不上就静默放弃握手。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn connect_loopback_with_retry(
     address: &std::net::SocketAddr,
     deadline: std::time::Instant,
@@ -1026,7 +1029,7 @@ fn connect_loopback_with_retry(
     connect_loopback_with_retry_using(address, deadline, std::net::TcpStream::connect_timeout)
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn connect_loopback_with_retry_using(
     address: &std::net::SocketAddr,
     deadline: std::time::Instant,
@@ -1057,12 +1060,12 @@ fn connect_loopback_with_retry_using(
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn runtime_override_key(config: &str) -> &str {
     config.split_once('=').map_or(config, |(key, _)| key).trim()
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn app_server_runtime_configs(runtime_overrides: &[String]) -> Vec<String> {
     let mut configs = vec!["analytics.enabled=false".to_string()];
     for config in runtime_overrides {
@@ -1082,13 +1085,13 @@ fn app_server_runtime_configs(runtime_overrides: &[String]) -> Vec<String> {
     configs
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) fn local_router_runtime_enabled(overrides: &[String]) -> bool {
     runtime_override_string(overrides, "model_provider")
         .is_some_and(|provider| crate::local_router::is_router_provider(&provider))
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn runtime_override_string(overrides: &[String], name: &str) -> Option<String> {
     let (_, value) = overrides
         .iter()
@@ -1102,7 +1105,7 @@ fn runtime_override_string(overrides: &[String], name: &str) -> Option<String> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn router_provider_for_params(
     _method: &str,
     _params: &serde_json::Map<String, serde_json::Value>,
@@ -1111,7 +1114,7 @@ fn router_provider_for_params(
     crate::local_router::ROUTER_PROVIDER_ID
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn rewrite_app_server_args(
     args: &[OsString],
     runtime_overrides: &[String],
@@ -1758,7 +1761,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn detached_cli_calls_resolve_the_saved_app_or_fail_without_starting_the_desktop() {
         let temp = tempfile::tempdir().unwrap();
@@ -1767,14 +1770,20 @@ mod tests {
         let app = temp.path().join("Codex.app");
         #[cfg(windows)]
         let app = temp.path().join("Codex");
+        #[cfg(target_os = "linux")]
+        let app = temp.path().join("chatgpt");
         #[cfg(target_os = "macos")]
         let target = app.join("Contents/Resources/codex");
         #[cfg(windows)]
         let target = app.join("resources/codex.exe");
+        #[cfg(target_os = "linux")]
+        let target = app.join("resources/codex");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "test CLI").unwrap();
         #[cfg(windows)]
         std::fs::write(app.join("Codex.exe"), "test desktop").unwrap();
+        #[cfg(target_os = "linux")]
+        std::fs::write(app.join("ChatGPT"), "test desktop").unwrap();
         store
             .save(&crate::config::CodeyConfig {
                 codex_app_path: app.to_string_lossy().into_owned(),

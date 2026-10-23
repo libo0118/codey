@@ -184,14 +184,14 @@ pub(super) async fn spawn_codex(
     options: CodexLaunchOptions<'_>,
     runtime_config_overrides: &[String],
 ) -> Result<SpawnedCodex> {
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let _ = (
         disable_codex_pet,
         subagent_gate_active,
         misc_model,
         runtime_config_overrides,
     );
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     let _ = (disable_codex_pet, misc_model);
     let mut runtime_arguments = codex_runtime_arguments(
         options.gpu_launch_mode,
@@ -432,22 +432,28 @@ pub(super) async fn spawn_codex(
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
+        #[cfg(target_os = "macos")]
         let is_app_bundle = app_dir.extension().and_then(|value| value.to_str()) == Some("app");
         // 唯一的进程注入入口是 CLI 包装器：Codex 原生读取 CODEX_CLI_PATH，
         // Electron fuse 关闭后 NODE_OPTIONS 与 --inspect 不再可用。
         let wrapper = prepare_cli_wrapper(app_dir, subagent_gate_active, runtime_config_overrides)
             .await
             .map_err(recovery::recoverable)?;
+        #[cfg(target_os = "macos")]
         let mut command = if is_app_bundle {
             build_fresh_macos_open_command(app_dir, debug_port, &runtime_arguments)
         } else {
             build_codex_command(app_dir, debug_port, &runtime_arguments)
         };
+        #[cfg(target_os = "linux")]
+        let command = build_codex_command(app_dir, debug_port, &runtime_arguments);
         // `.app` 经 open 启动，环境随 --env 参数进入；非 bundle 直接拉起，
         // 由 spawn 环境继承。
+        #[cfg(target_os = "macos")]
         let mut spawned_environment = Vec::new();
+        #[cfg(target_os = "macos")]
         if is_app_bundle {
             add_macos_launch_environment(&mut command, &wrapper.environment)
                 .map_err(recovery::recoverable)?;
@@ -461,6 +467,14 @@ pub(super) async fn spawn_codex(
                 spawned_environment.extend(environment.iter().cloned());
             }
         }
+        #[cfg(target_os = "linux")]
+        let spawned_environment = {
+            let mut environment = wrapper.environment.clone();
+            if let Some(proxy) = &launch_proxy_environment {
+                environment.extend(proxy.iter().cloned());
+            }
+            environment
+        };
         let mut spawned = spawn_command(command, &spawned_environment)?;
         let startup_result = confirm_cli_wrapper_startup(
             wrapper.into_handshake(),
@@ -482,7 +496,7 @@ pub(super) async fn spawn_codex(
                     "confirm_cli_wrapper_startup",
                     format!("{error:#}"),
                     serde_json::json!({
-                        "platform": "macos",
+                        "platform": std::env::consts::OS,
                         "processId": spawned.process_id,
                         "processGroupId": spawned.process_group_id,
                     }),
@@ -501,7 +515,7 @@ pub(super) async fn spawn_codex(
                 if let Err(stop_error) = &stop_result {
                     error_log::record_failure(
                         "cleanup_failed",
-                        "cleanup_macos_after_startup_patch_failure",
+                        "cleanup_unix_after_startup_patch_failure",
                         format!("{stop_error:#}"),
                         serde_json::json!({
                             "appPath": app_dir,
@@ -526,7 +540,7 @@ pub(super) async fn spawn_codex(
         }
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let command = build_codex_command(app_dir, debug_port, &runtime_arguments);
         let mut spawned =
@@ -537,7 +551,7 @@ pub(super) async fn spawn_codex(
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct CliWrapperLaunch {
     listener: tokio::net::TcpListener,
     token: Vec<u8>,
@@ -545,7 +559,7 @@ struct CliWrapperLaunch {
     environment: Vec<(String, String)>,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 impl CliWrapperLaunch {
     fn into_handshake(self) -> CliWrapperHandshake {
         CliWrapperHandshake {
@@ -558,20 +572,20 @@ impl CliWrapperLaunch {
 
 /// Two independent confirmation channels for the CLI wrapper: the loopback
 /// handshake connection and a marker file it writes next to Codey's state.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct CliWrapperHandshake {
     listener: tokio::net::TcpListener,
     token: Vec<u8>,
     marker_path: PathBuf,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const CLI_WRAPPER_MARKER_DIR: &str = "cli-wrapper";
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 const CLI_WRAPPER_MARKER_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Removes marker files left behind by launches that never reached cleanup.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn prune_cli_wrapper_markers(
     directory: &std::path::Path,
     now: std::time::SystemTime,
@@ -599,7 +613,7 @@ fn prune_cli_wrapper_markers(
     removed
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn prepare_cli_wrapper_marker(token: &str) -> PathBuf {
     let directory = codey_runtime_core::paths::default_app_state_dir().join(CLI_WRAPPER_MARKER_DIR);
     let marker_path = directory.join(format!("{token}.json"));
@@ -1057,7 +1071,7 @@ fn windows_cli_wrapper_target_from_source(
     stage_windows_cli_runtime(target, &local_app_data)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn prepare_cli_wrapper(
     app_dir: &std::path::Path,
     subagent_gate_active: bool,
@@ -1081,7 +1095,7 @@ async fn prepare_cli_wrapper(
         .await
         .context("准备 Windows Codex 用户运行文件的任务异常退出")??
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let target = source.clone();
     validate_code_mode_host(&target)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1129,7 +1143,7 @@ async fn prepare_cli_wrapper(
     ));
     #[cfg(windows)]
     let wrapper = codey;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let wrapper = {
         let path = crate::config::default_config_path().with_file_name("codex-cli-wrapper");
         // The wrapper write fsyncs; keep it off the two-worker async runtime.
@@ -1137,10 +1151,10 @@ async fn prepare_cli_wrapper(
         let write_codey = codey.clone();
         let write_environment = environment.clone();
         tokio::task::spawn_blocking(move || {
-            write_macos_cli_wrapper(&write_path, &write_codey, &write_environment)
+            write_unix_cli_wrapper(&write_path, &write_codey, &write_environment)
         })
         .await
-        .context("写入 macOS Codex CLI 兼容入口的任务异常退出")??;
+        .context("写入 Unix Codex CLI 兼容入口的任务异常退出")??;
         path
     };
     if crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides) {
@@ -1166,7 +1180,7 @@ async fn prepare_cli_wrapper(
 
 /// Desktop must execute the wrapper for process overrides to reach app-server.
 /// Router and native telemetry use loopback; direct model traffic keeps its proxy.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn cli_runtime_environment(
     runtime_config_overrides: &[String],
     no_proxy: Option<&str>,
@@ -1190,7 +1204,7 @@ fn cli_runtime_environment(
             crate::launch_proxy::merge_loopback_no_proxy(no_proxy.or(lowercase_no_proxy)),
         ));
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         environment.extend([
             (
@@ -1203,14 +1217,14 @@ fn cli_runtime_environment(
             ),
         ]);
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (no_proxy, lowercase_no_proxy);
     }
     environment
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn validate_code_mode_host(target: &std::path::Path) -> Result<()> {
     // Codex Desktop enables features.code_mode_host in its app-server arguments.
     let host = target.with_file_name(if cfg!(windows) {
@@ -1232,8 +1246,8 @@ fn validate_code_mode_host(target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn write_macos_cli_wrapper(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_unix_cli_wrapper(
     path: &std::path::Path,
     codey: &std::path::Path,
     environment: &[(String, String)],
@@ -1253,9 +1267,9 @@ fn write_macos_cli_wrapper(
         quote(&codey.to_string_lossy())
     ));
     crate::fs_util::atomic_write_private_with_parent(path, script.as_bytes())
-        .with_context(|| format!("写入 macOS Codex CLI 兼容入口失败：{}", path.display()))?;
+        .with_context(|| format!("写入 Unix Codex CLI 兼容入口失败：{}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("设置 macOS Codex CLI 兼容入口权限失败：{}", path.display()))?;
+        .with_context(|| format!("设置 Unix Codex CLI 兼容入口权限失败：{}", path.display()))?;
     Ok(())
 }
 
@@ -1352,7 +1366,7 @@ async fn launch_windows_codex_without_compatibility(
     Ok(spawned)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn spawned_codex_alive(spawned: &mut SpawnedCodex) -> Result<bool> {
     if let Some(child) = spawned.child.as_mut() {
         return child
@@ -1371,7 +1385,7 @@ async fn spawned_codex_alive(spawned: &mut SpawnedCodex) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn process_probe_confirms_exit(probe: Result<bool>, process_id: Option<u32>) -> bool {
     match probe {
         Ok(running) => !running,
@@ -1386,7 +1400,7 @@ fn process_probe_confirms_exit(probe: Result<bool>, process_id: Option<u32>) -> 
 }
 
 /// Resolves once the launched process is gone; never resolves without one.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn startup_process_exited(
     spawned: Option<&mut SpawnedCodex>,
 ) -> crate::codex_startup_patch::StartupProcessExited {
@@ -1431,7 +1445,7 @@ async fn startup_process_exited(
 
 /// 等待 CLI 包装器确认：启动期间进程退出会立即结束等待，
 /// 避免把整段就绪预算耗在已退出的进程上。
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn confirm_cli_wrapper_startup(
     handshake: CliWrapperHandshake,
     deadline: tokio::time::Instant,
@@ -1447,7 +1461,7 @@ async fn confirm_cli_wrapper_startup(
 
 /// Polls the wrapper's marker file. Resolves on an executed or failed record;
 /// keeps waiting while the file is missing or still says launching.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn watch_cli_wrapper_marker(path: &std::path::Path) -> Result<()> {
     use crate::codex_startup_patch::{CliWrapperFailure, CliWrapperMarker, CliWrapperMarkerStatus};
 
@@ -1500,7 +1514,7 @@ async fn watch_cli_wrapper_marker(path: &std::path::Path) -> Result<()> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn wait_for_cli_wrapper(
     handshake: CliWrapperHandshake,
     deadline: tokio::time::Instant,
@@ -1765,7 +1779,7 @@ mod cli_wrapper_tests {
         );
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn native_stats_force_cli_without_changing_model_proxy_environment() {
         let overrides = vec!["otel.trace_exporter={ otlp-http={ endpoint='http://127.0.0.1:1/v1/traces', protocol='json' } }".to_string()];
@@ -1781,7 +1795,7 @@ mod cli_wrapper_tests {
                 "corp.internal,127.0.0.1,localhost,::1".to_string(),
             ),
         ];
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let expected = {
             let mut expected = expected;
             expected.push((
@@ -1800,7 +1814,7 @@ mod cli_wrapper_tests {
                 "other.internal,127.0.0.1,localhost,::1".to_string(),
             )
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             assert_eq!(fallback[1].1, "127.0.0.1,localhost,::1");
             assert_eq!(fallback[2].1, "other.internal,127.0.0.1,localhost,::1");
@@ -1888,7 +1902,7 @@ mod cli_wrapper_tests {
         assert!(error.to_string().contains("0xC0000005"));
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn test_handshake(
         listener: tokio::net::TcpListener,
         token: &[u8],
@@ -1965,7 +1979,7 @@ mod cli_wrapper_tests {
         assert!(!should_retry_startup(&timeout(), 2));
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cli_wrapper_wait_respects_the_callers_deadline() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1983,7 +1997,7 @@ mod cli_wrapper_tests {
         assert!(tokio::time::Instant::now() >= deadline);
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cli_retry_gets_a_full_readiness_window() {
         use tokio::io::AsyncWriteExt;
@@ -2025,7 +2039,7 @@ mod cli_wrapper_tests {
         sender.await.unwrap();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cli_launch_failure_returns_its_cause() {
         use tokio::io::AsyncWriteExt;
@@ -2068,7 +2082,7 @@ mod cli_wrapper_tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cli_handshake_requires_authenticated_exec_completion() {
         use tokio::io::AsyncWriteExt;
@@ -2102,7 +2116,7 @@ mod cli_wrapper_tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cli_wrapper_marker_confirms_execution_or_failure_without_a_connection() {
         use crate::codex_startup_patch::{
@@ -2166,12 +2180,12 @@ mod cli_wrapper_tests {
         ));
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn startup_wait_ends_as_soon_as_the_codex_process_exits() {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let mut command = tokio::process::Command::new("sh");
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         command.args(["-c", "exit 17"]);
         #[cfg(windows)]
         let mut command = tokio::process::Command::new("cmd");
@@ -2255,7 +2269,7 @@ mod cli_wrapper_tests {
         );
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[tokio::test(start_paused = true)]
     async fn cli_wrapper_accepts_cold_start_within_readiness_deadline() {
         use tokio::io::AsyncWriteExt;
@@ -2281,9 +2295,9 @@ mod cli_wrapper_tests {
         sender.await.unwrap();
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn macos_cli_wrapper_restores_environment_after_codex_filters_it() {
+    fn unix_cli_wrapper_restores_environment_after_codex_filters_it() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -2296,7 +2310,7 @@ mod cli_wrapper_tests {
         std::fs::set_permissions(&codey, std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected = "target with ' quote";
         let wrapper = temp.path().join("codex-cli-wrapper");
-        write_macos_cli_wrapper(
+        write_unix_cli_wrapper(
             &wrapper,
             &codey,
             &[(

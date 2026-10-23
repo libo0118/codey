@@ -20,19 +20,17 @@ export async function loadSpawnCodexSections() {
     readSource("backend/src/codex_startup_patch.rs"),
   ]);
   const spawnStart = launcher.indexOf("async fn spawn_codex");
-  const macosStart = launcher.indexOf('#[cfg(target_os = "macos")]\n    {', spawnStart);
-  const otherStart = launcher.indexOf('#[cfg(not(any(windows, target_os = "macos")))]', macosStart);
-  assert.ok(spawnStart >= 0 && macosStart > spawnStart && otherStart > macosStart);
-  const windowsSpawn = launcher.slice(
-    launcher.indexOf("#[cfg(windows)]\n    {", spawnStart),
-    launcher.indexOf('#[cfg(target_os = "macos")]', spawnStart),
-  );
-  const macosSpawn = launcher.slice(macosStart, otherStart);
+  const windowsStart = launcher.indexOf("#[cfg(windows)]\n    {", spawnStart);
+  const unixStart = launcher.indexOf('#[cfg(any(target_os = "macos", target_os = "linux"))]\n    {', spawnStart);
+  const otherStart = launcher.indexOf('#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]', unixStart);
+  assert.ok(spawnStart >= 0 && windowsStart > spawnStart && unixStart > windowsStart && otherStart > unixStart);
+  const windowsSpawn = launcher.slice(windowsStart, unixStart);
+  const unixSpawn = launcher.slice(unixStart, otherStart);
   const cleanup = launcherPlatform.slice(
     launcherPlatform.indexOf("async fn stop_windows_spawned_codex"),
     launcherPlatform.indexOf(
       '#[cfg(target_os = "macos")]\npub(super) fn build_fresh_macos_open_command',
     ),
   );
-  return { cleanup, launcher, launcherPlatform, macosSpawn, startupPatch, windowsSpawn };
+  return { cleanup, launcher, launcherPlatform, unixSpawn, startupPatch, windowsSpawn };
 }

@@ -305,7 +305,7 @@ struct RuntimeAgentPlan {
 }
 
 pub(crate) fn runtime_router_platform_supported() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 pub(crate) fn unsupported_runtime_platform_message() -> &'static str {
@@ -325,8 +325,8 @@ pub(crate) fn apply_runtime_router_config(
     // The startup patch supplies the runtime gate that makes these generated
     // roles safe. Never install the coupled role/prompt/hook configuration on
     // a platform where that patch is not available.
-    let subagent_optimization =
-        options.subagent_optimization && cfg!(any(windows, target_os = "macos"));
+    let subagent_optimization = options.subagent_optimization
+        && cfg!(any(windows, target_os = "macos", target_os = "linux"));
     if !runtime_router_platform_supported() {
         bail!(unsupported_runtime_platform_message());
     }

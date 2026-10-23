@@ -4,7 +4,7 @@ import test from "node:test";
 import { loadSpawnCodexSections } from "./helpers/startup-patch.mjs";
 import { readSource } from "./helpers/read-source.mjs";
 
-// Static contracts keep both platforms' spawn_codex wiring visible on any CI host.
+// Static contracts keep all platforms' spawn_codex wiring visible on any CI host.
 test("Windows startup compatibility failure cleans the process before compatible restart", async () => {
   const { cleanup, windowsSpawn } = await loadSpawnCodexSections();
   const cleanupCall = windowsSpawn.indexOf(
@@ -44,11 +44,11 @@ test("Windows startup compatibility failure cleans the process before compatible
 });
 
 test("the CLI wrapper is the only main-process compatibility entry", async () => {
-  const { launcher, macosSpawn, windowsSpawn } = await loadSpawnCodexSections();
+  const { launcher, unixSpawn, windowsSpawn } = await loadSpawnCodexSections();
 
   // Electron fuses disabled NODE_OPTIONS and --inspect; neither may appear in
   // any launch path, and no fuse probe decides startup wiring anymore.
-  for (const section of [windowsSpawn, macosSpawn]) {
+  for (const section of [windowsSpawn, unixSpawn]) {
     const code = section.replaceAll(/\/\/[^\n]*/g, "");
     assert.doesNotMatch(code, /electron_fuses|NODE_OPTIONS|--inspect|StartupRequire|inspector/i);
     assert.match(section, /prepare_cli_wrapper\(/);
@@ -108,13 +108,29 @@ test("the CLI wrapper is the only main-process compatibility entry", async () =>
 
   // macOS: the wrapper environment rides the `open --env` channel for .app
   // bundles and the spawn environment otherwise.
-  const macosPrepare = macosSpawn.indexOf("prepare_cli_wrapper(");
-  const bundleCommand = macosSpawn.indexOf("build_fresh_macos_open_command(");
-  const applyEnvironment = macosSpawn.indexOf("add_macos_launch_environment(&mut command, &wrapper.environment)");
-  const confirm = macosSpawn.indexOf("confirm_cli_wrapper_startup(");
+  const macosPrepare = unixSpawn.indexOf("prepare_cli_wrapper(");
+  const bundleCommand = unixSpawn.indexOf("build_fresh_macos_open_command(");
+  const applyEnvironment = unixSpawn.indexOf("add_macos_launch_environment(&mut command, &wrapper.environment)");
+  const confirm = unixSpawn.indexOf("confirm_cli_wrapper_startup(");
   assert.ok(macosPrepare >= 0 && bundleCommand > macosPrepare && applyEnvironment > bundleCommand && confirm > applyEnvironment);
-  assert.match(macosSpawn, /spawned\.startup_injection_mode = "cli"\.to_string\(\)/);
-  assert.match(macosSpawn, /spawned\.performance_status = "ready"\.to_string\(\)/);
+  assert.match(unixSpawn, /spawned\.startup_injection_mode = "cli"\.to_string\(\)/);
+  assert.match(unixSpawn, /spawned\.performance_status = "ready"\.to_string\(\)/);
+});
+
+test("Linux startup passes the wrapper environment and keeps Unix exec readiness", async () => {
+  const { startupPatch, unixSpawn } = await loadSpawnCodexSections();
+  assert.match(unixSpawn, /#\[cfg\(target_os = "linux"\)\]\s*let command = build_codex_command\(app_dir, debug_port, &runtime_arguments\);/);
+  assert.match(
+    unixSpawn,
+    /#\[cfg\(target_os = "linux"\)\]\s*let spawned_environment = \{\s*let mut environment = wrapper\.environment\.clone\(\);\s*if let Some\(proxy\) = &launch_proxy_environment \{\s*environment\.extend\(proxy\.iter\(\)\.cloned\(\)\);\s*\}\s*environment\s*\};\s*let mut spawned = spawn_command\(command, &spawned_environment\)\?;/,
+  );
+  const unixStart = startupPatch.indexOf('#[cfg(any(target_os = "macos", target_os = "linux"))]\n        {');
+  const windowsStart = startupPatch.indexOf("#[cfg(windows)]", unixStart);
+  assert.ok(unixStart >= 0 && windowsStart > unixStart);
+  const unixExec = startupPatch.slice(unixStart, windowsStart);
+  assert.match(unixExec, /use std::os::unix::process::CommandExt;/);
+  assert.match(unixExec, /readiness\.mark_executed\(\);[\s\S]*?Err\(command\.exec\(\)\)/);
+  assert.doesNotMatch(unixExec, /command\.spawn\(/);
 });
 
 test("Startup waits end on process exit, marker confirmation or handshake", async () => {
@@ -151,26 +167,26 @@ test("Startup waits end on process exit, marker confirmation or handshake", asyn
   );
 });
 
-test("macOS startup patch requires app-server runtime override validation", async () => {
-  const { macosSpawn } = await loadSpawnCodexSections();
-  const successStart = macosSpawn.indexOf("Ok(()) =>");
-  const failureStart = macosSpawn.indexOf("Err(error) =>", successStart);
+test("macOS and Linux startup patches require app-server runtime override validation", async () => {
+  const { unixSpawn } = await loadSpawnCodexSections();
+  const successStart = unixSpawn.indexOf("Ok(()) =>");
+  const failureStart = unixSpawn.indexOf("Err(error) =>", successStart);
 
-  assert.match(macosSpawn, /confirm_cli_wrapper_startup\(/);
+  assert.match(unixSpawn, /confirm_cli_wrapper_startup\(/);
   assert.ok(successStart >= 0);
   assert.ok(failureStart > successStart);
   assert.doesNotMatch(
-    macosSpawn.slice(successStart, failureStart),
+    unixSpawn.slice(successStart, failureStart),
     /terminate_unix_codex_processes|reap_child_after_cleanup|degraded/,
   );
   // On failure the spawned tree is swept before the launch reports an error;
   // the remote-debugging port argument marks our Electron instance under `open`.
   assert.match(
-    macosSpawn.slice(failureStart),
+    unixSpawn.slice(failureStart),
     /let launch_marker = format!\("--remote-debugging-port=\{debug_port\}"\)/,
   );
   assert.match(
-    macosSpawn.slice(failureStart),
+    unixSpawn.slice(failureStart),
     /terminate_unix_codex_processes\(\s*app_dir,\s*spawned\.process_id,\s*spawned\.process_group_id,\s*Some\(launch_marker\.as_str\(\)\),?\s*\)/,
   );
 });
