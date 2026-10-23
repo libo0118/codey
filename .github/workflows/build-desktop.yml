@@ -250,6 +250,7 @@ jobs:
             --env CODEY_VERSION="$version" debian:11 bash -euo pipefail -c '
               apt-get update
               apt-get install -y --no-install-recommends "/packages/Codey-$CODEY_VERSION-linux-x64.deb"
+              ps -p $$ -o pid= > /dev/null
               test "$(command -v codey)" = /usr/bin/codey
               test -x /usr/lib/codey/codey
               test -x /usr/lib/codey/codey-fastctx
@@ -267,6 +268,7 @@ jobs:
           docker run --rm --platform linux/amd64 --volume "$PWD/dist/linux:/packages:ro" \
             --env CODEY_VERSION="$version" registry.access.redhat.com/ubi8/ubi:8.10 bash -euo pipefail -c '
               dnf install -y "/packages/Codey-$CODEY_VERSION-linux-x64.rpm"
+              ps -p $$ -o pid= > /dev/null
               test "$(command -v codey)" = /usr/bin/codey
               test -x /usr/lib/codey/codey
               test -x /usr/lib/codey/codey-fastctx

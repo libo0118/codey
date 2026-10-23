@@ -73,8 +73,9 @@ async function packageInstallers(bundle, stage, version, output, name) {
   await mkdir(join(stage, "debian"));
   await writeFile(join(stage, "debian/control"), `Source: codey\nSection: devel\nPriority: optional\nMaintainer: ${maintainer}\n\nPackage: codey\nArchitecture: amd64\nDescription: ${description}\n`);
   const { stdout: shlibs } = await execute("dpkg-shlibdeps", ["-O", ...["codey", "codey-fastctx"].map(binary => `-e${join(payload, "usr/lib/codey", binary)}`)], { cwd: stage });
-  const depends = shlibs.match(/^shlibs:Depends=(.*)$/m)?.[1];
-  if (!depends) throw new Error("Unable to determine Debian shared-library dependencies");
+  const libraryDepends = shlibs.match(/^shlibs:Depends=(.*)$/m)?.[1];
+  if (!libraryDepends) throw new Error("Unable to determine Debian shared-library dependencies");
+  const depends = `${libraryDepends}, procps`;
   const debRoot = join(stage, "deb");
   await stageLinuxInstallTree(bundle, debRoot);
   await mkdir(join(debRoot, "DEBIAN"));
@@ -92,7 +93,7 @@ async function packageInstallers(bundle, stage, version, output, name) {
   for (const directory of ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"]) await mkdir(join(rpmRoot, directory), { recursive: true });
   const spec = join(rpmRoot, "SPECS/codey.spec");
   // Preserve the same ELF bytes in all formats; the Rust release build owns stripping.
-  await writeFile(spec, `%global debug_package %{nil}\n%global _build_id_links none\n%global _binary_payload w9.gzdio\n%global __strip /bin/true\nName: codey\nVersion: ${versions.rpmVersion}\nRelease: ${versions.rpmRelease}\nSummary: ${description}\nLicense: AGPL-3.0-only AND Apache-2.0 AND MIT\nURL: https://github.com/libo0118/codey\nBuildArch: x86_64\nRequires: /bin/sh\n\n%description\n${description}.\n\n%install\nmkdir -p "%{buildroot}"\ncp -a "${payload}/." "%{buildroot}/"\n\n%files\n%defattr(-,root,root,-)\n/usr/bin/codey\n/usr/lib/codey\n/usr/share/applications/codey.desktop\n%doc /usr/share/doc/codey\n`);
+  await writeFile(spec, `%global debug_package %{nil}\n%global _build_id_links none\n%global _binary_payload w9.gzdio\n%global __strip /bin/true\nName: codey\nVersion: ${versions.rpmVersion}\nRelease: ${versions.rpmRelease}\nSummary: ${description}\nLicense: AGPL-3.0-only AND Apache-2.0 AND MIT\nURL: https://github.com/libo0118/codey\nBuildArch: x86_64\nRequires: /bin/sh\nRequires: procps-ng\n\n%description\n${description}.\n\n%install\nmkdir -p "%{buildroot}"\ncp -a "${payload}/." "%{buildroot}/"\n\n%files\n%defattr(-,root,root,-)\n/usr/bin/codey\n/usr/lib/codey\n/usr/share/applications/codey.desktop\n%doc /usr/share/doc/codey\n`);
   const rpm = join(output, `${name}.rpm`);
   await execute("rpmbuild", ["-bb", "--target", "x86_64", "--define", `_topdir ${rpmRoot}`, "--define", `_rpmdir ${output}`, "--define", `_rpmfilename ${name}.rpm`, spec], { maxBuffer: 8 * 1024 * 1024 });
   const { stdout: rpmIdentity } = await execute("rpm", ["-qp", "--queryformat", "%{NAME} %{VERSION} %{RELEASE} %{ARCH}\n", rpm]);

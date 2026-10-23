@@ -139,10 +139,12 @@ test("native Debian and RPM packages retain ELF bytes, metadata, dependencies, a
     assert.match(execFileSync("dpkg-deb", ["--info", deb], { encoding: "utf8" }), /Architecture: amd64/);
     assert.match(execFileSync("dpkg-deb", ["--contents", deb], { encoding: "utf8" }), /usr\/lib\/codey\/codey-fastctx/);
     assert.match(execFileSync("dpkg-deb", ["--field", deb, "Depends"], { encoding: "utf8" }), /libc6 \(>= /);
+    assert.match(execFileSync("dpkg-deb", ["--field", deb, "Depends"], { encoding: "utf8" }), /, procps/);
     assert.match(execFileSync("rpm", ["-qpi", rpm], { encoding: "utf8" }), /Architecture\s*:\s*x86_64/);
     assert.match(execFileSync("rpm", ["-qpl", rpm], { encoding: "utf8" }), /\/usr\/bin\/codey/);
     assert.ok(execFileSync("rpm", ["-qp", "--queryformat", "[%{FILEUSERNAME} %{FILEGROUPNAME}\\n]", rpm], { encoding: "utf8" }).trim().split(/\r?\n/).every(owner => owner === "root root"));
     assert.match(execFileSync("rpm", ["-qp", "--requires", rpm], { encoding: "utf8" }), /libc\.so\.6/);
+    assert.match(execFileSync("rpm", ["-qp", "--requires", rpm], { encoding: "utf8" }), /^procps-ng$/m);
     execFileSync("dpkg", ["--compare-versions", linuxPackageVersions("1.2.3-beta.1").deb, "lt", "1.2.3"]);
     assert.equal(execFileSync("rpm", ["--eval", '%{lua:print(rpm.vercmp("1.2.3-0.beta.1", "1.2.3-1"))}'], { encoding: "utf8" }).trim(), "-1");
     assert.deepEqual((await readdir(join(directory, "dist/linux"))).sort(), ["Codey-1.2.3-libo.1-linux-x64.deb", "Codey-1.2.3-libo.1-linux-x64.rpm", "Codey-1.2.3-libo.1-linux-x64.tar.gz"]);
