@@ -588,7 +588,7 @@ fn route_alias_preserves_declared_ultrafast_speed() {
         .as_array_mut()
         .unwrap()
         .iter_mut()
-        .find(|model| model["slug"] == "gpt-6.1-sol")
+        .find(|model| model["slug"] == "gpt-5.6-sol")
         .unwrap();
     model["service_tiers"] = json!([{"id": "priority"}, {"id": "ultrafast"}]);
     model["additional_speed_tiers"] = json!(["fast", "ultrafast"]);
@@ -598,7 +598,7 @@ fn route_alias_preserves_declared_ultrafast_speed() {
     )
     .unwrap();
 
-    let selection = vec!["route-x/gpt-6.1-sol".to_string()];
+    let selection = vec!["route-x/gpt-5.6-sol".to_string()];
     refresh_for_provider(home.path(), false, Some(&selection), &selection).unwrap();
 
     let catalog: Value =
@@ -608,7 +608,7 @@ fn route_alias_preserves_declared_ultrafast_speed() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|model| model["slug"] == "route-x/gpt-6.1-sol")
+        .find(|model| model["slug"] == "route-x/gpt-5.6-sol")
         .unwrap();
     assert_native_fast(alias);
     assert_native_ultrafast(alias);
