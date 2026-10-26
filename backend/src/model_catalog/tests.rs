@@ -581,19 +581,17 @@ fn account_snapshot_preserves_declared_ultrafast_without_model_name_inference() 
 }
 
 #[test]
-fn route_alias_for_six_one_sol_keeps_ultrafast_speed() {
+fn route_alias_preserves_declared_ultrafast_speed() {
     let home = tempfile::tempdir().unwrap();
     let mut cache = official_cache();
-    cache["models"].as_array_mut().unwrap().push(json!({
-        "slug": "gpt-6.1-sol",
-        "display_name": "GPT-6.1-Sol",
-        "visibility": "list",
-        "priority": 0,
-        "default_reasoning_level": "low",
-        "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
-        "service_tiers": [{"id": "priority"}, {"id": "ultrafast"}],
-        "additional_speed_tiers": ["fast", "ultrafast"]
-    }));
+    let model = cache["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "gpt-6.1-sol")
+        .unwrap();
+    model["service_tiers"] = json!([{"id": "priority"}, {"id": "ultrafast"}]);
+    model["additional_speed_tiers"] = json!(["fast", "ultrafast"]);
     fs::write(
         home.path().join("models_cache.json"),
         serde_json::to_vec(&cache).unwrap(),
