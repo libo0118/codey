@@ -94,6 +94,15 @@ fn image_request_uses_the_model_route_instead_of_a_conversation_binding() {
             .provider_id,
         chat_id
     );
+    let hinted_alias = snapshot
+        .route_for_image_request_observed(
+            &model_alias(&images_id, "gpt-image-2"),
+            Some(&chat_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(hinted_alias.provider_id, images_id);
+    assert_eq!(hinted_alias.upstream_model, "gpt-image-2");
     config
         .selected_models_by_provider
         .get_mut(&chat_id)
@@ -589,6 +598,12 @@ async fn send_router_websocket_request_on_stream(
         ))
         .await
         .unwrap();
+    read_router_websocket_turn(socket).await
+}
+
+async fn read_router_websocket_turn(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+) -> Vec<Value> {
     let mut events = Vec::new();
     loop {
         let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
@@ -1465,6 +1480,9 @@ async fn websocket_rejected_message_reports_type_without_echoing_payload() {
 #[path = "steering_tests.rs"]
 mod steering_tests;
 
+#[path = "websocket_backoff_tests.rs"]
+mod websocket_backoff_tests;
+
 #[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn declared_responses_route_reuses_upstream_websocket() {
@@ -1997,6 +2015,53 @@ async fn official_prewarm_generate_false_is_answered_locally_on_http_fallback() 
 }
 
 #[tokio::test]
+async fn missing_codey_history_requests_full_input_before_sending_upstream() {
+    for protocol in [
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+        // 原生线路续接旧适配线路的合成响应。
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (mut config, provider, model) =
+            router_config(format!("http://{}/v1", listener.local_addr().unwrap()));
+        config.profiles[0].upstream_protocol = protocol.into();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut client = connect_router_websocket(&router.endpoint()).await;
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create", "model":model_alias(&provider, &model),
+                    "previous_response_id":"resp_codey_missing", "input":"next"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(text) =
+            tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected recovery error");
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "error", "{protocol}: {event}");
+        assert_eq!(event["error"]["code"], "previous_response_not_found");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        client.close(None).await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn previous_response_not_found_allows_client_full_request_retry() {
     for sse_wrapped in [false, true] {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2143,7 +2208,7 @@ async fn previous_response_not_found_allows_client_full_request_retry() {
 }
 
 #[tokio::test]
-async fn persisted_context_rejection_is_not_replayed_without_a_new_client_request() {
+async fn persisted_context_rejection_without_previous_response_id_is_not_replayed() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = upstream.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
@@ -2174,6 +2239,369 @@ async fn persisted_context_rejection_is_not_replayed_without_a_new_client_reques
     upstream_task.await.unwrap();
     client.close(None).await.unwrap();
     router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn persisted_context_rejection_recovers_same_turn_over_http_with_complete_history() {
+    for sse_wrapped in [false, true] {
+        let logs = tempfile::tempdir().unwrap();
+        let auth_home = tempfile::tempdir().unwrap();
+        let auth_path = auth_home.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","account_id":"test-account"}}"#,
+        )
+        .unwrap();
+        let first_output = json!([
+            {"type":"message","id":"msg-first","role":"assistant","status":"completed",
+                "content":[{"type":"output_text","text":"first answer","annotations":[]}]},
+            {"type":"reasoning","id":"rs-first","summary":[],"encrypted_content":"encrypted-reasoning"},
+            {"type":"compaction","encrypted_content":"encrypted-compaction"}
+        ]);
+        let expected_output = first_output.clone();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _first = websocket.next().await.unwrap().unwrap();
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({"type":"response.completed","response":{
+                        "id":"resp-first","status":"completed","output":first_output
+                    }})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let WebSocketMessage::Text(text) =
+                tokio::time::timeout(Duration::from_secs(5), websocket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected continuation on the original WebSocket");
+            };
+            let continuation: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(continuation["previous_response_id"], "resp-first");
+            assert_eq!(continuation["input"], "next task");
+            assert_eq!(continuation["type"], "response.create");
+            assert!(continuation.get("stream").is_none());
+            let error = json!({"type":"error","status":400,"error":{
+                "type":"invalid_request_error","code":"unsupported_persisted_item_context",
+                "message":"Persisted context cannot be replayed"
+            }});
+            websocket
+                .send(WebSocketMessage::Text(
+                    if sse_wrapped {
+                        format!("data: {error}\n\n")
+                    } else {
+                        error.to_string()
+                    }
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let (mut http, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+                .await
+                .expect("the rejected continuation must recover during the same client request")
+                .unwrap();
+            let request =
+                tokio::time::timeout(Duration::from_secs(5), read_http_request(&mut http))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/v1/responses");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let events = [
+                json!({"type":"response.created","response":{"id":"resp-http","status":"in_progress"}}),
+                json!({"type":"response.output_text.delta","response_id":"resp-http","delta":"recovered"}),
+                json!({"type":"response.completed","response":{"id":"resp-http","status":"completed","output":[]}}),
+            ];
+            let response = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write_static_response(&mut http, "text/event-stream", response.as_bytes())
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), upstream.accept())
+                    .await
+                    .is_err(),
+                "one rejected continuation must produce only one HTTP recovery request"
+            );
+            body
+        });
+        let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        config.route_request_log.enabled = true;
+        config.route_request_log.backend = crate::config::RouteRequestLogBackend::Sqlite;
+        let router = LocalRouter::start_with_logger(
+            &config,
+            Arc::new(RouteRequestLogController::with_root(
+                logs.path().to_path_buf(),
+            )),
+        )
+        .await
+        .unwrap();
+        let mut snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::make_mut(snapshot.routes.get_mut(&provider).unwrap());
+        route.official_account = true;
+        route.official_auth = Some(OfficialRouteAuth {
+            account_id: "test-account".into(),
+            email: None,
+            record_path: auth_path.clone(),
+            path: auth_path,
+            siwc_path: None,
+            accepts_incoming_authorization: false,
+        });
+        *router.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mut client = connect_router_websocket(&router.endpoint()).await;
+        let alias = model_alias(&provider, &model);
+        let first = send_router_websocket_request(&mut client, &alias, "first task").await;
+        assert_eq!(first.last().unwrap()["response"]["id"], "resp-first");
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create","model":alias,"previous_response_id":"resp-first",
+                    "input":"next task","instructions":"keep this instruction","service_tier":"priority"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let events = read_router_websocket_turn(&mut client).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "response.created",
+                "response.output_text.delta",
+                "response.completed"
+            ],
+            "the client must receive only the recovered HTTP turn: {events:?}"
+        );
+        assert_eq!(events[1]["delta"], "recovered");
+        assert_eq!(events.last().unwrap()["response"]["id"], "resp-http");
+        let body = tokio::time::timeout(Duration::from_secs(5), upstream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body["model"], model);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "keep this instruction");
+        assert_eq!(body["service_tier"], "priority");
+        assert!(body.get("type").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        let mut expected = vec![json!({"role":"user","content":"first task"})];
+        expected.extend(expected_output.as_array().unwrap().iter().cloned());
+        expected.push(json!({"role":"user","content":"next task"}));
+        assert_eq!(body["input"], Value::Array(expected));
+        client.close(None).await.unwrap();
+        router.stop().await.unwrap();
+        let page = crate::route_request_log::query_route_request_logs(
+            logs.path(),
+            crate::config::RouteRequestLogBackend::Sqlite,
+            crate::route_request_log::RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        let recovered = page
+            .items
+            .iter()
+            .find(|item| item.fallback_count == 1)
+            .unwrap();
+        assert_eq!(recovered.status, "succeeded");
+        assert!(recovered.error_code.is_none());
+        assert_eq!(
+            recovered.fallback_reason.as_deref(),
+            Some("websocket_persisted_context_rejected")
+        );
+        assert_eq!(recovered.upstream_attempts.len(), 2);
+        assert_eq!(
+            recovered.upstream_attempts[0].transport,
+            UpstreamTransport::WebSocket
+        );
+        assert_eq!(
+            recovered.upstream_attempts[0].outcome,
+            crate::route_request_log::AttemptOutcome::Failed
+        );
+        assert_eq!(
+            recovered.upstream_attempts[1].transport,
+            UpstreamTransport::HttpSse
+        );
+        assert_eq!(
+            recovered.upstream_attempts[1].trigger,
+            crate::route_request_log::AttemptTrigger::TransportFallback
+        );
+        assert_eq!(
+            recovered.upstream_attempts[1].outcome,
+            crate::route_request_log::AttemptOutcome::Succeeded
+        );
+    }
+}
+
+async fn assert_persisted_context_rejection_is_not_replayed(
+    first_output: Option<Value>,
+    continuation_input: Value,
+    preceding_event: Option<Value>,
+    error_type: &str,
+    error_code: &str,
+) {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let mut first_response = json!({"type":"response.completed","response":{
+        "id":"resp-first","status":"completed"
+    }});
+    if let Some(output) = first_output {
+        first_response["response"]["output"] = output;
+    }
+    let error = json!({"type":"error","status":400,"error":{
+        "type":error_type,"code":error_code,"message":"Persisted context cannot be replayed"
+    }});
+    let expected_preceding_event = preceding_event.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _first = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(WebSocketMessage::Text(first_response.to_string().into()))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(text) =
+            tokio::time::timeout(Duration::from_secs(5), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected continuation on the original WebSocket");
+        };
+        let continuation: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(continuation["previous_response_id"], "resp-first");
+        if let Some(event) = preceding_event {
+            websocket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        websocket
+            .send(WebSocketMessage::Text(error.to_string().into()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), upstream.accept())
+                .await
+                .is_err(),
+            "unsafe continuation must not start another upstream request"
+        );
+    });
+    let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+    config.profiles[0].supports_websockets = true;
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut client = connect_router_websocket(&router.endpoint()).await;
+    let alias = model_alias(&provider, &model);
+    let first = send_router_websocket_request(&mut client, &alias, "first task").await;
+    assert_eq!(first.last().unwrap()["response"]["id"], "resp-first");
+    client
+        .send(WebSocketMessage::Text(
+            json!({"type":"response.create","model":alias,
+                "previous_response_id":"resp-first","input":continuation_input})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let events = read_router_websocket_turn(&mut client).await;
+    if let Some(event) = expected_preceding_event {
+        assert_eq!(events.first().unwrap()["type"], event["type"]);
+        assert_eq!(events.len(), 2, "{events:?}");
+    } else {
+        assert_eq!(events.len(), 1, "{events:?}");
+    }
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "response.failed",
+        "{events:?}"
+    );
+    let error = &events.last().unwrap()["response"]["error"];
+    assert_eq!(error["codey"]["originalCode"], error_code, "{error}");
+    tokio::time::timeout(Duration::from_secs(5), upstream_task)
+        .await
+        .unwrap()
+        .unwrap();
+    client.close(None).await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn persisted_context_rejection_after_any_response_event_is_not_replayed() {
+    for event in [
+        json!({"type":"response.created","response":{"id":"resp-next","status":"in_progress"}}),
+        json!({"type":"response.output_text.delta","response_id":"resp-next","delta":"started"}),
+        json!({"type":"response.output_item.added","response_id":"resp-next","output_index":0,
+            "item":{"type":"function_call","id":"fc-next","call_id":"call-next","name":"run","arguments":"{}"}}),
+    ] {
+        assert_persisted_context_rejection_is_not_replayed(
+            Some(json!([])),
+            json!("next task"),
+            Some(event),
+            "invalid_request_error",
+            "unsupported_persisted_item_context",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn persisted_context_rejection_without_complete_replayable_history_is_not_replayed() {
+    for (output, input) in [
+        (None, json!("next task")),
+        (
+            Some(json!([{ "type":"item_reference","id":"unavailable-item" }])),
+            json!("next task"),
+        ),
+        (
+            Some(json!([])),
+            json!([{ "type":"function_call_output","call_id":"unknown-call","output":"done" }]),
+        ),
+    ] {
+        assert_persisted_context_rejection_is_not_replayed(
+            output,
+            input,
+            None,
+            "invalid_request_error",
+            "unsupported_persisted_item_context",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn persisted_context_recovery_requires_exact_error_type_and_code() {
+    for (error_type, error_code) in [
+        ("server_error", "unsupported_persisted_item_context"),
+        (
+            "invalid_request_error",
+            "unsupported_persisted_item_context_other",
+        ),
+    ] {
+        assert_persisted_context_rejection_is_not_replayed(
+            Some(json!([])),
+            json!("next task"),
+            None,
+            error_type,
+            error_code,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -5653,22 +6081,24 @@ async fn route_metadata_conflicts_still_reject_raw_historical_and_default_models
         if let Some(requested_model) = requested_model {
             body["model"] = requested_model.into();
         }
-        let response = client
-            .post(format!("{}/responses", endpoint.base_url))
-            .bearer_auth(&endpoint.token)
-            .header(
-                TURN_METADATA_HEADER,
-                json!({ROUTE_METADATA_KEY:"old-route"}).to_string(),
-            )
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response.json::<Value>().await.unwrap()["error"]["code"],
-            "route_metadata_invalid"
-        );
+        for path in ["responses", "images/generations", "images/edits"] {
+            let response = client
+                .post(format!("{}/{path}", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .header(
+                    TURN_METADATA_HEADER,
+                    json!({ROUTE_METADATA_KEY:"old-route"}).to_string(),
+                )
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "route_metadata_invalid"
+            );
+        }
     }
     router.stop().await.unwrap();
 }
@@ -13251,6 +13681,449 @@ async fn non_stream_transport_error_response_preserves_http_status_and_text() {
     assert!(response.contains("content-type: text/plain; charset=utf-8\r\n"));
     assert!(response.contains("Codey 线路「Relay」无法连接上游 relay.example:8443"));
     assert!(response.contains("错误码：upstream_unreachable"));
+}
+
+#[tokio::test]
+async fn request_log_resolves_model_identity_before_http_websocket_and_image_rejections() {
+    let logs = tempfile::tempdir().unwrap();
+    let (mut config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+    let alias = model_alias(&provider_id, &model);
+    let raw_model = "vendor/raw-model";
+    config
+        .selected_models_by_provider
+        .get_mut(&provider_id)
+        .unwrap()
+        .push(raw_model.into());
+    config
+        .model_alias_history
+        .insert(alias.clone(), "outdated-model".into());
+    config
+        .model_alias_history
+        .insert("retired/model".into(), model.clone());
+    config
+        .model_alias_history
+        .insert(raw_model.into(), "wrongly-stripped-model".into());
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut socket = connect_router_websocket(&endpoint).await;
+    let cases = [
+        (alias.as_str(), model.as_str()),
+        ("retired/model", model.as_str()),
+        (raw_model, raw_model),
+        ("unknown/namespace/model", "unknown/namespace/model"),
+    ];
+    for (requested, _) in cases {
+        let mut body = json!({
+            "model": requested, "input": "test", "prompt": "test",
+            "client_metadata": {ROUTE_METADATA_KEY: 123}
+        });
+        for path in ["responses", "images/generations"] {
+            let response = client
+                .post(format!("{}/{path}", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "route_metadata_invalid"
+            );
+        }
+        body["type"] = "response.create".into();
+        socket
+            .send(WebSocketMessage::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected failure event")
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(
+            event["response"]["error"]["codey"]["errorCode"],
+            "route_metadata_invalid"
+        );
+    }
+    socket.close(None).await.unwrap();
+    router.stop().await.unwrap();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 12);
+    for (requested, expected) in cases {
+        let items = page
+            .items
+            .iter()
+            .filter(|item| item.requested_model == requested)
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert_eq!(item.model.as_deref(), Some(expected));
+            assert_eq!(item.error_code.as_deref(), Some("route_metadata_invalid"));
+            assert!(item.provider.is_none());
+            assert!(item.upstream_authority.is_none());
+            assert!(item.upstream_transport.is_none());
+            assert!(item.upstream_attempts.is_empty());
+        }
+    }
+
+    // 在临时库中还原旧日志格式，验证页面 API 也使用当前与历史别名。
+    let connection =
+        rusqlite::Connection::open(logs.path().join("route-requests.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE route_request_logs SET model = CASE
+                WHEN request_kind = 'images_generations' THEN requested_model
+                ELSE NULL END",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let response = client
+        .post(format!(
+            "{}/codey/api/query_route_request_log_stats",
+            endpoint.base_url.trim_end_matches("/v1")
+        ))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"allTime": true, "groupBy": "model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let stats = response.json::<Value>().await.unwrap();
+    assert_eq!(stats["total"], 12);
+    let groups = stats["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 3);
+    let model_group = groups.iter().find(|group| group["key"] == model).unwrap();
+    assert_eq!(model_group["total"], 6);
+    assert!(model_group["totalTokensSum"].is_null());
+    assert_eq!(model_group["totalTokensKnownCount"], 0);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn router_image_aliases_rewrite_the_upstream_body_and_preserve_raw_models() {
+    let logs = tempfile::tempdir().unwrap();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let (mut config, provider_id, text_model) = router_config(format!("http://{address}/v1"));
+    let image_model = "vendor/gpt-image-2";
+    let nested_model = model_alias(&provider_id, &text_model);
+    config
+        .selected_models_by_provider
+        .get_mut(&provider_id)
+        .unwrap()
+        .extend([image_model.to_string(), nested_model.clone()]);
+    config.default_model = model_alias(&provider_id, &text_model);
+    config
+        .model_alias_history
+        .insert("retired/image-model".into(), image_model.into());
+    config
+        .model_alias_history
+        .insert(image_model.into(), "wrongly-stripped-image-model".into());
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    let alias = model_alias(&provider_id, image_model);
+    let nested_alias = model_alias(&provider_id, &nested_model);
+    let cases = [
+        ("generations", alias.as_str(), image_model),
+        ("edits", alias.as_str(), image_model),
+        ("generations", "retired/image-model", image_model),
+        ("generations", image_model, image_model),
+        ("edits", "unknown/image-model", "unknown/image-model"),
+        ("generations", nested_alias.as_str(), nested_model.as_str()),
+    ];
+    let count = cases.len();
+    let upstream_task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for _ in 0..count {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            captured.push((request.path, request.body));
+            write_json_response(&mut stream, 200, &json!({"created":1,"data":[]}))
+                .await
+                .unwrap();
+        }
+        captured
+    });
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut originals = Vec::new();
+    for (path, requested, _) in cases {
+        let original =
+            format!("{{ \n \"model\": {requested:?}, \"prompt\": \"draw an otter\" }}\n");
+        let response = client
+            .post(format!("{}/images/{path}", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(original.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.bytes().await.unwrap();
+        originals.push(original);
+    }
+    let captured = tokio::time::timeout(Duration::from_secs(5), upstream_task)
+        .await
+        .unwrap()
+        .unwrap();
+    router.stop().await.unwrap();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, count as u64);
+    for (((path, requested, expected), (upstream_path, bytes)), original) in
+        cases.into_iter().zip(captured).zip(originals)
+    {
+        assert_eq!(upstream_path, format!("/v1/images/{path}"));
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model"], expected);
+        assert_eq!(body["prompt"], "draw an otter");
+        if requested == expected {
+            assert_eq!(bytes, original.as_bytes());
+        }
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.requested_model == requested)
+            .unwrap();
+        assert_eq!(item.model.as_deref(), Some(expected));
+        assert_eq!(item.provider.as_deref(), Some(provider_id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn router_image_aliases_keep_the_selected_route_despite_replayed_metadata() {
+    let logs = tempfile::tempdir().unwrap();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let (mut config, provider_a, text_model) = router_config(format!("http://{address}/a/v1"));
+    let mut route_b = config.profiles[0].clone();
+    route_b.id = "route-b".into();
+    route_b.base_url = format!("http://{address}/b/v1");
+    config.profiles.push(route_b);
+    let image_model = "vendor/gpt-image-2";
+    let nested_model = model_alias(&provider_a, &text_model);
+    config
+        .selected_models_by_provider
+        .get_mut(&provider_a)
+        .unwrap()
+        .extend([image_model.to_string(), nested_model.clone()]);
+    config
+        .selected_models_by_provider
+        .insert("route-b".into(), vec![text_model.clone()]);
+    config.default_model = model_alias("route-b", &text_model);
+    config
+        .model_alias_history
+        .insert("retired/image-model".into(), image_model.into());
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    let alias = model_alias(&provider_a, image_model);
+    let nested_alias = model_alias(&provider_a, &nested_model);
+    let cases = [
+        // 当前别名优先于有效、缺失、相同和相互冲突的旧线路提示。
+        (
+            "generations",
+            alias.as_str(),
+            "route-b",
+            "route-b",
+            "a",
+            image_model,
+        ),
+        (
+            "edits",
+            alias.as_str(),
+            "deleted-route",
+            "deleted-route",
+            "a",
+            image_model,
+        ),
+        (
+            "generations",
+            alias.as_str(),
+            provider_a.as_str(),
+            provider_a.as_str(),
+            "a",
+            image_model,
+        ),
+        (
+            "edits",
+            alias.as_str(),
+            "route-b",
+            provider_a.as_str(),
+            "a",
+            image_model,
+        ),
+        // 原始与历史模型仍服从明确线路提示，图片模型不必登记于该线路。
+        (
+            "generations",
+            "gpt-image-2",
+            "route-b",
+            "route-b",
+            "b",
+            "gpt-image-2",
+        ),
+        (
+            "edits",
+            "retired/image-model",
+            "route-b",
+            "route-b",
+            "b",
+            image_model,
+        ),
+        (
+            "generations",
+            image_model,
+            "route-b",
+            "route-b",
+            "b",
+            image_model,
+        ),
+        (
+            "edits",
+            nested_alias.as_str(),
+            "route-b",
+            "route-b",
+            "a",
+            nested_model.as_str(),
+        ),
+    ];
+    let count = cases.len();
+    let upstream_task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for _ in 0..count {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            write_json_response(&mut stream, 200, &json!({"created":1,"data":[]}))
+                .await
+                .unwrap();
+            captured.push(request);
+        }
+        captured
+    });
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (index, (path, requested, header_hint, body_hint, _, _)) in cases.iter().enumerate() {
+        let response = client
+            .post(format!("{}/images/{path}", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("thread-id", format!("image-alias-{index}"))
+            .header(
+                TURN_METADATA_HEADER,
+                json!({ROUTE_METADATA_KEY:header_hint,"keep":"header"}).to_string(),
+            )
+            .json(&json!({
+                "model":requested, "prompt":"draw an otter",
+                "client_metadata":{ROUTE_METADATA_KEY:body_hint,"keep":"body"}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "case {index}");
+        response.bytes().await.unwrap();
+    }
+    let captured = tokio::time::timeout(Duration::from_secs(5), upstream_task)
+        .await
+        .unwrap()
+        .unwrap();
+    router.stop().await.unwrap();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, count as u64);
+    for (index, ((path, requested, _, _, route, expected_model), request)) in
+        cases.into_iter().zip(captured).enumerate()
+    {
+        assert_eq!(
+            request.path,
+            format!("/{route}/v1/images/{path}"),
+            "case {index}"
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], expected_model, "case {index}");
+        assert_eq!(body["prompt"], "draw an otter");
+        assert!(body["client_metadata"].get(ROUTE_METADATA_KEY).is_none());
+        assert_eq!(body["client_metadata"]["keep"], "body");
+        assert!(incoming_header(&request, TURN_METADATA_HEADER).is_none());
+        let session = format!("image-alias-{index}");
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.codex_session_id.as_deref() == Some(session.as_str()))
+            .unwrap();
+        assert_eq!(item.requested_model, requested);
+        assert_eq!(item.model.as_deref(), Some(expected_model));
+        assert_eq!(
+            item.provider.as_deref(),
+            Some(if route == "a" {
+                provider_a.as_str()
+            } else {
+                "route-b"
+            })
+        );
+        assert_eq!(item.status, "succeeded");
+    }
 }
 
 #[tokio::test]

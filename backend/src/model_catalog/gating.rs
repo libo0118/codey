@@ -2,12 +2,6 @@ use super::*;
 
 pub(super) const FAST_SERVICE_TIER_ID: &str = "priority";
 pub(super) const FAST_SPEED_TIER_ID: &str = "fast";
-/// 官方 Ultrafast API 支持 6.1 Sol 和 6 Astra，上游目录目前只声明 Fast，由 Codey
-/// 补齐 Ultrafast 能力。客户端要求 `service_tiers`
-/// 和 `additional_speed_tiers` 同时声明该档，否则会将其丢弃。
-pub(super) const ULTRAFAST_SERVICE_TIER_ID: &str = "ultrafast";
-pub(super) const ULTRAFAST_SPEED_TIER_ID: &str = "ultrafast";
-const ULTRAFAST_MODEL_SLUGS: [&str; 2] = ["gpt-6.1-sol", "gpt-6-astra"];
 
 /// Makes a previously generated catalog safe to reuse when the upstream model
 /// cache cannot be refreshed. Older catalogs may still advertise capabilities
@@ -151,80 +145,6 @@ pub(super) fn add_fast_speed_controls(model: &mut Value) {
         }
     } else {
         model["additional_speed_tiers"] = json!([FAST_SPEED_TIER_ID]);
-    }
-}
-
-/// 上游会为同一个模型下发多个 slug：`-wm` 是 Work 模式，`-priority` 是 Fast 档，
-/// `-ultrafast` 是 Ultrafast 档。只认这几种后缀，免得把 `gpt-6-astra-max`
-/// 这类无关变体也当成同族。
-const SPEED_VARIANT_SUFFIXES: [&str; 3] = ["-wm", "-priority", "-ultrafast"];
-
-/// 只有官方支持的模型补 Ultrafast。路由前缀和后缀先归一化再比较，
-/// 否则 `route-x/gpt-6.1-sol` 和 `gpt-6.1-sol-wm` 都会漏掉。
-pub(crate) fn supports_ultrafast_speed(model: &Value) -> bool {
-    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
-    let upstream = route_scoped_upstream_model_id(slug)
-        .trim()
-        .to_ascii_lowercase();
-    ULTRAFAST_MODEL_SLUGS.iter().any(|candidate| {
-        upstream.as_str() == *candidate
-            || SPEED_VARIANT_SUFFIXES.iter().any(|suffix| {
-                upstream
-                    .as_str()
-                    .strip_suffix(*suffix)
-                    .is_some_and(|base| base == *candidate)
-            })
-    })
-}
-
-fn ultrafast_service_tier() -> Value {
-    json!({
-        "id": ULTRAFAST_SERVICE_TIER_ID,
-        "name": "Ultrafast",
-        "description": "The fastest available responses for latency-sensitive work."
-    })
-}
-
-pub(crate) fn add_ultrafast_speed_controls(model: &mut Value) {
-    let service_tier = ultrafast_service_tier();
-    let service_tiers = model.get_mut("service_tiers").and_then(Value::as_array_mut);
-    if let Some(service_tiers) = service_tiers {
-        if !service_tiers
-            .iter()
-            .any(|tier| tier.get("id").and_then(Value::as_str) == Some(ULTRAFAST_SERVICE_TIER_ID))
-        {
-            service_tiers.push(service_tier);
-        }
-    } else {
-        model["service_tiers"] = json!([service_tier]);
-    }
-
-    let speed_tiers = model
-        .get_mut("additional_speed_tiers")
-        .and_then(Value::as_array_mut);
-    if let Some(speed_tiers) = speed_tiers {
-        if !speed_tiers
-            .iter()
-            .any(|tier| tier.as_str() == Some(ULTRAFAST_SPEED_TIER_ID))
-        {
-            speed_tiers.push(json!(ULTRAFAST_SPEED_TIER_ID));
-        }
-    } else {
-        model["additional_speed_tiers"] = json!([ULTRAFAST_SPEED_TIER_ID]);
-    }
-}
-
-pub(super) fn remove_ultrafast_speed_controls(model: &mut Value) {
-    if let Some(service_tiers) = model.get_mut("service_tiers").and_then(Value::as_array_mut) {
-        service_tiers.retain(|tier| {
-            tier.get("id").and_then(Value::as_str) != Some(ULTRAFAST_SERVICE_TIER_ID)
-        });
-    }
-    if let Some(speed_tiers) = model
-        .get_mut("additional_speed_tiers")
-        .and_then(Value::as_array_mut)
-    {
-        speed_tiers.retain(|tier| tier.as_str() != Some(ULTRAFAST_SPEED_TIER_ID));
     }
 }
 

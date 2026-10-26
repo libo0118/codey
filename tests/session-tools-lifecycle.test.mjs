@@ -195,7 +195,7 @@ test("dispose cancels scan, watcher, sidebar tooltip and running recheck timers"
   assert.ok(button);
   button.dispatchEvent({ type: "mouseenter" });
   const delays = [...runtime.timeouts.values()].map(({ delay }) => delay);
-  for (const delay of [40, 60, 400, 2_000, 30_000]) assert.ok(delays.includes(delay), `missing ${delay} timer`);
+  for (const delay of [40, 60, 250, 400, 2_000, 30_000]) assert.ok(delays.includes(delay), `missing ${delay} timer`);
   const callbacks = [...runtime.timeouts.values()].map(({ callback }) => callback);
   runtime.window.__codeySessionToolsInstall.dispose();
   const queries = runtime.queries();

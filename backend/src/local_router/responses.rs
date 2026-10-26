@@ -358,17 +358,31 @@ impl RouterServer {
                         return Ok(());
                     }
                 };
-                let backend = self
-                    .snapshot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .request_log_backend;
+                let (backend, model_aliases) = {
+                    let snapshot = self
+                        .snapshot
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let aliases = if statistics {
+                        crate::route_request_log::RouteRequestLogModelAliases::new(
+                            snapshot
+                                .aliases
+                                .iter()
+                                .map(|(alias, target)| (alias.clone(), target.model.clone())),
+                            snapshot.raw_models.keys().cloned(),
+                            snapshot.model_alias_history.clone(),
+                        )
+                    } else {
+                        Default::default()
+                    };
+                    (snapshot.request_log_backend, aliases)
+                };
                 let root = self.request_log.root().to_path_buf();
                 match tokio::task::spawn_blocking(move || {
                     let value = if statistics {
                         serde_json::to_value(
-                            crate::route_request_log::query_route_request_log_stats(
-                                &root, backend, query,
+                            crate::route_request_log::query_route_request_log_stats_with_model_aliases(
+                                &root, backend, query, model_aliases,
                             )?,
                         )
                     } else {
@@ -556,8 +570,23 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let (route_hint, body_mutated) =
-            match take_codey_route_metadata(&mut request, &mut body, None) {
+        let snapshot = Arc::clone(
+            &self
+                .snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let image_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(probe) = &probe {
+            probe.record_request_model(&image_model, snapshot.request_model_name(&image_model));
+        }
+        let explicit_model_alias = snapshot.active_model_alias(&image_model);
+        let (route_hint, mut body_mutated) =
+            match take_codey_route_metadata(&mut request, &mut body, explicit_model_alias) {
                 Ok(extracted) => extracted,
                 Err(error) => {
                     mark_error(400, "route_metadata_invalid");
@@ -572,19 +601,9 @@ impl RouterServer {
                     return Ok(());
                 }
             };
-        let snapshot = Arc::clone(
-            &self
-                .snapshot
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let image_model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let mut route_decision = crate::route_request_log::RouteDecision::default();
         let resolved = snapshot.route_for_image_request_observed(
-            image_model,
+            &image_model,
             route_hint.as_deref(),
             probe
                 .as_ref()
@@ -594,8 +613,8 @@ impl RouterServer {
         if let Some(probe) = &probe {
             probe.record_route_decision(route_decision);
         }
-        let route = match resolved {
-            Ok(route) => route,
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
             Err(error) => {
                 mark_error(404, "route_not_enabled");
                 write_error_response(
@@ -609,11 +628,12 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        let route = resolved.route;
+        if image_model != resolved.upstream_model {
+            body["model"] = Value::String(resolved.upstream_model.clone());
+            body_mutated = true;
+        }
         if let Some(probe) = &probe {
-            let model = body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
             probe.resolve_route(
                 &route.provider_id,
                 &route.route_name,
@@ -621,8 +641,8 @@ impl RouterServer {
                     .official_auth
                     .as_ref()
                     .map(|auth| auth.account_id.as_str()),
-                model,
-                model,
+                &image_model,
+                &resolved.upstream_model,
                 &route.upstream_authority,
                 route.protocol.label(),
                 "images",
@@ -1318,8 +1338,13 @@ impl RouterServer {
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}
-                WebSocketMessage::Close(frame) => {
-                    downstream.close(frame).await?;
+                WebSocketMessage::Close(_) => {
+                    // Reading a Close already queued tungstenite's reply; sending
+                    // another Close fails with SendAfterClosing. Flush the reply.
+                    downstream.upstream.take();
+                    let _ =
+                        tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, downstream.socket.flush())
+                            .await;
                     break;
                 }
                 WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
@@ -1571,6 +1596,18 @@ impl RouterServer {
                 .await;
         }
         if let Some(probe) = &probe {
+            let requested_model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let snapshot = self
+                .snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            probe.record_request_model(
+                requested_model,
+                snapshot.request_model_name(requested_model),
+            );
             probe.set_subagent(request_is_subagent(&request));
             probe.set_requested_service_tier(body.get("service_tier").and_then(Value::as_str));
             probe.record_request_body(RequestBodySummary::from_responses_body(
@@ -1944,6 +1981,15 @@ impl RouterServer {
         if bridge != ProtocolBridge::NativeResponses
             && let Err(error) = downstream.prepare_adapted_response_context(&mut body)
         {
+            if error.is::<MissingResponseHistory>() {
+                return write_missing_response_history(
+                    downstream,
+                    &error,
+                    &resolved.route,
+                    "restore_adapted_response_history",
+                )
+                .await;
+            }
             downstream
                 .write_error(
                     413,
@@ -1959,6 +2005,15 @@ impl RouterServer {
         if restoring_adapted_history {
             match downstream.prepare_adapted_response_context(&mut body) {
                 Ok(true) => {}
+                Err(error) if error.is::<MissingResponseHistory>() => {
+                    return write_missing_response_history(
+                        downstream,
+                        &error,
+                        &resolved.route,
+                        "restore_adapted_response_history",
+                    )
+                    .await;
+                }
                 _ => {
                     return downstream
                         .write_error(
@@ -2268,9 +2323,11 @@ impl RouterServer {
                     UpstreamWebSocketAttempt::Completed => return Ok(()),
                     UpstreamWebSocketAttempt::UseHttp(reason) => reason,
                 };
-                if had_previous_response && responses_previous_response_id(&upstream_body).is_none()
+                if fallback_reason == "websocket_persisted_context_rejected"
+                    || (had_previous_response
+                        && responses_previous_response_id(&upstream_body).is_none())
                 {
-                    // Reconnection may have expanded history before its handshake failed.
+                    // 重连可能已展开历史；同轮恢复也必须按恢复后的 HTTP 正文重新编码。
                     body_mutated = true;
                     encoded_body = None;
                 }
@@ -2291,6 +2348,16 @@ impl RouterServer {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    if error.is::<MissingResponseHistory>() {
+                        // 此时尚未生成，或上游已明确拒绝且没有执行迹象。
+                        return write_missing_response_history(
+                            downstream,
+                            &error,
+                            &resolved.route,
+                            "restore_native_response_history",
+                        )
+                        .await;
+                    }
                     record_router_failure_nonblocking(
                         "local_router_context_not_recoverable",
                         "restore_native_response_history",
@@ -2581,4 +2648,43 @@ pub(crate) fn format_upstream_response_headers(headers: &reqwest::header::Header
 
 fn is_sensitive_upstream_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
+}
+
+/// 发往上游前找不到续接历史。Codex 收到这个裸错误会丢弃响应链并重发完整输入。
+async fn write_missing_response_history<D>(
+    downstream: &mut D,
+    error: &anyhow::Error,
+    route: &RouteTarget,
+    operation: &'static str,
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
+    record_router_failure_nonblocking(
+        "local_router_previous_response_not_found",
+        operation,
+        error.to_string(),
+        json!({"requestId": current_router_request_id(), "routeId": route.provider_id}),
+    );
+    if !downstream.is_websocket() {
+        return downstream
+            .write_error(
+                400,
+                "previous_response_not_found",
+                error.to_string(),
+                Some(route),
+            )
+            .await;
+    }
+    downstream
+        .write_event(&json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": error.to_string(),
+            },
+        }))
+        .await
 }

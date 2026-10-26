@@ -157,8 +157,14 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   )?.[1] ?? "";
   assert.match(sessionObserverBody, /pendingMutationTargets\.get\(target\)/);
   assert.match(sessionObserverBody, /scheduleIncrementalScan\(null\)/);
-  assert.doesNotMatch(sessionObserverBody, /querySelector|\.closest|\.matches|getSessionId\(|reconcileStaleCompletedTask\(/);
+  assert.doesNotMatch(sessionObserverBody, /querySelector|\.closest|\.matches|getSessionId\(/);
   assert.match(sessionTools, /codeyTimed\("codey-inject\.sessionToolDrain"/);
+  // getSessionId() reads layout; it must not run synchronously per mutation batch.
+  assert.doesNotMatch(sessionObserverBody, /getSessionId\(\)/);
+  assert.match(
+    sessionObserverBody,
+    /completionReconcileCheckTimer = window\.setTimeout\(\(\) => \{[\s\S]*?void reconcileStaleCompletedTask\(\);[\s\S]*?\}, completionReconcileMutationDelayMs\)/,
+  );
   assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
   assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
   assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);

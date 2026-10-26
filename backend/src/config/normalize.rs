@@ -1446,6 +1446,11 @@ impl CodeyConfig {
     }
 
     fn normalize_subagent_model_references(&mut self) {
+        // Native model selection resolves saved selectors at the runtime
+        // boundary. Preserve raw ids here, including provider-looking names.
+        if !self.local_router_enabled {
+            return;
+        }
         let targets = self.configured_model_targets();
         if targets.is_empty() {
             return;
@@ -1462,7 +1467,6 @@ impl CodeyConfig {
             .iter()
             .map(|profile| local_router::model_alias(profile.provider_id(), ""))
             .collect::<Vec<_>>();
-        let qualify_unique_models = self.local_router_enabled;
         for selection in self.subagent_roles.values_mut() {
             let requested = selection.model.trim();
             let canonical = targets
@@ -1470,9 +1474,6 @@ impl CodeyConfig {
                 .find(|target| model_id::equal(&target.alias, requested))
                 .map(|target| target.alias.clone())
                 .or_else(|| {
-                    if !qualify_unique_models {
-                        return None;
-                    }
                     // Preserve the model's route identity for subagents. The
                     // router selects their isolated HTTP/SSE transport per
                     // request, so catalog identity does not grant upstream WS.

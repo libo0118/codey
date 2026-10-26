@@ -644,17 +644,17 @@ fn native_renderer_catalog_and_hot_reload_do_not_require_local_routes() {
 }
 
 #[test]
-fn native_renderer_catalog_adds_ultrafast_only_for_supported_models_without_changing_membership() {
+fn native_renderer_catalog_does_not_infer_speed_tiers_from_model_names() {
     let models = [
-        ("gpt-6.1-sol", true),
-        ("gpt-6-astra", true),
-        ("route-x/gpt-6.1-sol", true),
-        ("gpt-6-astra-wm", true),
-        ("gpt-6.1-sol-priority", true),
-        ("gpt-6-astra-ultrafast", true),
-        ("gpt-6-sol", false),
-        ("gpt-6-astra-max", false),
-        ("unknown-model", false),
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "route-x/gpt-6.1-sol",
+        "gpt-6-astra-wm",
+        "gpt-6.1-sol-priority",
+        "gpt-6-astra-ultrafast",
+        "gpt-6-sol",
+        "gpt-6-astra-max",
+        "unknown-model",
     ];
     for official in [true, false] {
         let mut state = model_catalog::ModelSelectionState {
@@ -664,7 +664,7 @@ fn native_renderer_catalog_adds_ultrafast_only_for_supported_models_without_chan
         if official {
             state.official_models = models
                 .iter()
-                .map(|(slug, _)| model_catalog::OfficialModelAvailability {
+                .map(|slug| model_catalog::OfficialModelAvailability {
                     slug: (*slug).into(),
                     display_name: format!("Display {slug}"),
                     supported: true,
@@ -677,18 +677,15 @@ fn native_renderer_catalog_adds_ultrafast_only_for_supported_models_without_chan
             unchecked.supported = false;
             state.official_models.push(unchecked);
         } else {
-            state.third_party_models = models.iter().map(|(slug, _)| (*slug).into()).collect();
+            state.third_party_models = models.iter().map(|slug| (*slug).into()).collect();
             state.third_party_models.push("CODEX-AUTO-REVIEW".into());
         }
         let catalog = renderer_native_model_catalog_value(&state);
         assert_eq!(catalog["native_selection_only"], true);
         assert_eq!(catalog["default_model"], "gpt-6-sol");
-        assert_eq!(
-            catalog["models"],
-            json!(models.iter().map(|(slug, _)| *slug).collect::<Vec<_>>())
-        );
+        assert_eq!(catalog["models"], json!(models));
         assert!(catalog.get("model_provider").is_none());
-        for (entry, (slug, ultrafast)) in catalog["model_metadata"]
+        for (entry, slug) in catalog["model_metadata"]
             .as_array()
             .unwrap()
             .iter()
@@ -704,16 +701,11 @@ fn native_renderer_catalog_adds_ultrafast_only_for_supported_models_without_chan
                 assert_eq!(entry["display_name"], slug);
                 assert!(entry.get("supported_reasoning_efforts").is_none());
             }
-            if ultrafast {
-                assert_eq!(entry["service_tiers"][0]["id"], "ultrafast");
-                assert_eq!(entry["additional_speed_tiers"], json!(["ultrafast"]));
-            } else {
-                assert!(entry.get("service_tiers").is_none(), "{slug}: {entry}");
-                assert!(
-                    entry.get("additional_speed_tiers").is_none(),
-                    "{slug}: {entry}"
-                );
-            }
+            assert!(entry.get("service_tiers").is_none(), "{slug}: {entry}");
+            assert!(
+                entry.get("additional_speed_tiers").is_none(),
+                "{slug}: {entry}"
+            );
         }
     }
 }
@@ -769,6 +761,31 @@ fn native_model_conversion_uses_synced_upstream_models_without_enabled_targets()
         native_upstream_model(&config, "route-a/vendor/model"),
         "vendor/model"
     );
+}
+
+#[test]
+fn native_model_conversion_preserves_known_raw_ids_and_expands_aliases_only_once() {
+    let config = CodeyConfig {
+        local_router_enabled: false,
+        profiles: vec![
+            configured_route("route-a", None),
+            configured_route("route-b", None),
+        ],
+        selected_models_by_provider: BTreeMap::from([
+            ("route-a".into(), vec!["Vendor/Model".into()]),
+            ("route-b".into(), vec!["route-a/Vendor/Model".into()]),
+        ]),
+        model_alias_history: BTreeMap::from([("vendor/model".into(), "Model".into())]),
+        ..CodeyConfig::default()
+    };
+    for (input, expected) in [
+        (" ROUTE-A/vendor/model ", "route-a/Vendor/Model"),
+        ("route-b/route-a/vendor/model", "route-a/Vendor/Model"),
+        ("vendor/model", "Vendor/Model"),
+        ("unknown/Vendor/Model", "unknown/Vendor/Model"),
+    ] {
+        assert_eq!(native_upstream_model(&config, input), expected, "{input}");
+    }
 }
 
 #[test]

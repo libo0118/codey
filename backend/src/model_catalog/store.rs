@@ -346,11 +346,6 @@ fn read_official_entries_uncached(
             complete_reasoning_metadata(&mut model, &fallbacks);
             normalize_official_model(&mut model, slug, display_name, priority);
             add_fast_speed_controls(&mut model);
-            if supports_ultrafast_speed(&model) {
-                add_ultrafast_speed_controls(&mut model);
-            } else {
-                remove_ultrafast_speed_controls(&mut model);
-            }
             Ok(model)
         })
         .collect()

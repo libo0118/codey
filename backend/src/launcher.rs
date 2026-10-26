@@ -65,6 +65,8 @@ use process::{codex_runtime_arguments, gpu_launch_arguments};
 
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
+// 页面明确答复桥接失效后，确认这一判断不必再等一整轮巡检。
+const CDP_WATCHDOG_UNHEALTHY_CONFIRM_INTERVAL: Duration = Duration::from_secs(5);
 // 页面端点对 CDP 命令完全没有回应：页面忙碌不成立，target 很可能已被替换。
 // 连续多轮无响应后重新发现 target，而不是一直当作"页面忙"等下去。
 const CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD: u8 = 3;
@@ -75,9 +77,9 @@ const CDP_WATCHDOG_INCONCLUSIVE_LIMIT: u8 = 6;
 // A completely unresponsive endpoint is a stronger signal than a busy page,
 // so it must rebuild sooner.
 const _: () = assert!(CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD < CDP_WATCHDOG_INCONCLUSIVE_LIMIT);
-// 每轮重装内部已自带整段发现阶段重试预算：连续这么多轮仍摸不到可注入
-// 页面时，调试端口就是随旧进程消失了，再重试只是在刷同样的超时。
+// 连续发现失败只能说明端点暂时不可达；降低重试频率，保留后续自动恢复。
 const CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT: u8 = 3;
+const CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionHealth {
@@ -478,13 +480,19 @@ async fn run_startup_session_maintenance(
                     summary.deleted, summary.cleared_sessions
                 );
             }
+            // 失败日志按错误文本去重，不看上下文；同一错误的会话必须合并成一条，
+            // 否则同一次启动里第二个及之后的会话会被静默吞掉。
+            let mut failures = std::collections::BTreeMap::<String, Vec<String>>::new();
             for (session_id, message) in summary.failures {
+                failures.entry(message).or_default().push(session_id);
+            }
+            for (message, session_ids) in failures {
                 error_log::record_failure(
                     "patch_failed",
                     "reapply_message_deletion",
                     message,
                     serde_json::json!({
-                        "sessionId": session_id,
+                        "sessionIds": session_ids,
                     }),
                 );
             }
@@ -634,16 +642,33 @@ fn router_subagent_runtime_config(
         selection.model = if route_catalog_installed {
             routed
         } else {
-            let model = native_subagent_model(config, &targets, &routed);
+            let model = targets
+                .iter()
+                .find(|target| model_id::equal(&target.alias, &routed))
+                .map(|target| target.upstream_model.clone())
+                .unwrap_or_else(|| crate::commands::native_upstream_model(config, &routed));
             // Without a custom catalog Codex validates native slugs before the
             // router sees the request. Only strip a route when raw-id routing
             // is unambiguous, including inherited thread route metadata.
             let mut matching = targets
                 .iter()
                 .filter(|target| model_id::equal(&target.upstream_model, &model));
+            let unique_target = match (matching.next(), matching.next()) {
+                (Some(target), None) => Some(target),
+                _ => None,
+            };
+            let preserves_route = unique_target.is_some_and(|target| {
+                targets
+                    .iter()
+                    .find(|candidate| model_id::equal(&candidate.alias, &model))
+                    .is_none_or(|alias_target| {
+                        alias_target.route_id == target.route_id
+                            && model_id::equal(&alias_target.upstream_model, &target.upstream_model)
+                    })
+            });
             anyhow::ensure!(
-                matching.next().is_some() && matching.next().is_none(),
-                "子代理角色 {role} 的模型 {routed} 无法在内置模型目录模式下安全派发：模型线路不存在或存在同名线路；请补齐 Codex 模型缓存并重启，或只启用一条提供该模型的线路"
+                preserves_route,
+                "子代理角色 {role} 的模型 {routed} 无法在内置模型目录模式下安全派发：模型线路不存在、存在同名线路或标识与其他线路冲突；请补齐 Codex 模型缓存并重启，或只启用一条提供该模型的线路"
             );
             // 路由是否唯一与模型品牌无关。Codey 的官方展示名单不能
             // 代表当前 Codex 或自定义 Provider 实际支持的模型范围。
@@ -1193,6 +1218,7 @@ async fn stop_runtime_watcher(
 async fn stop_codex_processes(
     app_dir: &std::path::Path,
     process_id: Option<u32>,
+    #[cfg(windows)] renderer_websocket_url: Option<&str>,
     #[cfg(unix)] process_group_id: Option<u32>,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -1209,7 +1235,11 @@ async fn stop_codex_processes(
     }
     #[cfg(windows)]
     {
-        terminate_windows_codex_processes(app_dir, process_id).await
+        if let Some(websocket_url) = renderer_websocket_url {
+            stop_windows_codex_processes(app_dir, process_id, websocket_url).await
+        } else {
+            terminate_windows_codex_processes(app_dir, process_id).await
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1251,7 +1281,7 @@ async fn inject_initial_renderer(
     spawned: &SpawnedCodex,
     child: &Arc<Mutex<Option<Child>>>,
     restore_context: RuntimeConfigRestoreContext<'_>,
-    prefetched_target: Option<tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>>>,
+    prefetched_target: Option<crate::target_prefetch::PrefetchTask>,
 ) -> Result<cdp::InjectedTarget> {
     let failure = match cdp::retry_inject_with_scripts(
         debug_port,
@@ -1288,6 +1318,8 @@ async fn inject_initial_renderer(
     if let Err(stop_error) = stop_codex_processes(
         app_dir,
         spawned.process_id,
+        #[cfg(windows)]
+        None,
         #[cfg(unix)]
         spawned.process_group_id,
     )
@@ -1350,21 +1382,25 @@ fn spawn_injection_watchdog(
     let watchdog_websocket_url = websocket_url.clone();
     let watchdog_scripts = injection_scripts;
     let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
+        let mut retry_interval = CDP_WATCHDOG_INTERVAL;
         let mut target = injected_target;
         let mut failure_counters = InjectionFailureCounters::default();
         let mut reported_health: Option<InjectionHealth> = None;
-        // 连续停在目标枚举/选择阶段的重装轮数：Codex 在托管外重启（自更新、
-        // 单实例交接等）会带走调试端口，此后任何页面侧重试都不可能恢复，
-        // 到达阈值后把集成标记为停用并退出看门狗，不再无限烧重试。
         let mut endpoint_losses: u8 = 0;
+        let mut confirm_unhealthy = false;
         'watchdog: loop {
+            // 泵已结束而重建失败时不再监听，否则会跳过重试间隔空转。
+            let pump_running = !target.pump_finished();
+            let wait = if confirm_unhealthy {
+                CDP_WATCHDOG_UNHEALTHY_CONFIRM_INTERVAL
+            } else {
+                retry_interval
+            };
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => break,
-                _ = interval.tick() => {}
+                _ = target.pump_closed(), if pump_running => {}
+                _ = tokio::time::sleep(wait) => {}
             }
             // A finished message pump means the in-page bridge can no longer
             // reach the backend at all. Probing again cannot change that, so
@@ -1434,9 +1470,15 @@ fn spawn_injection_watchdog(
                 reported_health = Some(health);
             }
             if health == InjectionHealth::Healthy {
+                if endpoint_losses > 0 {
+                    *watchdog_statuses.write().await = target.injection_statuses();
+                }
                 endpoint_losses = 0;
+                retry_interval = CDP_WATCHDOG_INTERVAL;
             }
-            if !watchdog_should_reinject(&mut failure_counters, health) {
+            let reinject = watchdog_should_reinject(&mut failure_counters, health);
+            confirm_unhealthy = !reinject && health == InjectionHealth::Unhealthy;
+            if !reinject {
                 continue;
             }
             let reinjection = tokio::select! {
@@ -1468,28 +1510,33 @@ fn spawn_injection_watchdog(
                     previous.close().await;
                     failure_counters = InjectionFailureCounters::default();
                     endpoint_losses = 0;
+                    retry_interval = CDP_WATCHDOG_INTERVAL;
                 }
                 Err(error) => {
                     let endpoint_unreachable = error.debug_endpoint_unreachable();
                     let error_message = format!("{error:#}");
-                    error_log::record_failure_with_metadata_async(
-                        "injection_failed",
-                        "reinject_cdp_bridge",
-                        error_message.clone(),
-                        error_log::FailureMetadata {
-                            stage: Some("runtime.renderer_reinjection".to_string()),
-                            recoverable: Some(true),
-                        },
-                        serde_json::json!({
-                            "debugPort": debug_port,
-                            "lastError": error.detail(),
-                            "debugEndpointUnreachable": endpoint_unreachable,
-                        }),
-                    )
-                    .await;
-                    *watchdog_statuses.write().await = watchdog_scripts
-                        .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
-                    eprintln!("Codey CDP bridge 恢复失败：{error_message}");
+                    // 低频恢复中的相同端点故障不重复写错误日志；阶段变化仍记录。
+                    if !endpoint_unreachable || endpoint_losses < CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown_rx => break 'watchdog,
+                            _ = error_log::record_failure_with_metadata_async(
+                                "injection_failed",
+                                "reinject_cdp_bridge",
+                                error_message.clone(),
+                                error_log::FailureMetadata {
+                                    stage: Some("runtime.renderer_reinjection".to_string()),
+                                    recoverable: Some(true),
+                                },
+                                serde_json::json!({
+                                    "debugPort": debug_port,
+                                    "lastError": error.detail(),
+                                    "debugEndpointUnreachable": endpoint_unreachable,
+                                }),
+                            ) => {}
+                        }
+                        eprintln!("Codey CDP bridge 恢复失败：{error_message}");
+                    }
                     failure_counters = InjectionFailureCounters::after_failed_reinjection();
                     endpoint_losses = if endpoint_unreachable {
                         endpoint_losses.saturating_add(1)
@@ -1497,19 +1544,24 @@ fn spawn_injection_watchdog(
                         0
                     };
                     if endpoint_losses >= CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
-                        // 调试端口随旧进程消失后不会回来：继续探测只是反复
-                        // 制造同样的超时。把状态固定为停用说明；用户经 Codey
-                        // 重新拉起 Codex 时会走全新的注入与看门狗。
                         *watchdog_statuses.write().await = watchdog_scripts
-                            .statuses_with_error("Codex 已在 Codey 之外重启，集成已停用；通过 Codey 重新启动 Codex 后恢复");
-                        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                            "bridge.injection_disabled",
-                            serde_json::json!({
-                                "debugPort": debug_port,
-                                "consecutiveEndpointLosses": endpoint_losses,
-                            }),
+                            .statuses_with_error("Codex 调试连接暂时不可用，Codey 将继续自动恢复");
+                        if retry_interval != CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL {
+                            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                                "bridge.recovery_backoff",
+                                serde_json::json!({
+                                    "debugPort": debug_port,
+                                    "consecutiveEndpointLosses": endpoint_losses,
+                                    "retryIntervalMs": CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL.as_millis(),
+                                }),
+                            );
+                        }
+                        retry_interval = CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL;
+                    } else {
+                        *watchdog_statuses.write().await = watchdog_scripts.statuses_with_error(
+                            format!("脚本重新注入失败，将继续自动恢复：{error_message}"),
                         );
-                        break 'watchdog;
+                        retry_interval = CDP_WATCHDOG_INTERVAL;
                     }
                 }
             }
@@ -1756,76 +1808,12 @@ async fn prepare_startup_storage(
     Ok(prepared)
 }
 
-fn native_subagent_model(
-    config: &CodeyConfig,
-    targets: &[RuntimeModelTarget],
-    model: &str,
-) -> String {
-    let model = model.trim();
-    targets
-        .iter()
-        .find(|target| model_id::equal(&target.alias, model))
-        .map(|target| target.upstream_model.clone())
-        .or_else(|| native_provider_prefixed_subagent_model(config, model))
-        .unwrap_or_else(|| model.to_string())
-}
-
-fn native_provider_prefixed_subagent_model(config: &CodeyConfig, model: &str) -> Option<String> {
-    for profile in &config.profiles {
-        let provider_id = profile.provider_id();
-        let prefix = local_router::model_alias(provider_id, "");
-        let Some(upstream_model) = strip_model_provider_prefix(model, &prefix) else {
-            continue;
-        };
-        let known_model = config
-            .upstream_models_by_provider
-            .get(provider_id)
-            .into_iter()
-            .flatten()
-            .chain(
-                config
-                    .selected_models_by_provider
-                    .get(provider_id)
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(
-                config
-                    .declared_official_models_by_provider
-                    .get(provider_id)
-                    .into_iter()
-                    .flatten(),
-            )
-            .find(|known| model_id::equal(known, upstream_model))
-            .cloned()
-            .or_else(|| {
-                model_catalog::default_official_model_slugs()
-                    .into_iter()
-                    .find(|known| model_id::equal(known, upstream_model))
-            });
-        if known_model.is_some() {
-            return known_model;
-        }
-    }
-    None
-}
-
-fn strip_model_provider_prefix<'a>(model: &'a str, prefix: &str) -> Option<&'a str> {
-    let prefix = prefix.trim();
-    model
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .and_then(|_| model.get(prefix.len()..))
-        .map(str::trim)
-        .filter(|suffix| !suffix.is_empty())
-}
-
 fn native_subagent_runtime_config(config: &CodeyConfig) -> CodeyConfig {
     let mut runtime_config = config.clone();
-    let targets = config.runtime_model_targets();
-    runtime_config.subagent_model = native_subagent_model(config, &targets, &config.subagent_model);
+    runtime_config.subagent_model =
+        crate::commands::native_upstream_model(config, &config.subagent_model);
     for selection in runtime_config.subagent_roles.values_mut() {
-        selection.model = native_subagent_model(config, &targets, &selection.model);
+        selection.model = crate::commands::native_upstream_model(config, &selection.model);
     }
     runtime_config
 }
@@ -1835,7 +1823,9 @@ fn reconciled_native_subagent_runtime_config(
     home: &std::path::Path,
 ) -> CodeyConfig {
     let mut runtime_config = native_subagent_runtime_config(config);
-    if let Ok(model_state) = crate::commands::native_subagent_model_state(&runtime_config, home) {
+    // Read selection state from the original selectors. The runtime copy has
+    // already expanded them once, and its raw ids can also look like aliases.
+    if let Ok(model_state) = crate::commands::native_subagent_model_state(config, home) {
         subagent_policy::reconcile_with_model_state(&mut runtime_config, Some(&model_state));
     }
     runtime_config
@@ -1965,10 +1955,10 @@ async fn spawn_and_inject_runtime(
             Some(plan) => Some(plan.start().await?),
             None => None,
         };
-    // 调试端口在 Chromium 主进程就绪后先于 CLI 包装器握手可用：与其并行预取
-    // 页面目标——除 /json 枚举外还尝试浏览器端点自动挂载，页面在首个导航前被
-    // 暂停时 Fetch 拦截能赶在任何资产请求之前落位。任务自带暂停态清理
-    // （EarlyAttachHold 的 Drop 保证放行），spawn 失败时直接放弃即可。
+    // 资产补丁服务先于 Codex 拉起：端点一出现就挂上页面，Fetch 拦截赶在主窗口
+    // 首次导航之前落位。调试端口在 Chromium 主进程就绪后先于 CLI 包装器握手
+    // 可用，与其并行预取页面目标；spawn 失败时直接放弃即可。
+    crate::renderer_asset_patch::start_service(patch.debug_port, config.slim_codex_pet);
     let target_prefetch = cdp::spawn_injectable_target_prefetch(patch.debug_port);
     let mut spawned = match spawn_codex(
         &mut storage.app_dir,
@@ -2429,10 +2419,14 @@ impl CodeyRuntime {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        #[cfg(windows)]
+        let renderer_websocket_url = self.injection_websocket_url.read().await.clone();
         self.stop_with_cleanup(
             stop_codex_processes(
                 &self.codex_app_path,
                 self.process_id,
+                #[cfg(windows)]
+                Some(&renderer_websocket_url),
                 #[cfg(unix)]
                 self.process_group_id,
             ),
@@ -2731,6 +2725,9 @@ mod subagent_model_tests;
 
 #[cfg(test)]
 mod model_delivery_test_support;
+
+#[cfg(test)]
+mod watchdog_recovery_tests;
 
 #[cfg(all(test, unix))]
 mod tests;

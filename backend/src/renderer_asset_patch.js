@@ -1,6 +1,7 @@
 // Codex 渲染进程资产源补丁。原本是主进程 protocol.handle 里对 app:// 响应
-// 做改写的纯函数部分；Electron fuse 关闭后主进程注入不可用，改由 CDP Fetch 会话
-// 在响应暂停时逐资产调用 globalThis.__codeyRendererPatchEntry 完成同样的改写。
+// 做改写的纯函数部分；Electron fuse 关闭后主进程注入不可用，改由 Codey 的补丁
+// 服务在 Fetch 响应暂停时逐资产调用 globalThis.__codeyRendererPatchEntry 完成
+// 同样的改写，结果按资产文件名缓存在 Codey 侧。
 // 本文件只依赖页面 JS 环境，不使用任何 Node/Electron API。
 (() => {
   const rendererPatchOptions =
@@ -9,7 +10,6 @@
       ? globalThis.__CODEY_RENDERER_PATCH_OPTIONS__
       : {};
   const disablePet = rendererPatchOptions.disablePet === true;
-  const threadOwnerDiscoveryTimeoutMs = 150;
   // 渲染进程没有 --codey-record-error 子进程可写：补丁失败经 CDP
   // Runtime.addBinding 暴露的 __codeyPatchLog 回传给 Rust 记录。
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
@@ -30,15 +30,18 @@
   const rendererPatchFailuresByFingerprint = new Map();
   let activeRendererPatchFailures = null;
   // 指纹只作补丁结果缓存键，不需要加密强度；原主进程版用 sha256，
-  // 页面里用同步 FNV-1a 变体即可，省掉 async crypto.subtle。
+  // 页面里用同步的双路 32 位 FNV-1a 即可；缓存命中时整段耗时都在这里，
+  // Math.imul 比逐字符 BigInt 运算约快一倍。
   const rendererPatchFingerprint = (source) => {
     try {
-      let hash = 0xcbf29ce484222325n;
+      let first = 0x811c9dc5;
+      let second = 0x050c5d1f;
       for (let index = 0; index < source.length; index += 1) {
-        hash ^= BigInt(source.charCodeAt(index));
-        hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+        const code = source.charCodeAt(index);
+        first = Math.imul(first ^ code, 0x01000193);
+        second = Math.imul(second ^ code, 0x5bd1e995);
       }
-      return `${source.length}:${hash.toString(36)}`;
+      return `${source.length}:${(first >>> 0).toString(36)}:${(second >>> 0).toString(36)}`;
     } catch {
       // Fingerprinting is only an optimization. If it is unavailable, keep
       // the existing compatibility behavior instead of risking a false cache hit.
@@ -83,46 +86,20 @@
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
   // 只截取传入的静态资产源码，不读取输入框、会话状态或凭据。
-  // 模型补丁优先记录过滤函数，避免被同一资产里更早的 Fast 控件占满。
-  const rendererModelFilterDiagnosticAnchor =
-    /function\s+[$A-Z_a-z][$\w]*\(\{[^}]{0,1024}\bisCustomModelProvider\s*:[^}]{0,256}\bmodel\s*:[^}]{0,256}\buseHiddenModels\s*:[^}]{0,256}\}\)\s*\{/;
-  const rendererModelGateDiagnosticAnchors = {
-    "model allowlist": [
-      rendererModelFilterDiagnosticAnchor,
-      /[$A-Z_a-z][$\w]*\.has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)/,
-      "useHiddenModels:",
-      "availableModels:",
-      "isCustomModelProvider:",
-    ],
-    "model visibility": [
-      rendererModelFilterDiagnosticAnchor,
-      "amazonBedrock",
-      /[$A-Z_a-z][$\w]*\.hidden\b/,
-      "useHiddenModels:",
-      "isCustomModelProvider:",
-    ],
-  };
   const rendererGateDiagnosticAnchors = [
-    "`composer.toggleFastMode`",
-    "composer.speedSlashCommand.disableDescription",
-    "isServiceTierAllowed",
-    "selectedServiceTier",
-    "featureRequirements?.fast_mode",
-    "useHiddenModels",
-    "availableOptions.length",
+    "serviceTierAccess:",
+    "supportsIndependentSpeedModes",
     "includeUltraReasoningEffort",
     "isCustomModelProvider",
+    "getHasInProgressLocalConversation",
+    "electron-app-state-snapshot-request",
   ];
-  const rendererGateFailureExcerpts = (source, name) => {
+  const rendererGateFailureExcerpts = (source) => {
     const excerpts = [];
     const ranges = [];
-    const anchors = rendererModelGateDiagnosticAnchors[name] ??
-      rendererGateDiagnosticAnchors;
-    for (const anchor of anchors) {
+    for (const anchor of rendererGateDiagnosticAnchors) {
       if (excerpts.length >= 2) break;
-      const index = typeof anchor === "string"
-        ? source.indexOf(anchor)
-        : source.search(anchor);
+      const index = source.indexOf(anchor);
       if (index < 0) continue;
       if (ranges.some(([start, end]) => index >= start && index < end)) continue;
       const start = Math.max(0, index - 120);
@@ -141,7 +118,7 @@
     const message =
       `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
     const context = { matchCount };
-    const excerpts = rendererGateFailureExcerpts(source, name);
+    const excerpts = rendererGateFailureExcerpts(source);
     if (excerpts.length) context.excerpts = excerpts;
     recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
     try {
@@ -232,27 +209,6 @@
       replaced +
       source.slice(absoluteOffset + args[0].length);
   };
-  const rendererHasNativeCustomProviderModelAccess = (source) => {
-    if (/function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
-      source,
-    )) return true;
-    // Codex 26.1007 的实际过滤函数增加了 API key/cyber 与配置目录检查。
-    // 精确核对其完整分支，只识别原生兼容性，不改写这些访问规则。
-    for (const match of source.matchAll(
-      /function\s+[$A-Z_a-z][$\w]*\(\{additionalAvailableModels:(?<additional>[$A-Z_a-z][$\w]*),apiKeyDaybreakSupported:(?<daybreak>[$A-Z_a-z][$\w]*),authMethod:(?<auth>[$A-Z_a-z][$\w]*),availableModels:(?<available>[$A-Z_a-z][$\w]*),hasConfiguredModelCatalog:(?<catalog>[$A-Z_a-z][$\w]*),isCustomModelProvider:(?<custom>[$A-Z_a-z][$\w]*),model:(?<model>[$A-Z_a-z][$\w]*),useHiddenModels:(?<hidden>[$A-Z_a-z][$\w]*)\}\)\{let (?<access>[$A-Z_a-z][$\w]*)=\k<model>\.availableAccessPrograms\?\.cyber;(?<body>[^{}]{1,1024})\}/g,
-    )) {
-      const { additional, daybreak, auth, available, catalog, custom, model,
-        hidden, access, body } = match.groups;
-      const expected = [
-        `return ${auth}===\`apikey\`&&!${daybreak}&&${access}!=null&&${access}.length>0&&!${access}.includes(\`standard\`)?!1:`,
-        `${additional}?.has(${model}.model)===!0||${model}.model!==\`codex-auto-review\`&&`,
-        `(${catalog}&&!${model}.hidden||(${hidden}&&!${custom}&&${auth}!==\`amazonBedrock\`?`,
-        `${available}.has(${model}.model)||${auth}===\`apikey\`&&${daybreak}&&!${model}.hidden&&${access}?.some(e=>e!==\`standard\`)===!0:!${model}.hidden))`,
-      ].join("");
-      if (body === expected) return true;
-    }
-    return false;
-  };
   const replacePetRendererImportWithStubs = (match, importClause) => {
     if (typeof importClause !== "string" || importClause.trim() === "") {
       return "";
@@ -314,55 +270,61 @@
     if (count === 0) return recordIncompatibleRendererGate(source, name, count);
     return patched;
   };
-  const threadOwnerDiscoveryExpression = (
-    coordinationName,
-    hostIdName,
-    conversationIdName,
-  ) =>
-    [
-      "await (globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__??=(()=>{",
-      "const requestsByClient=new WeakMap;",
-      "return{find(client,hostId,conversationId){",
-      "let requests=requestsByClient.get(client);",
-      "if(requests==null){requests=new Map;requestsByClient.set(client,requests)}",
-      "const key=String(hostId)+String.fromCharCode(0)+String(conversationId);",
-      "const existing=requests.get(key);",
-      "if(existing!=null)return existing;",
-      "let settled=false,timer;",
-      "const lookup=Promise.resolve().then(()=>client.findThreadOwner({hostId,conversationId}));",
-      "const request=new Promise((resolve,reject)=>{",
-      `timer=globalThis.setTimeout(()=>{if(settled)return;settled=true;resolve(null)},${threadOwnerDiscoveryTimeoutMs});`,
-      "lookup.then(owner=>{",
-      "if(settled)return;",
-      "settled=true;globalThis.clearTimeout(timer);",
-      "resolve(owner)",
-      "},error=>{",
-      "if(settled)return;",
-      "settled=true;globalThis.clearTimeout(timer);reject(error)",
-      "})",
-      "}).finally(()=>{if(requests.get(key)===request)requests.delete(key)});",
-      "requests.set(key,request);",
-      "return request",
-      "}}",
-      "})()).find(",
-      `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
-    ].join("");
-  const patchNewThreadDraftDefaults = (source) => {
-    const name = "new thread draft defaults";
-    if (source.includes("/*codey-new-thread-draft-defaults*/")
-      || activeRendererPatchFailures?.has(name)) return source;
-    // 三处必须同时识别：草稿速度初值、模型目录校验、手动草稿选择。
-    // 缓存中的默认模型继续有效；旧推理强度不再成为下一个草稿的初值。
+  const draftFactoryPattern = /\b[$A-Z_a-z][$\w]*=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,[$A-Z_a-z][$\w]*=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:null\}\)\)/g;
+  const draftResolverPattern = /function ([$A-Z_a-z][$\w]*)\(\{userSavedModelString:[$A-Z_a-z][$\w]*,userSavedReasoningEffort:[$A-Z_a-z][$\w]*,listModelsData:[$A-Z_a-z][$\w]*\}\)/g;
+  // Codex 26.1021 起，草稿原生保存手动选择并以 draftModelSettings 传入设置
+  // hook，只需把未手动选择的新草稿的推理强度初值换成 medium。返回改写后的
+  // 源码；无法唯一识别时返回匹配次数。
+  const patchNativeDraftReasoningEffort = (source, resolver) => {
+    const hooks = [...source.matchAll(
+      /function [$A-Z_a-z][$\w]*\(([$A-Z_a-z][$\w]*)\)\{let [$A-Z_a-z][$\w]*=\(0,[$A-Z_a-z][$\w]*\.c\)\(\d+\),\{((?=[^{}]*\bmanagedNewThreadModelSettings:)(?=[^{}]*\bdraftModelSettings:)(?=[^{}]*\bisNewThreadDraft:)[^{}]*)\}=\1,/g,
+    )];
+    if (hooks.length !== 1) return hooks.length;
+    const hook = hooks[0];
+    const bindings = Object.fromEntries(hook[2].split(",").map((entry) => entry.split(":")));
+    const managed = bindings.managedNewThreadModelSettings;
+    const draft = bindings.draftModelSettings;
+    const isDraft = bindings.isNewThreadDraft;
+    if (![managed, draft, isDraft].every((binding) => /^[$A-Z_a-z][$\w]*$/.test(binding ?? ""))) return 0;
+    const hookEnd = source.indexOf("}function ", hook.index + hook[0].length);
+    if (hookEnd < 0) return 0;
+    const call = `${resolver}({userSavedModelString:`;
+    const callStart = source.indexOf(call, hook.index);
+    const nextCall = callStart < 0 ? -1 : source.indexOf(call, callStart + 1);
+    if (callStart < 0 || callStart > hookEnd || (nextCall >= 0 && nextCall < hookEnd)) return 0;
+    // 参数里含有对象展开，按括号配对找到调用结尾。
+    const argsStart = callStart + resolver.length + 1;
+    let depth = 0;
+    let argsEnd = -1;
+    for (let index = argsStart; index < hookEnd; index += 1) {
+      const char = source[index];
+      if (char === "{" || char === "(" || char === "[") depth += 1;
+      else if (char === "}" || char === ")" || char === "]") {
+        depth -= 1;
+        if (depth === 0) {
+          argsEnd = index + 1;
+          break;
+        }
+      }
+    }
+    if (argsEnd < 0 || source[argsEnd] !== ")") return 0;
+    const args = source.slice(argsStart, argsEnd);
+    // 管理员下发的新会话设置和草稿内的手动选择保持原样；模型不在目录中时
+    // 沿用原生结果，模型不支持 medium 时由原生解析器回退。
+    const replacement = `/*codey-new-thread-draft-defaults*/((__codeyArgs,__codeyResolved=${resolver}(__codeyArgs))=>${isDraft}&&${draft}==null&&${managed}==null&&__codeyArgs.listModelsData?.models?.some(e=>e.model===__codeyResolved.model)?${resolver}({...__codeyArgs,userSavedModelString:__codeyResolved.model,userSavedReasoningEffort:\`medium\`}):__codeyResolved)(${args})`;
+    return source.slice(0, callStart) + replacement + source.slice(argsEnd + 1);
+  };
+  // 旧版 Codex：草稿不保存手动选择，需在草稿 hook 内补目录校验并让手动
+  // 选择写入草稿。返回改写后的源码；无法唯一识别时返回匹配次数。
+  const patchLegacyDraftReasoningEffort = (source, resolver) => {
     const patterns = {
-      factory: /\b[$A-Z_a-z][$\w]*=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,[$A-Z_a-z][$\w]*=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:null\}\)\)/g,
-      resolver: /function ([$A-Z_a-z][$\w]*)\(\{userSavedModelString:[$A-Z_a-z][$\w]*,userSavedReasoningEffort:[$A-Z_a-z][$\w]*,listModelsData:[$A-Z_a-z][$\w]*\}\)/g,
       catalog: /managedNewThreadModelSettings:[$A-Z_a-z][$\w]*,waitForModelList:[\s\S]{0,4000}?let\{data:([$A-Z_a-z][$\w]*),isLoading:[$A-Z_a-z][$\w]*\}=([$A-Z_a-z][$\w]*)\([$A-Z_a-z][$\w]*\),[$A-Z_a-z][$\w]*=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\?\.settings,\1\),[\s\S]{0,1500}?userSavedModelString:/g,
       model: /function [$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,[$A-Z_a-z][$\w]*\)\{let ([$A-Z_a-z][$\w]*)=\(0,([$A-Z_a-z][$\w]*)\.c\)\((\d+)\)[\s\S]{0,700}?let\{draftSettings:([$A-Z_a-z][$\w]*),isNewThreadDraft:[$A-Z_a-z][$\w]*,updateDraftSettings:([$A-Z_a-z][$\w]*)\}=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\([^)]*\),\{isLunaReserveActive:[$A-Z_a-z][$\w]*\}=\6,([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*==null&&[$A-Z_a-z][$\w]*,[^;]{0,300}?,([$A-Z_a-z][$\w]*)=\7&&\4\.modelSettings!=null,([$A-Z_a-z][$\w]*)=\6\.modelSettings;(?=if\(\8\))/g,
     };
     const matches = {};
     for (const [key, pattern] of Object.entries(patterns)) {
       const found = [...source.matchAll(pattern)];
-      if (found.length !== 1) return recordIncompatibleRendererGate(source, name, found.length);
+      if (found.length !== 1) return found.length;
       matches[key] = found[0];
     }
     const [, cache, , cacheSize, , update, settings, isDraft, hasOverride, model] = matches.model;
@@ -373,25 +335,39 @@
     );
     // 只在已识别的草稿 hook 内查找回调，不能误改另一个模型选择器。
     const modelEnd = source.indexOf("}function ", matches.model.index + matches.model[0].length);
-    if (modelEnd < 0) return recordIncompatibleRendererGate(source, name, 0);
+    if (modelEnd < 0) return 0;
     const modelScope = source.slice(matches.model.index, modelEnd + 1);
     const manualMatches = [...modelScope.matchAll(manualPattern)];
-    if (manualMatches.length !== 1) return recordIncompatibleRendererGate(source, name, manualMatches.length);
+    if (manualMatches.length !== 1) return manualMatches.length;
     const slots = Number(cacheSize);
     const catalogHook = matches.catalog[2];
-    const resolver = matches.resolver[1];
     // 新增目录 hook 始终调用，保留 React hook 顺序。未加载或模型不在目录中
     // 时保留现有设置；目录就绪后由原生解析器选择 medium 或模型支持的回退。
     const defaults = `/*codey-new-thread-draft-defaults*/let __codeyDraftCatalog=${catalogHook}({hostId:${settings}.hostId,enabled:${isDraft}}).data;if(${isDraft}&&!${hasOverride}&&__codeyDraftCatalog?.models?.some(e=>e.model===${model}.model)){let __codeyDraftEffort=${resolver}({userSavedModelString:${model}.model,userSavedReasoningEffort:\`medium\`,listModelsData:__codeyDraftCatalog}).reasoningEffort;if(${model}.reasoningEffort!==__codeyDraftEffort){let __codeyDraftSettings;${cache}[${slots}]!==${model}||${cache}[${slots + 1}]!==__codeyDraftEffort?(__codeyDraftSettings={...${model},reasoningEffort:__codeyDraftEffort},${cache}[${slots}]=${model},${cache}[${slots + 1}]=__codeyDraftEffort,${cache}[${slots + 2}]=__codeyDraftSettings):__codeyDraftSettings=${cache}[${slots + 2}],${model}=__codeyDraftSettings}}`;
     let patchedScope = modelScope.replace(matches.model[0],
       matches.model[0].replace(`.c)(${cacheSize})`, `.c)(${slots + 3})`) + defaults);
     patchedScope = patchedScope.replace(manualPattern, (match) => `${isDraft}||${match}`);
-    return (source.slice(0, matches.model.index) + patchedScope + source.slice(modelEnd + 1))
-      .replace(matches.factory[0], matches.factory[0].replace("serviceTier:null", "serviceTier:{value:`default`}"));
+    return source.slice(0, matches.model.index) + patchedScope + source.slice(modelEnd + 1);
+  };
+  const patchNewThreadDraftDefaults = (source) => {
+    const name = "new thread draft defaults";
+    if (source.includes("/*codey-new-thread-draft-defaults*/")
+      || activeRendererPatchFailures?.has(name)) return source;
+    // 草稿速度初值与推理强度初值必须同时识别；缓存中的默认模型继续有效，
+    // 旧推理强度不再成为下一个草稿的初值。
+    const factories = [...source.matchAll(draftFactoryPattern)];
+    if (factories.length !== 1) return recordIncompatibleRendererGate(source, name, factories.length);
+    const resolvers = [...source.matchAll(draftResolverPattern)];
+    if (resolvers.length !== 1) return recordIncompatibleRendererGate(source, name, resolvers.length);
+    const patched = source.includes("draftModelSettings:")
+      ? patchNativeDraftReasoningEffort(source, resolvers[0][1])
+      : patchLegacyDraftReasoningEffort(source, resolvers[0][1]);
+    if (typeof patched !== "string") return recordIncompatibleRendererGate(source, name, patched);
+    const factory = factories[0][0];
+    return patched.replace(factory, () => factory.replace("serviceTier:null", "serviceTier:{value:`default`}"));
   };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
-    let nativeCustomProviderModelAccess = false;
     if (source.includes("isNewThreadDraft:")
       && source.includes("modelSettingsPersistAsDefault:")
       && source.includes("userSavedReasoningEffort:")) {
@@ -416,7 +392,7 @@
       // 和其他禁用条件；每次渲染读取当前模型，避免模型切换后复用旧判断。
       patched = replaceUniqueRendererGate(
         patched,
-        /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===`gpt-reserve`[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\((?<host>[$A-Z_a-z][$\w]*)===`local`&&[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:\k<mode>,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let (?<disabled>[$A-Z_a-z][$\w]*)=[^;]{0,512}?\|\|\k<quota>,[\s\S]{0,6000}?submitDisabled:\k<disabled>,)/g,
+        /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===`gpt-reserve`[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\((?<host>[$A-Z_a-z][$\w]*)===`local`&&[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:[$A-Z_a-z][$\w]*,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let (?<disabled>[$A-Z_a-z][$\w]*)=[^;]{0,512}?\|\|\k<quota>,[\s\S]{0,6000}?submitDisabled:\k<disabled>,)/g,
         (...args) => {
           const { host, mode } = args.at(-1);
           return `${args[0]}&&/*codey-local-quota-gate*/(()=>{try{return globalThis.__codeyQuotaUnlock?.allowsLocalSend?.({hostId:${host},model:${mode}.settings.model})!==true}catch{return true}})()`;
@@ -500,90 +476,34 @@
       );
     }
     if (
-      source.includes("maybe_resume_owner_discovery_failed")
-      && source.includes("followExistingOwner")
-      && source.includes(".clientCoordination.findThreadOwner")
-    ) {
-      // Owner discovery is an optimization for reusing a stream already owned
-      // by another window. Merge only duplicate in-flight lookups: a settled
-      // positive answer can become stale as soon as its owner disconnects, and
-      // reusing it would mark this renderer as a follower without receiving a
-      // snapshot. Every later hydration attempt revalidates the live owner.
-      // Lookups retain a short safety window before local hydration.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /await\s+([$A-Z_a-z][$\w]*)\.clientCoordination\.findThreadOwner\(\{\s*hostId\s*:\s*([$A-Z_a-z][$\w]*)\s*,\s*conversationId\s*:\s*([$A-Z_a-z][$\w]*)\s*\}\)/g,
-        (_match, coordinationName, hostIdName, conversationIdName) =>
-          threadOwnerDiscoveryExpression(
-            coordinationName,
-            hostIdName,
-            conversationIdName,
-          ),
-        "thread owner discovery coalescing",
-      );
-    }
-    if (
       !source.includes("codeyReconcileCompletedConversation")
-      && source.includes("isLocalConversationInProgress")
+      && source.includes("getHasInProgressLocalConversation(")
       && source.includes("inactiveThreadUnsubscriber.clearConversationStreamOwnership")
-      && source.includes("getConversationStreamRevision")
-      && source.includes("async resumeConversation(")
+      && source.includes("getConversationStreamRevision(")
     ) {
       // A renderer can miss the terminal notification while retaining its old
       // in-progress turn and stream role. Confirm the native app-server state
-      // twice, reject a concurrent stream revision or follower window, then use
-      // the same needs_resume + maybeResumeConversation path as reconnect. This
-      // hydrates paginated history without discarding, interrupting, or starting
-      // another turn.
+      // twice, reject a concurrent stream revision, pending submission or
+      // follower window, then mark the thread needs_resume and resume it the
+      // same way reconnect recovery does. This hydrates history without
+      // discarding, interrupting, or starting another turn. The in-progress
+      // predicate is the one getHasInProgressLocalConversation already uses.
       patched = replaceUniqueRendererGate(
         patched,
-        /async resumeConversation\(([$A-Z_a-z][$\w]*)\)\{await this\.maybeResumeConversation\(\1\);/g,
-        (_match, paramsName) =>
-          `async codeyReconcileCompletedConversation(${paramsName}){let __codeyConversationId=${paramsName}?.conversationId,__codeyConversation=__codeyConversationId==null?null:this.getConversation(__codeyConversationId);if(__codeyConversationId==null||__codeyConversation==null||!this.productPolicy.runtimePolicy.isLocalConversationInProgress(__codeyConversation)||this.getStreamRole(__codeyConversationId)?.role===\`follower\`)return!1;let __codeyRevision=this.getConversationStreamRevision(__codeyConversationId),__codeyReadStatus=async()=>{let __codeyResponse=await this.sendRequest(\`thread/read\`,{threadId:__codeyConversationId,includeTurns:!1}),__codeyStatus=__codeyResponse?.thread?.status;return typeof __codeyStatus===\`string\`?__codeyStatus:__codeyStatus?.type},__codeyStatus=await __codeyReadStatus();if(__codeyStatus!==\`idle\`&&__codeyStatus!==\`error\`)return!1;await new Promise(__codeyResolve=>setTimeout(__codeyResolve,250));if(await __codeyReadStatus()!==__codeyStatus||this.getConversationStreamRevision(__codeyConversationId)!==__codeyRevision)return!1;__codeyConversation=this.getConversation(__codeyConversationId);if(__codeyConversation==null||!this.productPolicy.runtimePolicy.isLocalConversationInProgress(__codeyConversation)||this.getStreamRole(__codeyConversationId)?.role===\`follower\`)return!1;this.inactiveThreadUnsubscriber.clearConversationStreamOwnership(__codeyConversationId);this.updateConversationState(__codeyConversationId,__codeyState=>{__codeyState.resumeState=\`needs_resume\`},!1);await this.maybeResumeConversation(${paramsName});__codeyConversation=this.getConversation(__codeyConversationId);return __codeyConversation!=null&&!this.productPolicy.runtimePolicy.isLocalConversationInProgress(__codeyConversation)}async resumeConversation(${paramsName}){await this.maybeResumeConversation(${paramsName});`,
+        /getHasInProgressLocalConversation\(\{exceptConversationId:([$A-Z_a-z][$\w]*)\}=\{\}\)\{for\(let ([$A-Z_a-z][$\w]*) of this\.threadStore\.getRecentConversationIds\(\)\)\{if\(\2===\1\)continue;let ([$A-Z_a-z][$\w]*)=this\.conversations\.get\(\2\);if\(\3!=null&&([$A-Z_a-z][$\w]*)\(\3\)\)return!0\}return!1\}/g,
+        (match, _exceptName, _idName, _conversationName, inProgressName) =>
+          `async codeyReconcileCompletedConversation(__codeyParams){let __codeyId=__codeyParams?.conversationId,__codeyRunning=()=>{let __codeyConversation=__codeyId==null?null:this.getConversation(__codeyId);return __codeyConversation!=null&&__codeyConversation.unconfirmedTurnSubmissions?.some(e=>e.terminal!==!0)!==!0&&${inProgressName}(__codeyConversation)&&this.getStreamRole(__codeyId)?.role!==\`follower\`};if(!__codeyRunning())return!1;let __codeyRevision=this.getConversationStreamRevision(__codeyId),__codeyReadStatus=async()=>{let __codeyResponse=await this.sendRequest(\`thread/read\`,{threadId:__codeyId,includeTurns:!1}),__codeyStatus=__codeyResponse?.thread?.status;return typeof __codeyStatus===\`string\`?__codeyStatus:__codeyStatus?.type},__codeyStatus=await __codeyReadStatus();if(__codeyStatus!==\`idle\`&&__codeyStatus!==\`systemError\`&&__codeyStatus!==\`error\`)return!1;await new Promise(__codeyResolve=>setTimeout(__codeyResolve,250));if(await __codeyReadStatus()!==__codeyStatus||this.getConversationStreamRevision(__codeyId)!==__codeyRevision||!__codeyRunning())return!1;let __codeyCwd=this.getConversation(__codeyId)?.cwd;this.inactiveThreadUnsubscriber.clearConversationStreamOwnership(__codeyId);this.updateConversationState(__codeyId,__codeyState=>{__codeyState.resumeState=\`needs_resume\`},!1);await this.resumeConversation({...__codeyParams,workspaceRoots:__codeyParams.workspaceRoots?.length?__codeyParams.workspaceRoots:__codeyCwd?[__codeyCwd]:[\`/\`]});let __codeyConversation=this.getConversation(__codeyId);return __codeyConversation!=null&&!${inProgressName}(__codeyConversation)}${match}`,
         "completed thread reconciliation",
-      );
-    }
-    if (
-      source.includes("useHiddenModels:") &&
-      source.includes("availableModels:") &&
-      source.includes("includeUltraReasoningEffort") &&
-      source.includes("amazonBedrock")
-    ) {
-      // Newer Codex builds already bypass the native allowlist for custom
-      // providers and fall back to the model's own visibility bit. Recognize
-      // that semantic shape as compatible instead of logging a false failure.
-      nativeCustomProviderModelAccess =
-        rendererHasNativeCustomProviderModelAccess(source);
-      if (!nativeCustomProviderModelAccess) {
-        patched = replaceUniqueRendererGate(
-          patched,
-          /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
-          (_match, useAllowlistName, allowlistName, modelName) =>
-            `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
-          "model allowlist",
-        );
-      }
-    }
-    if (
-      source.includes("useHiddenModels:") &&
-      source.includes("includeUltraReasoningEffort") &&
-      source.includes("amazonBedrock") &&
-      !nativeCustomProviderModelAccess
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b[$A-Z_a-z][$\w]*\s*=\s*\(?\s*[$A-Z_a-z][$\w]*(?:\s*(?:\?\.|\.)\s*[$A-Z_a-z][$\w]*)?\s*\)?\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*(?:\s*(?:\?\.|\.)\s*[$A-Z_a-z][$\w]*)?)\s*(?:!==|!=)\s*(["'`])amazonBedrock\3\s*\)?/g,
-        (_match, visibilityPrefix, authMethodExpression) =>
-          `${visibilityPrefix}${authMethodExpression}=== \`chatgpt\``,
-        "model visibility",
       );
     }
     if (
       source.includes("includeUltraReasoningEffort:") &&
       source.includes("isCustomModelProvider:") &&
+      source.includes("modelCatalogPath:") &&
       source.includes("1186680773")
     ) {
       // 第三方线路按模型目录显示 Ultra，保留调用方和用户的推理等级设置。
+      // 宿主服务 chunk 只把同一开关作为参数传入，没有模型目录查询，不在此改写。
       patched = replaceUniqueRendererGate(
         patched,
         /(\(\{[^{}]*\bincludeUltraReasoningEffort\s*:\s*([$A-Z_a-z][$\w]*)[^{}]*\bisCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^{}]*\}\s*,\s*\{[^{}]*\bget\s*:\s*([$A-Z_a-z][$\w]*)[^{}]*\}\)\s*=>\s*\{[^{}]*\b[$A-Z_a-z][$\w]*\s*=\s*\2\s*&&\s*)(\4\(\s*[$A-Z_a-z][$\w]*\s*,\s*(["'`])1186680773\6\s*\))/g,
@@ -593,307 +513,40 @@
       );
     }
     if (
-      source.includes("serviceTierAccess:") &&
-      source.includes("serviceTierForRequest:") &&
-      source.includes("hasManagedNewThreadSettings:")
-    ) {
-      // API routes use only tiers declared by the current model; native account
-      // access and loading stay authoritative for ChatGPT/PAT and other auth.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(?<prefix>\b(?<auth>[$A-Z_a-z][$\w]*)\s*=\s*[$A-Z_a-z][$\w]*(?:\([$A-Z_a-z][$\w]*\))?\?\.authMethod\?\?null[\s\S]{0,1024}?let\s*\{serviceTierAccess:(?<access>[$A-Z_a-z][$\w]*)\}\s*=\s*[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\)),(?<body>[\s\S]{0,2048}?\blet\s+(?<model>[$A-Z_a-z][$\w]*)\s*=\s*(?<lookup>[$A-Z_a-z][$\w]*)\((?<models>[$A-Z_a-z][$\w]*)\?\.models,(?<settings>[$A-Z_a-z][$\w]*)\.model\)[\s\S]{0,4096}?\b[$A-Z_a-z][$\w]*\s*=\s*(?<options>[$A-Z_a-z][$\w]*)\(\k<model>\)\.filter\([\s\S]{0,3072}?\{availableOptions:[^{}]{0,300}?selectedServiceTier:(?<selected>[$A-Z_a-z][$\w]*),(?:selectedServiceTierForModel:[$A-Z_a-z][$\w]*,)?serviceTierForRequest:)(?<request>[$A-Z_a-z][$\w]*)\}/g,
-        (...args) => {
-          const g = args.at(-1);
-          const prefix = g.prefix.replace(`serviceTierAccess:${g.access}}`,
-            `serviceTierAccess:${g.access},isLoading:__codeyServiceTierAccessLoading}`);
-          const body = g.body.replace(
-            /\|\|([$A-Z_a-z][$\w]*)==null&&([$A-Z_a-z][$\w]*)(?=,[$A-Z_a-z][$\w]*=async)/,
-            "||__codeyApiServiceTier&&__codeyServiceTierAccessLoading||!__codeyApiServiceTier&&$1==null&&$2",
-          );
-          return `${prefix};const __codeyApiServiceTier=${g.auth}===\`apikey\`;${g.access}=__codeyApiServiceTier?Object.fromEntries(${g.options}(${g.lookup}(${g.models}?.models,${g.settings}.model)).filter(e=>e.iconKind!=null).map(e=>[e.iconKind,!0])):${g.access};let ${body}__codeyApiServiceTier?${g.selected}:${g.request},serviceTierAccess:${g.access}}`;
-        },
-        "API model service tier access",
-      );
-    }
-    if (
-      source.includes("serviceTierAccess:") &&
-      source.includes("modelPickerTriggerConfig:") &&
-      source.includes("selectedServiceTierIconKind:")
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b[$A-Z_a-z][$\w]*\s*=\s*![$A-Z_a-z][$\w]*\s*&&\s*![$A-Z_a-z][$\w]*\s*&&\s*)([$A-Z_a-z][$\w]*)\s*!=\s*null\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1/g,
-        (_match, prefix, access, settings) =>
-          `${prefix}(${settings}.serviceTierAccess??${access})!=null&&${settings}.availableOptions.length>1`,
-        "API model speed control",
-      );
-    }
-    if (
-      source.includes("serviceTierAccess:") &&
-      /availableOptions\.length\s*<=\s*1/.test(source)
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /if\s*\(\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\|\|\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*<=\s*1\s*\)\s*return\s+null/g,
-        (_match, access, settings) =>
-          `if((${settings}.serviceTierAccess??${access})==null||${settings}.availableOptions.length<=1)return null`,
-        "API model speed settings",
-      );
-    }
-    if (
-      source.includes("serviceTierAccess:") &&
-      source.includes("composer.speedSlashCommand.disableDescription")
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(enabled\s*:\s*)([$A-Z_a-z][$\w]*)\(([$A-Z_a-z][$\w]*)\.value,([$A-Z_a-z][$\w]*)\)\s*&&\s*!([$A-Z_a-z][$\w]*)\.isLoading/g,
-        (_match, prefix, allowed, option, access, settings) =>
-          `${prefix}${allowed}(${option}.value,${settings}.serviceTierAccess??${access})&&!${settings}.isLoading`,
-        "API model speed commands",
-      );
-    }
-    if (
-      source.includes("isServiceTierAllowed") &&
-      source.includes("featureRequirements?.fast_mode") &&
-      source.includes("authMethod:")
-    ) {
-      // Model serviceTiers are the authority for whether the control exists.
-      // Account requirements and their loading state must never hide it.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)([$A-Z_a-z][$\w]*)\s*&&\s*!([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null\s*&&\s*\5\?\.requirements\?\.featureRequirements\?\.fast_mode\s*!==\s*!1/g,
-        (_match, assignment) => `${assignment}!0`,
-        "service tier UI",
-      );
-    }
-    if (
       source.includes("supportsIndependentSpeedModes") &&
       source.includes("ultrafast_mode")
     ) {
-      // Ultrafast 与 Fast 是两条独立的授权字段。上一条只放开了 fast_mode，
-      // 这里把 ultrafast_mode 的判定一并收敛，避免上游把它默认置否后
-      // 速度档控件静默消失。
+      // API keys retain Fast; Ultrafast still requires native account access.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\bultrafast\s*:\s*)\([^;{}\n]{0,400}?\)\s*&&\s*[$A-Z_a-z][$\w]*\s*\?\.\s*ultrafast_mode\s*!==\s*!1/g,
-        (_match, prefix) => `${prefix}!0`,
-        "ultrafast tier entitlement",
+        /if\s*\(\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\)\s*return\s*!1\s*;\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*return\s+\4\s*===\s*`flex`\s*\|\|\s*\1\[\s*\2\s*\?\?\s*`fast`\s*\]/g,
+        (_match, access, mode, classify, tier) =>
+          `let ${mode}=${classify}(${tier});return ${mode}===\`fast\`||${tier}===\`flex\`||(${access}?.[${mode}??\`fast\`]??!1)`,
+        "service tier access",
       );
     }
-    if (
-      source.includes("isServiceTierAllowed") &&
-      source.includes("serviceTierForRequest:") &&
-      source.includes("availableOptions:")
-    ) {
-      // Preserve the model-aware resolver but remove its entitlement argument.
-      // This also covers builds where the permission provider above reshaped.
+    if (/=\{serviceTierAccess:[$A-Z_a-z][$\w]*,isLoading:/.test(source)) {
+      // Keep Fast visible without granting Ultrafast while requirements load.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\?\s*)([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\s*:\s*null\s*:\s*([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*,\s*\3\s*,\s*\2\s*\)/g,
-        (_match, _questionMark, _isAllowedName, tierName, resolverName, modelName) =>
-          `?${tierName}:${resolverName}(${modelName},${tierName})`,
-        "service tier selection permission",
-      );
-      // Reuse Codex's normalized selected tier for the request too. A Fast tier
-      // left over from another model must become null after switching to a
-      // model whose serviceTiers do not contain it.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\?\s*null\s*:\s*([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*,\s*\3\s*\))(?=\s*;\s*let\s+[$A-Z_a-z][$\w]*\s*=\s*[$A-Z_a-z][$\w]*\(\s*\3\s*\?\?\s*null\s*\))/g,
-        (_match, selectedExpression, selectedName, requestTierName) =>
-          `${selectedExpression},${requestTierName}=${selectedName}`,
-        "service tier model validation",
-      );
-      // Requirements can remain pending independently of the model catalog.
-      // Do not report that entitlement fetch as service-tier option loading.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*([$A-Z_a-z][$\w]*)\.isLoading\s*\|\|\s*([$A-Z_a-z][$\w]*)\s*\|\|\s*([$A-Z_a-z][$\w]*)\.isLoading)\s*\|\|\s*[$A-Z_a-z][$\w]*\s*==\s*null\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*,)/g,
-        (_match, modelLoadingExpression) => modelLoadingExpression,
-        "service tier entitlement loading",
+        /(\b([$A-Z_a-z][$\w]*)=)([$A-Z_a-z][$\w]*&&![$A-Z_a-z][$\w]*&&[$A-Z_a-z][$\w]*!=null\?[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\):null)(?=[^;]{0,200};let [$A-Z_a-z][$\w]*=\2,[$A-Z_a-z][$\w]*;return[^;]{0,200}?\{serviceTierAccess:)/g,
+        (_match, assignment, _name, nativeAccess) =>
+          `${assignment}((access)=>({...access,fast:!0,ultrafast:access?.ultrafast===!0}))(${nativeAccess})`,
+        "service tier access state",
       );
     }
-    if (
-      source.includes("composer.toggleFastMode") &&
-      source.includes("isServiceTierAllowed") &&
-      source.includes("availableOptions.length")
-    ) {
-      // 速度档入口不再跟随当前模型声明的档位数量，始终保留在输入区。
-      patched = replaceNearestRendererGateBeforeAnchor(
-        patched,
-        [
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, _settingsName, draftName) =>
-              `${assignment}!${draftName}`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment, _resultName, _settingsName, draftName) =>
-              `${assignment}!${draftName}`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment) => `${assignment}!0`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, preservedPrefix) => `${preservedPrefix}!0`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (
-              _match,
-              assignment,
-              _resultName,
-              draftName,
-              _settingsName,
-            ) => `${assignment}!${draftName}`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (
-              _match,
-              assignment,
-              _resultName,
-              _settingsName,
-              draftName,
-            ) => `${assignment}!${draftName}`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, assignment) => `${assignment}!0`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
-            replacement: (_match, preservedPrefix) => `${preservedPrefix}!0`,
-          },
-        ],
-        undefined,
-        "model-aware service tier control",
-        "`composer.toggleFastMode`",
-        8192,
-      );
-      if (source.includes("!=null")) {
-        patched = replaceUniqueRendererGate(
-          patched,
-          [
-            {
-              pattern: /(`composer\.toggleFastMode`[\s\S]{0,4096}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
-              replacement: (_match, prefix, loadingName, fastOptionName) =>
-                `${prefix}!${loadingName}&&${fastOptionName}!=null`,
-            },
-            {
-              pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,4096}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,4096}?`composer\.toggleFastMode`)/g,
-              replacement: (
-                _match,
-                preservedPrefix,
-                _resultName,
-                _draftName,
-                loadingName,
-                fastOptionName,
-              ) => `${preservedPrefix}!${loadingName}&&${fastOptionName}!=null`,
-            },
-          ],
-          undefined,
-          "model-aware Fast toggle",
-        );
-      }
-    }
-    if (
-      source.includes("composer.speedSlashCommand.disableDescription") &&
-      source.includes("isServiceTierAllowed") &&
-      source.includes("availableOptions.map")
-    ) {
-      // These commands are created only for service tiers exposed by the model.
+    if (source.includes("case`electron-app-state-snapshot-request`:")) {
+      // Main asks the focused window for a full app-state snapshot every 30 s,
+      // then adds process sampling, a debug log and a Sentry breadcrumb. Skip
+      // only the heartbeat reason; other diagnostic triggers still reply, and
+      // main expires unanswered requests on its own TTL.
+      // Builds differ only in whether the switch break is labelled.
       patched = replaceUniqueRendererGate(
         patched,
-        /(enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\.isLoading(?=\s*,\s*isSelected\s*:)/g,
-        (_match, assignment, settingsName) =>
-          `${assignment}!${settingsName}.isLoading`,
-        "model-aware service tier commands",
-      );
-    }
-    if (
-      source.includes("isServiceTierAllowed") &&
-      /availableOptions\.length\s*<=\s*1/.test(source) &&
-      source.includes("selectedServiceTier")
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /if\s*\(\s*!\s*([$A-Z_a-z][$\w]*)\s*\|\|\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*<=\s*1\s*\)\s*return\s+null/g,
-        (_match, _isAllowedName, settingsName) =>
-          `if(${settingsName}.availableOptions.length<=1)return null`,
-        "service tier settings UI",
-      );
-    }
-    if (
-      source.includes("Failed to load config requirements for service tier") &&
-      source.includes("featureRequirements?.fast_mode")
-    ) {
-      // A tier selected from the current model must not be stripped from thread
-      // requests by an account entitlement lookup.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /if\s*\(\s*\(\s*await\s+([$A-Z_a-z][$\w]*)\(\s*\)\s*\)\.requirements\?\.featureRequirements\?\.fast_mode\s*===\s*!1\s*\)\s*return\s+null/g,
-        "",
-        "service tier request sanitizer",
-      );
-    }
-    if (
-      source.includes("Failed to read service tier for request") &&
-      source.includes("featureRequirements?.fast_mode")
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /async\s+function\s+([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*,\s*([$A-Z_a-z][$\w]*)\s*\)\s*\{\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*await\s+[$A-Z_a-z][$\w]*\(\s*\2\s*,\s*\3\s*\)\s*;\s*if\s*\(\s*\4\s*!==\s*`chatgpt`\s*\)\s*return\s*!1\s*;[\s\S]{0,768}?\.requirements\?\.featureRequirements\?\.fast_mode\s*!==\s*!1\s*\}/g,
-        (_match, functionName, firstArgumentName, secondArgumentName) =>
-          `async function ${functionName}(${firstArgumentName},${secondArgumentName}){return!0}`,
-        "service tier request entitlement",
-      );
-    }
-    if (
-      source.includes("composer.intelligenceDropdown.model.title") &&
-      source.includes("modelPickerTriggerConfig:") &&
-      source.includes("selectedServiceTierIconKind:")
-    ) {
-      // Use the modern trigger for every route and model. Newer builds removed
-      // rowLabel/showFastServiceTierIndicator and memoize the trigger config.
-      patched = replaceUniqueRendererGate(
-        patched,
-        [
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\2\s*\?)/g,
-            replacement: (
-              _match,
-              assignment,
-              _triggerConfigName,
-              hideLabelName,
-            ) => `${assignment}!${hideLabelName}`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,12288}?\b([$A-Z_a-z][$\w]*)\s*=\s*\2\s*\?\s*\{[\s\S]{0,2048}?selectedServiceTierIconKind\s*:[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\4\b)/g,
-            replacement: (
-              _match,
-              assignment,
-              _triggerConfigName,
-              hideLabelName,
-            ) => `${assignment}!${hideLabelName}`,
-          },
-        ],
-        undefined,
-        "fast model trigger availability",
-      );
-      // Preserve Codex's native Fast indicators. Its own model/tier support
-      // checks already prevent them from appearing on unsupported models.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(modelPickerTriggerConfig\s*:\s*([$A-Z_a-z][$\w]*)\s*[,}][\s\S]{0,2048}?selectedServiceTierIconKind\s*:[\s\S]{0,12288}?)if\s*\(\s*[$A-Z_a-z][$\w]*\s*&&\s*\2\s*!=\s*null\s*\)|if\s*\(\s*[$A-Z_a-z][$\w]*\s*&&\s*modelPickerTriggerConfig\s*!=\s*null\s*\)/g,
-        (_match, aliasedPrefix, triggerConfigName) =>
-          aliasedPrefix == null
-            ? "if(modelPickerTriggerConfig!=null)"
-            : `${aliasedPrefix}if(${triggerConfigName}!=null)`,
-        "fast model trigger fallback",
+        /(case`electron-app-state-snapshot-request`:\{)(?=[\s\S]{0,2000}?collectAppStateSnapshot\(([$A-Z_a-z][$\w]*)\.hostId,\2\.reason\)[\s\S]{0,2000}?dispatchMessage\(`electron-app-state-snapshot-response`[^;]{0,400};break((?: [$A-Z_a-z][$\w]*)?)\})/g,
+        (_match, prefix, messageName, label) =>
+          `${prefix}if(${messageName}.reason===\`heartbeat\`)break${label};`,
+        "app state heartbeat snapshot",
       );
     }
     if (
@@ -901,8 +554,7 @@
       source.includes("beginCpuSampling") &&
       source.includes(
         "ensureHeartbeat(){this.heartbeatTimer??=setInterval",
-      ) &&
-      source.includes("rendererProcessCpuPercentAvg")
+      )
     ) {
       // Codey launches app-server with analytics.enabled=false, so renderer
       // interaction telemetry is discarded after paying for main/renderer CPU
@@ -928,41 +580,6 @@
     }
     return patched;
   };
-  const discoveredCodexRendererAssets = new Set();
-  const maximumDiscoveredCodexRendererAssets = 128;
-  const rememberCodexRendererAsset = (baseUrl, specifier) => {
-    try {
-      const url = new URL(specifier, baseUrl);
-      if (
-        url.protocol !== "app:" ||
-        !url.pathname.includes("/assets/") ||
-        !/\.(?:c|m)?js$/i.test(url.pathname)
-      ) return;
-      discoveredCodexRendererAssets.delete(url.pathname);
-      discoveredCodexRendererAssets.add(url.pathname);
-      while (
-        discoveredCodexRendererAssets.size >
-        maximumDiscoveredCodexRendererAssets
-      ) {
-        const oldest = discoveredCodexRendererAssets.keys().next().value;
-        if (oldest === undefined) break;
-        discoveredCodexRendererAssets.delete(oldest);
-      }
-    } catch {}
-  };
-  const discoverCodexRendererAssets = (baseUrl, source) => {
-    for (const match of source.matchAll(
-      /\b(?:src|href)\s*=\s*(["'])([^"']+\.(?:c|m)?js(?:[?#][^"']*)?)\1/gi,
-    )) rememberCodexRendererAsset(baseUrl, match[2]);
-  };
-  const isCodexRendererBootstrapUrl = (requestUrl) => {
-    try {
-      const url = new URL(requestUrl);
-      return url.protocol === "app:" && /\/index\.html$/i.test(url.pathname);
-    } catch {
-      return false;
-    }
-  };
   const isCodexRendererAssetUrl = (requestUrl) => {
     try {
       const url = new URL(requestUrl);
@@ -970,16 +587,15 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+          /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|initialize-app-host-services)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
           ) ||
           (
             disablePet &&
-            /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+            /\/(?:(?:pets-settings)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
               url.pathname,
             )
-          ) ||
-          discoveredCodexRendererAssets.has(url.pathname)
+          )
         )
       );
     } catch {
@@ -987,20 +603,9 @@
     }
   };
   // CDP Fetch 拦截入口：输入响应体文本，返回改写后的文本；null 表示放行原响应。
-  // index.html 只用于发现资产清单，不写回。
   globalThis.__codeyRendererPatchEntry = (requestUrl, source) => {
     try {
       if (typeof requestUrl !== "string" || typeof source !== "string") {
-        return null;
-      }
-      if (isCodexRendererBootstrapUrl(requestUrl)) {
-        try {
-          discoverCodexRendererAssets(requestUrl, source);
-        } catch (error) {
-          recordCodeyPatchFailure("renderer_patch:asset discovery", error, {
-            requestUrl,
-          });
-        }
         return null;
       }
       if (!isCodexRendererAssetUrl(requestUrl)) return null;

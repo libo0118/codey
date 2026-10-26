@@ -62,6 +62,7 @@
   let completionReconcileInFlight = false;
   let completionNextReconcileAt = 0;
   let completionReconcileSessionId = "";
+  let completionReconcileCheckTimer = 0;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
@@ -108,6 +109,9 @@
   // 一次超时置失败后按常规周期重试即可。
   const threadTimestampFetchTimeoutMs = 10_000;
   const completedTaskReconcileIntervalMs = 15_000;
+  // getSessionId() reads layout (getClientRects); calling it inside every
+  // mutation batch forced a synchronous reflow per streamed chunk.
+  const completionReconcileMutationDelayMs = 250;
   const threadTimestampBridgePath = "/session/timestamps";
   const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
@@ -2131,6 +2135,32 @@
   };
   window.__codeyAppServerManagerRegistryResolverFromModule = appServerManagerRegistryResolverFromModule;
 
+  const cachedAppServerManagerFromScope = (scope, hostId) => {
+    if (hostId !== "local") return null;
+    const managers = new Set();
+    const seenFamilies = new Set();
+    const nodes = new Set([scope.node, ...scope.chain?.values?.() || []]);
+    for (const node of nodes) {
+      for (const [family, bindings] of node?.familyBindings?.entries?.() || []) {
+        // New builds keep the concrete manager in a signal without exporting
+        // its registry. Read existing local bindings only; probing unused
+        // families can initialize managers or create deferred RPC connections.
+        if (family?.kind !== "signal-family" || !bindings?.has?.(hostId) || seenFamilies.has(family)) continue;
+        seenFamilies.add(family);
+        try {
+          const manager = scope.get(family, hostId);
+          const client = manager && Object.getOwnPropertyDescriptor(manager, "requestClient")?.value;
+          if (client?.hostId !== hostId || !declaredMethod(manager, "sendRequest")
+            || !["enqueueRequest", "createRequest", "onResult"].every((method) => declaredMethod(client, method))) continue;
+          managers.add(manager);
+        } catch {
+          continue;
+        }
+      }
+    }
+    return managers.size === 1 ? managers.values().next().value : null;
+  };
+
   const appServerManagerRegistryResolverFromSource = (source, module) => {
     // 新版不再导出注册表类，但仍导出它读取的两个状态定义。只解析同一
     // 原生查找表达式的引用，不执行源码，也不依赖压缩后的变量名。
@@ -2322,6 +2352,12 @@
     }
     if (sessionControllerLooksUsable(window.__codeyCodexSessionController, feature)) {
       return window.__codeyCodexSessionController;
+    }
+    const cachedManager = appServerManagerFromReact(cachedAppServerManagerFromScope);
+    const cachedController = cachedManager && managerSessionController(cachedManager);
+    if (sessionControllerLooksUsable(cachedController, feature)) {
+      window.__codeyCodexSessionController = cachedController;
+      return cachedController;
     }
     let fallbackDispatcher = typeof window.__codeyCodexSignalDispatcher === "function"
       ? window.__codeyCodexSignalDispatcher
@@ -2917,9 +2953,14 @@
 
   const archivePlacementTarget = (thread, archiveControl) => {
     const wrapper = archiveControl.parentElement;
-    return wrapper instanceof HTMLElement && wrapper !== thread
-      ? wrapper
-      : archiveControl;
+    if (!(wrapper instanceof HTMLElement) || wrapper === thread) return archiveControl;
+    // 新版按钮直接位于浮动操作栏内；仅跳过旧版的单按钮提示包装层，
+    // 避免把整个操作栏当成按钮包装层，将图标插到聊天行下方。
+    const style = window.getComputedStyle?.(wrapper);
+    const isActionRow = /^(?:inline-)?(?:flex|grid)$/.test(style?.display || "")
+      || /^(?:absolute|fixed)$/.test(style?.position || "")
+      || wrapper.querySelectorAll("button, [role=button]").length !== 1;
+    return isActionRow ? archiveControl : wrapper;
   };
 
   const installSessionDeleteButtons = (root = document) => {
@@ -3600,7 +3641,6 @@
   let overflowMutationRoot = null;
   let mutationWalk = null;
   let mutationDrainActive = false;
-  let completionMutationPending = false;
   const maxDrainRoots = 8;
   const maxDrainNodes = 64;
   const drainBudgetMs = 4;
@@ -3716,10 +3756,6 @@
         const startedAt = now();
         let scanned = 0;
         let visited = 0;
-        if (completionMutationPending) {
-          completionMutationPending = false;
-          void reconcileStaleCompletedTask();
-        }
         selectionScanRoots = new Set();
         try {
           while (mutationWorkPending() && scanned < maxDrainRoots && visited < maxDrainNodes) {
@@ -3864,8 +3900,13 @@
         dirty.removed ||= Boolean(mutation.removedNodes?.length);
       }
     }
-    completionMutationPending = true;
     scheduleIncrementalScan(null);
+    if (!completionReconcileCheckTimer && !completionReconcileInFlight) {
+      completionReconcileCheckTimer = window.setTimeout(() => {
+        completionReconcileCheckTimer = 0;
+        void reconcileStaleCompletedTask();
+      }, completionReconcileMutationDelayMs);
+    }
   };
   const sessionToolMutationOptions = {
     attributes: true,
@@ -3908,7 +3949,12 @@
       try { target.removeEventListener?.(type, handler, options); } catch {}
     }
     for (const id of installedIntervals) window.clearInterval?.(id);
-    for (const id of [scanTimer, watcherWakeTimer, threadUpdatedAtFetchTimer]) {
+    for (const id of [
+      scanTimer,
+      watcherWakeTimer,
+      threadUpdatedAtFetchTimer,
+      completionReconcileCheckTimer,
+    ]) {
       window.clearTimeout(id);
     }
     if (initialScanUsesIdleCallback) window.cancelIdleCallback?.(initialScanHandle);
@@ -3920,7 +3966,6 @@
     pendingMutationTargets.clear();
     overflowMutationRoot = null;
     mutationWalk = null;
-    completionMutationPending = false;
     mutationDrainActive = false;
     pendingThreadUpdatedAtRefs.clear();
     threadUpdatedAtRows.clear();

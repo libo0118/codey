@@ -355,6 +355,7 @@ pub(crate) fn apply_runtime_router_config(
     if let Some(local_router) = options.local_router {
         persist_runtime_router_disk_provider_or_rollback(home, &marker, local_router)?;
     }
+    crate::subagent_gate::spawn_stale_session_state_sweep(home);
     Ok(applied)
 }
 
@@ -2348,8 +2349,10 @@ fn enable_subagent_optimization(
     multi_agent["expose_spawn_agent_model_overrides"] = value(false);
     multi_agent["tool_namespace"] = value("agents");
     multi_agent["min_wait_timeout_ms"] = value(10_000);
-    multi_agent["default_wait_timeout_ms"] = value(30_000);
-    multi_agent["max_wait_timeout_ms"] = value(30_000);
+    // wait_agent returns as soon as a child finishes or the user sends input,
+    // so a longer ceiling only removes idle timeout round trips.
+    multi_agent["default_wait_timeout_ms"] = value(120_000);
+    multi_agent["max_wait_timeout_ms"] = value(120_000);
     let existing_root_usage_hint = multi_agent
         .get("root_agent_usage_hint_text")
         .map(|item| {

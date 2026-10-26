@@ -66,6 +66,35 @@ pub(crate) enum IdleWebSocketEvent {
 }
 
 /// 空闲下游 WebSocket 的登记表。名额按注册顺序保留，超出上限时关闭最久的一条。
+/// 空闲等待下一条请求时，对端不发 Close 帧直接断开 TCP 是连接的正常结束，
+/// 不能当作路由失败记录。
+fn idle_downstream_message(
+    message: Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>,
+) -> Result<Option<WebSocketMessage>> {
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+    match message {
+        Some(Err(
+            Error::ConnectionClosed
+            | Error::AlreadyClosed
+            | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        )) => Ok(None),
+        Some(Err(Error::Io(error)))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(None)
+        }
+        message => message
+            .transpose()
+            .context("读取 Codey Responses WebSocket 消息失败"),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct IdleDownstreamRegistry {
     next_id: u64,
@@ -350,9 +379,7 @@ impl WebSocketResponsesDownstream {
                 }
                 IdleWebSocketEvent::ConfigurationChanged => continue,
                 IdleWebSocketEvent::Downstream(message) => {
-                    let message = message
-                        .transpose()
-                        .context("读取 Codey Responses WebSocket 消息失败")?;
+                    let message = idle_downstream_message(message)?;
                     if matches!(&message, Some(WebSocketMessage::Text(_)))
                         && self
                             .upstream
@@ -467,9 +494,7 @@ impl WebSocketResponsesDownstream {
         };
         match outcome {
             IdleDownstreamWait::Evicted => Ok(None),
-            IdleDownstreamWait::Message(message) => message
-                .transpose()
-                .context("读取 Codey Responses WebSocket 消息失败"),
+            IdleDownstreamWait::Message(message) => idle_downstream_message(message),
             IdleDownstreamWait::TimedOut => {
                 let _ = self.close(None).await;
                 Ok(None)
@@ -536,8 +561,6 @@ impl WebSocketResponsesDownstream {
             .as_ref()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
         let now = Instant::now();
-        let backoff_key =
-            UpstreamWebSocketBackoffKey::for_route(route, upstream_url, auth_identity);
         let previous_response_id = responses_previous_response_id(body);
         let previous_response_key: Option<[u8; 32]> =
             previous_response_id.map(|id| Sha256::digest(id.as_bytes()).into());
@@ -568,6 +591,18 @@ impl WebSocketResponsesDownstream {
         let history_key = self
             .native_history
             .prepare_for_route(route, effective_auth, body);
+        let backoff_key =
+            UpstreamWebSocketBackoffKey::for_route(route, upstream_url, effective_auth);
+        // 同线路的其他会话可能已经报告故障；缓存连接也必须遵守共享退避。
+        if self
+            .websocket_backoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_backing_off(&backoff_key, Instant::now())
+        {
+            self.upstream.take();
+            return Ok(UpstreamWebSocketAttempt::UseHttp("websocket_backoff"));
+        }
         if route.official_account
             && self.native_history.requires_http_for_websocket(
                 body,
@@ -625,21 +660,16 @@ impl WebSocketResponsesDownstream {
                 ))
                 .await?
             {
-                Ok(socket) => {
-                    self.websocket_backoffs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_success(&backoff_key);
-                    CachedUpstreamWebSocket {
-                        route_id: route.provider_id.clone(),
-                        url: upstream_url.clone(),
-                        auth_identity,
-                        response_ids: VecDeque::new(),
-                        config_identity: route.websocket_config,
-                        liveness: UpstreamWebSocketLiveness::new(Instant::now()),
-                        socket,
-                    }
-                }
+                // 握手成功不代表请求已恢复；保留故障次数直到收到成功终态。
+                Ok(socket) => CachedUpstreamWebSocket {
+                    route_id: route.provider_id.clone(),
+                    url: upstream_url.clone(),
+                    auth_identity,
+                    response_ids: VecDeque::new(),
+                    config_identity: route.websocket_config,
+                    liveness: UpstreamWebSocketLiveness::new(Instant::now()),
+                    socket,
+                },
                 Err(error) => {
                     if upstream_websocket_endpoint_is_unsupported(&error) {
                         self.websocket_backoffs
@@ -695,21 +725,22 @@ impl WebSocketResponsesDownstream {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        // 必须按实际发送的正文判断；重连时可能已经移除了 previous_response_id。
+        let mut can_recover_persisted_context = responses_previous_response_id(body).is_some();
         let message_body = body
             .as_object_mut()
             .context("Responses WebSocket 上游请求必须是 JSON 对象")?;
-        message_body.remove("stream");
-        message_body.remove("background");
-        message_body.insert(
+        let http_stream = message_body.remove("stream");
+        let http_background = message_body.remove("background");
+        let http_type = message_body.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
         );
         let message =
             serde_json::to_string(body).context("序列化 Responses WebSocket 上游请求失败")?;
 
-        // Once send is attempted the request may have reached the upstream.
-        // Any later failure is surfaced to the caller and is never replayed
-        // over HTTP, avoiding duplicate tool calls and other side effects.
+        // 发送后通常不能重放。唯一例外是首事件明确拒绝持久化续接且没有执行迹象，
+        // 此时仍须验证完整历史，才能通过 HTTP 继续当前请求。
         if let Some(probe) = probe {
             probe.record_upstream_body(RequestBodySummary::from_responses_body(
                 body,
@@ -814,6 +845,7 @@ impl WebSocketResponsesDownstream {
                                 .expect("admitted interrupt must contain JSON"),
                         )
                         .context("序列化 Responses WebSocket 中断事件失败")?;
+                        can_recover_persisted_context = false;
                         match tokio::time::timeout(
                             DOWNSTREAM_WRITE_TIMEOUT,
                             upstream.socket.send(WebSocketMessage::Text(message.into())),
@@ -879,13 +911,70 @@ impl WebSocketResponsesDownstream {
                                 None,
                             ),
                         };
+                    // SSE 包装可能在同一帧里携带多个事件，不能忽略后续执行迹象。
+                    let only_event_in_frame = single_event.is_some() || events.len() == 1;
                     let mut raw_json_text = raw_json_text;
                     for mut event in single_event.into_iter().chain(events) {
+                        let persisted_context_rejected =
+                            responses_event_rejects_persisted_context(&event);
+                        if can_recover_persisted_context
+                            && only_event_in_frame
+                            && persisted_context_rejected
+                            && persisted_rejection_has_no_execution(&event)
+                        {
+                            // HTTP 使用当前请求头身份；刷新令牌及工具历史校验沿用既有规则。
+                            // 只在明确拒绝后重新暂存，健康 WS 不增加历史复制。
+                            let http_owner =
+                                self.native_history
+                                    .prepare_for_route(route, auth_identity, body);
+                            if self.native_history.can_recover_rejected_continuation(
+                                http_owner,
+                                route.official_account || route.supports_remote_compaction,
+                            ) {
+                                self.native_history.mark_continuation_rejected();
+                                let object =
+                                    body.as_object_mut().expect("validated request object");
+                                for (name, value) in [
+                                    ("stream", http_stream),
+                                    ("background", http_background),
+                                    ("type", http_type),
+                                ] {
+                                    object.remove(name);
+                                    if let Some(value) = value {
+                                        object.insert(name.into(), value);
+                                    }
+                                }
+                                if let Some(probe) = probe {
+                                    probe.mark_upstream_error_summary(&redact_upstream_error_text(
+                                        &event.to_string(),
+                                        route,
+                                    ));
+                                    // 不 observe 拒绝终态，避免污染随后 HTTP 成功的最终状态。
+                                    probe.finish_upstream_attempt(
+                                        crate::route_request_log::AttemptOutcome::Failed,
+                                        crate::route_request_log::AttemptPhase::ResponseBody,
+                                    );
+                                }
+                                // upstream 随返回丢弃；上下文拒绝不影响其他会话的线路退避。
+                                return Ok(UpstreamWebSocketAttempt::UseHttp(
+                                    "websocket_persisted_context_rejected",
+                                ));
+                            }
+                        }
+                        can_recover_persisted_context = false;
                         if collaboration_alias
                             .as_ref()
                             .is_some_and(|alias| alias.apply(&mut event))
                         {
                             raw_json_text = None;
+                        }
+                        let infrastructure_failure =
+                            responses_event_is_websocket_infrastructure_failure(&event);
+                        if infrastructure_failure {
+                            record_upstream_websocket_failure(
+                                &self.websocket_backoffs,
+                                &backoff_key,
+                            );
                         }
                         if responses_event_is_failure(&event) {
                             if let Some(probe) = probe {
@@ -944,24 +1033,24 @@ impl WebSocketResponsesDownstream {
                             probe.mark_first_downstream_content();
                         }
                         if terminal {
-                            let successful_backoff_key = UpstreamWebSocketBackoffKey::for_route(
-                                route,
-                                upstream_url,
-                                upstream.auth_identity,
-                            );
                             if let Some(response_id) = produced_response_id {
                                 if upstream.response_ids.len() >= MAX_CACHED_RESPONSE_IDS {
                                     upstream.response_ids.pop_front();
                                 }
                                 upstream.response_ids.push_back(response_id);
                             }
-                            if responses_websocket_connection_is_reusable(&event) {
+                            if !infrastructure_failure
+                                && !persisted_context_rejected
+                                && responses_websocket_connection_is_reusable(&event)
+                            {
                                 self.upstream = Some(upstream);
                             }
-                            self.websocket_backoffs
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .record_success(&successful_backoff_key);
+                            if !responses_event_is_failure(&event) {
+                                self.websocket_backoffs
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .record_success(&backoff_key);
+                            }
                             return Ok(UpstreamWebSocketAttempt::Completed);
                         }
                     }
@@ -1096,6 +1185,46 @@ pub(crate) fn responses_event_is_failure(event: &Value) -> bool {
         event.get("type").and_then(Value::as_str),
         Some("response.failed" | "error")
     )
+}
+
+pub(crate) fn responses_event_is_websocket_infrastructure_failure(event: &Value) -> bool {
+    responses_event_is_failure(event)
+        && ["/error/code", "/response/error/code"]
+            .into_iter()
+            .any(|path| {
+                event.pointer(path).and_then(Value::as_str) == Some("rebuild_target_not_ready")
+            })
+}
+
+fn responses_event_rejects_persisted_context(event: &Value) -> bool {
+    let error = match event["type"].as_str() {
+        Some("error") => event.get("error"),
+        Some("response.failed") => event.pointer("/response/error"),
+        _ => None,
+    };
+    error.is_some_and(|error| {
+        error["type"] == "invalid_request_error"
+            && error["code"] == "unsupported_persisted_item_context"
+    })
+}
+
+fn persisted_rejection_has_no_execution(event: &Value) -> bool {
+    // id、输出、用量或工具字段都可能表明响应已开始，即使拒绝是首个收到的事件。
+    [
+        "/response_id",
+        "/response/id",
+        "/item",
+        "/delta",
+        "/usage",
+        "/response/usage",
+    ]
+    .into_iter()
+    .all(|path| event.pointer(path).is_none_or(Value::is_null))
+        && ["/output", "/response/output"].into_iter().all(|path| {
+            event.pointer(path).is_none_or(|output| {
+                output.is_null() || output.as_array().is_some_and(Vec::is_empty)
+            })
+        })
 }
 
 pub(crate) fn parse_responses_websocket_sse_events(text: &str) -> Result<Vec<Value>> {
@@ -1849,6 +1978,115 @@ mod http_fallback_history_tests {
     }
 
     #[tokio::test]
+    async fn persisted_context_rejection_after_forwarded_interrupt_is_not_replayed() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (second_sent, second_received) = oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.next().await.unwrap().unwrap();
+            socket
+                .send(WebSocketMessage::Text(
+                    json!({"type":"response.completed",
+                        "response":{"id":"resp-original","status":"completed","output":[]}})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap();
+            second_sent.send(()).unwrap();
+            let WebSocketMessage::Text(interrupt) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected forwarded interrupt");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&interrupt).unwrap()["type"],
+                "response.interrupt"
+            );
+            socket
+                .send(WebSocketMessage::Text(
+                    json!({"type":"error","error":{"type":"invalid_request_error",
+                        "code":"unsupported_persisted_item_context","message":"Cannot replay"}})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let snapshot = RouterSnapshot::from_config(&config);
+        let route = &snapshot.routes[&provider];
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        downstream
+            .proxy_upstream_websocket(
+                route,
+                &HeaderMap::new(),
+                &mut json!({"model":model,"input":"task"}),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        peer.next().await.unwrap().unwrap();
+        downstream.clear_stream_id();
+        let client = tokio::spawn(async move {
+            second_received.await.unwrap();
+            peer.send(WebSocketMessage::Text(
+                json!({"type":"response.interrupt","response_id":"resp-original"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let WebSocketMessage::Text(event) = peer.next().await.unwrap().unwrap() else {
+                panic!("expected rejection");
+            };
+            let event: Value = serde_json::from_str(&event).unwrap();
+            assert_eq!(
+                event["response"]["error"]["codey"]["originalCode"],
+                "unsupported_persisted_item_context"
+            );
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            downstream.proxy_upstream_websocket(
+                route,
+                &HeaderMap::new(),
+                &mut json!({"model":model,"previous_response_id":"resp-original","input":"next"}),
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, UpstreamWebSocketAttempt::Completed);
+        assert!(downstream.upstream.is_none());
+        upstream.await.unwrap();
+        client.await.unwrap();
+    }
+
+    #[test]
+    fn persisted_context_recovery_rejects_execution_in_the_error_event() {
+        for evidence in [
+            json!({"response_id":"resp-new"}),
+            json!({"response":{"id":"resp-new"}}),
+            json!({"response":{"output":[{"type":"function_call"}]}}),
+            json!({"usage":{"output_tokens":1}}),
+            json!({"item":{"type":"function_call"}}),
+            json!({"delta":"started"}),
+        ] {
+            assert!(!persisted_rejection_has_no_execution(&evidence));
+        }
+        assert!(persisted_rejection_has_no_execution(
+            &json!({"response":{"output":[]}})
+        ));
+    }
+
+    #[tokio::test]
     async fn declared_search_tools_preserve_websocket_selection() {
         let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
         let snapshot = RouterSnapshot::from_config(&config);
@@ -2259,5 +2497,39 @@ mod admission_tests {
                 REQUEST_BODY_BUDGET_PERMITS - held
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod idle_disconnect_tests {
+    use super::super::tests::local_websocket_pair;
+    use super::*;
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+
+    #[test]
+    fn peer_disconnects_end_the_idle_wait_without_an_error() {
+        for error in [
+            Error::ConnectionClosed,
+            Error::AlreadyClosed,
+            Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+            Error::Io(std::io::ErrorKind::UnexpectedEof.into()),
+            Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        ] {
+            assert!(idle_downstream_message(Some(Err(error))).unwrap().is_none());
+        }
+        assert!(
+            idle_downstream_message(Some(Err(Error::Io(
+                std::io::ErrorKind::PermissionDenied.into()
+            ))))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_client_socket_ends_the_connection_cleanly() {
+        let (socket, peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        drop(peer);
+        assert!(downstream.next_message().await.unwrap().is_none());
     }
 }

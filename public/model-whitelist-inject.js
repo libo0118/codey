@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "81";
+  const patchVersion = "83";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -92,7 +92,6 @@
   let nextFullReactDiscoveryAt = 0;
   const modelListRequestIds = new Set();
   const knownModelQueryClients = new Set();
-  const nativeFastPermissions = new Map();
   let originalDispatchEvent = null;
   let patchedDispatchEvent = null;
   let groupedMenuTimer = 0;
@@ -355,6 +354,13 @@
     }
     return params;
   };
+  const collaborationSettingsForRequest = (method, params) => {
+    if (method !== "turn/start") return null;
+    const mode = params?.collaborationMode;
+    const settings = mode && typeof mode === "object" && !Array.isArray(mode) ? mode.settings : null;
+    return settings && typeof settings === "object" && !Array.isArray(settings)
+      && Object.hasOwn(settings, "model") ? settings : null;
+  };
   const routedRequestParams = (method, source, model, route) => {
     const routeProviderId = requestProviderId(route?.routeProviderId);
     const threadId = threadIdFromParams(source);
@@ -369,6 +375,12 @@
     const next = { ...source };
     // null 表示沿用对话模型；空字符串会让 app-server 报没有可用模型。
     if (routedModel) next.model = routedModel;
+    const collaborationSettings = collaborationSettingsForRequest(method, source);
+    if (collaborationSettings && routedModel) {
+      // Native collaboration mode owns the effective turn model, including Resume.
+      next.collaborationMode = { ...source.collaborationMode,
+        settings: { ...collaborationSettings, model: routedModel } };
+    }
     delete next.model_provider;
     if (threadProviderRequestMethods.has(method)) {
       next.modelProvider = routedProviderId;
@@ -394,6 +406,11 @@
           : {}),
         [routeMetadataKey]: routeProviderId,
       };
+    } else if (collaborationSettings && source[routeMetadataParam]) {
+      const metadata = { ...source[routeMetadataParam] };
+      delete metadata[routeMetadataKey];
+      if (Object.keys(metadata).length) next[routeMetadataParam] = metadata;
+      else delete next[routeMetadataParam];
     }
     let blocked = false;
     if (providerBoundExistingThreadMethods.has(method) && routedProviderId) {
@@ -674,7 +691,9 @@
   });
 
   const nativeFastServiceTiers = (value) => {
-    const tiers = Array.isArray(value) ? value : [];
+    // Undo only the tiers explicitly marked as injected by an older Codey.
+    const nativeTiers = value?.[Symbol.for("codey.nativeUltrafastTierSource")]?.nativeTiers ?? value;
+    const tiers = Array.isArray(nativeTiers) ? nativeTiers : [];
     const fastTierIndex = tiers.findIndex((tier) => tier?.id === fastServiceTierId);
     if (fastTierIndex < 0) return [...tiers, fastServiceTier()];
     const currentFastTier = tiers[fastTierIndex];
@@ -691,23 +710,9 @@
   };
 
   const nativeFastSpeedTiers = (value) => {
-    const tiers = Array.isArray(value) ? value : [];
+    const nativeTiers = value?.[Symbol.for("codey.nativeUltrafastTierSource")]?.nativeTiers ?? value;
+    const tiers = Array.isArray(nativeTiers) ? nativeTiers : [];
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
-  };
-
-  const nativeUltrafastTierSource = Symbol.for("codey.nativeUltrafastTierSource");
-  const isUltrafastTier = (tier) => tier === "ultrafast" || tier?.id === "ultrafast";
-  const nativeUltrafastTiers = (tiers, declaredTiers) => {
-    if (!nativeSelectionOnly) return tiers;
-    // Retain native declarations when backend-injected capabilities are withdrawn.
-    const previous = tiers[nativeUltrafastTierSource];
-    const nativeTiers = previous?.nativeTiers || tiers;
-    const ultrafast = (Array.isArray(declaredTiers) ? declaredTiers : []).find(isUltrafastTier);
-    if (!ultrafast || nativeTiers.some(isUltrafastTier)) return nativeTiers;
-    if (previous && JSON.stringify(previous.ultrafast) === JSON.stringify(ultrafast)) return tiers;
-    const nextTiers = [...nativeTiers, ultrafast];
-    Object.defineProperty(nextTiers, nativeUltrafastTierSource, { value: { nativeTiers, ultrafast } });
-    return nextTiers;
   };
 
   const generatedRouteProviderId = (providerId) => {
@@ -791,8 +796,8 @@
   const modelDescriptor = (modelName, current = null) => {
     const metadata = catalog.modelMetadata[modelName];
     const descriptorMetadata = {
-      serviceTiers: nativeUltrafastTiers(nativeFastServiceTiers(current?.serviceTiers), metadata?.service_tiers),
-      additionalSpeedTiers: nativeUltrafastTiers(nativeFastSpeedTiers(current?.additionalSpeedTiers), metadata?.additional_speed_tiers),
+      serviceTiers: nativeFastServiceTiers(current?.serviceTiers),
+      additionalSpeedTiers: nativeFastSpeedTiers(current?.additionalSpeedTiers),
       defaultServiceTier: Object.hasOwn(current || {}, "defaultServiceTier")
         ? current.defaultServiceTier
         : null,
@@ -917,8 +922,6 @@
       && leftMetadata.route_provider_id === rightMetadata.route_provider_id
       && leftMetadata.official_account === rightMetadata.official_account
       && leftMetadata.upstream_model === rightMetadata.upstream_model
-      && JSON.stringify(leftMetadata.service_tiers) === JSON.stringify(rightMetadata.service_tiers)
-      && JSON.stringify(leftMetadata.additional_speed_tiers) === JSON.stringify(rightMetadata.additional_speed_tiers)
       && sameReasoningEffortNames(
         leftMetadata.supported_reasoning_efforts,
         rightMetadata.supported_reasoning_efforts,
@@ -1765,103 +1768,6 @@
   const reactFiberKeys = (element) =>
     window.__codeySharedRuntime.reactInternalKeys(element, { includeContainer: true });
 
-  const restoreNativeFastPermissions = () => {
-    for (const [permission, original] of nativeFastPermissions) {
-      try { Object.assign(permission, original); } catch {}
-    }
-    nativeFastPermissions.clear();
-  };
-
-  const repairNativeFastControls = (target) => {
-    if (!catalog.loaded || disposed) return;
-    let fiber;
-    for (let node = target, hops = 0; node && !fiber && hops < 8; node = node.parentElement, hops += 1) {
-      fiber = reactFiberKeys(node).map((key) => node[key]).find(Boolean);
-    }
-    let picker;
-    let pastComposer = false;
-    const permissions = new Set();
-    const accessPermissions = new Set();
-    const nativeModels = new Set();
-    for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
-      const props = fiber.memoizedProps;
-      if (!picker && typeof props?.model === "string"
-        && Array.isArray(props.models) && Object.hasOwn(props, "onSelectServiceTier")) {
-        picker = props;
-      }
-      if (!picker) continue;
-      for (const node of [fiber, fiber.alternate]) {
-        for (const cells of node?.updateQueue?.memoCache?.data || []) {
-          if (!Array.isArray(cells)) continue;
-          const apiKeyAuth = cells.some((value) => value?.authMethod === "apikey");
-          for (const value of cells) {
-            const models = Array.isArray(value) ? value : value?.models;
-            if (Array.isArray(models) && nativeModels.size < 64) {
-              const model = models.find((model) => model?.model === picker.model);
-              if (model) nativeModels.add(model);
-            }
-            if (!pastComposer && value && typeof value.isServiceTierAllowed === "boolean"
-              && typeof value.isLoading === "boolean") permissions.add(value);
-            if (apiKeyAuth && value && Object.hasOwn(value, "serviceTierAccess")
-              && typeof value.isLoading === "boolean") accessPermissions.add(value);
-          }
-        }
-      }
-      // The request owner can live above the composer; keep the legacy boolean repair local.
-      if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) pastComposer = true;
-    }
-    if (!picker) return;
-    // Windows builds can disable the main-process Inspector. Repair only the
-    // native picker's cached permission results, before its own opening/selection
-    // event renders again. Both the UI and its serviceTierForRequest resolver then
-    // consume the same permission for every route and model. Keep loading state.
-    restoreNativeFastPermissions();
-    for (const permission of permissions) {
-      if (permission.isServiceTierAllowed || nativeFastPermissions.size >= 64) continue;
-      try {
-        permission.isServiceTierAllowed = true;
-        if (permission.isServiceTierAllowed) nativeFastPermissions.set(permission, { isServiceTierAllowed: false });
-      } catch {
-        // An incompatible immutable renderer result must not break the menu.
-      }
-    }
-    const model = picker.models.find((model) => model?.model === picker.model);
-    if (model) nativeModels.add(model);
-    for (const model of nativeSelectionOnly ? nativeModels : []) {
-      if (nativeFastPermissions.size >= 64) break;
-      const original = {};
-      // Jotai-based renderers may retain this model without a discoverable QueryClient.
-      for (const [key, metadataKey] of [["serviceTiers", "service_tiers"], ["additionalSpeedTiers", "additional_speed_tiers"]]) {
-        const previous = model[key];
-        if (!Array.isArray(previous)) continue;
-        const next = nativeUltrafastTiers(previous, catalog.modelMetadata[picker.model]?.[metadataKey]);
-        if (next === previous) continue;
-        try {
-          model[key] = next;
-          if (model[key] === next) original[key] = previous;
-        } catch {
-          // Immutable model data keeps its native capability declaration.
-        }
-      }
-      if (Object.keys(original).length) nativeFastPermissions.set(model, original);
-    }
-    const tiers = model?.serviceTiers;
-    const access = {
-      fast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "priority" || tier?.id === "fast"),
-      ultrafast: Array.isArray(tiers) && tiers.some((tier) => tier?.id === "ultrafast"),
-    };
-    for (const permission of accessPermissions) {
-      if (nativeFastPermissions.size >= 64) break;
-      const original = permission.serviceTierAccess;
-      try {
-        permission.serviceTierAccess = access;
-        if (permission.serviceTierAccess === access) nativeFastPermissions.set(permission, { serviceTierAccess: original });
-      } catch {
-        // An incompatible immutable renderer result must not break the menu.
-      }
-    }
-  };
-
   const reactModelStateNodes = (forceScan = false) => {
     const nodes = [
       document.body,
@@ -2675,6 +2581,8 @@
   const patchedRequestParams = (method, params) => {
     if (!modelBoundRequestMethods.has(method)) return params;
     let source = params && typeof params === "object" ? params : {};
+    const collaborationSettings = collaborationSettingsForRequest(method, source);
+    if (collaborationSettings) source = { ...source, model: collaborationSettings.model };
     if (method === "thread/resume" && restoredRequestEfforts.has(source)) {
       const evidence = restoredRequestEfforts.get(source);
       const effort = evidence.revision === threadEffortRevisions.get(threadIdFromParams(source))
@@ -2684,9 +2592,14 @@
       else config.model_reasoning_effort = effort;
       source = { ...source, config };
     }
-    const hasModelOverride = Object.hasOwn(source, "model")
-      && (method === "thread/settings/update" || source.model != null);
+    const hasModelOverride = Boolean(collaborationSettings) || (Object.hasOwn(source, "model")
+      && (method === "thread/settings/update" || source.model != null));
     const userIntentRoute = catalog.loaded ? pendingIntentRouteForRequest() : null;
+    // Invalid native selections must reach validation unchanged, never a saved route.
+    if (collaborationSettings && !userIntentRoute
+      && (typeof source.model !== "string" || !source.model.trim())) {
+      return routedRequestParams(method, source, "", null);
+    }
     // Opening history can include the composer's global default before the
     // thread's settings arrive. Explicit picker intent and settings updates
     // still take precedence over the saved route.
@@ -2756,6 +2669,7 @@
     const threadId = threadIdFromParams(source);
     const requestedBinding = threadRequestedRoutes.get(threadId);
     const requestedThreadRoute = requestedBinding && method !== "thread/start" && method !== "thread/fork"
+      && (!collaborationSettings || routeMatchesModel(requestedBinding, requestedModel))
       ? routeForHintedRawModel(requestedBinding.routeProviderId, requestedBinding.sourceModel) : null;
     const threadRoute = requestedModel
       ? routeForThreadModel(threadId, requestedModel)
@@ -2790,6 +2704,7 @@
       && requestUsesSupersededDefault(requestedModel)
     ) ? defaultRoute : null;
     const staleExplicitAliasRoute = (() => {
+      if (collaborationSettings) return null;
       if (!requestedProvider || isGatewayProviderId(requestedProvider)) return null;
       const prefix = `${requestedProvider}/`;
       if (!requestedModel.toLowerCase().startsWith(prefix.toLowerCase())) return null;
@@ -3277,7 +3192,6 @@
     if (event?.type === "keydown"
       && (!pickerInteraction || !["Enter", " ", "ArrowDown"].includes(event.key))) return;
     if (pickerInteraction) {
-      repairNativeFastControls(event.target);
       observeModelPickerTrigger(event.target.closest?.(modelPickerTriggerSelector));
     }
     installGroupedModelMenuObserver();
@@ -3409,7 +3323,10 @@
         if ((aborted || disposed) && prepared?.token) void bridge("/session/portable-compaction/cancel", { threadId: target.threadId, token: prepared.token }).catch(() => {});
         return prepared;
       }));
-      if (ticket?.status !== "ok" || typeof ticket.required !== "boolean") throw new Error("无法确认任务的原线路，请稍后重试。");
+      if (ticket?.status !== "ok" || typeof ticket.required !== "boolean") {
+        const message = ticket?.status === "failed" && typeof ticket.message === "string" ? ticket.message.trim() : "";
+        throw new Error(message || "无法确认任务的原线路，请稍后重试。");
+      }
       if (!ticket.required) return;
       if (!ticket.token) throw new Error("交接摘要凭据无效，请稍后重试。");
       const thread = await checked(send("thread/read", { threadId: target.threadId, includeTurns: false }));
@@ -3644,7 +3561,6 @@
       for (const cancel of portableCancels) cancel();
       requestGateRestorers.reverse().forEach((restore) => restore());
       requestGateRestorers.length = 0;
-      restoreNativeFastPermissions();
       window.clearTimeout(refreshTimer);
       refreshTimer = 0;
       window.clearTimeout(groupedMenuTimer);

@@ -129,6 +129,7 @@ export type Config = {
   manualThirdPartyModelsByProvider: Record<string, string[]>;
   declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
+  modelAliasHistory?: Record<string, string>;
   defaultModel: string;
   disableTraceLogWrites: boolean;
   protectCrashpadPending: boolean;

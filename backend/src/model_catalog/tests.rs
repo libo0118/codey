@@ -510,7 +510,7 @@ fn account_merge_excludes_old_runtime_templates_but_preserves_official_cache() {
 }
 
 #[test]
-fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
+fn account_snapshot_preserves_declared_ultrafast_without_model_name_inference() {
     let home = tempfile::tempdir().unwrap();
     write_cache(home.path());
     let snapshot = json!({
@@ -533,7 +533,9 @@ fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
                 "slug": "gpt-5.6-sol",
                 "display_name": "GPT-5.6-Sol",
                 "visibility": "list",
-                "description": "GPT-5.6-Sol"
+                "description": "GPT-5.6-Sol",
+                "service_tiers": [{"id": "ultrafast", "name": "Native Ultrafast"}],
+                "additional_speed_tiers": ["ultrafast"]
             }
         ]
     });
@@ -554,23 +556,28 @@ fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
         let Some(model) = models.iter().find(|model| model["slug"] == slug) else {
             panic!("目录里缺少 {slug}");
         };
-        // Fast 仍是第一档，Ultrafast 追加在它后面，选择器的默认顺序不变。
         assert_eq!(model["service_tiers"][0]["id"], FAST_SERVICE_TIER_ID);
         assert_native_fast(model);
-        assert_native_ultrafast(model);
+        assert!(
+            !model["service_tiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tier| tier["id"] == "ultrafast")
+        );
+        assert!(
+            !model["additional_speed_tiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tier| tier == "ultrafast")
+        );
     }
-    // 上游只按 1.5x 声明 Fast 的模型不会被顺带升级。
     let sol56 = models
         .iter()
         .find(|model| model["slug"] == "gpt-5.6-sol")
         .unwrap();
-    assert!(
-        !sol56["service_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)
-    );
+    assert_native_ultrafast(sol56);
 }
 
 #[test]
@@ -584,8 +591,8 @@ fn route_alias_for_six_one_sol_keeps_ultrafast_speed() {
         "priority": 0,
         "default_reasoning_level": "low",
         "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
-        "service_tiers": [{"id": "priority"}],
-        "additional_speed_tiers": ["fast"]
+        "service_tiers": [{"id": "priority"}, {"id": "ultrafast"}],
+        "additional_speed_tiers": ["fast", "ultrafast"]
     }));
     fs::write(
         home.path().join("models_cache.json"),
@@ -610,59 +617,31 @@ fn route_alias_for_six_one_sol_keeps_ultrafast_speed() {
 }
 
 #[test]
-fn ultrafast_speed_support_is_limited_to_the_two_x_fast_family() {
-    for slug in [
-        "gpt-6.1-sol",
-        "gpt-6.1-sol-wm",
-        "gpt-6.1-sol-priority",
-        "route-mu5dql1a/gpt-6.1-sol",
-        "my%20route/gpt-6.1-sol-wm",
-        "gpt-6-astra",
-        "gpt-6-astra-wm",
-        "codey-official-account-x/gpt-6-astra",
-    ] {
-        let model = json!({ "slug": slug });
-        assert!(supports_ultrafast_speed(&model), "{slug} 应支持 Ultrafast");
-    }
-    for slug in [
-        "gpt-5.6-sol",
-        "gpt-5.6-luna",
-        "gpt-6-sol",
-        "gpt-6-luna",
-        "gpt-6.1-sol2",
-        "gpt-6-astra2",
-        "route-x/gpt-6-astra-max",
-    ] {
-        let model = json!({ "slug": slug });
-        assert!(
-            !supports_ultrafast_speed(&model),
-            "{slug} 不应支持 Ultrafast"
-        );
-    }
-}
-
-#[test]
-fn ultrafast_speed_controls_keep_fast_first_and_stay_idempotent() {
-    let mut model = json!({
+fn borrowed_account_templates_drop_only_undeclared_ultrafast() {
+    let model = json!({
         "slug": "gpt-6.1-sol",
-        "service_tiers": [{ "id": FAST_SERVICE_TIER_ID, "name": "Fast" }],
-        "additional_speed_tiers": [FAST_SPEED_TIER_ID]
+        "base_instructions": "test runtime instructions",
+        "service_tiers": [{ "id": "priority" }, { "id": "flex" }, { "id": "ultrafast" }],
+        "additional_speed_tiers": ["fast", "other-speed", "ultrafast"]
     });
-    add_ultrafast_speed_controls(&mut model);
-    add_ultrafast_speed_controls(&mut model);
-
-    let tiers = model["service_tiers"].as_array().unwrap();
-    assert_eq!(tiers.len(), 2);
-    assert_eq!(tiers[0]["id"], FAST_SERVICE_TIER_ID);
-    assert_eq!(tiers[1]["id"], ULTRAFAST_SERVICE_TIER_ID);
+    let templates = vec![model];
+    let account = complete_account_models(&[json!({ "slug": "other-model" })], &templates);
     assert_eq!(
-        model["additional_speed_tiers"],
-        json!([FAST_SPEED_TIER_ID, ULTRAFAST_SPEED_TIER_ID])
+        account[0]["service_tiers"],
+        json!([{ "id": "priority" }, { "id": "flex" }])
     );
-
-    remove_ultrafast_speed_controls(&mut model);
-    assert_eq!(model["service_tiers"].as_array().unwrap().len(), 1);
-    assert_eq!(model["additional_speed_tiers"], json!([FAST_SPEED_TIER_ID]));
+    assert_eq!(account[0]["additional_speed_tiers"], json!(["fast", "other-speed"]));
+    let same_model = complete_account_models(&[json!({ "slug": "gpt-6.1-sol" })], &templates);
+    assert_native_ultrafast(&same_model[0]);
+    let declared = complete_account_models(
+        &[json!({
+            "slug": "other-model",
+            "service_tiers": [{ "id": "ultrafast" }],
+            "additional_speed_tiers": ["ultrafast"]
+        })],
+        &templates,
+    );
+    assert_native_ultrafast(&declared[0]);
 }
 
 #[test]
@@ -1235,7 +1214,7 @@ fn assert_native_ultrafast(model: &Value) {
     assert!(
         model["service_tiers"].as_array().is_some_and(|tiers| tiers
             .iter()
-            .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)),
+            .any(|tier| tier["id"] == "ultrafast")),
         "{} 的 service_tiers 缺少 Ultrafast：{}",
         model["slug"],
         model["service_tiers"]
@@ -1243,7 +1222,7 @@ fn assert_native_ultrafast(model: &Value) {
     assert!(
         model["additional_speed_tiers"]
             .as_array()
-            .is_some_and(|tiers| tiers.iter().any(|tier| tier == ULTRAFAST_SPEED_TIER_ID)),
+            .is_some_and(|tiers| tiers.iter().any(|tier| tier == "ultrafast")),
         "{} 的 additional_speed_tiers 缺少 Ultrafast：{}",
         model["slug"],
         model["additional_speed_tiers"]
