@@ -1265,7 +1265,8 @@ fn account_model_with_runtime_template(base: &Value, account: &Value) -> Value {
                     && let Some(tiers) = object.get_mut(key).and_then(Value::as_array_mut)
                 {
                     tiers.retain(|tier| {
-                        tier.as_str().or_else(|| tier.get("id").and_then(Value::as_str))
+                        tier.as_str()
+                            .or_else(|| tier.get("id").and_then(Value::as_str))
                             != Some("ultrafast")
                     });
                 }

@@ -630,7 +630,10 @@ fn borrowed_account_templates_drop_only_undeclared_ultrafast() {
         account[0]["service_tiers"],
         json!([{ "id": "priority" }, { "id": "flex" }])
     );
-    assert_eq!(account[0]["additional_speed_tiers"], json!(["fast", "other-speed"]));
+    assert_eq!(
+        account[0]["additional_speed_tiers"],
+        json!(["fast", "other-speed"])
+    );
     let same_model = complete_account_models(&[json!({ "slug": "gpt-6.1-sol" })], &templates);
     assert_native_ultrafast(&same_model[0]);
     let declared = complete_account_models(
@@ -1212,9 +1215,9 @@ fn assert_native_fast(model: &Value) {
 
 fn assert_native_ultrafast(model: &Value) {
     assert!(
-        model["service_tiers"].as_array().is_some_and(|tiers| tiers
-            .iter()
-            .any(|tier| tier["id"] == "ultrafast")),
+        model["service_tiers"]
+            .as_array()
+            .is_some_and(|tiers| tiers.iter().any(|tier| tier["id"] == "ultrafast")),
         "{} 的 service_tiers 缺少 Ultrafast：{}",
         model["slug"],
         model["service_tiers"]
