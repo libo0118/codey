@@ -38,7 +38,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const draftProject = projects.find(item => item.id === project);
   const defaultsReady = creationDefaults?.project === project;
   const composerSettings = { ...defaultThreadSettings(catalog, defaultsReady ? creationDefaults.settings : {}), ...editor.settings };
-  const { view, connected, connectionError, reconnect } = useRemoteConversationController(active, selectedId, onUnauthorized);
+  const { view, connected, isConnected, connectionError, reconnect } = useRemoteConversationController(active, selectedId, onUnauthorized);
   const composerView: View | null = creating ? { id: "", turns: [], requests: [], historyComplete: true, ...composerSettings } : view;
   const activeTurn = view ? [...view.turns].reverse().find(turn => turn.status === "inProgress") : undefined;
 
@@ -151,7 +151,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
         if (result.firstTurn !== "accepted") setError("会话已创建，请检查第一条消息是否已发送。");
       });
     }
-    if (!selectedId || !connected) return false;
+    if (!selectedId || !isConnected()) return false;
     return run(async current => {
       setEditor(previous => ({ ...previous, uncertain: true }));
       const submission = requests.rememberSubmission(selectedId, { action: activeTurn ? "steer" : "send", text: editor.text, images: editor.images });
@@ -163,10 +163,10 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   }
 
   function perform(action: string, args: Record<string, unknown> = {}, reload = false) {
-    if (!session.current || !selectedId || !connected) return Promise.resolve(false);
+    if (!session.current || !selectedId || !isConnected()) return Promise.resolve(false);
     return run(async current => {
       await requests.action(selectedId, action, args);
-      if (current() && reload) reconnect();
+      if (current() && reload && isConnected()) reconnect();
     });
   }
   function changeSettings(settings: ThreadSettings) {

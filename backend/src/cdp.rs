@@ -1748,20 +1748,39 @@ pub(crate) async fn remote_control_request(
     // the native manager adapter. Load it before starting an awaited CDP call.
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
-        r#"typeof window.__codeyRemoteControl === "function""#,
+        r#"typeof window.__codeyRemoteControl === "function"
+          && window.__codeyRemoteControl.version === 2
+          && window.__codeySessionToolsInjectLoaded === true
+          && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
     )
     .await
     .map_err(|_| "无法连接 Codex 桌面，请检查 Codey 是否正在运行")?;
     if runtime_value(&ready).and_then(serde_json::Value::as_bool) != Some(true) {
-        // Load this fork's session adapter before starting an awaited native action.
-        codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+        // Installed desktop controls retain their loader and selection closures.
+        let session_tools_load = format!(
+            r#"(() => {{
+              if (window.__codeySessionToolsInjectLoaded === true
+                && window.__codeyLoadCodexSessionController?.remoteVersion !== 1) {{
+                return "codey_remote_restart_required";
+              }}
+              {script};
+              return "";
+            }})()"#,
+            script = prepared_session_tools_load_script()
+        );
+        let prepared = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
             websocket_url,
-            &prepared_session_tools_load_script(),
+            &session_tools_load,
             false,
             SESSION_TOOLS_INJECT_TIMEOUT,
         )
         .await
         .map_err(|_| "桌面会话工具加载失败")?;
+        if runtime_value(&prepared).and_then(serde_json::Value::as_str)
+            == Some("codey_remote_restart_required")
+        {
+            return Err("桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接".into());
+        }
         let mut available = false;
         for delay in [0_u64, 80, 200, 500, 1000] {
             if delay > 0 {
@@ -1769,7 +1788,8 @@ pub(crate) async fn remote_control_request(
             }
             let probe = codey_runtime_core::bridge::evaluate_script(
                 websocket_url,
-                r#"typeof window.__codeyLoadCodexSessionController === "function""#,
+                r#"window.__codeySessionToolsInjectLoaded === true
+                  && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
             )
             .await;
             if probe
@@ -1802,9 +1822,20 @@ pub(crate) async fn remote_control_request(
     // structured renderer probes so both resume and create return their value.
     let script = format!(
         r#"(async () => {{
-          if (typeof window.__codeyRemoteControl !== "function") return JSON.stringify({{status:"failed",message:"桌面会话接口尚未就绪，请更新或重启 Codey"}});
+          if (typeof window.__codeyRemoteControl !== "function") return JSON.stringify({{status:"failed",code:"codey_remote_controller_not_ready",message:"桌面会话接口尚未就绪，请稍后重试"}});
           try {{ return JSON.stringify(await window.__codeyRemoteControl({args}, {expires_at})); }}
-          catch {{ return JSON.stringify({{status:"failed",message:"桌面未确认远程操作，请检查会话状态后重试"}}); }}
+          catch (error) {{
+            const messages = {{
+              codey_remote_controller_not_ready: "桌面会话接口尚未就绪，请稍后重试",
+              codey_remote_unsupported: "当前 Codex 暂不支持远程读取会话，请更新 Codey 后重试",
+              codey_remote_not_ready: "桌面尚未就绪，暂时无法读取此会话",
+              codey_remote_disconnected: "Codex 宿主会话接口未连接，请稍后重试",
+              codey_remote_restart_required: "桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接",
+            }};
+            const code = typeof error?.code === "string" && Object.hasOwn(messages, error.code) ? error.code : null;
+            return JSON.stringify(code ? {{status:"failed",code,message:messages[code]}}
+              : {{status:"failed",message:"桌面未确认远程操作，请检查会话状态后重试"}});
+          }}
         }})()"#
     );
     let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(

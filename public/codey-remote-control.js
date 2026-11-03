@@ -1,15 +1,28 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 1;
+  const version = 2;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
   const appServerManagerResolverFromModule = (...args) => window.__codeyAppServerManagerResolverFromModule?.(...args);
   const appServerManagerRegistryResolverFromModule = (...args) => window.__codeyAppServerManagerRegistryResolverFromModule?.(...args);
   const appServerManagerFromReact = (...args) => window.__codeyAppServerManagerFromReact?.(...args);
+  const remoteError = (code, message) => Object.assign(new Error(message), { code });
   const getCodexSessionController = async () => {
-    if (typeof window.__codeyLoadCodexSessionController !== "function") throw new Error("桌面会话接口尚未就绪");
-    return window.__codeyLoadCodexSessionController({ feature: "session" });
+    if (typeof window.__codeyLoadCodexSessionController !== "function") {
+      throw remoteError("codey_remote_controller_not_ready", "桌面会话接口尚未就绪");
+    }
+    if (window.__codeyLoadCodexSessionController.remoteVersion !== 1) {
+      throw remoteError("codey_remote_restart_required", "桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接");
+    }
+    try {
+      return await window.__codeyLoadCodexSessionController({ feature: "remote" });
+    } catch (error) {
+      if (error?.code === "codey_capability_unavailable") {
+        throw remoteError("codey_remote_unsupported", "当前 Codex 暂不支持远程读取会话，请更新 Codey 后重试");
+      }
+      throw error;
+    }
   };
   const discoverCodexAppAssetUrls = async () => {
     const loaded = [...new Set([
@@ -124,10 +137,10 @@
     };
     assertCurrent();
     if (args.action === "resume") {
-      const controller = await getCodexSessionController("remote");
+      const controller = await getCodexSessionController();
       const manager = controller.manager;
       if (typeof manager?.resumeConversation !== "function") {
-        throw new Error("当前 Codex 暂不支持远程读取会话，请更新 Codey 后重试");
+        throw remoteError("codey_remote_unsupported", "当前 Codex 暂不支持远程读取会话，请更新 Codey 后重试");
       }
       assertCurrent();
       // resumeConversation also discovers an owner in another window and
@@ -136,7 +149,9 @@
         conversationId: args.threadId, model: null, serviceTier: null,
         reasoningEffort: null, workspaceRoots: [], collaborationMode: null,
       });
-      if (result?.status !== "ready") throw new Error("桌面尚未就绪，暂时无法读取此会话");
+      if (result?.status !== "ready") {
+        throw remoteError("codey_remote_not_ready", "桌面尚未就绪，暂时无法读取此会话");
+      }
       return { status: "ok" };
     }
     if (args.action !== "create" && args.action !== "defaults") throw new Error("不支持的远程会话操作");

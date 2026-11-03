@@ -9,6 +9,23 @@ import vm from "node:vm";
 import { FakeElementCore } from "./helpers/fake-element.mjs";
 
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
+const remoteControlSource = readFileSync(new URL("../public/codey-remote-control.js", import.meta.url), "utf8");
+const cdpSource = readFileSync(new URL("../backend/src/cdp.rs", import.meta.url), "utf8");
+const formatSessionToolsScript = (template, script) => template.replace(/\{\{|\}\}|\{script\}/g,
+  (value) => value === "{{" ? "{" : value === "}}" ? "}" : script);
+const sessionToolsInstaller = formatSessionToolsScript(
+  cdpSource.match(/fn session_tools_load_script[\s\S]*?r#"([\s\S]*?)"#/)[1], source,
+);
+const remotePrepareSource = formatSessionToolsScript(
+  cdpSource.match(/let session_tools_load = format!\([\s\S]*?r#"([\s\S]*?)"#/)[1], sessionToolsInstaller,
+);
+
+function loadRemoteControl(runtime) {
+  vm.runInNewContext(remoteControlSource, { window: runtime.window, document: runtime.document, URL });
+  return (threadId = "thread-1") => runtime.window.__codeyRemoteControl(
+    { action: "resume", threadId }, Date.now() + 10_000,
+  );
+}
 
 class FakeElement extends FakeElementCore {
   constructor(attributes = {}) {
@@ -130,6 +147,7 @@ function loadInjection({
   selectedTurnIds = [],
   hiddenTurnIds = [],
   sessionElements = {},
+  installViaRemote = false,
 } = {}) {
   const rows = turnIds.map((turnId) => new FakeElement({ "data-turn-key": turnId }));
   rows.forEach((row) => {
@@ -312,7 +330,7 @@ function loadInjection({
       return now;
     }
   }
-  vm.runInNewContext(source, {
+  const context = vm.createContext({
     __codeyAppServerManagers: appServerManagers,
     Map,
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
@@ -342,6 +360,7 @@ function loadInjection({
     URLSearchParams,
     window,
   });
+  vm.runInContext(installViaRemote ? remotePrepareSource : source, context);
   rows.forEach((row) => {
     row.dataset.codeyMessageId = window.__codeyGetMessageId(row);
   });
@@ -362,6 +381,8 @@ function loadInjection({
     bridgeCalls,
     confirmations,
     document,
+    reloadInjection: () => vm.runInContext(source, context),
+    prepareRemoteSessionTools: () => vm.runInContext(remotePrepareSource, context),
     emitMutations: (mutations) => mutationHandler?.(mutations),
     flushNextTimer: () => {
       const entry = timers.entries().next().value;
@@ -695,6 +716,163 @@ test("background completion reconcile backs off longer than other failed capabil
     await assert.rejects(load(), /暂不支持/);
     assert.equal(discoveries, 12, `${feature} rediscovers once its backoff cap expires`);
   }
+});
+
+test("remote resume discovers a native manager even with a cached legacy signals controller", async () => {
+  for (const cachedSignals of [false, true]) {
+    const calls = [];
+    const dispatcher = () => assert.fail("remote resume must not dispatch legacy signals");
+    const manager = {
+      sendRequest() { assert.fail("remote resume must use the native operation"); },
+      async resumeConversation(params) { calls.push(params); return { status: "ready" }; },
+    };
+    const runtime = loadInjection({
+      initialSessionId: "",
+      codexSessionController: cachedSignals ? { kind: "signals", refreshRecentConversations: dispatcher } : null,
+      codexSignalDispatcher: cachedSignals ? dispatcher : null,
+      discoveredAppServerManager: manager,
+    });
+    assert.equal((await loadRemoteControl(runtime)()).status, "ok");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].conversationId, "thread-1");
+  }
+});
+
+test("remote capability rejects signals, incomplete managers, disposed managers, and dynamic RPC properties", async () => {
+  let calls = 0;
+  const dispatcher = () => { calls += 1; };
+  const signals = { kind: "signals", refreshRecentConversations: dispatcher };
+  const legacy = loadInjection({ initialSessionId: "", codexSessionController: signals, codexSignalDispatcher: dispatcher });
+  await assert.rejects(loadRemoteControl(legacy)(), { code: "codey_remote_unsupported" });
+  assert.equal(calls, 0, "legacy dispatch is not a native resume capability");
+  assert.equal(await legacy.window.__codeyLoadCodexSessionController({ feature: "session" }), signals);
+  await (await legacy.window.__codeyLoadCodexSessionController({ feature: "refresh" })).refreshRecentConversations();
+  assert.equal(calls, 1, "ordinary session and refresh retain their legacy fallback");
+
+  const managers = [
+    { sendRequest() { calls += 1; } },
+    { disposed: true, sendRequest() {}, resumeConversation() { calls += 1; } },
+    new Proxy({}, { get: () => () => { calls += 1; } }),
+  ];
+  for (const manager of managers) {
+    const runtime = loadInjection({ initialSessionId: "", discoveredAppServerManager: manager });
+    await assert.rejects(loadRemoteControl(runtime)(), { code: "codey_remote_unsupported" });
+  }
+  assert.equal(calls, 1, "discovery never probes a modifying RPC operation");
+});
+
+test("remote resume accepts a late native method but never treats an unconfirmed native result as ready", async () => {
+  let calls = 0;
+  const manager = { sendRequest() { assert.fail("must not send"); } };
+  const runtime = loadInjection({ initialSessionId: "", discoveredAppServerManager: manager });
+  const resume = loadRemoteControl(runtime);
+  await assert.rejects(resume(), { code: "codey_remote_unsupported" });
+  manager.resumeConversation = async () => { calls += 1; return { status: "ready" }; };
+  assert.equal((await resume()).status, "ok");
+  assert.equal(calls, 1);
+  for (const result of [undefined, null, { status: "not-ready" }]) {
+    manager.resumeConversation = async () => { calls += 1; return result; };
+    await assert.rejects(resume(), { code: "codey_remote_not_ready" });
+  }
+  assert.equal(calls, 4, "each request calls native resume once, with no replay");
+});
+
+test("remote preparation preserves old desktop selection and deletion controls until a local restart", async () => {
+  const runtime = loadInjection({
+    turnIds: [],
+    codexSessionController: createRecoveryController([]),
+    bridgeHandler: async (path) => path === "/session/delete-messages"
+      ? { status: "ok", deleted: 1 } : { status: "ok" },
+  });
+  await flushMicrotasks();
+  // Mount real main-script handlers; the ordinary fixture stubs the toolbar DOM.
+  const body = new TreeElement();
+  body.isConnected = true;
+  runtime.document.body = body;
+  const getElementById = runtime.document.getElementById;
+  runtime.document.getElementById = (id) => id === "codey-message-toolbar"
+    ? body.children.find((element) => element.id === id) || null : getElementById(id);
+  runtime.document.createElement = () => {
+    const element = new TreeElement();
+    Object.defineProperty(element, "innerHTML", { set(html) {
+      if (!html.includes("data-codey-delete")) return;
+      for (const attribute of ["data-codey-count", "data-codey-delete", "data-codey-clear"]) {
+        element.appendChild(new FakeElementCore("button", { attributes: { [attribute]: "" } }));
+      }
+    } });
+    return element;
+  };
+  const rows = ["turn-1", "turn-2"].map((turnId) => {
+    const row = body.appendChild(new TreeElement({ "data-turn-key": turnId }));
+    runtime.appendExistingRow(row);
+    return row;
+  });
+  runtime.window.__codeyInstallMessageSelection();
+  const toolbar = runtime.document.getElementById("codey-message-toolbar");
+  const selectButton = messageSelectButton(rows[0]);
+  const click = (button) => button.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  click(selectButton);
+  assert.equal(rows[0].classList.contains("codey-message-selected"), true);
+  const oldLoader = runtime.window.__codeyLoadCodexSessionController;
+  const oldInstall = runtime.window.__codeySessionToolsInstall;
+  const sessionId = runtime.window.__codeyGetSessionId();
+  delete oldLoader.remoteVersion;
+  const stage = runtime.prepareRemoteSessionTools();
+  assert.equal(runtime.window.__codeyGetSessionId(), sessionId);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1", "turn-2"]);
+  assert.equal(rows[0].classList.contains("codey-message-selected"), true);
+  assert.equal(toolbar.hidden, false);
+  click(toolbar.querySelector("[data-codey-clear]"));
+  assert.equal(rows[0].classList.contains("codey-message-selected"), false);
+  assert.equal(toolbar.hidden, true);
+  click(selectButton);
+  assert.equal(rows[0].classList.contains("codey-message-selected"), true);
+  click(toolbar.querySelector("[data-codey-delete]"));
+  await flushMicrotasks();
+  const deletions = runtime.bridgeCalls.filter(({ path }) => path === "/session/delete-messages");
+  assert.deepEqual(JSON.parse(JSON.stringify(deletions.map(({ payload }) => payload))), [
+    { sessionId, messageIds: ["turn-1"] },
+  ], "the old toolbar still uses a live native deletion controller");
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
+  assert.equal(rows[1].removed, false);
+  assert.equal(stage, "codey_remote_restart_required");
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, oldLoader);
+  assert.equal(runtime.window.__codeySessionToolsInstall, oldInstall);
+  assert.equal(runtime.window.__codeySessionToolsInjectLoaded, true);
+  assert.equal(runtime.getReloadCount(), 0);
+  runtime.reloadInjection();
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, oldLoader, "a direct injection also preserves an installed desktop generation");
+});
+
+test("remote preparation cold-installs session tools and leaves the current generation idempotent", async () => {
+  const runtime = loadInjection({
+    installViaRemote: true,
+    initialSessionId: "",
+    discoveredAppServerManager: {
+      sendRequest() { assert.fail("must not send"); },
+      async resumeConversation() { return { status: "ready" }; },
+    },
+  });
+  const loader = runtime.window.__codeyLoadCodexSessionController;
+  assert.equal(loader.remoteVersion, 1);
+  assert.equal(runtime.window.__codeySessionToolsInjectLoaded, true);
+  assert.equal(runtime.prepareRemoteSessionTools(), "");
+  runtime.reloadInjection();
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, loader);
+  assert.equal((await loadRemoteControl(runtime)()).status, "ok");
+});
+
+test("remote adapter refuses a legacy loader without invoking or disposing it", async () => {
+  let calls = 0;
+  const runtime = loadInjection();
+  const loader = () => { calls += 1; assert.fail("must not use a legacy controller"); };
+  runtime.window.__codeyLoadCodexSessionController = loader;
+  const install = runtime.window.__codeySessionToolsInstall;
+  await assert.rejects(loadRemoteControl(runtime)(), { code: "codey_remote_restart_required" });
+  assert.equal(calls, 0);
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, loader);
+  assert.equal(runtime.window.__codeySessionToolsInstall, install);
+  assert.equal(runtime.window.__codeySessionToolsInjectLoaded, true);
 });
 
 test("cached manager discovery rejects remote, incomplete, ambiguous, and unmounted clients", async () => {
@@ -3291,9 +3469,12 @@ function loadHostedManagerInjection(handlers, options = {}) {
   const connection = { kind: "signal-family" };
   const account = { kind: "signal-family" };
   const calls = [];
+  const pendingDisposals = [];
   const rpcHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, (...args) => {
     calls.push([name, ...args]);
-    return Promise.resolve().then(() => handler(...args));
+    const pending = Promise.resolve().then(() => handler(...args));
+    pending[Symbol.dispose] = () => pendingDisposals.push(name);
+    return pending;
   }]));
   let current = { status: "ready", client: { hostId: "local", rpc: fakeRpcStub(rpcHandlers) } };
   let connectionReads = 0;
@@ -3322,11 +3503,107 @@ function loadHostedManagerInjection(handlers, options = {}) {
   return {
     ...runtime,
     calls,
+    pendingDisposals,
     connectionReads: () => connectionReads,
     imports: () => imports,
     setConnection: (value) => { current = value; },
   };
 }
+
+test("remote resume bridges the hosted manager through its real controller", async () => {
+  const runtime = loadHostedManagerInjection({
+    getConversationCwd: () => "/project",
+    resumeConversation: () => ({ status: "ready" }),
+  });
+  assert.equal((await loadRemoteControl(runtime)()).status, "ok");
+  assert.deepEqual(JSON.parse(JSON.stringify(runtime.calls)), [
+    ["getConversationCwd", "thread-1"],
+    ["resumeConversation", {
+      conversationId: "thread-1", model: null, serviceTier: null,
+      reasoningEffort: null, workspaceRoots: ["/project"], collaborationMode: null,
+    }],
+  ]);
+  assert.deepEqual(runtime.pendingDisposals, ["getConversationCwd", "resumeConversation"]);
+});
+
+test("hosted remote resume preserves native workspace fallback and releases rejected RPC results", async () => {
+  const fallback = loadHostedManagerInjection({
+    getConversationCwd: () => null,
+    resumeConversation: () => ({ status: "ready" }),
+  });
+  assert.equal((await loadRemoteControl(fallback)()).status, "ok");
+  assert.deepEqual([...fallback.calls.at(-1)[1].workspaceRoots], ["/"]);
+  for (const failAt of ["getConversationCwd", "resumeConversation"]) {
+    const failure = Error("private native failure");
+    const handlers = { getConversationCwd: () => "/repo", resumeConversation: () => ({ status: "ready" }) };
+    handlers[failAt] = () => { throw failure; };
+    const runtime = loadHostedManagerInjection(handlers);
+    await assert.rejects(loadRemoteControl(runtime)(), (error) => error === failure);
+    assert.deepEqual(runtime.pendingDisposals, failAt === "getConversationCwd"
+      ? ["getConversationCwd"] : ["getConversationCwd", "resumeConversation"]);
+    assert.equal(runtime.calls.filter(([name]) => name === "resumeConversation").length, failAt === "getConversationCwd" ? 0 : 1);
+  }
+});
+
+test("hosted remote resume rejects non-ready results without replaying", async () => {
+  for (const result of [undefined, { status: "not-ready", reason: "inactive-window" }]) {
+    const runtime = loadHostedManagerInjection({ getConversationCwd: () => "/repo", resumeConversation: () => result });
+    await assert.rejects(loadRemoteControl(runtime)(), { code: "codey_remote_not_ready" });
+    assert.deepEqual(runtime.pendingDisposals, ["getConversationCwd", "resumeConversation"]);
+    assert.equal(runtime.calls.filter(([name]) => name === "resumeConversation").length, 1);
+  }
+});
+
+test("hosted remote capability can become ready after an early failed discovery", async () => {
+  const runtime = loadHostedManagerInjection({ resumeConversation() { assert.fail("must not use the disconnected RPC"); } });
+  runtime.setConnection({ status: "connecting", client: null });
+  const resume = loadRemoteControl(runtime);
+  await assert.rejects(resume(), { code: "codey_remote_unsupported" });
+  const resumed = [];
+  runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: fakeRpcStub({
+    getConversationCwd: () => "/ready",
+    resumeConversation: (params) => { resumed.push(params); return { status: "ready" }; },
+  }) } });
+  assert.equal((await resume()).status, "ok", "user retry rediscovers a ready connection without stale backoff");
+  assert.equal(resumed.length, 1);
+  assert.deepEqual([...resumed[0].workspaceRoots], ["/ready"]);
+  assert.deepEqual(runtime.calls, []);
+});
+
+test("hosted remote resume follows replacement RPCs and fails safely while disconnected", async () => {
+  const runtime = loadHostedManagerInjection({ resumeConversation() { assert.fail("must not use stale RPC"); } });
+  await runtime.window.__codeyLoadCodexSessionController({ feature: "remote" });
+  const resume = loadRemoteControl(runtime);
+  runtime.setConnection({ status: "disconnected", client: null });
+  await assert.rejects(resume(), { code: "codey_remote_disconnected" });
+  assert.deepEqual(runtime.calls, []);
+  const replacementCalls = [];
+  const newRpc = fakeRpcStub({ resumeConversation: (params) => {
+    replacementCalls.push(params);
+    return { status: "ready" };
+  } });
+  runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: fakeRpcStub({
+    getConversationCwd: () => {
+      runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: newRpc } });
+      return "/same-project";
+    },
+    resumeConversation() { assert.fail("the stub changed while reading cwd"); },
+  }) } });
+  assert.equal((await resume()).status, "ok");
+  assert.equal(replacementCalls.length, 1);
+  assert.deepEqual([...replacementCalls[0].workspaceRoots], ["/same-project"]);
+});
+
+test("current remote discovery replaces a stale cached hosted wrapper without reloading session tools", async () => {
+  const runtime = loadHostedManagerInjection({ getConversationCwd: () => "/repo", resumeConversation: () => ({ status: "ready" }) });
+  const old = { codeyHostedAppServerManager: true, sendRequest() { assert.fail("must not use a stale wrapper"); } };
+  runtime.window.__codeyCodexSessionController = { kind: "manager", manager: old };
+  const loader = runtime.window.__codeyLoadCodexSessionController;
+  assert.equal((await loadRemoteControl(runtime)()).status, "ok");
+  assert.notEqual(runtime.window.__codeyCodexSessionController.manager, old);
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, loader);
+  assert.deepEqual(runtime.pendingDisposals, ["getConversationCwd", "resumeConversation"]);
+});
 
 test("hosted AppServerManager serves MCP reload, usage, and refresh through its RPC stub", async () => {
   const runtime = loadHostedManagerInjection({

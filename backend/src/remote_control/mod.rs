@@ -19,6 +19,40 @@ use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
 
 type SharedAuth = Arc<Mutex<auth::Auth>>;
 
+async fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+    #[cfg(not(windows))]
+    {
+        TcpListener::bind(address).await
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{
+            SO_EXCLUSIVEADDRUSE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, setsockopt,
+        };
+
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        let exclusive = 1_i32.to_ne_bytes();
+        // Windows needs exclusivity before bind to reject overlapping interface listeners.
+        // SAFETY: the socket owns the live handle and the option buffer outlives this call.
+        let result = unsafe {
+            setsockopt(
+                SOCKET(socket.as_raw_socket() as usize),
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                Some(&exclusive),
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(std::io::Error::from_raw_os_error(
+                unsafe { WSAGetLastError() }.0,
+            ));
+        }
+        socket.bind(address)?;
+        socket.listen(128)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct RemoteControl {
     operation: AsyncMutex<()>,
@@ -169,7 +203,7 @@ impl RemoteControl {
             }
             (auth.port(), server::validate_public_url(auth.public_url())?)
         };
-        let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
+        let listener = bind_listener(SocketAddr::from(([0, 0, 0, 0], port)))
             .await
             .map_err(|_| "远程服务监听失败，请检查端口占用和防火墙设置")?;
         let address = listener.local_addr().map_err(|_| "读取远程监听地址失败")?;
@@ -346,37 +380,95 @@ mod tests {
 
     #[tokio::test]
     async fn occupied_custom_port_does_not_enable_or_replace_the_listener() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = fixture(temp.path().join("config.json"));
-        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = occupied.local_addr().unwrap().port();
-        invoke(&state,"configure_remote_control",&json!({"settings":{"username":"admin","password":"test-password-1234","port":port},"revision":"","confirmed":true})).await.unwrap();
-        assert!(
-            invoke(&state, "start_remote_control", &json!({}))
+        for host in [[127, 0, 0, 1], [0, 0, 0, 0]] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = fixture(temp.path().join("config.json"));
+            let control = &state.remote_control;
+            let occupied = TcpListener::bind(SocketAddr::from((host, 0)))
                 .await
-                .is_err()
-        );
-        assert_eq!(
-            invoke(&state, "remote_control_status", &json!({}))
+                .unwrap();
+            let port = occupied.local_addr().unwrap().port();
+            invoke(
+                &state,
+                "configure_remote_control",
+                &json!({
+                    "settings":{"username":"admin","password":"test-password-1234","port":port},
+                    "revision":"","confirmed":true,
+                }),
+            )
+            .await
+            .unwrap();
+            let auth = control.auth(&state).await.unwrap();
+            for enabled in [false, true] {
+                auth.lock().unwrap().set_enabled(enabled).unwrap();
+                let saved = std::fs::read(temp.path().join("remote-control.json")).unwrap();
+                assert!(
+                    invoke(&state, "start_remote_control", &json!({}))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(control.status(&state).await.unwrap()["running"], false);
+                assert!(control.running.lock().await.is_none());
+                assert_eq!(auth.lock().unwrap().enabled(), enabled);
+                assert_eq!(
+                    std::fs::read(temp.path().join("remote-control.json")).unwrap(),
+                    saved
+                );
+                assert_eq!(occupied.local_addr().unwrap().port(), port);
+            }
+            drop(occupied);
+            control.restore_startup(&state).await.unwrap();
+            let started = control.status(&state).await.unwrap();
+            assert_eq!(started["running"], true);
+            assert_eq!(started["address"], format!("0.0.0.0:{port}"));
+            let core = Arc::clone(&control.running.lock().await.as_ref().unwrap().core);
+            assert!(
+                invoke(&state, "start_remote_control", &json!({}))
+                    .await
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(
+                &core,
+                &control.running.lock().await.as_ref().unwrap().core,
+            ));
+            assert_eq!(control.status(&state).await.unwrap(), started);
+            assert!(auth.lock().unwrap().enabled());
+            invoke(&state, "stop_remote_control", &json!({}))
                 .await
-                .unwrap()["running"],
-            false
-        );
-        assert!(
-            !state
-                .remote_control
-                .auth(&state)
+                .unwrap();
+            assert!(!auth.lock().unwrap().enabled());
+            let released = TcpListener::bind(SocketAddr::from((host, port)))
                 .await
-                .unwrap()
-                .lock()
-                .unwrap()
-                .enabled()
-        );
-        assert!(
-            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
-                .await
-                .is_err()
-        );
+                .unwrap();
+            drop(released);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_listener_rejects_reuse_address_takeover() {
+        let listener = bind_listener(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for host in [[127, 0, 0, 1], [0, 0, 0, 0]] {
+            let takeover = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .unwrap();
+            takeover.set_reuse_address(true).unwrap();
+            assert!(
+                takeover
+                    .bind(&SocketAddr::from((host, port)).into())
+                    .is_err()
+            );
+        }
+        drop(listener);
+        bind_listener(SocketAddr::from(([0, 0, 0, 0], port)))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

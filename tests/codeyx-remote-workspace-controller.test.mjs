@@ -77,12 +77,15 @@ test("连接按会话隔离、隐藏清理、断线退避重连且不重放写�
   const second = h.sockets[1]; first.handlers.message({ type: "state", state: { ...view, title: "late" } }); assert.equal(h.render().view.title, undefined);
   second.handlers.message({ type: "state", state: { ...view, id: "other" } }); assert.equal(h.render().connected, false);
   second.handlers.invalid(); assert.match(h.render().connectionError, /数据无效/);
-  second.handlers.message({ type: "state", state: view }); assert.equal(h.render().connected, true);
-  second.handlers.message({ type: "disconnected", message: "桌面离线" }); await h.flush(); h.browser.tick();
-  assert.equal(h.sockets.length, 2); assert.equal(h.render().connectionError, "桌面离线"); assert.equal(h.render().connected, false);
-  h.render().reconnect(); h.render(); assert.equal(h.sockets.length, 3);
+  second.handlers.message({ type: "state", state: view }); assert.equal(h.render().connected, false);
+  h.browser.tick(); assert.equal(h.sockets.length, 2);
+  h.render().reconnect(); h.render(); const third = h.sockets[2];
+  third.handlers.message({ type: "state", state: view }); assert.equal(h.render().connected, true);
+  third.handlers.message({ type: "disconnected", message: "桌面离线" }); await h.flush(); h.browser.tick();
+  assert.equal(h.sockets.length, 3); assert.equal(h.render().connectionError, "桌面离线"); assert.equal(h.render().connected, false);
+  h.render().reconnect(); h.render(); assert.equal(h.sockets.length, 4);
   h.sockets.at(-1).handlers.close(); h.last("session").reject({ status: 401 }); await h.flush(); h.browser.tick();
-  assert.equal(h.unauthorized, 1); assert.equal(h.sockets.length, 3); assert.equal(h.calls.filter(call => call.name === "action").length, 0); h.unmount();
+  assert.equal(h.unauthorized, 1); assert.equal(h.sockets.length, 4); assert.equal(h.calls.filter(call => call.name === "action").length, 0); h.unmount();
 });
 
 test("发送立即锁定重复提交，失败保留草稿和防重记录，显式核对后才能再次发送", async t => {

@@ -223,7 +223,7 @@ mod tests {
         let mut incoming = previous.clone();
         let profile = &mut incoming.profiles[0];
         profile.name = "Backup route".into();
-        profile.short_name = "Backup".into();
+        profile.short_name = "Bkp".into();
         profile.base_url = "https://example.com/v1".into();
         profile.api_key = "backup-secret".into();
         let provider = profile.provider_id().to_owned();
@@ -248,8 +248,18 @@ mod tests {
                 }],
             )]),
         );
-        incoming.upstream_model_reasoning_efforts_by_provider =
-            incoming.model_reasoning_efforts_by_provider.clone();
+        incoming
+            .upstream_model_reasoning_efforts_by_provider
+            .insert(
+                provider.clone(),
+                std::collections::BTreeMap::from([(
+                    "backup-model".into(),
+                    vec![crate::config::ModelReasoningEffort {
+                        level: "medium".into(),
+                        value: "upstream-medium".into(),
+                    }],
+                )]),
+            );
         incoming.model_context_by_provider.insert(
             provider,
             std::collections::BTreeMap::from([(
@@ -261,8 +271,13 @@ mod tests {
                 },
             )]),
         );
+        crate::config::validate_provider_profiles(&incoming.profiles).unwrap();
+        let mut expected = incoming.clone().normalize();
         let content = backup::export(incoming).unwrap();
-        let mut expected = backup::parse(&content).unwrap().prepare(&previous).unwrap();
+        assert_eq!(
+            backup::parse(&content).unwrap().prepare(&previous).unwrap(),
+            expected
+        );
         assert_ne!(expected.default_model, previous.default_model);
         assert_ne!(
             expected.selected_models_by_provider,
@@ -275,6 +290,18 @@ mod tests {
         assert_ne!(
             expected.model_reasoning_efforts_by_provider,
             previous.model_reasoning_efforts_by_provider
+        );
+        assert_ne!(
+            expected.upstream_model_reasoning_efforts_by_provider,
+            previous.upstream_model_reasoning_efforts_by_provider
+        );
+        assert_ne!(
+            expected.model_reasoning_efforts_by_provider,
+            expected.upstream_model_reasoning_efforts_by_provider
+        );
+        assert_ne!(
+            expected.model_context_by_provider,
+            previous.model_context_by_provider
         );
         let (saved, _) = restore_config(
             &state,
@@ -347,13 +374,20 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let state = state(path.clone());
         let mut previous = state.config.read().await.clone().normalize();
+        previous.profiles[0].base_url = "https://api.example.com/v1".into();
         previous.profiles[0].api_key = "recovery-snapshot-secret".into();
-        *state.config.write().await = previous.clone();
+        crate::config::validate_provider_profiles(&previous.profiles).unwrap();
+        *state.config.write().await = previous;
+        let previous_memory = state.config.read().await.clone();
         let backup_path = path.with_file_name("config.json.bak.1");
-        let bytes = serde_json::to_vec(&previous).unwrap();
-        std::fs::write(&backup_path, &bytes).unwrap();
-        assert_eq!(state.store.load().unwrap(), previous);
-        let error = restore_config(&state, incoming(), previous.settings_revision)
+        ConfigStore::new(&backup_path)
+            .save(&previous_memory)
+            .unwrap();
+        let bytes = std::fs::read(&backup_path).unwrap();
+        let previous_disk = state.store.load().unwrap();
+        assert_eq!(previous_disk, previous_memory.clone().normalize());
+        assert_ne!(previous_disk, previous_memory);
+        let error = restore_config(&state, incoming(), previous_memory.settings_revision)
             .await
             .err()
             .unwrap();
@@ -362,8 +396,8 @@ mod tests {
         assert!(error.contains("请用恢复前快照核对/恢复"));
         assert!(!error.contains("原配置未更改"));
         assert!(!error.contains("recovery-snapshot-secret"));
-        assert_eq!(*state.config.read().await, previous);
-        assert_eq!(state.store.load().unwrap(), previous);
+        assert_eq!(*state.config.read().await, previous_memory);
+        assert_eq!(state.store.load().unwrap(), previous_disk);
         assert_eq!(std::fs::read(backup_path).unwrap(), bytes);
         assert!(path.is_dir());
         let snapshots = std::fs::read_dir(temp.path())
@@ -378,10 +412,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(snapshots.len(), 1);
         assert!(error.contains(snapshots[0].to_string_lossy().as_ref()));
-        let snapshot = backup::parse(&std::fs::read_to_string(&snapshots[0]).unwrap())
+        let snapshot_content = std::fs::read_to_string(&snapshots[0]).unwrap();
+        let snapshot: Value = serde_json::from_str(&snapshot_content).unwrap();
+        let snapshot_config: CodeyConfig =
+            serde_json::from_value(snapshot["config"].clone()).unwrap();
+        assert_eq!(snapshot_config, previous_memory);
+        let snapshot = backup::parse(&snapshot_content)
             .unwrap()
-            .prepare(&previous)
+            .prepare(&previous_memory)
             .unwrap();
-        assert_eq!(snapshot, previous);
+        assert_eq!(snapshot, previous_disk);
     }
 }

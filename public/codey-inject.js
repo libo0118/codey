@@ -2462,7 +2462,9 @@
     if (cached) return cached;
     const rpc = () => {
       const state = scope.get(family, hostId);
-      if (!hostedAppServerConnection(state, hostId)) throw new Error("Codex 宿主会话接口未连接");
+      if (!hostedAppServerConnection(state, hostId)) {
+        throw Object.assign(new Error("Codex 宿主会话接口未连接"), { code: "codey_remote_disconnected" });
+      }
       return state.client.rpc;
     };
     const manager = {
@@ -2471,6 +2473,13 @@
         params === undefined ? rpc().sendRequest(method) : rpc().sendRequest(method, params)
       )),
       refreshRecentConversations: () => callHostedAppServer(() => rpc().refreshRecentConversations()),
+      async resumeConversation(params) {
+        const cwd = await callHostedAppServer(() => rpc().getConversationCwd(params.conversationId));
+        return callHostedAppServer(() => rpc().resumeConversation({
+          ...params,
+          workspaceRoots: params.workspaceRoots?.length ? params.workspaceRoots : [cwd || "/"],
+        }));
+      },
       codeyReconcileCompletedConversation: (params) => reconcileHostedConversation(rpc, params),
       codeyPrepareMessageDeletion: (conversationId) => prepareHostedMessageDeletion(rpc, conversationId),
       codeyFinishMessageDeletion: (conversationId, messageIds) => finishHostedMessageDeletion(rpc, conversationId, messageIds),
@@ -2664,6 +2673,12 @@
         && ["enqueueRequest", "createRequest", "onResult"].every((method) => declaredMethod(client, method));
     }
     if (feature === "usage" || feature === "mcpReload") return typeof controller.manager?.sendRequest === "function";
+    if (feature === "remote") {
+      const manager = controller.manager;
+      return controller.kind === "manager" && manager?.disposed !== true
+        && (ownHostedAppServerManagers.has(manager)
+          || (manager?.codeyHostedAppServerManager !== true && Boolean(declaredMethod(manager, "resumeConversation"))));
+    }
     if (feature === "reconcile") return sessionControllerCanReconcileCompletedConversation(controller);
     const methods = feature === "deleteMessages"
       ? ["prepareMessageDeletion", "finishMessageDeletion"]
@@ -2673,7 +2688,7 @@
   };
 
   const capabilityProbes = new Map();
-  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", modelRouting: "模型请求校验", refresh: "会话列表刷新", session: "会话管理" };
+  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", modelRouting: "模型请求校验", refresh: "会话列表刷新", session: "会话管理", remote: "远程读取会话" };
   const capabilityMessage = (feature) => `当前 Codex 暂不支持${capabilityLabels[feature] || "此功能"}，请稍后重试`;
   const pageCapabilities = Object.create(null);
   window.__codeyPageCapabilities = pageCapabilities;
@@ -2747,7 +2762,7 @@
           return registered;
         }
         const resolvers = [
-          feature === "deleteMessages" || feature === "modelRouting" ? appServerManagerRegistryResolverFromModule(module) : null,
+          feature === "deleteMessages" || feature === "modelRouting" || feature === "remote" ? appServerManagerRegistryResolverFromModule(module) : null,
           appServerManagerResolverFromModule(module),
         ].filter(Boolean);
         for (const resolver of resolvers) {
@@ -2760,7 +2775,7 @@
           }
           window.__codeyCodexSessionController ||= controller;
         }
-        if (feature === "deleteMessages" || feature === "modelRouting") {
+        if (feature === "deleteMessages" || feature === "modelRouting" || feature === "remote") {
           const resolver = await loadManagerSourceResolver(url, module);
           if (disposed) throw unavailableCapability(feature);
           const registered = registeredMessageDeletionController(feature);
@@ -2777,7 +2792,7 @@
         continue;
       }
     }
-    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload" && feature !== "deleteMessages" && feature !== "modelRouting") {
+    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload" && feature !== "deleteMessages" && feature !== "modelRouting" && feature !== "remote") {
       window.__codeyCodexSignalDispatcher = fallbackDispatcher;
       const controller = legacySessionController(fallbackDispatcher);
       window.__codeyCodexSessionController = controller;
@@ -2803,7 +2818,8 @@
     if (state.pending) return state.pending;
     // modelRouting 的调用方只有请求入口校验，重试节奏由宿主注入流程控制；
     // 这里套用指数退避会让一次早期探测失败冻结后续所有注入尝试。
-    if (feature !== "modelRouting" && Date.now() < state.retryAt) throw unavailableCapability(feature);
+    // 远程读取由用户触发，每次重新发现刚就绪的宿主，不重放原生操作。
+    if (feature !== "modelRouting" && feature !== "remote" && Date.now() < state.retryAt) throw unavailableCapability(feature);
     const discover = () => discoverCodexSessionController(feature);
     // MCP 刷新由宿主 CDP 预算约束；5 秒发现上限会让慢机或尚未 hydrate 的
     // 页面在导入/启停后误报失败，只能重启 Codex。
@@ -2842,6 +2858,7 @@
     }).finally(() => { state.pending = null; });
     return state.pending;
   };
+  loadCodexSessionController.remoteVersion = 1;
   window.__codeyLoadCodexSessionController = loadCodexSessionController;
   window.__codeyLoadCodexRequestClient = async () => (
     (await loadCodexSessionController({ feature: "modelRouting" })).manager.requestClient

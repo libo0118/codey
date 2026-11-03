@@ -22,7 +22,7 @@ const SESSION_SECONDS: i64 = 12 * 60 * 60;
 const MAX_STORE: u64 = 256 * 1024;
 const BAD_LOGIN: &str = "账号或密码错误";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Credentials {
     username: String,
@@ -250,7 +250,10 @@ impl Auth {
         Ok(())
     }
 
-    fn commit(&mut self, document: Document) -> Result<(), String> {
+    fn commit(
+        &mut self,
+        update: impl FnOnce(&mut Document) -> Result<bool, String>,
+    ) -> Result<(), String> {
         use fs2::FileExt;
         let parent = self.path.parent().ok_or("远程账号保存路径无效")?;
         std::fs::create_dir_all(parent).map_err(|_| "创建远程账号目录失败")?;
@@ -273,12 +276,25 @@ impl Auth {
         if !crate::fs_util::locked_file_matches_path(&lock, &lock_path) {
             return Err("远程账号锁已变化，请重试".into());
         }
-        self.ensure_current()?;
-        let bytes = serde_json::to_vec_pretty(&document).map_err(|_| "远程账号保存失败")?;
-        crate::fs_util::atomic_write_private_with_parent(&self.path, &bytes)
-            .map_err(|_| "远程账号保存失败，原设置未改变")?;
-        self.fingerprint = Some(crate::fs_util::sha256_hex(&bytes));
-        self.document = document;
+        let mut current = Self::load(self.path.clone())?;
+        // Session-only changes may merge; credential or listener changes require a fresh revision.
+        if current.document.revision != self.document.revision
+            || current.document.credentials != self.document.credentials
+            || current.document.enabled != self.document.enabled
+            || current.document.port != self.document.port
+            || current.document.public_url != self.document.public_url
+        {
+            return Err("远程设置已更新，请刷新后重试".into());
+        }
+        if update(&mut current.document)? {
+            let bytes =
+                serde_json::to_vec_pretty(&current.document).map_err(|_| "远程账号保存失败")?;
+            crate::fs_util::atomic_write_private_with_parent(&self.path, &bytes)
+                .map_err(|_| "远程账号保存失败，原设置未改变")?;
+            current.fingerprint = Some(crate::fs_util::sha256_hex(&bytes));
+        }
+        self.fingerprint = current.fingerprint;
+        self.document = current.document;
         Ok(())
     }
 
@@ -309,56 +325,58 @@ impl Auth {
         port: u16,
         public_url: String,
     ) -> Result<(), String> {
-        if revision != self.document.revision {
-            return Err("远程设置已更新，请刷新后重试".into());
-        }
         if port == 0 {
             return Err("端口须为1–65535".into());
         }
         let username = username.trim();
-        let mut next = self.document.clone();
-        let changed_identity = credentials.is_some()
-            || next
+        self.commit(|next| {
+            if revision != next.revision {
+                return Err("远程设置已更新，请刷新后重试".into());
+            }
+            let changed_identity = credentials.is_some()
+                || next
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|old| old.username != username);
+            if let Some(credentials) = credentials {
+                next.credentials = Some(credentials);
+            }
+            let account = next
                 .credentials
-                .as_ref()
-                .is_some_and(|old| old.username != username);
-        if let Some(credentials) = credentials {
-            next.credentials = Some(credentials);
-        }
-        let account = next
-            .credentials
-            .as_mut()
-            .ok_or("请先设置管理员账号和至少12个字符的密码")?;
-        if username.is_empty()
-            || username.chars().count() > 128
-            || username.chars().any(char::is_control)
-        {
-            return Err("账号格式无效".into());
-        }
-        account.username = username.to_string();
-        if !changed_identity && next.port == port && next.public_url == public_url {
-            return Ok(());
-        }
-        if changed_identity {
-            next.sessions.clear();
-        }
-        next.port = port;
-        next.public_url = public_url;
-        next.revision = uuid::Uuid::new_v4().to_string();
-        self.commit(next)
+                .as_mut()
+                .ok_or("请先设置管理员账号和至少12个字符的密码")?;
+            if username.is_empty()
+                || username.chars().count() > 128
+                || username.chars().any(char::is_control)
+            {
+                return Err("账号格式无效".into());
+            }
+            account.username = username.to_string();
+            if !changed_identity && next.port == port && next.public_url == public_url {
+                return Ok(false);
+            }
+            if changed_identity {
+                next.sessions.clear();
+            }
+            next.port = port;
+            next.public_url = public_url;
+            next.revision = uuid::Uuid::new_v4().to_string();
+            Ok(true)
+        })
     }
 
     pub fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        if enabled && !self.configured() {
-            return Err("请先设置管理员账号和密码".into());
-        }
-        if self.document.enabled == enabled {
-            return Ok(());
-        }
-        let mut next = self.document.clone();
-        next.enabled = enabled;
-        next.revision = uuid::Uuid::new_v4().to_string();
-        self.commit(next)
+        self.commit(|next| {
+            if enabled && next.credentials.is_none() {
+                return Err("请先设置管理员账号和密码".into());
+            }
+            if next.enabled == enabled {
+                return Ok(false);
+            }
+            next.enabled = enabled;
+            next.revision = uuid::Uuid::new_v4().to_string();
+            Ok(true)
+        })
     }
 
     pub fn attempt(&mut self, ip: IpAddr) -> bool {
@@ -387,25 +405,26 @@ impl Auth {
         if self.document.revision != expected_revision || !self.configured() {
             return Err(BAD_LOGIN.into());
         }
-        let mut next = self.document.clone();
-        let now = now();
-        next.sessions.retain(|session| session.expires_at > now);
-        if next.sessions.len() >= MAX_SESSIONS {
-            return Err("登录会话已达上限，请在本机撤销旧会话".into());
-        }
         let token = secret(32)?;
-        next.sessions.push(Session {
-            id: uuid::Uuid::new_v4().to_string(),
-            digest: digest(&token),
-            created_at: now,
-            expires_at: now
-                + if remember {
-                    REMEMBER_SECONDS
-                } else {
-                    SESSION_SECONDS
-                },
-        });
-        self.commit(next)?;
+        self.commit(|next| {
+            let now = now();
+            next.sessions.retain(|session| session.expires_at > now);
+            if next.sessions.len() >= MAX_SESSIONS {
+                return Err("登录会话已达上限，请在本机撤销旧会话".into());
+            }
+            next.sessions.push(Session {
+                id: uuid::Uuid::new_v4().to_string(),
+                digest: digest(&token),
+                created_at: now,
+                expires_at: now
+                    + if remember {
+                        REMEMBER_SECONDS
+                    } else {
+                        SESSION_SECONDS
+                    },
+            });
+            Ok(true)
+        })?;
         Ok(Login {
             session: self.session(&token),
             token,
@@ -440,17 +459,19 @@ impl Auth {
     }
 
     pub fn logout(&mut self, token: &str) -> Result<(), String> {
-        let mut next = self.document.clone();
-        next.sessions
-            .retain(|session| session.digest != digest(token));
-        self.commit(next)
+        self.commit(|next| {
+            next.sessions
+                .retain(|session| session.digest != digest(token));
+            Ok(true)
+        })
     }
 
     pub fn revoke(&mut self, id: &str) -> Result<(), String> {
-        let mut next = self.document.clone();
-        next.sessions
-            .retain(|session| id != "*" && session.id != id);
-        self.commit(next)
+        self.commit(|next| {
+            next.sessions
+                .retain(|session| id != "*" && session.id != id);
+            Ok(true)
+        })
     }
 
     pub fn status(&self) -> Value {
@@ -581,23 +602,196 @@ mod tests {
     }
 
     #[test]
-    fn independent_writers_cannot_restore_old_credentials_or_overwrite_sessions() {
+    fn independent_session_writers_preserve_settings_revision_and_merge_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("remote.json");
         let mut first = configured(path.clone());
-        let mut stale = Auth::load(path.clone()).unwrap();
+        let mut second = Auth::load(path.clone()).unwrap();
+        let mut third = Auth::load(path.clone()).unwrap();
+        let revision = first.revision().to_owned();
+        let first_login = first.issue(&revision, true).unwrap();
+        assert!(!second.authorized(&first_login.token));
+        second
+            .configure(&revision, "admin", None, 18787, String::new())
+            .unwrap();
+        assert_eq!(second.revision(), revision);
+        assert!(second.authorized(&first_login.token));
+        let second_login = third.issue(&revision, false).unwrap();
+        let reloaded = Auth::load(path.clone()).unwrap();
+        assert_eq!(reloaded.revision(), revision);
+        assert!(reloaded.authorized(&first_login.token));
+        assert!(reloaded.authorized(&second_login.token));
+
+        second
+            .configure(&revision, "admin", None, 18788, String::new())
+            .unwrap();
+        let reloaded = Auth::load(path).unwrap();
+        assert_ne!(reloaded.revision(), revision);
+        assert_eq!(reloaded.port(), 18788);
+        assert!(reloaded.authorized(&first_login.token));
+        assert!(reloaded.authorized(&second_login.token));
+    }
+
+    #[test]
+    fn independent_setting_writers_cannot_restore_old_credentials_or_reuse_revisions() {
+        for (username, password, port, public_url) in [
+            ("admin", Some("updated-password-1234"), 18787, ""),
+            ("renamed", None, 18787, ""),
+            ("admin", None, 18788, ""),
+            ("admin", None, 18787, "https://example.com"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("remote.json");
+            let mut first = configured(path.clone());
+            let revision = first.revision().to_owned();
+            let login = first.issue(&revision, true).unwrap();
+            let mut stale = Auth::load(path.clone()).unwrap();
+            let old_credentials = stale.credentials();
+            first
+                .configure(
+                    &revision,
+                    username,
+                    password.map(|password| Credentials::new(username, password).unwrap()),
+                    port,
+                    public_url.into(),
+                )
+                .unwrap();
+            assert_ne!(first.revision(), revision);
+            let stored = std::fs::read(&path).unwrap();
+            assert!(
+                stale
+                    .configure(&revision, "admin", None, 18787, String::new())
+                    .is_err()
+            );
+            assert!(
+                stale
+                    .configure(&revision, "admin", old_credentials, 18787, String::new())
+                    .is_err()
+            );
+            assert!(stale.issue(&revision, true).is_err());
+            assert!(stale.set_enabled(true).is_err());
+            assert!(stale.logout(&login.token).is_err());
+            assert!(stale.revoke("*").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), stored);
+            let mut reloaded = Auth::load(path.clone()).unwrap();
+            let current_revision = reloaded.revision().to_owned();
+            reloaded
+                .configure(&current_revision, username, None, port, public_url.into())
+                .unwrap();
+            assert_eq!(reloaded.revision(), current_revision);
+            assert!(
+                reloaded
+                    .credentials()
+                    .unwrap()
+                    .verify(username, password.unwrap_or("test-password-1234"))
+            );
+            if password.is_some() {
+                assert!(
+                    !reloaded
+                        .credentials()
+                        .unwrap()
+                        .verify(username, "test-password-1234")
+                );
+            }
+            assert_eq!(
+                reloaded.authorized(&login.token),
+                password.is_none() && username == "admin"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_session_writers_cannot_restore_logged_out_or_revoked_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote.json");
+        let mut first = configured(path.clone());
+        let revision = first.revision().to_owned();
+        let first_login = first.issue(&revision, true).unwrap();
+        let mut second = Auth::load(path.clone()).unwrap();
+        first.logout(&first_login.token).unwrap();
+        let second_login = second.issue(&revision, true).unwrap();
+        let third_login = second.issue(&revision, false).unwrap();
+        first.revoke(&second.document.sessions[0].id).unwrap();
+        let reloaded = Auth::load(path.clone()).unwrap();
+        assert_eq!(reloaded.revision(), revision);
+        assert!(!reloaded.authorized(&first_login.token));
+        assert!(!reloaded.authorized(&second_login.token));
+        assert!(reloaded.authorized(&third_login.token));
+        second.revoke("*").unwrap();
+        first.set_enabled(false).unwrap();
+        assert_eq!(first.revision(), revision);
+        assert!(first.document.sessions.is_empty());
+        let new_login = second.issue(&revision, true).unwrap();
+        first.set_enabled(true).unwrap();
+        let reloaded = Auth::load(path).unwrap();
+        assert!(reloaded.enabled());
+        assert_ne!(reloaded.revision(), revision);
+        assert!(reloaded.authorized(&new_login.token));
+        assert!(!reloaded.authorized(&first_login.token));
+        assert!(!reloaded.authorized(&second_login.token));
+        assert!(!reloaded.authorized(&third_login.token));
+    }
+
+    #[test]
+    fn external_corruption_blocks_authorization_and_no_op_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote.json");
+        let mut first = configured(path.clone());
         let revision = first.revision().to_owned();
         let login = first.issue(&revision, true).unwrap();
-        assert!(!stale.authorized(&login.token));
-        assert!(
-            stale
-                .configure(&revision, "admin", None, 18787, String::new())
-                .is_err()
-        );
         assert!(Auth::load(path.clone()).unwrap().authorized(&login.token));
         std::fs::write(&path, b"corrupted").unwrap();
         assert!(!first.authorized(&login.token));
+        assert!(
+            first
+                .configure(&revision, "admin", None, 18787, String::new())
+                .is_err()
+        );
+        assert!(first.set_enabled(false).is_err());
         assert!(first.logout(&login.token).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"corrupted");
+    }
+
+    #[test]
+    fn external_setting_edits_cannot_reuse_the_current_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote.json");
+        let mut auth = configured(path.clone());
+        let revision = auth.revision().to_owned();
+        let login = auth.issue(&revision, true).unwrap();
+        let mut changed = auth.document.clone();
+        changed.credentials.as_mut().unwrap().username = "external".into();
+        let stored = serde_json::to_vec_pretty(&changed).unwrap();
+        std::fs::write(&path, &stored).unwrap();
+        assert!(!auth.authorized(&login.token));
+        assert!(auth.issue(&revision, true).is_err());
+        assert!(
+            auth.configure(&revision, "admin", None, 18787, String::new())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
+    }
+
+    #[test]
+    fn no_op_configuration_changes_require_the_store_lock() {
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote.json");
+        let mut auth = configured(path.clone());
+        let revision = auth.revision().to_owned();
+        let stored = std::fs::read(&path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        assert!(
+            auth.configure(&revision, "admin", None, 18787, String::new())
+                .is_err()
+        );
+        assert!(auth.set_enabled(false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
     }
 
     #[test]
@@ -609,10 +803,12 @@ mod tests {
             auth.document.sessions[0].expires_at - auth.document.sessions[0].created_at,
             REMEMBER_SECONDS
         );
-        let mut next = auth.document.clone();
-        next.sessions[0].created_at = now() - SESSION_SECONDS;
-        next.sessions[0].expires_at = now() - 1;
-        auth.commit(next).unwrap();
+        auth.commit(|next| {
+            next.sessions[0].created_at = now() - SESSION_SECONDS;
+            next.sessions[0].expires_at = now() - 1;
+            Ok(true)
+        })
+        .unwrap();
         assert!(!auth.authorized(&login.token));
     }
 }

@@ -9,7 +9,7 @@ const auth = fs.readFileSync(new URL("../backend/src/remote_control/auth.rs", im
 
 function runtime(manager = {}) {
   const window = {
-    __codeyLoadCodexSessionController: async () => ({ kind: "manager", manager }),
+    __codeyLoadCodexSessionController: Object.assign(async () => ({ kind: "manager", manager }), { remoteVersion: 1 }),
     __codeyAppServerManagerResolverFromModule: () => () => manager,
     __codeyAppServerManagerRegistryResolverFromModule: () => null,
     __codeyAppServerManagerFromReact: resolver => resolver({ get: () => null }, "local"),
