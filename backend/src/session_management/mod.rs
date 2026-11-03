@@ -118,9 +118,11 @@ fn read_pending(home: &Path) -> Result<Pending> {
         });
     }
     files::checked(home, &path)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&crate::fs_util::read_bounded(&path, MAX_PENDING_BYTES)?)
-            .context("会话清理任务文件损坏，已停止清理")?;
+    let value: serde_json::Value = serde_json::from_slice(&crate::fs_util::read_bounded(
+        &path,
+        MAX_PENDING_BYTES as u64,
+    )?)
+    .context("会话清理任务文件损坏，已停止清理")?;
     let pending: Pending = match value["version"].as_u64() {
         Some(1) => {
             #[derive(Deserialize)]
