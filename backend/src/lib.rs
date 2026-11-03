@@ -1,6 +1,8 @@
 mod account_usage;
 mod appserver_call;
+mod backup;
 mod cdp;
+mod codegraph_runtime;
 mod codex_config;
 mod codex_config_guidance;
 mod codex_extensions;
@@ -38,14 +40,17 @@ mod pet_slim_patch;
 mod plugin_log_terminal;
 mod plugin_marketplace;
 mod plugin_routes;
+mod ponytail;
 mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
 mod provider_models;
+mod remote_control;
 mod renderer_asset_patch;
 mod route_request_log;
 mod scope_guard;
 mod session_index_cleanup;
+mod session_management;
 mod session_metadata;
 mod session_model;
 mod session_transfer;
@@ -315,6 +320,14 @@ async fn run(ui: NativeUpdateUi, lifecycle: Arc<DesktopLifecycle>) -> Result<()>
     .await
     .context("初始化 Codey 状态的任务异常退出")?;
     let _plugin_shutdown = PluginShutdownGuard;
+    if state.remote_control.restore_startup(&state).await.is_err() {
+        error_log::record_failure(
+            "remote_control_restore_failed",
+            "restore_remote_control",
+            "远程服务未恢复，请在本机远程控制设置中检查账号、端口与配置".to_string(),
+            serde_json::json!({}),
+        );
+    }
     // 临时状态的恢复和路由兼容桩都在每次启动里做。进程入口再做一次的话，
     // 第一次失败只记日志，第二次同样的错误才会中止启动。
     // Resolve the default official account while the launch path prepares its

@@ -7,7 +7,7 @@ const source = await readFile(new URL("../src/SettingsLayout.tsx", import.meta.u
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
-const pages = ["overview", "models", "prompt", "subagents", "plugins", "mcp", "skills"];
+const pages = ["overview", "models", "prompt", "subagents", "remote", "sessions", "backup", "builtinTools", "plugins", "mcp", "skills"];
 
 // 与现有组件测试一样，用轻量 hook/组件身份模型验证生命周期，无需 DOM 或新增依赖。
 function layoutHarness() {
@@ -71,7 +71,7 @@ function layoutHarness() {
       return { ...node, props: { ...node.props, children: visit(node.props.children, `${address}.children`) } };
     }
     // 每次父级更新都生成新的内容元素和 render callback，模拟 App 的实际调用。
-    const sections = Object.fromEntries(pages.map(id => [id, ["models", "mcp", "skills"].includes(id)
+    const sections = Object.fromEntries(pages.map(id => [id, ["models", "remote", "sessions", "backup", "builtinTools", "mcp", "skills"].includes(id)
       ? active => { callbacks.push({ id, active }); return jsx(Page, { id, active }); }
       : jsx(Page, { id })]));
     tree = visit(jsx(exports.SettingsLayout, { sections, hidden }), "root");
@@ -140,6 +140,16 @@ test("visited render callbacks receive active=false while hidden and latest acti
   harness.select("mcp");
   assert.equal(harness.page("mcp").active, true);
   assert.equal(harness.page("skills").active, false);
+});
+
+test("new management pages stop active work while another page is selected", () => {
+  const harness = layoutHarness();
+  for (const id of ["remote", "sessions", "backup", "builtinTools"]) {
+    harness.select(id);
+    assert.equal(harness.page(id).active, true);
+    harness.select("overview");
+    assert.equal(harness.page(id).active, false);
+  }
 });
 
 test("returning from usage analysis restores the models page and its existing state", () => {

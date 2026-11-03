@@ -13,6 +13,7 @@ import modelStyles from "./styles.models.css?inline";
 import featureStyles from "./styles.features.css?inline";
 import diagnosticStyles from "./styles.diagnostics.css?inline";
 import responsiveStyles from "./styles.responsive.css?inline";
+import integrationStyles from "./styles.integrations.css?inline";
 import { codeyApiPath, invoke } from "./api";
 import { SETTINGS_OVERLAY_Z_INDEX_CSS } from "./overlay.constants";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
@@ -143,6 +144,7 @@ if (window.location.pathname === REQUEST_LOG_PATH) {
     featureStyles,
     diagnosticStyles,
     responsiveStyles,
+    integrationStyles,
   ].join("\n");
   document.head.appendChild(style);
   const root = document.getElementById("root") ?? document.body.appendChild(document.createElement("div"));
@@ -186,6 +188,7 @@ if (!window.__codeySettingsOverlay) {
       featureStyles,
       diagnosticStyles,
       responsiveStyles,
+      integrationStyles,
     ),
   ];
   // HeroUI 的主题变量声明在 :root / [data-theme] 上，ShadowRoot 内没有 :root，

@@ -5,17 +5,15 @@ import { build, transformWithEsbuild } from "vite";
 import { writeBuildOutputs } from "./build-output.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const result = await build({
-  root,
-  configFile: join(root, "vite.overlay.config.ts"),
-  build: { write: false },
-});
-const outputs = new Map(
-  [result].flat().flatMap(({ output }) => output.map((asset) => [
-    asset.fileName,
-    asset.type === "chunk" ? asset.code : asset.source,
-  ])),
-);
+const outputs = new Map();
+for (const config of ["vite.overlay.config.ts", "vite.remote.config.ts"]) {
+  const result = await build({ root, configFile: join(root, config), build: { write: false } });
+  for (const { output } of [result].flat()) {
+    for (const asset of output) {
+      outputs.set(asset.fileName, asset.type === "chunk" ? asset.code : asset.source);
+    }
+  }
+}
 
 // public/ 下的注入脚本以源码形态维护，但会被逐字节嵌入 Codey 二进制并在
 // Codex 渲染进程内求值。这里统一压缩到 dist-overlay/inject/，cdp.rs 只嵌入

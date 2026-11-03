@@ -15,7 +15,6 @@ import {
 
 import type {
   Config,
-  FastContextToolsStatus,
   SubagentRoleId,
 } from "./App.types";
 import {
@@ -413,7 +412,6 @@ export const SubagentPolicyCard = memo(SubagentPolicyCardComponent);
 
 type FeaturePolicyCardProps = {
   config: Config;
-  fastContextToolsStatus: FastContextToolsStatus;
   isMacClient: boolean;
   isWindowsClient: boolean;
   cleanupBusy: boolean;
@@ -454,7 +452,6 @@ const LAUNCH_PROXY_TOOLTIP_CONTENT = (
 
 function FeaturePolicyCardComponent({
   config,
-  fastContextToolsStatus,
   isMacClient,
   isWindowsClient,
   cleanupBusy,
@@ -476,30 +473,6 @@ function FeaturePolicyCardComponent({
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
-  const fastctxStatusBlocksEmbedded =
-    fastContextToolsStatus.userConfigured ||
-    fastContextToolsStatus.detectionFailed;
-  const fastContextToolsEnabled =
-    config.fastContextTools && !fastctxStatusBlocksEmbedded;
-  const fastctxBlockedReason = fastContextToolsStatus.detectionFailed
-    ? "暂时无法确认 Codex 配置中的 FastCtx 状态，为避免重复加载，Codey 内置 FastCtx 不可开启"
-    : fastContextToolsStatus.userConfigured
-      ? `已检测到 Codex 配置中的 FastCtx${
-          fastContextToolsStatus.serverId
-            ? `（${fastContextToolsStatus.serverId}）`
-            : ""
-        }，为避免重复加载，Codey 内置 FastCtx 不可开启`
-      : "";
-  const fastContextToolsSwitch = (
-    <Switch
-      checked={fastContextToolsEnabled}
-      disabled={isBusy || fastctxStatusBlocksEmbedded}
-      onCheckedChange={(checked) =>
-        onConfigChange({ ...config, fastContextTools: checked })
-      }
-      aria-label="启用 FastCtx 上下文工具"
-    />
-  );
 
   return (
     <>
@@ -667,44 +640,6 @@ function FeaturePolicyCardComponent({
                   {config.slimCodexPet
                     ? "已收起宠物并取消隐藏窗口预热；语音功能仍按需启用"
                     : "保留 Codex 宠物的完整功能"}
-                </small>
-              </div>
-            </div>
-
-            <div
-              className={`feature-card ${fastContextToolsEnabled ? "active" : ""}`}
-            >
-              <div className="feature-card-header">
-                <div className="feature-card-title">
-                  <strong>FastCtx 上下文工具</strong>
-                  <Badge variant="secondary" className="font-mono">v0.2.6</Badge>
-                </div>
-                {fastctxStatusBlocksEmbedded ? (
-                  <Tooltip
-                    content={fastctxBlockedReason}
-                    position="top"
-                  >
-                    <span
-                      className="fastctx-disabled-switch-tooltip"
-                      tabIndex={0}
-                      aria-label={fastctxBlockedReason}
-                    >
-                      {fastContextToolsSwitch}
-                    </span>
-                  </Tooltip>
-                ) : (
-                  fastContextToolsSwitch
-                )}
-              </div>
-              <div className="feature-card-body">
-                <small>
-                  {fastctxStatusBlocksEmbedded
-                    ? fastContextToolsStatus.detectionFailed
-                      ? "暂时无法确认 FastCtx 状态，内置工具保持关闭"
-                      : "已检测到已配置的 FastCtx，Codey 不会重复加载内置工具"
-                    : config.fastContextTools
-                      ? "下次启动加载 Codey 内置 FastCtx 文件工具"
-                      : "保持 Codex 默认文件工具，不加载额外 MCP"}
                 </small>
               </div>
             </div>

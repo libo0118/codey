@@ -22,6 +22,10 @@ import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
 import { UsageAnalysisHeader, UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
+import { BuiltinToolsPage } from "./features/builtin-tools";
+import { BackupPage } from "./features/backup";
+import { SessionsPage } from "./features/session-management";
+import { RemoteControlPanel } from "./features/remote-control";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
 import {
@@ -1654,7 +1658,6 @@ export function App({
               />
               <FeaturePolicyCard
                 config={config}
-                fastContextToolsStatus={fastContextToolsStatus}
                 isMacClient={status.clientPlatform === "macos"}
                 isWindowsClient={status.clientPlatform === "windows"}
                 cleanupBusy={busy === "clear-diagnostic-storage"}
@@ -1718,6 +1721,11 @@ export function App({
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
             />
           ),
+          remote: (active) => <RemoteControlPanel active={active} isBusy={isBusy} container={popupContainer} />,
+          sessions: (active) => <SessionsPage active={active} isBusy={isBusy} onRestart={handleRestartCodex} container={popupContainer} />,
+          backup: (active) => <BackupPage active={active} isBusy={isBusy} dirty={dirty} setBusy={setBusy} container={popupContainer}
+            onSaved={result => applyCommandResult(result, incoming => adoptSavedConfig(incoming, config))} onReload={load} />,
+          builtinTools: (active) => <BuiltinToolsPage active={active} config={config} fastContextToolsStatus={fastContextToolsStatus} runtimeStatus={status} isBusy={isBusy} onConfigChange={handleConfigChange} />,
           plugins: <CodeyPluginsSection container={popupContainer} />,
           mcp: (active) => (
             <CodexExtensionsPage kind="mcp" active={active} request={extensionRequest} container={popupContainer} />

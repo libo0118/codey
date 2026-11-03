@@ -1740,6 +1740,95 @@ async fn ensure_mcp_reload_function_ready(websocket_url: &str) {
     }
 }
 
+pub(crate) async fn remote_control_request(
+    websocket_url: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // A request client is sufficient for MCP reload, but remote operations need
+    // the native manager adapter. Load it before starting an awaited CDP call.
+    let ready = codey_runtime_core::bridge::evaluate_script(
+        websocket_url,
+        r#"typeof window.__codeyRemoteControl === "function""#,
+    )
+    .await
+    .map_err(|_| "无法连接 Codex 桌面，请检查 Codey 是否正在运行")?;
+    if runtime_value(&ready).and_then(serde_json::Value::as_bool) != Some(true) {
+        // Load this fork's session adapter before starting an awaited native action.
+        codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+            websocket_url,
+            &prepared_session_tools_load_script(),
+            false,
+            SESSION_TOOLS_INJECT_TIMEOUT,
+        )
+        .await
+        .map_err(|_| "桌面会话工具加载失败")?;
+        let mut available = false;
+        for delay in [0_u64, 80, 200, 500, 1000] {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let probe = codey_runtime_core::bridge::evaluate_script(
+                websocket_url,
+                r#"typeof window.__codeyLoadCodexSessionController === "function""#,
+            )
+            .await;
+            if probe
+                .ok()
+                .as_ref()
+                .and_then(runtime_value)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                available = true;
+                break;
+            }
+        }
+        if !available {
+            return Err("桌面会话接口尚未就绪，请稍后重试".into());
+        }
+        codey_runtime_core::bridge::evaluate_script(
+            websocket_url,
+            include_str!("../../dist-overlay/inject/codey-remote-control.js"),
+        )
+        .await
+        .map_err(|_| "远程桌面适配加载失败")?;
+    }
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "系统时间无效")?
+        .as_millis()
+        + 60_000;
+    // CDP returns object references by default. Send JSON text like the other
+    // structured renderer probes so both resume and create return their value.
+    let script = format!(
+        r#"(async () => {{
+          if (typeof window.__codeyRemoteControl !== "function") return JSON.stringify({{status:"failed",message:"桌面会话接口尚未就绪，请更新或重启 Codey"}});
+          try {{ return JSON.stringify(await window.__codeyRemoteControl({args}, {expires_at})); }}
+          catch {{ return JSON.stringify({{status:"failed",message:"桌面未确认远程操作，请检查会话状态后重试"}}); }}
+        }})()"#
+    );
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+        websocket_url,
+        &script,
+        true,
+        Duration::from_secs(65),
+    )
+    .await
+    .map_err(|_| "桌面响应中断或超时，操作可能已提交；请先查看会话，不要重复发送".to_string())?;
+    let value = runtime_value(&response)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter(|value| value.is_object())
+        .ok_or("桌面会话接口返回了无效结果")?;
+    if value["status"] == "failed" {
+        return Err(value["message"]
+            .as_str()
+            .unwrap_or("桌面未确认远程操作")
+            .to_string());
+    }
+    Ok(value)
+}
+
 pub async fn refresh_model_whitelist(
     websocket_url: &str,
     expected_catalog: &serde_json::Value,

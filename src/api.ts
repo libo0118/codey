@@ -64,6 +64,16 @@ export const CODEY_API_COMMANDS = [
   "clear_codey_plugin_logs",
   "invoke_codey_plugin",
   "codex_extensions",
+  "builtin_tools",
+  "config_backup",
+  "list_codex_sessions",
+  "delete_codex_sessions",
+  "save_codex_session_cleanup_policy",
+  "remote_control_status",
+  "configure_remote_control",
+  "start_remote_control",
+  "stop_remote_control",
+  "revoke_remote_session",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];
@@ -83,6 +93,7 @@ export function codeyApiPath(command: string): `/api/${CodeyApiCommand}` {
 
 declare global {
   interface Window {
+    __codeyRemoteMode?: boolean;
     __codeyInvokeApi?: (
       command: CodeyApiCommand,
       args: Record<string, unknown>,
@@ -96,6 +107,10 @@ export class CodeyApiError extends Error {
     super(message);
     this.name = "CodeyApiError";
   }
+}
+
+export function isCodeyApiError(error: unknown): error is CodeyApiError {
+  return error instanceof CodeyApiError;
 }
 
 export async function invoke<T>(

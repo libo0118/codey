@@ -1,0 +1,205 @@
+/* Optional management pages use the existing Codey surface tokens. */
+.codey-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  border: 1px solid var(--codey-border);
+  border-radius: 10px;
+  background: var(--codey-surface-muted);
+  padding: 10px 12px;
+  color: var(--codey-text-soft);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.codey-callout > svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.codey-callout-body {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.codey-callout-body > p {
+  margin: 0;
+}
+
+.codey-callout[data-tone="warning"] {
+  border-color: var(--codey-amber-border);
+  background: var(--codey-amber-soft);
+}
+
+.codey-callout[data-tone="warning"] > svg {
+  color: var(--codey-amber-hover);
+}
+
+.codey-callout[data-tone="danger"] {
+  border-color: var(--codey-red-border);
+  background: var(--codey-red-soft);
+  color: var(--codey-text);
+}
+
+.codey-callout[data-tone="danger"] > svg {
+  color: var(--codey-red);
+}
+
+.codey-callout[data-tone="success"] {
+  border-color: var(--codey-green-border);
+  background: var(--codey-green-soft);
+}
+
+.codey-callout[data-tone="success"] > svg {
+  color: var(--codey-green-hover);
+}
+
+.codey-callout[data-tone="info"] {
+  border-color: var(--codey-blue-border);
+  background: var(--codey-blue-soft);
+}
+
+.codey-callout[data-tone="info"] > svg {
+  color: var(--codey-blue);
+}
+
+[data-theme="dark"] .codey-callout[data-tone="warning"] > svg {
+  color: var(--codey-amber);
+}
+
+[data-theme="dark"] .codey-callout[data-tone="success"] > svg {
+  color: var(--codey-green);
+}
+
+/* 原生下拉沿用 HeroUI 输入框外观，保留原生选择语义与键盘行为。 */
+.codey-native-select {
+  appearance: none;
+  -webkit-appearance: none;
+  min-height: 36px;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 14px;
+  cursor: pointer;
+}
+
+.codey-native-select:disabled {
+  cursor: not-allowed;
+}
+
+.codey-native-check {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin: 2px 0 0;
+  accent-color: var(--codey-blue);
+  cursor: pointer;
+}
+
+.codey-native-check:disabled {
+  cursor: not-allowed;
+}
+
+.codey-native-check:focus-visible {
+  outline: 2px solid var(--codey-blue);
+  outline-offset: 2px;
+}
+
+/* 可勾选的列表行：悬停、选中、聚焦与禁用状态。 */
+.codey-select-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border: 1px solid var(--codey-border);
+  border-radius: 12px;
+  background: var(--codey-surface);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color 140ms var(--codey-ease-out), background-color 140ms var(--codey-ease-out);
+}
+
+.codey-select-row:hover {
+  border-color: var(--codey-border-strong);
+  background: var(--codey-surface-muted);
+}
+
+.codey-select-row:has(:checked) {
+  border-color: var(--codey-blue-border);
+  background: var(--codey-blue-soft);
+}
+
+.codey-select-row:has(:disabled) {
+  cursor: default;
+}
+
+.codey-select-row:has(:disabled):not(:has(:checked)):hover {
+  border-color: var(--codey-border);
+  background: var(--codey-surface);
+}
+
+.codey-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  border: 1px dashed var(--codey-border-strong);
+  border-radius: 12px;
+  padding: 32px 16px;
+  color: var(--codey-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.codey-empty-state > svg {
+  color: var(--codey-subtle);
+}
+
+.codey-inline-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--codey-muted);
+  font-size: 12.5px;
+}
+
+.codey-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--codey-border);
+  border-radius: 12px;
+  background: var(--codey-surface);
+  padding: 16px 18px;
+}
+
+.codey-panel-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.codey-panel-heading p {
+  margin: 0;
+  color: var(--codey-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.codey-field-label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--codey-text-soft);
+  font-size: 12px;
+  font-weight: 500;
+}

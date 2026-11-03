@@ -38,7 +38,9 @@ fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a92
 fs2.workspace = true
 futures-util.workspace = true
 http-body = "1"
-hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"], default-features = false }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "tokio"], default-features = false }
 memchr = "2"
 notify = "8.2"
 percent-encoding = "2"
@@ -69,7 +71,9 @@ name = "fastctx_protocol"
 harness = false
 
 [target.'cfg(unix)'.dependencies]
+flate2 = "1"
 libc = "0.2"
+tar = "0.4"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

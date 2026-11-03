@@ -4,6 +4,10 @@
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
 import { pluginConfigBusinessValuesEqual, validatePluginConfigText, type CodeyPlugin } from "../codeyPlugins";
 import { createCodexExtensionsPreview } from "./codexExtensionsMock";
+import { createBuiltinToolsPreview } from "./builtinToolsMock";
+import { createSessionsPreview } from "./sessionsMock";
+import { createBackupPreview } from "./backupPreview";
+import { createRemoteControlPreview } from "./remoteControlMock";
 import {
   AUTO_REVIEW_MODEL,
   includesModelId,
@@ -611,14 +615,24 @@ if (import.meta.env.DEV) {
     let activePluginConfigContent: string | null = null;
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
+    const builtinToolsPreview = createBuiltinToolsPreview();
+    const sessionsPreview = createSessionsPreview();
+    const remotePreview = createRemoteControlPreview();
+    const backupPreview = createBackupPreview(() => ({ config: previewConfig, modelState: previewModelState,
+      providerStatus: previewProviderStatus() }), config => { previewConfig = config; refreshPreviewModelState(); });
     let computerUseReady = false;
     const previewPackageUploads = new Map<string, { name: string; size: number; signature: string }>();
     window.__codeyInvokeApi = async (command, args) => {
-      console.log(`[Mock API Call] ${command}`, args);
+      console.log(`[Mock API Call] ${command}`, command === "config_backup" ? { action: args.action } : command === "configure_remote_control" ? "[redacted]" : args);
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
 
+      if (command === "update_install_report") return null;
       if (command === "codex_extensions") return extensionsPreview(args?.request as Record<string, unknown>);
+      if (command === "builtin_tools") return builtinToolsPreview(args);
+      if (command === "config_backup") return backupPreview(args);
+      if (command === "list_codex_sessions" || command === "delete_codex_sessions" || command === "save_codex_session_cleanup_policy") return sessionsPreview(command, args);
+      if (["remote_control_status", "configure_remote_control", "start_remote_control", "stop_remote_control", "revoke_remote_session"].includes(command)) return remotePreview(command, args);
 
       if (command === "plugin_marketplace_status" || command === "repair_plugin_marketplace" || command === "prepare_computer_use") {
         const supported = previewClientPlatform === "macos" || previewClientPlatform === "windows";

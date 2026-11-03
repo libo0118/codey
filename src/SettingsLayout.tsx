@@ -1,6 +1,10 @@
 import { useId, useState, type ReactNode, type RefObject } from "react";
 import {
   IconBook2,
+  IconDeviceMobile,
+  IconMessages,
+  IconDatabaseExport,
+  IconTools,
   IconLayoutDashboard,
   IconPlugConnected,
   IconRoute,
@@ -15,12 +19,16 @@ const SETTINGS_PAGES = [
   { id: "models", title: "线路与模型", icon: IconRoute, group: "核心配置" },
   { id: "prompt", title: "提示词优化", icon: IconSparkles, group: "核心配置" },
   { id: "subagents", title: "子代理优化", icon: IconUsersGroup, group: "核心配置" },
+  { id: "remote", title: "远程控制", icon: IconDeviceMobile, group: "运行管理" },
+  { id: "sessions", title: "会话管理", icon: IconMessages, group: "运行管理" },
+  { id: "backup", title: "备份与恢复", icon: IconDatabaseExport, group: "运行管理" },
+  { id: "builtinTools", title: "内置工具", icon: IconTools, group: "扩展生态" },
   { id: "plugins", title: "Codey 插件", icon: IconPlugConnected, group: "扩展生态" },
   { id: "mcp", title: "MCP 管理", icon: IconServer, group: "扩展生态" },
   { id: "skills", title: "Skill 管理", icon: IconBook2, group: "扩展生态" },
 ] as const;
 
-const SETTINGS_GROUPS = ["核心配置", "扩展生态"] as const;
+const SETTINGS_GROUPS = ["核心配置", "运行管理", "扩展生态"] as const;
 
 type SettingsPageId = (typeof SETTINGS_PAGES)[number]["id"];
 type SettingsSection = ReactNode | ((active: boolean) => ReactNode);

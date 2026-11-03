@@ -437,6 +437,7 @@ async fn run_startup_session_maintenance(
     let maintenance_home = home.to_path_buf();
     let maintenance_result = tokio::task::spawn_blocking(move || {
         let stale_lock_recovery = maintenance_lock::recover_stale_locks(&maintenance_home);
+        let session_cleanup = crate::session_management::finish_pending(&maintenance_home);
         // A loaded Codex thread may have flushed a deleted turn after the live
         // request completed. Reapply durable tombstones after the old process
         // is stopped and before the new process can hydrate that stale data.
@@ -444,24 +445,30 @@ async fn run_startup_session_maintenance(
         // `session_index.jsonl` is also cleaned before spawn, while its
         // source snapshot is stable. The original file is backed up.
         let index_cleanup = session_index_cleanup::cleanup(&maintenance_home);
-        (stale_lock_recovery, message_delete_replay, index_cleanup)
+        (
+            stale_lock_recovery,
+            session_cleanup,
+            message_delete_replay,
+            index_cleanup,
+        )
     })
     .await;
-    let (stale_lock_recovery, message_delete_replay, index_cleanup) = match maintenance_result {
-        Ok(result) => result,
-        Err(error) => {
-            let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
-            error_log::record_failure(
-                "patch_failed",
-                "run_startup_session_repairs",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "codexHome": home,
-                }),
-            );
-            return Err(error);
-        }
-    };
+    let (stale_lock_recovery, session_cleanup, message_delete_replay, index_cleanup) =
+        match maintenance_result {
+            Ok(result) => result,
+            Err(error) => {
+                let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
+                error_log::record_failure(
+                    "patch_failed",
+                    "run_startup_session_repairs",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "codexHome": home,
+                    }),
+                );
+                return Err(error);
+            }
+        };
     match stale_lock_recovery {
         Ok(recovered) => {
             for path in recovered {
@@ -479,6 +486,14 @@ async fn run_startup_session_maintenance(
             );
             eprintln!("清理陈旧维护锁失败：{error:#}");
         }
+    }
+    if let Err(error) = session_cleanup {
+        error_log::record_failure(
+            "cleanup_failed",
+            "finish_pending_session_cleanup",
+            format!("会话清理未完成，待清理任务和未删除的数据已保留：{error:#}"),
+            serde_json::json!({ "codexHome": home }),
+        );
     }
     match message_delete_replay {
         Ok(summary) => {

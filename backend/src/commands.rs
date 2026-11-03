@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod backup;
+mod builtin_tools;
 mod config_apply;
 mod config_repair;
 mod diagnostics;
@@ -19,6 +21,7 @@ mod official_accounts;
 mod plugins;
 mod prompt_optimization;
 mod runtime;
+mod sessions;
 mod updates;
 mod webhooks;
 mod wechat_claw;
@@ -156,6 +159,9 @@ pub struct AppState {
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     pub(crate) failed_runtime_start: Mutex<Option<Arc<crate::launcher::PendingRuntimeCleanup>>>,
     runtime_operation: Mutex<()>,
+    builtin_tools: builtin_tools::ToolState,
+    session_cleanup_watcher: Mutex<Option<sessions::SessionCleanupWatcher>>,
+    pub(crate) remote_control: crate::remote_control::RemoteControl,
     diagnostic_storage_operation: Mutex<()>,
     trace_log_write_protection_active: AtomicBool,
     trace_log_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
@@ -306,6 +312,9 @@ impl AppState {
             runtime: Mutex::new(None),
             failed_runtime_start: Mutex::new(None),
             runtime_operation: Mutex::new(()),
+            builtin_tools: builtin_tools::ToolState::default(),
+            session_cleanup_watcher: Mutex::new(None),
+            remote_control: crate::remote_control::RemoteControl::default(),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_write_protection_active: AtomicBool::new(false),
             trace_log_guard_state: Arc::new(trace_log_guard::TraceLogGuardState::default()),
@@ -441,7 +450,7 @@ impl AppState {
         });
     }
 
-    fn is_shutting_down(&self) -> bool {
+    pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
     }
 
@@ -521,11 +530,16 @@ impl AppState {
                     runtime.and_then(|runtime| runtime.conversation_stats_registry());
                 let stats = crate::conversation_stats::snapshot_with_history(
                     codex_home().to_path_buf(),
-                    session_id,
+                    session_id.clone(),
                     runtime_stats,
                 )
                 .await;
-                json!({"status":"ok", "stats": stats})
+                let codegraph = builtin_tools::session_status(self, &session_id)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Some(json!({"phase":"unavailable", "message":"CodeGraph 项目状态暂不可用"}))
+                    });
+                json!({"status":"ok", "stats": stats, "codegraph": codegraph})
             }
             "/session/model" => {
                 let thread_id = bridge_string(&payload, "threadId");
@@ -1186,6 +1200,16 @@ fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool 
 
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
+        "builtin_tools" => builtin_tools::invoke(state, &args).await,
+        "config_backup" => backup::invoke(state, &args).await,
+        "list_codex_sessions" | "delete_codex_sessions" | "save_codex_session_cleanup_policy" => {
+            sessions::invoke(state, command, &args).await
+        }
+        "remote_control_status"
+        | "configure_remote_control"
+        | "start_remote_control"
+        | "stop_remote_control"
+        | "revoke_remote_session" => crate::remote_control::invoke(state, command, &args).await,
         "load_codey_config" => load_codey_config(state).await,
         "save_codey_config" => match codey_config_save_input(&args) {
             Ok(input) => save_codey_config_input(state, input).await,
@@ -2045,11 +2069,20 @@ async fn save_codey_config_locked(
         reconcile_subagent_models_for_mode(&mut config, &model_state);
         config = config.normalize();
     }
+    persist_codey_config_locked(state, &previous, config, fast_context_tools_status).await
+}
+
+async fn persist_codey_config_locked(
+    state: &Arc<AppState>,
+    previous: &CodeyConfig,
+    mut config: CodeyConfig,
+    fast_context_tools_status: FastContextToolsStatus,
+) -> Result<SavedCodeyConfig, String> {
     // Codex reads each registered role config_file again when spawning a child.
     // Check the Codey-owned runtime files on every save while the policy stays
     // enabled, even when the in-memory role summary did not change. Enabling or
     // disabling still requires a restart to register/unregister tools and hooks.
-    let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
+    let reconcile_subagent_config = should_reconcile_runtime_subagent_config(previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
     let config = save_config_to_store(state, config).await?;

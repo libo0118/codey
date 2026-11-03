@@ -7,6 +7,7 @@ fn main() {
     for path in [
         "../src",
         "../vite.overlay.config.ts",
+        "../vite.remote.config.ts",
         "../package.json",
         "../pnpm-lock.yaml",
         "icons/Codey.ico",
@@ -22,12 +23,7 @@ fn main() {
     // include_str! 会把 dist-overlay 下的文件登记进 dep-info，跳过时改动产物
     // 仍会触发重新编译。
     println!("cargo:rerun-if-env-changed=CODEY_SKIP_OVERLAY_BUILD");
-    if std::env::var_os("CODEY_SKIP_OVERLAY_BUILD").is_some_and(|value| value == "1") {
-        assert!(
-            Path::new("../dist-overlay/codey-overlay.js").is_file(),
-            "CODEY_SKIP_OVERLAY_BUILD=1 但 dist-overlay/codey-overlay.js 不存在，请先运行 pnpm run vite:build"
-        );
-    } else {
+    if !std::env::var_os("CODEY_SKIP_OVERLAY_BUILD").is_some_and(|value| value == "1") {
         let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
         match Command::new(npm)
             .args(["run", "vite:build"])
@@ -46,6 +42,17 @@ fn main() {
             ),
             Ok(_) => {}
         }
+    }
+    for path in [
+        "../dist-overlay/codey-overlay.js",
+        "../dist-overlay/codey-remote.js",
+        "../dist-overlay/codey-remote.css",
+        "../dist-overlay/inject/codey-remote-control.js",
+    ] {
+        assert!(
+            Path::new(path).is_file(),
+            "缺少嵌入资源 {path}，请先运行 pnpm run vite:build"
+        );
     }
 
     #[cfg(windows)]

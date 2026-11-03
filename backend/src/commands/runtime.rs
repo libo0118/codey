@@ -577,6 +577,7 @@ async fn launch_codey_inner_locked_for_intent(
         )));
     }
     *state.runtime.lock().await = Some(Arc::new(runtime));
+    super::sessions::start_cleanup_watcher(state).await;
     let runtime_generation = state.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
     super::sync_wechat_claw_service(state).await;
     if let Some(initial_scan_task) = initial_scan_task {
@@ -842,6 +843,8 @@ pub(crate) async fn cleanup_failed_runtime_start(state: &Arc<AppState>) -> Resul
 
 pub async fn begin_shutdown(state: &Arc<AppState>) {
     state.shutting_down.store(true, Ordering::Release);
+    super::sessions::stop_cleanup_watcher(state).await;
+    state.remote_control.shutdown().await;
     state.cancel_pending_runtime_recovery();
     let restart = state.restart_task.lock().await.take();
     if let Some(ScheduledRestart { cancel, task }) = restart {
