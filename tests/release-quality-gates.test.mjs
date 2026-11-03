@@ -126,6 +126,20 @@ test("Linux x64 independently passes the same gates before both platform package
   assert.doesNotMatch(workflow, /runs-on: macos|arm64|aarch64/);
 });
 
+test("Windows Rust tests share a bounded test-process budget without changing Linux", () => {
+  const windowsJob = workflow.slice(workflow.indexOf("\n  windows:"), workflow.indexOf("\n  linux:"));
+  for (const job of [ciWorkflow, windowsJob]) {
+    assert.doesNotMatch(job, /continue-on-error:\s*true/);
+    const rustTests = job.match(/- name: Rust tests[\s\S]*?(?=\n      - name:)/)?.[0];
+    assert.ok(rustTests);
+    assert.match(rustTests, /run: cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+    assert.match(rustTests, /^\s{10}RUST_TEST_THREADS: "2"\r?$/m);
+    assert.doesNotMatch(rustTests, /--skip|--ignored|--test-threads/);
+  }
+  const linuxJob = workflow.slice(workflow.indexOf("\n  linux:"), workflow.indexOf("\n  release:"));
+  assert.doesNotMatch(linuxJob, /RUST_TEST_THREADS/);
+});
+
 test("Windows release reuses the prebuilt frontend overlay", () => {
   assert.match(workflow, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
   assert.match(workflow, /cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);

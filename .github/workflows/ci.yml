@@ -83,6 +83,8 @@ jobs:
         run: cargo test --workspace --locked
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
+          # Bound test-to-test contention; each test retains its own concurrency.
+          RUST_TEST_THREADS: "2"
 
       - name: Rust lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
