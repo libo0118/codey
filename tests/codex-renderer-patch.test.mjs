@@ -932,3 +932,87 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     }
   }
 });
+
+test("slim pet stops the hidden avatar overlay prewarm without blocking on-demand voice", async () => {
+  const runtimeSource = [
+    "function eJ(){let O=Y(`2635985366`),t=tJ(),s=Co(),Be=Cf();",
+    "(0,nJ.useEffect)(()=>{s||jr.dispatchMessage(`electron-avatar-overlay-restore-ready`,{onDemandEnabled:O,shouldPrewarmAvatarOverlay:t&&Be})},[O,t,s,Be]);}",
+  ].join("");
+  const url = "app://-/assets/app-runtime-aa2c0a69096f.js";
+  for (const disablePet of [true, false]) {
+    delete globalThis.__codeyRendererPatchInstalled;
+    (0, eval)(await loadStartupPatchTemplate({ disablePet }));
+    const patched = globalThis.__codeyRendererPatchEntry(url, runtimeSource);
+    if (!disablePet) {
+      assert.equal(patched, null, "app-runtime is only intercepted for the slim pet");
+      continue;
+    }
+    assert.match(patched, /\{onDemandEnabled:O,shouldPrewarmAvatarOverlay:!1\}/);
+    assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+  }
+});
+
+test("checkout webviews load on demand instead of prewarming hidden pages", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const url = "app://-/assets/webview-page-71976c9e9730.js";
+  const pricing = "function ue(a,s,c,h,l,p,_,C){let O;e[9]!==a?(O=!re()&&a===`chatgpt`&&!s&&c!=null&&!h&&l?.structure===`personal`&&ee(p,He,{disableExposureLog:!0}).get(`use_embedded_checkout`,!1)?_e({currentPlan:ye(l.plan_type),url:_()}):null,e[9]=a,e[16]=O):O=e[16];let A=C??O;return(0,X.jsx)(me,{forcePricingRefreshInBackground:!0,search:A})}";
+  const credit = "function U(y,eligible){let T,E,Y={useLayoutEffect(){}},re=()=>!eligible,ee=()=>({get:()=>eligible}),d,He;if((0,Y.useLayoutEffect)(T,E),!y&&(re()||!ee(d,He,{disableExposureLog:!0}).get(`use_embedded_credit_checkout`,!1)))return null;let N=!y;return{isPrewarm:N}}";
+  const patched = globalThis.__codeyRendererPatchEntry(url, `${pricing}${credit}`);
+  assert.match(patched, /\(O=null,e\[9\]=a,e\[16\]=O\)/, "no background pricing search without a pricing route");
+  assert.match(patched, /let A=C\?\?O;/, "an opened pricing route still drives the native webview");
+  const creditGate = Function(`${patched.slice(patched.indexOf("function U("))};return U`)();
+  assert.equal(creditGate(false, true), null, "an eligible account no longer mounts the hidden credit page");
+  assert.deepEqual({ ...creditGate(true, true) }, { isPrewarm: false }, "a presented credit page still loads");
+  assert.deepEqual({ ...creditGate(true, false) }, { isPrewarm: false });
+  assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+});
+
+test("the hosted AppServerManager service leaves a diagnostic marker when it connects", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const url = "app://-/assets/renderer-app-server-managers-8103218e001d.js";
+  const source = "function im(e){let t=A.appServerManagers;if(t==null)throw Error(`Desktop host did not provide its AppServerManager service`);return tm(e,t)}";
+  const patched = globalThis.__codeyRendererPatchEntry(url, source);
+  const connect = (service) => Function("A", "tm", `${patched};return im`)({ appServerManagers: service }, () => "connected");
+  delete globalThis.__codeyAppServerManagerHosted;
+  assert.throws(() => connect(null)(), /did not provide/);
+  assert.equal(globalThis.__codeyAppServerManagerHosted, undefined, "a missing host service is not marked");
+  assert.equal(connect({})(), "connected");
+  assert.equal(globalThis.__codeyAppServerManagerHosted, true);
+  delete globalThis.__codeyAppServerManagerHosted;
+  assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+});
+
+test("hosted composer sends pass through the portable handoff gate", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const followUp = "async function f(e,n,i,o){let l=d(e,n),m=null;return f=await l.sendFollowUpMessage(i,{...o,useUserMessageAdmission:c(e,n),writingBlockContextPrepared:m!=null}),f}";
+  const turnStart = "async function f(e,n,r,a){let c=d(e,n);return await c.startTurn(r,{...a,context:{...a.context,onRequestDispatched:a.context?.onRequestDispatched},request:{...a.request}})}async function p(e,n,r,a){let s=d(e,n);await s.startEmptyTurn(r,a)}";
+  const cases = [
+    ["app://-/assets/send-follow-up-message-41b7bd38775d.js", followUp, "sendFollowUpMessage", { prompt: "hi" }],
+    ["app://-/assets/start-turn-e9a3bd89232f.js", turnStart, "startTurn", { request: { input: [] } }],
+  ];
+  for (const [url, source, method, options] of cases) {
+    const patched = globalThis.__codeyRendererPatchEntry(url, source);
+    assert.ok(patched?.includes(`"${method}",`), method);
+    assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, `${method} patch is idempotent`);
+    const calls = [];
+    const rpc = { [method]: async (...args) => { calls.push(["native", ...args]); return "sent"; } };
+    const run = Function("d", "c", `${patched};return f`)(() => rpc, () => true);
+    delete globalThis.__codeyModelWhitelistPatch;
+    assert.equal(await run({}, "local", "thread", options), "sent", `${method} works without the gate`);
+    globalThis.__codeyModelWhitelistPatch = { hostedTurnCall: async (target, name, threadId, value) => {
+      calls.push(["gate", name, threadId]);
+      return target[name](threadId, value);
+    } };
+    try {
+      assert.equal(await run({}, "local", "thread", options), "sent");
+    } finally {
+      delete globalThis.__codeyModelWhitelistPatch;
+    }
+    assert.deepEqual(calls.map(([kind, name]) => kind === "gate" ? `gate:${name}` : kind), ["native", `gate:${method}`, "native"]);
+  }
+  const lock = "function t(e){return!r.has(e)&&(r.add(e),!0)}";
+  assert.equal(globalThis.__codeyRendererPatchEntry("app://-/assets/start-turn-lock-be4319076981.js", lock), null);
+});

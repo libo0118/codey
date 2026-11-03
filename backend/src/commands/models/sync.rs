@@ -550,7 +550,10 @@ pub(crate) async fn fetch_provider_models(
     })
     .await
     .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
-    provider_models::fetch_catalog(&fetch_profile, provider_models::http_client()).await
+    let client = provider_models::http_client()
+        .current(&fetch_profile.normalized_base_url())
+        .await;
+    provider_models::fetch_catalog(&fetch_profile, &client).await
 }
 
 #[cfg(test)]

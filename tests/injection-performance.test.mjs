@@ -5,13 +5,22 @@ import vm from "node:vm";
 import { readSource } from "./helpers/read-source.mjs";
 
 test("renderer core loads session tools after idle time or sidebar use", async () => {
-  const [inject, sessionTools, bridge, petShield, securityShield, promptOptimize] = await Promise.all([
+  const [
+    inject,
+    sessionTools,
+    bridge,
+    petShield,
+    securityShield,
+    promptOptimize,
+    quotaDismiss,
+  ] = await Promise.all([
     readSource("public/renderer-inject.js"),
     readSource("public/codey-inject.js"),
     readSource("public/codey-bridge.js"),
     readSource("public/pet-control-shield.js"),
     readSource("public/security-warning-shield.js"),
     readSource("public/prompt-optimize.js"),
+    readSource("public/quota-notice-dismiss.js"),
   ]);
 
   assert.match(inject, /const queryWithin = \(root, selector\)/);
@@ -106,11 +115,14 @@ test("renderer core loads session tools after idle time or sidebar use", async (
     /const reconcileStaleCompletedTask = async \(\) => \{([\s\S]*?)\n  \};/,
   )?.[1] ?? "";
   assert.ok(reconcileBody.length > 0);
-  assert.match(reconcileBody, /const sessionId = getSessionId\(\)/);
+  assert.match(reconcileBody, /const candidateSessionId = sessionIdentityCandidate\(\)/);
+  assert.match(reconcileBody, /const sessionId = candidateSessionId \|\| getSessionId\(\)/);
   assert.doesNotMatch(
     reconcileBody,
     /querySelector|data-turn-key|textContent|discardConversation|unsubscribe|interrupt|turn\/start/,
   );
+  assert.match(sessionTools, /const visibleSessionIdentityValue = \(\) => \{/);
+  assert.match(sessionTools, /candidates\.filter\(isRenderedSessionElement\)/);
   assert.match(sessionTools, /window\.__codeyRendererInvalidateHeaderMount\?\.\(root\)/);
   assert.doesNotMatch(sessionTools, /headerMountDirty/);
   assert.match(sessionTools, /const threadUpdatedAtRows = new Set\(\)/);
@@ -155,15 +167,21 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   const sessionObserverBody = sessionTools.match(
     /const handleSessionToolMutationsImpl = \(mutations\) => \{([\s\S]*?)\n  \};\n  const sessionToolMutationOptions/,
   )?.[1] ?? "";
-  assert.match(sessionObserverBody, /pendingMutationTargets\.get\(target\)/);
-  assert.match(sessionObserverBody, /scheduleIncrementalScan\(null\)/);
-  assert.doesNotMatch(sessionObserverBody, /querySelector|\.closest|\.matches|getSessionId\(/);
-  assert.match(sessionTools, /codeyTimed\("codey-inject\.sessionToolDrain"/);
+  assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
+  assert.match(sessionObserverBody, /reconcileStaleCompletedTask/);
+  assert.match(
+    sessionObserverBody,
+    /const targetContext = contextForTarget\(target\);[\s\S]*?if \(targetContext\.conversationTurn\) continue;/,
+  );
   // getSessionId() reads layout; it must not run synchronously per mutation batch.
   assert.doesNotMatch(sessionObserverBody, /getSessionId\(\)/);
   assert.match(
     sessionObserverBody,
     /completionReconcileCheckTimer = window\.setTimeout\(\(\) => \{[\s\S]*?void reconcileStaleCompletedTask\(\);[\s\S]*?\}, completionReconcileMutationDelayMs\)/,
+  );
+  assert.match(
+    sessionTools,
+    /const conversationOnlyWrapper = \([\s\S]*?installMessageSelection\(root\);\s*return;/,
   );
   assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
   assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
@@ -180,7 +198,7 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   );
   assert.match(modelWhitelist, /characterData:\s*true/);
   assert.doesNotMatch(inject, /__codeyBlockNativePetControls/);
-  assert.match(petShield, /const block = \(root = document\)/);
+  assert.match(petShield, /const block = \(root = document, options = \{\}\)/);
   assert.match(petShield, /if \(!enabled\) \{/);
   assert.match(bridge, /window\.__codeyMutationDispatcher = Object\.freeze/);
   assert.match(bridge, /const createShieldLifecycle = \(\{/);
@@ -188,6 +206,17 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   assert.doesNotMatch(petShield, /const controlsWithin = \(root, selector\) =>/);
   assert.match(petShield, /__codeyMutationDispatcher\?\.createShieldLifecycle/);
   assert.match(securityShield, /__codeyMutationDispatcher\.subscribe/);
+  assert.match(quotaDismiss, /__codeyMutationDispatcher\.subscribe/);
+  assert.match(quotaDismiss, /const conversationTurnSelector = "\[data-turn-key\]"/);
+  assert.match(quotaDismiss, /shouldSkipMountedTurnMutation/);
+  assert.match(quotaDismiss, /warningSurfaceSelector[\s\S]*node\.children[\s\S]*warningSurfaceSelector/);
+  assert.match(quotaDismiss, /pendingRoots\.values\(\)\.next\(\)\.value/);
+  assert.doesNotMatch(quotaDismiss, /pendingRoots\.add\(document\.documentElement\)/);
+  assert.match(securityShield, /const conversationTurnSelector = "\[data-turn-key\]"/);
+  assert.match(securityShield, /shouldSkipMountedTurnMutation/);
+  assert.match(securityShield, /warningSurfaceSelector[\s\S]*node\.children[\s\S]*warningSurfaceSelector/);
+  assert.match(securityShield, /pendingRoots\.values\(\)\.next\(\)\.value/);
+  assert.doesNotMatch(securityShield, /pendingRoots\.add\(document\.documentElement\)/);
   assert.doesNotMatch(petShield, /new MutationObserver/);
   assert.doesNotMatch(securityShield, /new MutationObserver/);
 });
@@ -598,8 +627,38 @@ test("adjacent selected turns render as one continuous outline", async () => {
 
 test("selection changes resynchronize adjacent-turn grouping", async () => {
   const source = await readSource("public/codey-inject.js");
-  assert.match(source, /const syncSelectionGroups = \(visibleRows = null\) => \{/);
+  assert.match(source, /const syncSelectionGroups = \(\) => \{/);
   assert.match(source, /lastSelectedRow = anchor;\s*syncSelectionGroups\(\);/s);
   assert.match(source, /row\.dataset\.codeySelectedPrevious = "true"/);
   assert.match(source, /row\.dataset\.codeySelectedNext = "true"/);
+});
+
+test("adjacent message rows are collected from live sibling collections", async () => {
+  const source = await readSource("public/codey-inject.js");
+  const start = source.indexOf("  const adjacentMessageSelectionRows = (root) => {");
+  const end = source.indexOf("\n  };\n", start) + "\n  };\n".length;
+  assert.ok(start >= 0 && end > start);
+  const { FakeElementCore, useLiveChildren } = await import("./helpers/fake-element.mjs");
+  const parent = new FakeElementCore("div");
+  const rows = Array.from({ length: 25 }, (_, index) => {
+    const row = parent.appendChild(new FakeElementCore("div"));
+    row.dataset.row = String(index);
+    return row;
+  });
+  useLiveChildren(parent);
+  const context = {
+    HTMLElement: FakeElementCore,
+    hasCanonicalTurnAncestor: () => false,
+    isRenderedSessionElement: () => true,
+    maxAdjacentMessageSelectionRows: 9,
+    messageSelectionRowsWithin: (element) => [element],
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; this.adjacent = adjacentMessageSelectionRows;`, context);
+
+  const collected = context.adjacent(rows[12]);
+
+  assert.deepEqual(
+    Array.from(collected, (row) => Number(row.dataset.row)).sort((a, b) => a - b),
+    rows.slice(3, 22).map((row) => Number(row.dataset.row)),
+  );
 });

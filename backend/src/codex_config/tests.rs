@@ -696,6 +696,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -861,6 +862,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -914,6 +916,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1220,7 +1223,6 @@ fn isolated_prompt_sources_migrate_historical_defaults_and_preserve_user_guidanc
     let temp = tempfile::tempdir().unwrap();
     let mut sources = Vec::new();
     for (name, current, versions) in [
-        ("root.md", SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
         (
             "fastctx.md",
             CODEY_FASTCTX_GUIDANCE,
@@ -1257,17 +1259,11 @@ enabled = true
         "User collaboration policy.\n\n{}",
         ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..].join("\n\n"),
     ));
-    apply_isolated_prompt_sources(
-        &mut document,
-        Some(&sources[0]),
-        Some(&sources[1]),
-        Some(&sources[2]),
-    )
-    .unwrap();
+    apply_isolated_prompt_sources(&mut document, Some(&sources[0]), Some(&sources[1])).unwrap();
     let first = document_string(&document).unwrap();
     let root = document["developer_instructions"].as_str().unwrap();
     assert!(root.contains("User root guidance."));
-    assert_eq!(root.matches(SUBAGENT_GUIDANCE.trim()).count(), 1);
+    assert!(!root.contains("## 子代理使用"));
     assert_eq!(root.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
     let child = document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
         .as_str()
@@ -1291,13 +1287,7 @@ enabled = true
     ] {
         assert!(!first.contains(stale), "{stale}");
     }
-    apply_isolated_prompt_sources(
-        &mut document,
-        Some(&sources[0]),
-        Some(&sources[1]),
-        Some(&sources[2]),
-    )
-    .unwrap();
+    apply_isolated_prompt_sources(&mut document, Some(&sources[0]), Some(&sources[1])).unwrap();
     assert_eq!(document_string(&document).unwrap(), first);
 }
 
@@ -1484,6 +1474,7 @@ wire_api = "responses"
             subagent_optimization: false,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            scope_guard: false,
             local_router: None,
         },
     )
@@ -1531,6 +1522,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1577,6 +1569,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -1795,6 +1788,7 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                scope_guard: false,
                 marker: &marker,
                 backup_root: &backup_root,
             },
@@ -1865,6 +1859,7 @@ fn runtime_context_overlay_required_models_respect_router_and_catalog_selection(
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                scope_guard: false,
                 marker: &marker,
                 backup_root: &backup_root,
             },
@@ -1938,6 +1933,7 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backups,
         },
@@ -2011,6 +2007,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                scope_guard: false,
                 marker: &marker,
                 backup_root: &backup_root,
             },
@@ -2059,6 +2056,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -2117,6 +2115,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
                     subagent_model: DEFAULT_SUBAGENT_MODEL,
                     subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                     subagent_roles: None,
+                    scope_guard: false,
                     marker: &marker,
                     backup_root: &backup_root,
                 },
@@ -2171,6 +2170,7 @@ wire_api = "responses"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -2342,6 +2342,7 @@ service_tier = "flex"
                     subagent_model: DEFAULT_SUBAGENT_MODEL,
                     subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                     subagent_roles: None,
+                    scope_guard: false,
                     marker: &marker,
                     backup_root: &backup_root,
                 },
@@ -3167,6 +3168,7 @@ command = "echo preserve-user-hook"
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -3271,6 +3273,7 @@ default_subagent_reasoning_effort = "low"
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -3295,6 +3298,7 @@ fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -3326,6 +3330,7 @@ fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
                 subagent_optimization: true,
                 subagent_model: "gpt-5.6-sol",
                 subagent_reasoning_effort: "high",
+                scope_guard: false,
                 local_router: Some(test_runtime_router_endpoint()),
             },
         )
@@ -3351,6 +3356,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-luna",
             subagent_reasoning_effort: "high",
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -3371,6 +3377,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_optimization: true,
             subagent_model: "   ",
             subagent_reasoning_effort: "high",
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -3572,6 +3579,7 @@ experimental_bearer_token = "upstream-secret-token"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -3709,6 +3717,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -3750,6 +3759,7 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backups,
         },
@@ -3804,6 +3814,7 @@ wire_api = "responses"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
+            scope_guard: false,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -3933,6 +3944,73 @@ wire_api = "responses"
 }
 
 #[test]
+fn isolated_scope_guard_adds_start_hooks_beside_the_subagent_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state_dir = temp.path().join("codey-state");
+    let marker = state_dir.join("codex-lease.json");
+    let backup_root = state_dir.join("codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = b"model = \"user-model\"\n";
+    fs::write(home.join("config.toml"), original_config).unwrap();
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            local_router: Some(test_runtime_router_endpoint()),
+            remote_compaction_models: None,
+            stream_max_retries: 5,
+            use_official_catalog: false,
+            model_contexts: None,
+            required_catalog_models: &[],
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            scope_guard: true,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    let hook_states = applied
+        .runtime_config_overrides
+        .iter()
+        .find_map(|entry| entry.strip_prefix("hooks.state="))
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+    assert_eq!(
+        hook_states.as_inline_table().unwrap().len(),
+        SUBAGENT_GATE_HOOKS.len() + SCOPE_GUARD_HOOKS.len()
+    );
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
+    let session_start = hooks["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(session_start.len(), 1);
+    assert_eq!(
+        session_start[0]["matcher"].as_str(),
+        Some(crate::scope_guard::SESSION_START_MATCHER)
+    );
+    let subagent_start_commands = hooks["hooks"]["SubagentStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(subagent_start_commands.len(), 2);
+    assert!(subagent_start_commands[0].contains(crate::subagent_gate::HOOK_ARGUMENT));
+    assert!(subagent_start_commands[1].contains(crate::scope_guard::HOOK_ARGUMENT));
+
+    assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+    assert!(!home.join("hooks.json").exists());
+}
+
+#[test]
 fn isolated_runtime_constraints_stay_out_of_config_and_restore_hooks() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -3971,8 +4049,8 @@ wire_api = "responses"
     let seeded_constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     fs::create_dir_all(&seeded_constraints_dir).unwrap();
     fs::write(
-        seeded_constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
-        SUBAGENT_GUIDANCE,
+        seeded_constraints_dir.join(CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE),
+        SUBAGENT_GUIDANCE_VERSIONS[0],
     )
     .unwrap();
     fs::write(
@@ -4195,11 +4273,11 @@ wire_api = "responses"
         Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER)
     );
     let constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
-    assert_eq!(
-        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
-        SUBAGENT_GUIDANCE
+    assert!(
+        !constraints_dir
+            .join(CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE)
+            .exists()
     );
-    assert!(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE).exists());
     assert!(
         constraints_dir
             .join(CODEY_FASTCTX_INSTRUCTIONS_FILE)
@@ -4258,7 +4336,7 @@ wire_api = "responses"
     // Codey-owned constraint files are rebuilt from the current definitions;
     // hand-edited or stale content there does not carry into the runtime.
     fs::write(
-        constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
+        constraints_dir.join(CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE),
         "CUSTOM ROOT CONSTRAINT",
     )
     .unwrap();
@@ -4290,9 +4368,10 @@ wire_api = "responses"
         &backup_root,
     )
     .unwrap();
-    assert_eq!(
-        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
-        SUBAGENT_GUIDANCE
+    assert!(
+        !constraints_dir
+            .join(CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE)
+            .exists()
     );
     assert_eq!(
         fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
@@ -4309,7 +4388,7 @@ wire_api = "responses"
         .as_str()
         .unwrap();
     // Injected text is trimmed, so compare against the trimmed guidance.
-    assert!(developer_instructions.contains(SUBAGENT_GUIDANCE.trim()));
+    assert!(!developer_instructions.contains("## 子代理使用"));
     assert!(developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
     assert!(!developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
     let collaboration_override = reapplied

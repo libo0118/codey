@@ -26,6 +26,8 @@ pub(crate) const CLI_WRAPPER_TARGET_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TARGET"
 pub(crate) const CLI_WRAPPER_SOURCE_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SOURCE";
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_OVERRIDES_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_OVERRIDES";
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+pub(crate) const CLI_WRAPPER_MISC_MODEL_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_MISC_MODEL";
 /// 本次启动具备 stdin relay 的包装器路径，供主进程核对实际启动入口。
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) const CLI_WRAPPER_STDIN_RELAY_ENV: &str = "CODEY_CODEX_CLI_STDIN_RELAY";
@@ -239,16 +241,19 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             std::env::var(CLI_WRAPPER_OVERRIDES_ENV).context("Codex 请求转发缺少运行时配置")?;
         let overrides: Vec<String> =
             serde_json::from_str(&overrides).context("解析 Codex 请求转发配置失败")?;
-        let result = route_local_app_server_input(
+        let misc_model = std::env::var(CLI_WRAPPER_MISC_MODEL_ENV).ok();
+        let result = forward_app_server_input(
             std::io::stdin().lock(),
             std::io::stdout().lock(),
             &overrides,
             Some(crate::codex_config::codex_home()),
+            local_router_runtime_enabled(&overrides),
+            misc_model.as_deref(),
         );
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::BrokenPipe
         {
-            return Err(error).context("转发 Codex 本地路由请求失败");
+            return Err(error).context("转发 Codex 请求失败");
         }
         return Ok(true);
     }
@@ -316,6 +321,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             CLI_WRAPPER_TARGET_ENV,
             CLI_WRAPPER_SOURCE_ENV,
             CLI_WRAPPER_OVERRIDES_ENV,
+            CLI_WRAPPER_MISC_MODEL_ENV,
             CLI_WRAPPER_STDIN_RELAY_ENV,
             CLI_WRAPPER_SUBAGENT_ENV,
             CLI_WRAPPER_PORT_ENV,
@@ -343,7 +349,9 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
                 command.env("PATH", path);
             }
         }
-        if app_server && local_router_runtime_enabled(&runtime_overrides) {
+        let misc_model = std::env::var(CLI_WRAPPER_MISC_MODEL_ENV).ok();
+        if app_server && app_server_input_relay_required(&runtime_overrides, misc_model.as_deref())
+        {
             // Keep Unix exec/PID semantics. The helper owns only the input pipe;
             // Desktop closing stdin ends it, including when app-server restarts.
             let mut relay = std::process::Command::new(std::env::current_exe()?);
@@ -355,14 +363,10 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
                 use std::os::windows::process::CommandExt;
                 relay.creation_flags(codey_runtime_core::windows_create_no_window());
             }
-            let relay =
-                input_router.insert(relay.spawn().context("启动 Codex 本地路由请求转发失败")?);
-            command.stdin(
-                relay
-                    .stdout
-                    .take()
-                    .context("Codex 本地路由请求管道不可用")?,
-            );
+            let relay = input_router.insert(relay.spawn().context("启动 Codex 请求转发失败")?);
+            command.stdin(relay.stdout.take().context("Codex 请求管道不可用")?);
+        }
+        if app_server && local_router_runtime_enabled(&runtime_overrides) {
             let mut observer = std::process::Command::new(std::env::current_exe()?);
             observer
                 .arg("--codey-observe-app-server-output")
@@ -503,21 +507,39 @@ fn observe_local_app_server_output(
     let mut buffer = [0; 8192];
     let mut line = Vec::new();
     let mut oversized = false;
+    // 小行等到换行才转发以便改写；超过暂存上限后剩余字节随读随转发。
+    let mut streaming = false;
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {
+            if !streaming {
+                output.write_all(&line)?;
+                output.flush()?;
+            }
             if !oversized && !line.is_empty() {
                 remember_app_server_settings(&line, home);
             }
             return Ok(());
         }
-        for &byte in &buffer[..count] {
+        let mut start = 0;
+        for (index, &byte) in buffer[..count].iter().enumerate() {
             if byte == b'\n' {
                 if !oversized {
                     remember_app_server_settings(&line, home);
                 }
+                if streaming {
+                    output.write_all(&buffer[start..=index])?;
+                } else {
+                    match rewrite_prediction_resume_response(&line) {
+                        Some(rewritten) => output.write_all(&rewritten)?,
+                        None => output.write_all(&line)?,
+                    }
+                    output.write_all(b"\n")?;
+                }
+                start = index + 1;
                 line.clear();
                 oversized = false;
+                streaming = false;
             } else if !oversized {
                 // 大型响应仍原样转发，但无需为观察小型设置通知保留完整副本。
                 if line.len() == 1024 * 1024 {
@@ -525,12 +547,54 @@ fn observe_local_app_server_output(
                     oversized = true;
                 } else {
                     line.push(byte);
+                    if !streaming && line.len() > PREDICTION_RESUME_LINE_LIMIT {
+                        output.write_all(&line)?;
+                        streaming = true;
+                        start = index + 1;
+                    }
                 }
             }
         }
-        output.write_all(&buffer[..count])?;
+        if streaming {
+            output.write_all(&buffer[start..count])?;
+        }
         output.flush()?;
     }
+}
+
+/// 预测前的会话设置回复不含历史轮次，远小于此上限。
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+const PREDICTION_RESUME_LINE_LIMIT: usize = 256 * 1024;
+
+/// Codex 主进程只为 openai provider 的会话生成输入框预测，预测前会读取会话设置。
+/// 主进程与页面的请求均使用 `thread/resume:<uuid>`，不能据此区分来源。
+/// 官方账号线路兼容预测时改报 openai，同时用 codeyRuntimeModelProvider 保留真实
+/// provider，供页面恢复运行时状态；预测的 thread/fork 仍走本地路由。
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+fn rewrite_prediction_resume_response(line: &[u8]) -> Option<Vec<u8>> {
+    const RESUME_ID_PREFIX: &str = "thread/resume:";
+    if !line
+        .windows(RESUME_ID_PREFIX.len() + 1)
+        .any(|window| window[0] == b'"' && &window[1..] == RESUME_ID_PREFIX.as_bytes())
+    {
+        return None;
+    }
+    let mut message = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    if !message.get("id")?.as_str()?.starts_with(RESUME_ID_PREFIX) {
+        return None;
+    }
+    let result = message.get_mut("result")?.as_object_mut()?;
+    let official = result.get("modelProvider")?.as_str()?
+        == crate::local_router::ROUTER_PROVIDER_ID
+        && crate::model_id::parse_alias(result.get("model")?.as_str()?)
+            .is_some_and(|alias| crate::config::is_official_profile_id(alias.provider_key));
+    if !official {
+        return None;
+    }
+    let runtime_provider = result.get("modelProvider")?.clone();
+    result.insert("codeyRuntimeModelProvider".into(), runtime_provider);
+    result.insert("modelProvider".into(), "openai".into());
+    serde_json::to_vec(&message).ok()
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
@@ -581,11 +645,13 @@ fn remember_app_server_settings(line: &[u8], home: &std::path::Path) {
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
-fn route_local_app_server_input(
+fn forward_app_server_input(
     mut input: impl std::io::BufRead,
     mut output: impl std::io::Write,
     runtime_overrides: &[String],
     codex_home: Option<&std::path::Path>,
+    local_router_enabled: bool,
+    misc_model: Option<&str>,
 ) -> std::io::Result<()> {
     let mut line = Vec::new();
     let mut live_threads = std::collections::HashSet::<String>::new();
@@ -595,6 +661,9 @@ fn route_local_app_server_input(
             return Ok(());
         }
         let mut parsed = serde_json::from_slice::<serde_json::Value>(&line).ok();
+        let mut changed = parsed.as_mut().is_some_and(|message| {
+            rewrite_title_generation_request(message, runtime_overrides, misc_model)
+        });
         if let Some(message) = parsed.as_ref()
             && matches!(
                 message.get("method").and_then(serde_json::Value::as_str),
@@ -619,6 +688,7 @@ fn route_local_app_server_input(
             live_threads.insert(thread_id.to_owned());
         }
         if let Some(message) = parsed.as_mut()
+            && local_router_enabled
             && matches!(
                 message.get("method").and_then(serde_json::Value::as_str),
                 Some("thread/start" | "thread/resume" | "thread/fork")
@@ -698,13 +768,89 @@ fn route_local_app_server_input(
                             && !key.starts_with("model_providers.")
                     });
                 }
-                line = serde_json::to_vec(&message).map_err(std::io::Error::other)?;
-                line.push(b'\n');
+                changed = true;
             }
+        }
+        if changed {
+            line = serde_json::to_vec(&parsed.unwrap()).map_err(std::io::Error::other)?;
+            line.push(b'\n');
         }
         output.write_all(&line)?;
         output.flush()?;
     }
+}
+
+#[cfg(test)]
+fn route_local_app_server_input(
+    input: impl std::io::BufRead,
+    output: impl std::io::Write,
+    runtime_overrides: &[String],
+    codex_home: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    forward_app_server_input(input, output, runtime_overrides, codex_home, true, None)
+}
+
+/// Desktop 用来源和临时会话标记识别标题任务，也可能从已有会话分支。
+/// 后续标题 turn/start 传 model:null，沿用临时会话的模型。
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+fn rewrite_title_generation_request(
+    message: &mut serde_json::Value,
+    runtime_overrides: &[String],
+    misc_model: Option<&str>,
+) -> bool {
+    if !matches!(
+        message.get("method").and_then(serde_json::Value::as_str),
+        Some("thread/start" | "thread/fork")
+    ) {
+        return false;
+    }
+    let Some(params) = message
+        .get_mut("params")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if params.get("ephemeral").and_then(serde_json::Value::as_bool) != Some(true)
+        || params
+            .get("threadSource")
+            .and_then(serde_json::Value::as_str)
+            != Some("thread_title")
+    {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(model) = misc_model.map(str::trim).filter(|model| !model.is_empty()) {
+        params.insert("model".into(), model.into());
+        changed = true;
+    }
+    // Desktop 用 {enabled:false} 禁用 MCP。CLI 注入的 FastCtx 传输字段在
+    // 此覆盖层缺失时会使配置解析失败；补齐禁用条目的 command，不启动服务。
+    if let Some(server) = params
+        .get_mut("config")
+        .and_then(|config| config.get_mut("mcp_servers"))
+        .and_then(|servers| servers.get_mut("codey_fastctx"))
+        .and_then(serde_json::Value::as_object_mut)
+        && server.get("enabled").and_then(serde_json::Value::as_bool) == Some(false)
+        && !server.contains_key("command")
+        && !server.contains_key("url")
+        && let Some(command) =
+            runtime_override_string(runtime_overrides, "mcp_servers.codey_fastctx.command")
+                .filter(|command| !command.trim().is_empty())
+    {
+        server.insert("command".into(), command.into());
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+pub(crate) fn app_server_input_relay_required(
+    overrides: &[String],
+    misc_model: Option<&str>,
+) -> bool {
+    local_router_runtime_enabled(overrides)
+        || misc_model.is_some_and(|model| !model.trim().is_empty())
+        || runtime_override_string(overrides, "mcp_servers.codey_fastctx.command").is_some()
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
@@ -1403,6 +1549,91 @@ mod tests {
     }
 
     #[test]
+    fn output_observer_preserves_runtime_provider_for_main_and_page_resume() {
+        struct SplitRead<'a>(&'a [u8]);
+        impl std::io::Read for SplitRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let end = 7.min(buffer.len());
+                std::io::Read::read(&mut self.0, &mut buffer[..end])
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let resume = |id: serde_json::Value, model: &str, provider: &str| {
+            serde_json::json!({"id":id,"result":{"thread":{"id":"t",
+                "model":"historical/model","modelProvider":"historical-provider","turns":[]},
+                "model":model,"modelProvider":provider,"serviceTier":null,
+                "reasoningEffort":"high","cwd":"/workspace/project"}})
+        };
+        let official = "codey-official-account-a1/gpt-6-astra";
+        // 主进程预测和页面 AppServerRequestClient 使用相同的 UUID 请求 ID 格式。
+        let internal = resume(
+            "thread/resume:3b771392-5499-4e6d-b053-464bac001422".into(),
+            official,
+            "codey_router",
+        );
+        let mut page = resume(
+            "thread/resume:adeea1ac-2707-4580-a4ee-8cadb48187e0".into(),
+            official,
+            "codey_router",
+        );
+        page["result"]["thread"]["turns"] = serde_json::json!([{
+            "id":"old-turn","model":"historical/other-model","modelProvider":"other-provider",
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"保留历史"}]}]
+        }]);
+        let mut large = page.clone();
+        large["result"]["thread"]["preview"] = "z".repeat(PREDICTION_RESUME_LINE_LIMIT + 1).into();
+        let unchanged = [
+            resume(
+                "thread/resume:2".into(),
+                "third-party/model",
+                "codey_router",
+            ),
+            resume(3.into(), official, "codey_router"),
+            resume("thread/resume:4".into(), official, "other"),
+            resume("thread/resume:5".into(), "gpt-6-astra", "codey_router"),
+            resume(
+                "thread/fork:68756161-c580-4637-b424-fc4056064ce5".into(),
+                official,
+                "codey_router",
+            ),
+            resume("thread/resume:6".into(), official, "openai"),
+            large,
+        ];
+        let input = format!(
+            "{}\r\n{}\n{}\n{}",
+            internal,
+            page,
+            unchanged
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\r\n"),
+            "y".repeat(PREDICTION_RESUME_LINE_LIMIT + 1)
+        );
+        let mut output = Vec::new();
+        observe_local_app_server_output(SplitRead(input.as_bytes()), &mut output, home.path())
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let (first, rest) = output.split_once('\n').unwrap();
+        let (second, rest) = rest.split_once('\n').unwrap();
+        for (line, mut expected) in [(first, internal), (second, page)] {
+            let actual: serde_json::Value = serde_json::from_str(line).unwrap();
+            let runtime_provider = expected["result"]["modelProvider"].clone();
+            expected["result"]["codeyRuntimeModelProvider"] = runtime_provider;
+            expected["result"]["modelProvider"] = "openai".into();
+            assert_eq!(
+                actual, expected,
+                "all other response fields must be preserved"
+            );
+        }
+        assert_eq!(
+            rest,
+            input.splitn(3, '\n').nth(2).unwrap(),
+            "other responses and large lines must pass through byte-for-byte"
+        );
+    }
+
+    #[test]
     fn output_observer_keeps_forwarding_after_storage_failure_and_large_messages() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("codey-session-models"), b"blocked").unwrap();
@@ -1826,6 +2057,194 @@ mod tests {
             );
             assert_eq!(&output[first_line + 1..], passthrough);
         }
+    }
+
+    #[test]
+    fn title_generation_uses_misc_model_and_keeps_disabled_fastctx_valid() {
+        for local_router_enabled in [false, true] {
+            for method in ["thread/start", "thread/fork"] {
+                let overrides =
+                    vec!["mcp_servers.codey_fastctx.command=\"/Codey path/codey\"".to_string()];
+                let mut expected = serde_json::json!({
+                    "id":"title:1", "method":method,
+                    "params":{"threadId":"source", "ephemeral":true,
+                        "threadSource":"thread_title", "model":"native-title-model",
+                        "modelProvider":null, "excludeTurns":true,
+                        "config":{"mcp_servers":{"codey_fastctx":{"enabled":false},
+                            "user_server":{"enabled":false}}, "features.hooks":false}}
+                });
+                let turn = "{\"id\":2,\"method\":\"turn/start\",\"params\":{\"threadId\":\"temporary\",\"turnTrigger\":\"thread_title\",\"model\":null,\"effort\":null}}\r\n";
+                let input = format!("{expected}\n{turn}");
+                let mut output = Vec::new();
+                forward_app_server_input(
+                    std::io::BufReader::with_capacity(1, input.as_bytes()),
+                    &mut output,
+                    &overrides,
+                    None,
+                    local_router_enabled,
+                    Some("configured/title-model"),
+                )
+                .unwrap();
+                let newline = output.iter().position(|byte| *byte == b'\n').unwrap();
+                let actual: serde_json::Value = serde_json::from_slice(&output[..newline]).unwrap();
+                expected["params"]["model"] = "configured/title-model".into();
+                expected["params"]["config"]["mcp_servers"]["codey_fastctx"]["command"] =
+                    "/Codey path/codey".into();
+                if local_router_enabled {
+                    expected["params"]["modelProvider"] = "codey_router".into();
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    &output[newline + 1..],
+                    turn.as_bytes(),
+                    "the native null model inherits the temporary thread model"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn title_generation_preserves_native_model_without_a_misc_selection() {
+        for misc_model in [None, Some(""), Some("  ")] {
+            for method in ["thread/start", "thread/fork"] {
+                let input = serde_json::json!({"id":1,"method":method,"params":{
+                    "threadSource":"thread_title","ephemeral":true,"model":"native-title-model",
+                    "config":{"mcp_servers":{"codey_fastctx":{"enabled":false}}}
+                }});
+                let mut output = Vec::new();
+                forward_app_server_input(
+                    input.to_string().as_bytes(),
+                    &mut output,
+                    &["mcp_servers.codey_fastctx.command=codey".into()],
+                    None,
+                    false,
+                    misc_model,
+                )
+                .unwrap();
+                let actual: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(actual["params"]["model"], "native-title-model");
+                assert_eq!(
+                    actual["params"]["config"]["mcp_servers"]["codey_fastctx"],
+                    serde_json::json!({"enabled":false,"command":"codey"})
+                );
+                assert!(actual["params"].get("modelProvider").is_none());
+
+                let mut unchanged = Vec::new();
+                let bytes = format!(" {input}\r\n");
+                forward_app_server_input(
+                    bytes.as_bytes(),
+                    &mut unchanged,
+                    &[],
+                    None,
+                    false,
+                    misc_model,
+                )
+                .unwrap();
+                assert_eq!(unchanged, bytes.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn misc_model_never_rewrites_unconfirmed_or_ordinary_requests() {
+        let mut messages = Vec::new();
+        for method in [
+            "thread/start",
+            "thread/fork",
+            "thread/resume",
+            "turn/start",
+            "thread/settings/update",
+        ] {
+            for source in [
+                None,
+                Some("automation"),
+                Some("thread_summary"),
+                Some("thread_title"),
+            ] {
+                for ephemeral in [None, Some(false), Some(true)] {
+                    if matches!(method, "thread/start" | "thread/fork")
+                        && source == Some("thread_title")
+                        && ephemeral == Some(true)
+                    {
+                        continue;
+                    }
+                    let mut params = serde_json::json!({"model":"gpt-6-luna","threadId":"ordinary",
+                        "turnTrigger":"thread_title", "input":"Generate a title",
+                        "config":{"mcp_servers":{"codey_fastctx":{"enabled":false}}}});
+                    if let Some(source) = source {
+                        params["threadSource"] = source.into();
+                    }
+                    if let Some(ephemeral) = ephemeral {
+                        params["ephemeral"] = ephemeral.into();
+                    }
+                    messages.push(
+                        serde_json::json!({"id":messages.len(),"method":method,"params":params})
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        messages.extend([
+            "invalid-json".into(),
+            "{}".into(),
+            "{\"id\":9,\"result\":{}}".into(),
+            "{\"method\":\"thread/start\",\"params\":null}".into(),
+        ]);
+        let input = format!(" {}\r\n", messages.join("\r\n "));
+        let mut output = Vec::new();
+        forward_app_server_input(
+            input.as_bytes(),
+            &mut output,
+            &["mcp_servers.codey_fastctx.command=codey".into()],
+            None,
+            false,
+            Some("configured/title-model"),
+        )
+        .unwrap();
+        assert_eq!(output, input.as_bytes());
+    }
+
+    #[test]
+    fn title_generation_does_not_replace_existing_or_user_mcp_transports() {
+        for server in [
+            serde_json::json!({"enabled":false,"command":"user-command","args":["keep"]}),
+            serde_json::json!({"enabled":false,"url":"https://user.example/mcp"}),
+            serde_json::json!({"enabled":true}),
+            serde_json::json!({"enabled":null}),
+            serde_json::Value::Null,
+        ] {
+            let mut message = serde_json::json!({"method":"thread/start","params":{
+                "threadSource":"thread_title","ephemeral":true,
+                "config":{"mcp_servers":{"codey_fastctx":server,"user":{"enabled":false}}}
+            }});
+            let before = message.clone();
+            assert!(!rewrite_title_generation_request(
+                &mut message,
+                &["mcp_servers.codey_fastctx.command=codey".into()],
+                None
+            ));
+            assert_eq!(message, before);
+        }
+    }
+
+    #[test]
+    fn input_relay_covers_title_configuration_without_enabling_a_router() {
+        for misc_model in [None, Some(""), Some("  ")] {
+            assert!(!app_server_input_relay_required(&[], misc_model));
+        }
+        for overrides in [
+            vec!["model_provider=codey_router".into()],
+            vec!["mcp_servers.codey_fastctx.command=codey".into()],
+        ] {
+            assert!(app_server_input_relay_required(&overrides, None));
+        }
+        assert!(app_server_input_relay_required(
+            &[],
+            Some("configured-title-model")
+        ));
+        assert!(!local_router_runtime_enabled(&[
+            "model_provider=openai".into()
+        ]));
     }
 
     #[test]

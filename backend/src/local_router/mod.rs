@@ -49,6 +49,7 @@ use crate::route_request_log::{
     RouteRequestLogReconfigure, RouteRequestLogStart, UpstreamTransport,
     observe_upstream_response_model,
 };
+use crate::system_proxy_client::SystemProxyClient;
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
 /// Codey 曾为原生远程压缩单独创建 Provider。旧配置可能残留这张表，这里只用于
@@ -195,6 +196,7 @@ mod native_response_fix;
 mod plugin_transport;
 mod portable_compaction;
 mod portable_history;
+mod rejected_reasoning;
 mod request_log_tap;
 mod request_meta;
 mod request_preparation;
@@ -233,6 +235,7 @@ pub(crate) use native_history::*;
 pub(crate) use native_response_fix::*;
 pub(crate) use portable_compaction::*;
 pub(crate) use portable_history::*;
+pub(crate) use rejected_reasoning::*;
 pub(crate) use request_log_tap::*;
 pub(crate) use request_meta::*;
 use request_preparation::*;

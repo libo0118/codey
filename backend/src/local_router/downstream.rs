@@ -1,4 +1,12 @@
 use super::*;
+#[cfg(test)]
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
 
 #[async_trait]
 pub(crate) trait ResponsesDownstream: Send {
@@ -35,6 +43,12 @@ pub(crate) trait ResponsesDownstream: Send {
     }
 
     fn set_streaming_errors(&mut self, _enabled: bool) {}
+
+    fn set_compaction_disconnect_monitor(&mut self, _enabled: bool) {}
+
+    fn compaction_disconnect_monitor(&self) -> bool {
+        false
+    }
 
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
         None
@@ -90,6 +104,10 @@ pub(crate) trait ResponsesDownstream: Send {
     async fn start_event_stream(&mut self) -> Result<()>;
     async fn write_event(&mut self, event: &Value) -> Result<()>;
     async fn finish_event_stream(&mut self) -> Result<()>;
+    /// 仅用于已成功交付并提交的压缩响应，传输收尾不再决定逻辑结果。
+    async fn finish_delivered_compaction_stream(&mut self) {
+        let _ = self.finish_event_stream().await;
+    }
     /// Relays a native upstream response. The probe, when present, records
     /// first-byte and completion timing; wrappers inject their own probe.
     async fn proxy_response_with_probe(
@@ -131,15 +149,17 @@ pub(crate) trait ResponsesDownstream: Send {
     }
 }
 
-// HTTP FIN cannot distinguish a legal write-half shutdown from cancellation.
-// HTTP also avoids an extra async-trait allocation on every response chunk.
+// 普通 HTTP 避免为每个响应块增加 async-trait 分配；压缩单独监视连接重置。
 pub(crate) async fn await_upstream<D, T, F>(downstream: &mut D, future: F) -> Result<T>
 where
     D: ResponsesDownstream + ?Sized,
     T: Send,
     F: std::future::Future<Output = T> + Send,
 {
-    if downstream.is_websocket() || downstream.event_stream_started() {
+    if downstream.is_websocket()
+        || downstream.event_stream_started()
+        || downstream.compaction_disconnect_monitor()
+    {
         downstream.wait_for_upstream(future).await
     } else {
         Ok(future.await)
@@ -260,6 +280,14 @@ where
 
     fn set_streaming_errors(&mut self, enabled: bool) {
         self.inner.set_streaming_errors(enabled);
+    }
+
+    fn set_compaction_disconnect_monitor(&mut self, enabled: bool) {
+        self.inner.set_compaction_disconnect_monitor(enabled);
+    }
+
+    fn compaction_disconnect_monitor(&self) -> bool {
+        self.inner.compaction_disconnect_monitor()
     }
 
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
@@ -383,6 +411,13 @@ where
         result
     }
 
+    async fn finish_delivered_compaction_stream(&mut self) {
+        if let Some(probe) = self.probe.as_ref() {
+            probe.finish_success();
+        }
+        self.inner.finish_delivered_compaction_stream().await;
+    }
+
     async fn proxy_response_with_probe(
         &mut self,
         response: reqwest::Response,
@@ -439,6 +474,9 @@ pub(crate) struct HttpResponsesDownstream {
     pub(crate) stream: TcpStream,
     event_stream_started: bool,
     streaming_errors: bool,
+    compaction_disconnect_monitor: bool,
+    #[cfg(test)]
+    write_pause: Option<(usize, oneshot::Receiver<()>)>,
 }
 
 impl HttpResponsesDownstream {
@@ -447,7 +485,64 @@ impl HttpResponsesDownstream {
             stream,
             event_stream_started: false,
             streaming_errors: false,
+            compaction_disconnect_monitor: false,
+            #[cfg(test)]
+            write_pause: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_json_write_after(&mut self, bytes: usize) -> oneshot::Sender<()> {
+        let (resume, resumed) = oneshot::channel();
+        self.write_pause = Some((bytes, resumed));
+        resume
+    }
+}
+
+#[cfg(test)]
+struct ControlledHttpWrite<'a> {
+    stream: &'a mut TcpStream,
+    remaining: Option<usize>,
+    resume: Option<oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl AsyncWrite for ControlledHttpWrite<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        // 写出真实响应的指定前缀后暂停，恢复信号也负责唤醒写入任务。
+        if this.remaining == Some(0) && !bytes.is_empty() {
+            let Some(resume) = this.resume.as_mut() else {
+                return Poll::Pending;
+            };
+            let resumed = std::task::ready!(Pin::new(resume).poll(cx));
+            this.resume = None;
+            if resumed.is_err() {
+                return Poll::Pending;
+            }
+            this.remaining = None;
+        }
+        let bytes = match this.remaining {
+            Some(remaining) => &bytes[..bytes.len().min(remaining)],
+            None => bytes,
+        };
+        let written = std::task::ready!(Pin::new(&mut *this.stream).poll_write(cx, bytes))?;
+        if let Some(remaining) = &mut this.remaining {
+            *remaining -= written;
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().stream).poll_shutdown(cx)
     }
 }
 
@@ -467,6 +562,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
         message: String,
         route: Option<&RouteTarget>,
     ) -> Result<()> {
+        begin_compaction_delivery();
         write_error_response(&mut self.stream, status, code, message, route).await
     }
     fn event_stream_started(&self) -> bool {
@@ -477,6 +573,14 @@ impl ResponsesDownstream for HttpResponsesDownstream {
         self.streaming_errors = enabled;
     }
 
+    fn set_compaction_disconnect_monitor(&mut self, enabled: bool) {
+        self.compaction_disconnect_monitor = enabled;
+    }
+
+    fn compaction_disconnect_monitor(&self) -> bool {
+        self.compaction_disconnect_monitor
+    }
+
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
     where
         T: Send,
@@ -484,6 +588,8 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     {
         if self.event_stream_started {
             await_http_stream_upstream(&mut self.stream, future).await
+        } else if self.compaction_disconnect_monitor {
+            await_http_admission(&mut self.stream, future).await
         } else {
             Ok(future.await)
         }
@@ -496,6 +602,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
         message: String,
         route: Option<&RouteTarget>,
     ) -> Result<()> {
+        begin_compaction_delivery();
         if self.streaming_errors || self.event_stream_started {
             return self
                 .write_response_failure(&ResponsesFailure::new(status, code, message, route))
@@ -505,6 +612,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_text_error(&mut self, status: u16, code: &str, message: String) -> Result<()> {
+        begin_compaction_delivery();
         if self.streaming_errors || self.event_stream_started {
             return self.write_error(status, code, message, None).await;
         }
@@ -512,6 +620,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        begin_compaction_delivery();
         if self.streaming_errors || self.event_stream_started {
             self.start_event_stream().await?;
             self.write_event(&failure.normalized_event()).await?;
@@ -541,6 +650,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_json_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        begin_compaction_delivery();
         if self.streaming_errors || self.event_stream_started {
             return self.write_response_failure(failure).await;
         }
@@ -557,10 +667,21 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
+        begin_compaction_delivery();
+        #[cfg(test)]
+        if let Some((remaining, resume)) = self.write_pause.take() {
+            let mut stream = ControlledHttpWrite {
+                stream: &mut self.stream,
+                remaining: Some(remaining),
+                resume: Some(resume),
+            };
+            return write_json_response(&mut stream, status, value).await;
+        }
         write_json_response(&mut self.stream, status, value).await
     }
 
     async fn start_event_stream(&mut self) -> Result<()> {
+        begin_compaction_delivery();
         if self.event_stream_started {
             return Ok(());
         }
@@ -579,6 +700,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
     }
 
     async fn write_event(&mut self, event: &Value) -> Result<()> {
+        begin_compaction_delivery();
         let event = normalized_response_event(event);
         write_responses_sse_event(&mut self.stream, &event).await
     }
@@ -669,6 +791,63 @@ pub(crate) struct AdaptedResponsesHistory {
 }
 
 const STREAMED_OUTPUT_ITEM_LIMIT: usize = 512;
+
+/// 返回序列化正文所需字节数的保守下界，用于让大型历史准备走阻塞路径。
+fn json_value_reaches_serialized_threshold(value: &Value, threshold: usize) -> bool {
+    fn add_raw(bytes: &mut usize, added: usize, threshold: usize) -> bool {
+        *bytes = bytes.saturating_add(added);
+        *bytes >= threshold
+    }
+
+    fn add(value: &Value, bytes: &mut usize, threshold: usize) -> bool {
+        let added = match value {
+            Value::Null | Value::Bool(_) => 4,
+            Value::Number(number) => number.to_string().len(),
+            Value::String(text) => text.len().saturating_add(2),
+            Value::Array(items) => {
+                let structural = 2_usize.saturating_add(items.len().saturating_sub(1));
+                return add_raw(bytes, structural, threshold)
+                    || items.iter().any(|item| add(item, bytes, threshold));
+            }
+            Value::Object(object) => {
+                let structural = 2_usize
+                    .saturating_add(3_usize.saturating_mul(object.len()))
+                    .saturating_add(object.len().saturating_sub(1));
+                if add_raw(bytes, structural, threshold) {
+                    return true;
+                }
+                for (key, value) in object {
+                    if add_raw(bytes, key.len(), threshold) || add(value, bytes, threshold) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        };
+        add_raw(bytes, added, threshold)
+    }
+
+    let mut bytes = 0;
+    add(value, &mut bytes, threshold)
+}
+
+fn is_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+fn run_history_preparation<T>(offload: bool, prepare: impl FnOnce() -> T) -> T {
+    if offload {
+        tokio::task::block_in_place(prepare)
+    } else {
+        prepare()
+    }
+}
+
+fn should_offload_history_preparation(body: &Value) -> bool {
+    json_value_reaches_serialized_threshold(body, REQUEST_JSON_OFFLOAD_BYTES)
+        && is_multi_thread_runtime()
+}
 
 impl AdaptedResponsesHistory {
     pub(crate) fn clear_pending(&mut self) {
@@ -807,7 +986,7 @@ impl AdaptedResponsesHistory {
     }
 
     pub(crate) fn prepare(&mut self, body: &mut Value) -> Result<bool> {
-        self.prepare_context(body, false, true, None)
+        self.prepare_context_maybe_offloaded(body, false, true, None)
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -819,7 +998,20 @@ impl AdaptedResponsesHistory {
         body: &mut Value,
         previous: Option<&Self>,
     ) -> Result<bool> {
-        self.prepare_context(body, true, false, previous)
+        self.prepare_context_maybe_offloaded(body, true, false, previous)
+    }
+
+    fn prepare_context_maybe_offloaded(
+        &mut self,
+        body: &mut Value,
+        native: bool,
+        expand: bool,
+        previous_history: Option<&Self>,
+    ) -> Result<bool> {
+        let offload = should_offload_history_preparation(body);
+        run_history_preparation(offload, || {
+            self.prepare_context(body, native, expand, previous_history)
+        })
     }
 
     fn prepare_context(
@@ -1065,5 +1257,120 @@ mod history_tests {
             assert!(error.to_string().contains("会话历史已失效"));
             assert!(history.pending_input.is_none());
         }
+    }
+
+    fn history_threshold_body(at_threshold: bool) -> Value {
+        let overhead = serde_json::to_vec(&json!({"input": ""})).unwrap().len();
+        let len = REQUEST_JSON_OFFLOAD_BYTES - overhead - 1 + usize::from(at_threshold);
+        json!({"input": "x".repeat(len)})
+    }
+
+    fn history_input(at_threshold: bool) -> Value {
+        let overhead = serde_json::to_vec(&json!({"input": ""})).unwrap().len();
+        let len = REQUEST_JSON_OFFLOAD_BYTES - overhead - 1 + usize::from(at_threshold);
+        json!("x".repeat(len))
+    }
+
+    #[test]
+    fn history_offload_threshold_uses_the_existing_request_boundary() {
+        let small = history_threshold_body(false);
+        let large = history_threshold_body(true);
+        assert_eq!(
+            serde_json::to_vec(&small).unwrap().len(),
+            REQUEST_JSON_OFFLOAD_BYTES - 1
+        );
+        assert_eq!(
+            serde_json::to_vec(&large).unwrap().len(),
+            REQUEST_JSON_OFFLOAD_BYTES
+        );
+        assert!(!json_value_reaches_serialized_threshold(
+            &small,
+            REQUEST_JSON_OFFLOAD_BYTES
+        ));
+        assert!(json_value_reaches_serialized_threshold(
+            &large,
+            REQUEST_JSON_OFFLOAD_BYTES
+        ));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(!should_offload_history_preparation(&small));
+            assert!(should_offload_history_preparation(&large));
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(!should_offload_history_preparation(&large));
+        });
+    }
+
+    #[test]
+    fn offloaded_history_preserves_expansion_budget_and_missing_history_behavior() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut history = AdaptedResponsesHistory::default();
+            let mut first = history_threshold_body(false);
+            assert!(!history.prepare(&mut first).unwrap());
+            history
+                .remember(
+                    "resp_codey_large",
+                    &[json!({"role":"assistant","content":"ok"})],
+                )
+                .unwrap();
+
+            let mut continuation = json!({
+                "previous_response_id": "resp_codey_large",
+                "input": history_input(true),
+            });
+            assert!(history.prepare(&mut continuation).unwrap());
+            assert!(continuation.get("previous_response_id").is_none());
+            assert_eq!(
+                continuation["input"],
+                json!([
+                    history_input(false),
+                    {"role":"assistant","content":"ok"},
+                    history_input(true),
+                ])
+            );
+            assert_eq!(history.pending_input.as_ref().unwrap().len(), 3);
+
+            history.clear_pending();
+            let mut missing = json!({
+                "input": history_threshold_body(true)["input"].clone(),
+            });
+            missing["previous_response_id"] = json!("resp_codey_missing");
+            let original = missing.clone();
+            let error = history.prepare(&mut missing).unwrap_err();
+            assert!(error.is::<MissingResponseHistory>());
+            assert_eq!(missing, original);
+            assert!(history.pending_input.is_none());
+
+            let mut history = AdaptedResponsesHistory {
+                last: Some((
+                    "resp-retained".into(),
+                    vec![json!({"role":"assistant","content":"retained"})],
+                )),
+                last_bytes: RETAINED_RESPONSE_BUDGET_BYTES,
+                ..Default::default()
+            };
+            let mut body = json!({
+                "input": history_threshold_body(true)["input"].clone(),
+            });
+            let original = body.clone();
+            assert!(history.prepare(&mut body).is_err());
+            assert_eq!(body, original);
+            assert!(history.pending_input.is_none());
+        });
     }
 }

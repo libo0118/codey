@@ -62,6 +62,7 @@
   let completionReconcileInFlight = false;
   let completionNextReconcileAt = 0;
   let completionReconcileSessionId = "";
+  let completionCandidateSessionId = "";
   let completionReconcileCheckTimer = 0;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
@@ -69,8 +70,8 @@
   let threadUpdatedAtFetchInFlight = false;
   const threadUpdatedAtCache = new Map();
   const threadWorkStateByRow = new WeakMap();
-  // React can briefly detach the native status rail or replace a virtualized
-  // row. Preserve the last confirmed running state until a delayed rescan.
+  // 同一主机和会话可出现在多个列表中。运行状态统一维护，行记录只保留
+  // 原生状态观测，不能用已显示的置顶标记恢复上一轮任务。
   const threadRunningStateByCacheKey = new Map();
   const threadRunningRecheckTimers = new Map();
   const projectRunningRecoveryClickedAt = new WeakMap();
@@ -91,6 +92,17 @@
     "[data-message-id]",
   ].join(", ");
   const canonicalConversationTurnSelector = "[data-turn-key]";
+  const sessionIdentityAttributes = [
+    "data-above-composer-conversation-id",
+    "data-session-id",
+    "data-conversation-id",
+    "data-thread-id",
+    "data-request-user-input-auto-resolution-conversation-id",
+    "data-response-annotation-conversation",
+  ];
+  const sessionIdentitySelector = sessionIdentityAttributes
+    .map((attribute) => `[${attribute}]`)
+    .join(", ");
   const sidebarScanRootSelector = [
     "header",
     "nav",
@@ -111,13 +123,22 @@
   const completedTaskReconcileIntervalMs = 15_000;
   // getSessionId() reads layout (getClientRects); calling it inside every
   // mutation batch forced a synchronous reflow per streamed chunk.
-  const completionReconcileMutationDelayMs = 250;
+  const completionReconcileMutationDelayMs = 1_000;
   const threadTimestampBridgePath = "/session/timestamps";
   const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const maxSessionCacheEntries = 2_048;
   const maxHardDeletedMessageKeys = 10_000;
   const maxPendingScanRoots = 64;
+  const maxIncrementalScanRootsPerFlush = 8;
+  const maxIncrementalScanDurationMs = 8;
+  const maxIncrementalMutationRecordsPerBatch = 512;
+  const maxIncrementalNodesPerBatch = 256;
+  const maxDeferredMutationTasks = 2_048;
+  const maxDeferredMutationBatches = 64;
+  const maxDeferredMutationNodes = 16_384;
+  const maxCriticalMutationProbeNodes = 16;
+  const maxAdjacentMessageSelectionRows = 9;
   const maxMessageLogicalGroupKeys = 4_096;
   const maxSelectedLogicalMessageKeys = 2_048;
   const projectRunningRecoveryClickCooldownMs = 1_000;
@@ -164,21 +185,34 @@
     return [...document.querySelectorAll(selector)].find(isRenderedSessionElement);
   };
 
-  const getSessionId = () => {
-    const attributes = [
-      // Codex keeps inactive conversations mounted. Prefer the visible
-      // composer, and never use an identifier from a hidden conversation.
-      "data-above-composer-conversation-id",
-      "data-session-id",
-      "data-conversation-id",
-      "data-thread-id",
-      "data-request-user-input-auto-resolution-conversation-id",
-      "data-response-annotation-conversation",
-    ];
-    for (const attribute of attributes) {
-      const value = visibleSessionElement(`[${attribute}]`)?.getAttribute(attribute);
-      if (value) return value.replace(/^local:/, "");
+  const visibleSessionIdentityValue = () => {
+    // Codex keeps inactive conversations mounted. Query the combined selector
+    // once, then apply the attribute order only to visible candidates.
+    let candidates = [...(document.querySelectorAll?.(sessionIdentitySelector) || [])];
+    if (!candidates.length) {
+      // A few test DOMs and older renderer shims do not implement compound
+      // selector matching. Keep the production fast path and fall back per
+      // attribute so a visible session switch still invalidates the interval.
+      candidates = sessionIdentityAttributes.flatMap((attribute) => {
+        const selector = `[${attribute}]`;
+        const first = document.querySelector?.(selector);
+        const all = [...(document.querySelectorAll?.(selector) || [])];
+        return first && !all.includes(first) ? [first, ...all] : all;
+      });
     }
+    const visibleCandidates = candidates.filter(isRenderedSessionElement);
+    for (const attribute of sessionIdentityAttributes) {
+      const value = visibleCandidates
+        .find((element) => element.hasAttribute?.(attribute))
+        ?.getAttribute(attribute);
+      if (value) return String(value).replace(/^local:/, "");
+    }
+    return "";
+  };
+
+  const getSessionId = () => {
+    const sessionIdentity = visibleSessionIdentityValue();
+    if (sessionIdentity) return sessionIdentity;
     const activeThread = visibleSessionElement('[data-app-action-sidebar-thread-active="true"]')
       ?.getAttribute("data-app-action-sidebar-thread-id");
     if (activeThread) return activeThread.replace(/^local:/, "");
@@ -186,6 +220,7 @@
     if (match) return match[1];
     return new URLSearchParams(location.search).get("conversation_id") || new URLSearchParams(location.search).get("session_id") || "";
   };
+  const sessionIdentityCandidate = visibleSessionIdentityValue;
 
   const sidebarTitles = (root = document) => queryWithin(root,
     "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
@@ -676,8 +711,8 @@
   );
 
   const addStyle = () => {
-    if (document.getElementById(styleId)) return;
-    const style = document.createElement("style");
+    // 重新注入时沿用同一节点但刷新规则，新增的样式不必等页面重载。
+    const style = document.getElementById(styleId) || document.createElement("style");
     style.id = styleId;
     style.textContent = `
       #${toolbarId} { -webkit-app-region: no-drag !important; position: fixed; right: 18px; top: 60px; z-index: 2147483644; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid rgba(124, 140, 255, .44); border-radius: 999px; background: rgba(20, 24, 36, .68); color: rgba(238, 242, 255, .94); box-shadow: 0 8px 24px rgba(0,0,0,.18); backdrop-filter: blur(10px); font: 12px/1 system-ui, sans-serif; }
@@ -699,6 +734,7 @@
       [data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title],
       [data-app-action-sidebar-project-row][data-app-action-sidebar-project-id] { position: relative; }
       :where([data-codey-message-row]) { position: relative; }
+      [data-codey-hard-deleted="true"] { display: none !important; }
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
@@ -714,7 +750,106 @@
       #${sidebarActionTooltipId} { position: fixed; z-index: 2147483647; max-width: min(20rem, calc(100vw - 16px)); pointer-events: none; }
       [data-codey-pet-control-blocked="true"] { display: none !important; pointer-events: none !important; }
     `;
-    document.documentElement.appendChild(style);
+    if (!style.isConnected) document.documentElement.appendChild(style);
+  };
+
+  // 宿主模式删除后要让宿主丢弃并重新载入会话，视图会短暂清空再重建。重载期间用
+  // 当前画面的静态副本盖住对话区和输入框，重建完成、恢复滚动位置后再淡出。
+  const reloadMaskAttribute = "data-codey-reload-mask";
+  // 副本保留样式依赖的 id、类名和 data-thread-* 等属性，只去掉让扫描器把它当成
+  // 真实轮次或输入框的标记；副本排在原节点之后，按 id 查找仍先命中原节点。
+  const reloadMaskStrippedAttribute = (name, value) => (
+    name === "data-turn-key" || name === "data-message-author-role" || name === "data-message-id"
+    || name === "data-testid" || name === "contenteditable" || name.startsWith("data-app-action-")
+    || (name === "role" && value === "textbox")
+  );
+  const opaqueBackgroundColor = (element) => {
+    for (let node = element; node instanceof Element; node = node.parentElement) {
+      const color = getComputedStyle(node).backgroundColor;
+      if (color && color !== "transparent" && !/^rgba\([^)]*,\s*0\)$/.test(color)) return color;
+    }
+    return "";
+  };
+  const firstVisibleTurnAnchor = (scroller) => {
+    const top = scroller.getBoundingClientRect().top;
+    for (const row of scroller.querySelectorAll(canonicalConversationTurnSelector)) {
+      const rect = row.getBoundingClientRect();
+      if (rect.height > 0 && rect.bottom > top + 1) {
+        return { key: row.getAttribute("data-turn-key"), offset: rect.top - top };
+      }
+    }
+    return null;
+  };
+  const createConversationReloadMask = () => {
+    const scroller = document.querySelector(".thread-scroll-container");
+    if (!(scroller instanceof HTMLElement) || !scroller.parentElement) return null;
+    const rect = scroller.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const background = opaqueBackgroundColor(scroller);
+    const anchor = firstVisibleTurnAnchor(scroller);
+    const footer = [...scroller.children].find((child) => child.hasAttribute("data-thread-scroll-footer"));
+    const layers = [];
+    const addLayer = (source, box, removeFooter) => {
+      const layer = source.cloneNode(true);
+      if (removeFooter) {
+        [...layer.children].find((child) => child.hasAttribute("data-thread-scroll-footer"))?.remove();
+      }
+      for (const element of [layer, ...layer.querySelectorAll("*")]) {
+        for (const { name, value } of [...element.attributes]) {
+          if (reloadMaskStrippedAttribute(name, value)) element.removeAttribute(name);
+        }
+      }
+      Object.assign(layer.style, {
+        position: "fixed", left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`,
+        height: `${box.height}px`, margin: "0", zIndex: String(40 + layers.length), pointerEvents: "none",
+        background, opacity: "1", transition: "opacity 120ms ease",
+      });
+      layer.setAttribute(reloadMaskAttribute, "true");
+      layer.setAttribute("aria-hidden", "true");
+      layer.inert = true;
+      scroller.parentElement.appendChild(layer);
+      // 祖先若带 transform，fixed 会相对它定位；按实际偏差校正一次。
+      const placed = layer.getBoundingClientRect();
+      if (Math.abs(placed.left - box.left) > 0.5 || Math.abs(placed.top - box.top) > 0.5) {
+        layer.style.left = `${box.left * 2 - placed.left}px`;
+        layer.style.top = `${box.top * 2 - placed.top}px`;
+      }
+      layers.push(layer);
+      return layer;
+    };
+    addLayer(scroller, rect, true).scrollTop = scroller.scrollTop;
+    if (footer instanceof HTMLElement) addLayer(footer, footer.getBoundingClientRect(), false);
+    let released = false;
+    return {
+      async settle() {
+        const startedAt = performance.now();
+        let lastHeight = -1;
+        let stableReads = 0;
+        while (performance.now() - startedAt < 2500) {
+          await new Promise((resolve) => window.setTimeout(resolve, 50));
+          const live = document.querySelector(`.thread-scroll-container:not([${reloadMaskAttribute}])`);
+          if (!live?.querySelector(canonicalConversationTurnSelector)) {
+            stableReads = 0;
+            continue;
+          }
+          stableReads = live.scrollHeight === lastHeight ? stableReads + 1 : 0;
+          lastHeight = live.scrollHeight;
+          if (stableReads < 3 || performance.now() - startedAt < 150) continue;
+          const row = anchor && [...live.querySelectorAll(canonicalConversationTurnSelector)]
+            .find((candidate) => candidate.getAttribute("data-turn-key") === anchor.key);
+          if (row) {
+            live.scrollTop += row.getBoundingClientRect().top - live.getBoundingClientRect().top - anchor.offset;
+          }
+          return;
+        }
+      },
+      release() {
+        if (released) return;
+        released = true;
+        for (const layer of layers) layer.style.opacity = "0";
+        window.setTimeout(() => layers.forEach((layer) => layer.remove()), 140);
+      },
+    };
   };
 
   const logicalAnchorForMessageRow = (row) => messageLogicalAnchorByRow.get(row) || row;
@@ -1330,13 +1465,18 @@
     return [...(element.children || [])].some((child) => nativeElementLooksLikeThreadStatus(child));
   };
 
-  const nativeThreadWorkInProgress = (row) => {
+  const nativeThreadWorkState = (row) => {
     const statusState = nativeReactThreadStatusState(row);
-    if (nativeThreadStatusTypeLooksActive(statusState?.type)) {
-      return true;
-    }
+    const completed = /^(?:complete(?:d)?|finished|done|error|failed|failure|interrupted|cancelled|canceled|stopped)$/i
+      .test(String(statusState?.type || "").trim());
     const { trailing } = threadUpdatedAtPlacement(row);
-    return (trailing || []).some((candidate) => nativeElementLooksLikeThreadStatus(candidate));
+    return {
+      completed,
+      workInProgress: !completed && (
+        nativeThreadStatusTypeLooksActive(statusState?.type)
+        || (trailing || []).some((candidate) => nativeElementLooksLikeThreadStatus(candidate))
+      ),
+    };
   };
 
   const threadKindFromRow = (row) => {
@@ -1393,6 +1533,43 @@
     threadRunningRecheckTimers.delete(cacheKey);
   };
 
+  const threadObservationMatchesRow = (row, observation, cacheKey) => (
+    observation?.cacheKey === cacheKey
+    && observation.hostId === threadHostIdFromRow(row)
+    && observation.sessionId === threadSessionIdFromRow(threadIdentityNode(row) || row)
+  );
+
+  const syncThreadRunningRows = (cacheKey, workInProgress) => {
+    forEachTrackedThreadRow((row) => {
+      const observation = threadWorkStateByRow.get(row);
+      if (!threadObservationMatchesRow(row, observation, cacheKey)) return;
+      // 其他列表未更新的运行图标仍属于上一轮，需先观测到非运行状态，
+      // 该行后续的运行信号才可启动新一轮。
+      if (!workInProgress && observation.detectedWorkInProgress) observation.suppressed = true;
+      updateThreadRunningPriority(row, workInProgress);
+    });
+  };
+
+  const finishThreadRunningState = (cacheKey, state) => {
+    state.workInProgress = false;
+    state.missingSince = null;
+    state.completionVersion = (state.completionVersion || 0) + 1;
+    rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
+    cancelThreadRunningRecheck(cacheKey);
+    syncThreadRunningRows(cacheKey, false);
+    return false;
+  };
+
+  const hasObservedThreadWorkInProgress = (cacheKey) => {
+    let running = false;
+    forEachTrackedThreadRow((row) => {
+      const observation = threadWorkStateByRow.get(row);
+      if (observation?.detectedWorkInProgress && !observation.suppressed
+        && threadObservationMatchesRow(row, observation, cacheKey)) running = true;
+    });
+    return running;
+  };
+
   const scheduleThreadRunningRecheck = (cacheKey, delayMs) => {
     if (disposed || !cacheKey || threadRunningRecheckTimers.has(cacheKey)) return;
     const timer = window.setTimeout(() => {
@@ -1407,8 +1584,9 @@
       }
       refreshTrackedThreadUpdatedTimes();
       const current = threadRunningStateByCacheKey.get(cacheKey);
-      if (current === state && current?.missingSince === state.missingSince) {
-        threadRunningStateByCacheKey.delete(cacheKey);
+      if (current?.workInProgress && Number.isFinite(current.missingSince)
+        && Date.now() - current.missingSince >= threadRunningLossGraceMs) {
+        finishThreadRunningState(cacheKey, current);
       }
     }, Math.max(0, Number(delayMs) || 0));
     threadRunningRecheckTimers.set(cacheKey, timer);
@@ -1417,11 +1595,13 @@
   const stableThreadWorkInProgress = (
     cacheKey,
     detectedWorkInProgress,
-    previouslyRunning = false,
+    completed = false,
     runningContext = {},
     now = Date.now(),
   ) => {
     if (!cacheKey) return detectedWorkInProgress;
+    const state = threadRunningStateByCacheKey.get(cacheKey);
+    if (completed) return finishThreadRunningState(cacheKey, { ...state, ...runningContext });
     if (detectedWorkInProgress) {
       rememberBoundedMapValue(
         threadRunningStateByCacheKey,
@@ -1430,20 +1610,21 @@
           ...(threadRunningStateByCacheKey.get(cacheKey) || {}),
           ...runningContext,
           missingSince: null,
+          workInProgress: true,
         },
       );
       cancelThreadRunningRecheck(cacheKey);
       return true;
     }
-    let state = threadRunningStateByCacheKey.get(cacheKey);
-    if (!state && previouslyRunning) {
-      state = { ...runningContext, missingSince: now };
-      rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
-    }
-    if (!state) return false;
+    if (!state?.workInProgress) return false;
     if (runningContext.sessionId) state.sessionId = runningContext.sessionId;
     if (runningContext.hostId) state.hostId = runningContext.hostId;
     if (runningContext.projectListId) state.projectListId = runningContext.projectListId;
+    if (hasObservedThreadWorkInProgress(cacheKey)) {
+      state.missingSince = null;
+      cancelThreadRunningRecheck(cacheKey);
+      return true;
+    }
     if (!Number.isFinite(state.missingSince)) {
       state.missingSince = now;
       rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
@@ -1453,13 +1634,12 @@
       scheduleThreadRunningRecheck(cacheKey, remainingMs);
       return true;
     }
-    threadRunningStateByCacheKey.delete(cacheKey);
-    cancelThreadRunningRecheck(cacheKey);
-    return false;
+    return finishThreadRunningState(cacheKey, state);
   };
 
   const sidebarThreadTimestampState = (row, now = Date.now()) => {
-    const detectedWorkInProgress = nativeThreadWorkInProgress(row);
+    const nativeState = nativeThreadWorkState(row);
+    const detectedWorkInProgress = nativeState.workInProgress;
     const identity = threadIdentityNode(row);
     if (!(identity instanceof HTMLElement)) {
       return {
@@ -1485,22 +1665,45 @@
     }
     const cacheKey = threadTimestampCacheKey(hostId, sessionId);
     const previous = threadWorkStateByRow.get(row);
-    if (previous?.cacheKey && previous.cacheKey !== cacheKey) {
+    // 仅在临时会话获得正式 ID 时迁移状态；复用行或切换主机不能迁移其他
+    // 会话的运行状态，也不能取消其复查定时器。
+    if (previous?.cacheKey !== cacheKey && previous?.hostId === hostId
+      && previous?.sessionId?.startsWith("client-new-thread:")
+      && !sessionId.startsWith("client-new-thread:")) {
       const previousRunningState = threadRunningStateByCacheKey.get(previous.cacheKey);
       if (previousRunningState && !threadRunningStateByCacheKey.has(cacheKey)) {
         rememberBoundedMapValue(
           threadRunningStateByCacheKey,
           cacheKey,
-          previousRunningState,
+          { ...previousRunningState, hostId, sessionId },
         );
       }
       threadRunningStateByCacheKey.delete(previous.cacheKey);
       cancelThreadRunningRecheck(previous.cacheKey);
     }
+    const shared = threadRunningStateByCacheKey.get(cacheKey);
+    const sameIdentity = previous?.cacheKey === cacheKey;
+    const observation = {
+      cacheKey,
+      completionVersion: shared?.completionVersion || 0,
+      detectedWorkInProgress,
+      hostId,
+      nativeCompleted: nativeState.completed,
+      sessionId,
+      suppressed: detectedWorkInProgress && sameIdentity && (
+        previous.suppressed === true
+        || (previous.detectedWorkInProgress && (
+          shared?.workInProgress === false
+          || (previous.completionVersion || 0) < (shared?.completionVersion || 0)
+        ))
+      ),
+    };
+    threadWorkStateByRow.set(row, observation);
+    const previouslyRunning = shared?.workInProgress === true;
     const workInProgress = stableThreadWorkInProgress(
       cacheKey,
-      detectedWorkInProgress,
-      previous?.workInProgress === true,
+      detectedWorkInProgress && !observation.suppressed,
+      nativeState.completed && (!sameIdentity || !previous.nativeCompleted),
       {
         hostId,
         projectListId: threadProjectListIdFromRow(row),
@@ -1508,13 +1711,8 @@
       },
       now,
     );
-    const completedWork = Boolean(
-      previous
-      && previous.cacheKey === cacheKey
-      && previous.workInProgress
-      && !workInProgress
-    );
-    threadWorkStateByRow.set(row, { cacheKey, workInProgress });
+    const completedWork = previouslyRunning && !workInProgress;
+    if (!previouslyRunning && workInProgress) syncThreadRunningRows(cacheKey, true);
     return {
       cacheKey,
       completedWork,
@@ -1647,7 +1845,7 @@
   const recoverHiddenRunningThreads = (root = document) => {
     if (!threadRunningStateByCacheKey.size) return;
     const runningStates = [...threadRunningStateByCacheKey.values()]
-      .filter((state) => state?.sessionId);
+      .filter((state) => state?.sessionId && state.workInProgress);
     if (!runningStates.length) return;
     const now = Date.now();
     projectListsForRunningRecovery(root).forEach((projectList) => {
@@ -2004,7 +2202,52 @@
     return key ? element[key] : null;
   };
 
-  const collectAppServerScopeCandidates = (root, candidates, seen) => {
+  const inspectAppServerScopeValue = (value) => {
+    let descriptors;
+    try {
+      descriptors = Object.getOwnPropertyDescriptors(value);
+    } catch {
+      return null;
+    }
+    const hasFunction = (name) => {
+      if (typeof descriptors[name]?.value === "function") return true;
+      try {
+        return typeof value[name] === "function";
+      } catch {
+        return false;
+      }
+    };
+    return {
+      candidate: hasFunction("get")
+        && hasFunction("set")
+        && hasFunction("watch")
+        && hasFunction("when")
+        && Object.prototype.hasOwnProperty.call(descriptors, "query"),
+      descriptors,
+      children: null,
+    };
+  };
+
+  const appServerScopeChildren = (inspection) => {
+    if (inspection.children) return inspection.children;
+    const children = [];
+    for (const [key, descriptor] of Object.entries(inspection.descriptors)) {
+      if (
+        !Object.prototype.hasOwnProperty.call(descriptor, "value")
+        || ["return", "child", "sibling", "alternate", "stateNode", "_owner"].includes(key)
+      ) continue;
+      const nested = descriptor.value;
+      if (nested && (typeof nested === "object" || typeof nested === "function")) children.push(nested);
+    }
+    inspection.children = children;
+    inspection.descriptors = null;
+    return children;
+  };
+
+  // `inspections` memoizes per-object results for one synchronous scan. Fibers
+  // share large objects (one has ~35k own keys), and re-enumerating them for
+  // every fiber blocked the main thread for ~2 s per failed discovery.
+  const collectAppServerScopeCandidates = (root, candidates, seen, inspections) => {
     const queue = [{ depth: 0, value: root }];
     let cursor = 0;
     let inspected = 0;
@@ -2018,39 +2261,16 @@
       ) continue;
       seen.add(value);
       inspected += 1;
-      let descriptors;
-      try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {
-        continue;
+      let inspection = inspections.get(value);
+      if (inspection === undefined) {
+        inspection = inspectAppServerScopeValue(value);
+        inspections.set(value, inspection);
       }
-      const hasFunction = (name) => {
-        if (typeof descriptors[name]?.value === "function") return true;
-        try {
-          return typeof value[name] === "function";
-        } catch {
-          return false;
-        }
-      };
-      if (
-        hasFunction("get")
-        && hasFunction("set")
-        && hasFunction("watch")
-        && hasFunction("when")
-        && Object.prototype.hasOwnProperty.call(descriptors, "query")
-      ) {
-        candidates.push(value);
-      }
+      if (!inspection) continue;
+      if (inspection.candidate) candidates.push(value);
       if (depth >= 6) continue;
-      for (const [key, descriptor] of Object.entries(descriptors)) {
-        if (
-          !Object.prototype.hasOwnProperty.call(descriptor, "value")
-          || ["return", "child", "sibling", "alternate", "stateNode", "_owner"].includes(key)
-        ) continue;
-        const nested = descriptor.value;
-        if (nested && (typeof nested === "object" || typeof nested === "function")) {
-          queue.push({ depth: depth + 1, value: nested });
-        }
+      for (const nested of appServerScopeChildren(inspection)) {
+        queue.push({ depth: depth + 1, value: nested });
       }
     }
   };
@@ -2065,15 +2285,16 @@
       document.body,
     ].filter((element) => element instanceof HTMLElement))].slice(0, 32);
     const seenScopes = new WeakSet();
+    const inspections = new WeakMap();
     for (const element of elements) {
       let fiber = reactFiberFromElement(element);
       for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
         const candidates = [];
         const seenValues = new WeakSet();
-        collectAppServerScopeCandidates(fiber.memoizedState, candidates, seenValues);
-        collectAppServerScopeCandidates(fiber.memoizedProps, candidates, seenValues);
-        collectAppServerScopeCandidates(fiber.dependencies, candidates, seenValues);
-        collectAppServerScopeCandidates(fiber.updateQueue, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.memoizedState, candidates, seenValues, inspections);
+        collectAppServerScopeCandidates(fiber.memoizedProps, candidates, seenValues, inspections);
+        collectAppServerScopeCandidates(fiber.dependencies, candidates, seenValues, inspections);
+        collectAppServerScopeCandidates(fiber.updateQueue, candidates, seenValues, inspections);
         for (const scope of candidates) {
           if (seenScopes.has(scope)) continue;
           seenScopes.add(scope);
@@ -2135,9 +2356,134 @@
   };
   window.__codeyAppServerManagerRegistryResolverFromModule = appServerManagerRegistryResolverFromModule;
 
+  // Codex 26.1027 起 AppServerManager 运行在桌面宿主进程，页面只在宿主连接
+  // 信号里持有它的 RPC 存根：{status:"ready", client:{hostId, rpc}}。存根的任意
+  // 属性都可调用，只能按原型上的 dup/onRpcBroken 识别。
+  const isAppServerRpcStub = (value) => (
+    typeof value === "function"
+    && Boolean(declaredMethod(value, "dup"))
+    && Boolean(declaredMethod(value, "onRpcBroken"))
+  );
+  const hostedAppServerConnection = (state, hostId) => (
+    state?.status === "ready"
+    && state.client?.hostId === hostId
+    && isAppServerRpcStub(state.client.rpc)
+  );
+
+  // RPC 结果用完即释放，与 Codex 自己调用宿主接口的方式一致。
+  const callHostedAppServer = async (call) => {
+    const pending = call();
+    try {
+      return await pending;
+    } finally {
+      try { pending?.[Symbol.dispose]?.(); } catch {}
+    }
+  };
+
+  // 与资源补丁里的 codeyReconcileCompletedConversation 同一判定：原生 app-server
+  // 两次确认已结束、其间没有新提交，才退订并按重连恢复的方式重新载入。宿主不暴露
+  // 流修订号，改为比对进行中的轮次；尚未确认的提交没有轮次 ID，不会被当作卡住。
+  const reconcileHostedConversation = async (rpc, params) => {
+    const conversationId = params?.conversationId;
+    if (conversationId == null) return false;
+    const runningTurnId = async () => {
+      const [state, role] = await Promise.all([
+        callHostedAppServer(() => rpc().getThreadExecutionState(conversationId)),
+        callHostedAppServer(() => rpc().getStreamRole(conversationId)),
+      ]);
+      return state?.inProgress === true && state.activeTurnId != null && role?.role !== "follower"
+        ? state.activeTurnId : null;
+    };
+    const readStatus = async () => {
+      const response = await callHostedAppServer(() => rpc().sendRequest("thread/read", {
+        threadId: conversationId,
+        includeTurns: false,
+      }));
+      const status = response?.thread?.status;
+      return typeof status === "string" ? status : status?.type;
+    };
+    const turnId = await runningTurnId();
+    if (turnId == null) return false;
+    const status = await readStatus();
+    if (status !== "idle" && status !== "systemError" && status !== "error") return false;
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    if (await readStatus() !== status || await runningTurnId() !== turnId) return false;
+    const cwd = await callHostedAppServer(() => rpc().getConversationCwd(conversationId));
+    // 宿主只在本窗口持有该会话的历史流时退订，退订后标记 needs_resume 并释放流。
+    await callHostedAppServer(() => rpc().unsubscribeInactiveConversation(conversationId));
+    if (await runningTurnId() === turnId) return false;
+    await callHostedAppServer(() => rpc().resumeConversation({
+      ...params,
+      workspaceRoots: params.workspaceRoots?.length ? params.workspaceRoots : cwd ? [cwd] : ["/"],
+    }));
+    const state = await callHostedAppServer(() => rpc().getThreadExecutionState(conversationId));
+    return state != null && state.inProgress !== true;
+  };
+
+  // 宿主托管时页面拿不到会话状态：删除前由宿主退订并标记待恢复，再按原流程直接
+  // 退订一次（宿主只在本窗口持有历史流时才会发出）；app-server 仍可能保留已加载的
+  // 会话，后端为此记录删除墓碑并在启动维护时重放。完成后经宿主恢复重建页面历史。
+  const prepareHostedMessageDeletion = async (rpc, conversationId) => {
+    const [state, role] = await Promise.all([
+      callHostedAppServer(() => rpc().getThreadExecutionState(conversationId)),
+      callHostedAppServer(() => rpc().getStreamRole(conversationId)),
+    ]);
+    if (state == null) throw new Error("当前会话尚未加载，请打开该对话后再删除");
+    if (state.inProgress === true) throw new Error("当前任务仍在运行，请等待任务结束后再删除");
+    if (role?.role === "follower") throw new Error("请在拥有当前会话的窗口中删除消息");
+    await callHostedAppServer(() => rpc().unsubscribeInactiveConversation(conversationId));
+    await callHostedAppServer(() => rpc().sendRequest("thread/unsubscribe", { threadId: conversationId }));
+  };
+  const finishHostedMessageDeletion = async (rpc, conversationId, messageIds = []) => {
+    if (messageIds.length) {
+      // 宿主恢复和后台补读都会把已载入的旧轮次并回来，正在查看时也不会清空。
+      // 让宿主丢弃该会话的缓存，打开中的对话随即按改写后的文件重新载入；
+      // 丢弃会移除列表摘要，随后刷新会话列表补回。
+      await callHostedAppServer(() => rpc().discardConversationFromCache(conversationId));
+      await callHostedAppServer(() => rpc().refreshRecentConversations());
+      return;
+    }
+    const cwd = await callHostedAppServer(() => rpc().getConversationCwd(conversationId));
+    const result = await callHostedAppServer(() => rpc().resumeConversation({
+      conversationId,
+      model: null,
+      reasoningEffort: null,
+      workspaceRoots: [cwd || "/"],
+    }));
+    if (result?.status !== "ready") throw new Error("Codex 暂时无法重新载入当前对话");
+  };
+
+  // 每次调用都重新读取连接信号：宿主重连会换存根，不能继续用已断开的旧连接。
+  const hostedAppServerManagers = new WeakMap();
+  // 重新注入时旧脚本缓存的适配器可能缺少新方法，只信任本次脚本创建的实例。
+  const ownHostedAppServerManagers = new WeakSet();
+  const hostedAppServerManager = (scope, family, hostId) => {
+    const cached = hostedAppServerManagers.get(family);
+    if (cached) return cached;
+    const rpc = () => {
+      const state = scope.get(family, hostId);
+      if (!hostedAppServerConnection(state, hostId)) throw new Error("Codex 宿主会话接口未连接");
+      return state.client.rpc;
+    };
+    const manager = {
+      codeyHostedAppServerManager: true,
+      sendRequest: (method, params) => callHostedAppServer(() => (
+        params === undefined ? rpc().sendRequest(method) : rpc().sendRequest(method, params)
+      )),
+      refreshRecentConversations: () => callHostedAppServer(() => rpc().refreshRecentConversations()),
+      codeyReconcileCompletedConversation: (params) => reconcileHostedConversation(rpc, params),
+      codeyPrepareMessageDeletion: (conversationId) => prepareHostedMessageDeletion(rpc, conversationId),
+      codeyFinishMessageDeletion: (conversationId, messageIds) => finishHostedMessageDeletion(rpc, conversationId, messageIds),
+    };
+    hostedAppServerManagers.set(family, manager);
+    ownHostedAppServerManagers.add(manager);
+    return manager;
+  };
+
   const cachedAppServerManagerFromScope = (scope, hostId) => {
     if (hostId !== "local") return null;
     const managers = new Set();
+    const connections = new Set();
     const seenFamilies = new Set();
     const nodes = new Set([scope.node, ...scope.chain?.values?.() || []]);
     for (const node of nodes) {
@@ -2149,6 +2495,10 @@
         seenFamilies.add(family);
         try {
           const manager = scope.get(family, hostId);
+          if (hostedAppServerConnection(manager, hostId)) {
+            connections.add(family);
+            continue;
+          }
           const client = manager && Object.getOwnPropertyDescriptor(manager, "requestClient")?.value;
           if (client?.hostId !== hostId || !declaredMethod(manager, "sendRequest")
             || !["enqueueRequest", "createRequest", "onResult"].every((method) => declaredMethod(client, method))) continue;
@@ -2158,7 +2508,10 @@
         }
       }
     }
-    return managers.size === 1 ? managers.values().next().value : null;
+    if (managers.size) return managers.size === 1 ? managers.values().next().value : null;
+    return connections.size === 1
+      ? hostedAppServerManager(scope, connections.values().next().value, hostId)
+      : null;
   };
 
   const appServerManagerRegistryResolverFromSource = (source, module) => {
@@ -2274,11 +2627,16 @@
 
   const managerSessionController = (manager) => {
     const canDeleteMessages = isLocalMessageDeletionManager(manager);
+    const hostedDeletion = !canDeleteMessages && ownHostedAppServerManagers.has(manager);
     return {
       kind: "manager",
       manager,
-      prepareMessageDeletion: canDeleteMessages ? messageDeletionMethods.prepare.bind(manager) : null,
-      finishMessageDeletion: canDeleteMessages ? messageDeletionMethods.finish.bind(manager) : null,
+      // RPC 存根的任意属性都像函数，宿主删除只认本脚本创建的适配器。
+      prepareMessageDeletion: canDeleteMessages ? messageDeletionMethods.prepare.bind(manager)
+        : hostedDeletion ? (conversationId) => manager.codeyPrepareMessageDeletion(conversationId) : null,
+      finishMessageDeletion: canDeleteMessages ? messageDeletionMethods.finish.bind(manager)
+        : hostedDeletion ? (conversationId, messageIds) => manager.codeyFinishMessageDeletion(conversationId, messageIds) : null,
+      reloadsConversationAfterDeletion: hostedDeletion,
       refreshRecentConversations: typeof manager.refreshRecentConversations === "function"
         ? () => manager.refreshRecentConversations() : null,
       reconcileCompletedConversation: typeof manager.codeyReconcileCompletedConversation === "function"
@@ -2353,11 +2711,21 @@
     if (sessionControllerLooksUsable(window.__codeyCodexSessionController, feature)) {
       return window.__codeyCodexSessionController;
     }
+    const hostedUnsupported = () => new Error("Codex 的会话管理运行在桌面宿主进程，页面无法接管该接口");
+    // 宿主进程里的管理器只开放 RPC 方法；请求客户端与本地会话状态都不在页面里，
+    // 资源模块中也没有别的实例，已确认后不再重扫 React 或逐个导入资源。
+    if (ownHostedAppServerManagers.has(window.__codeyCodexSessionController?.manager)) {
+      throw hostedUnsupported();
+    }
     const cachedManager = appServerManagerFromReact(cachedAppServerManagerFromScope);
     const cachedController = cachedManager && managerSessionController(cachedManager);
     if (sessionControllerLooksUsable(cachedController, feature)) {
       window.__codeyCodexSessionController = cachedController;
       return cachedController;
+    }
+    if (cachedManager?.codeyHostedAppServerManager === true) {
+      window.__codeyCodexSessionController = cachedController;
+      throw hostedUnsupported();
     }
     let fallbackDispatcher = typeof window.__codeyCodexSignalDispatcher === "function"
       ? window.__codeyCodexSignalDispatcher
@@ -2459,7 +2827,10 @@
         return registered;
       }
       state.failures += 1;
-      state.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(state.failures - 1, 5));
+      // 完成状态同步只是后台修复，由 15 秒定时器和页面事件反复触发；接口长期
+      // 不可用时每轮失败发现都要遍历 React 树，上限放宽到 5 分钟。
+      const maxRetryMs = feature === "reconcile" ? 300_000 : 30_000;
+      state.retryAt = Date.now() + Math.min(maxRetryMs, 1_000 * 2 ** Math.min(state.failures - 1, 9));
       const capabilityError = unavailableCapability(feature);
       // 探测超时、资源导入失败等真实原因要带进抛出的错误里：capability 状态
       // 对用户保持通用文案，但错误日志需要能区分结构漂移和探测失败。
@@ -2625,19 +2996,27 @@
 
   const reconcileStaleCompletedTask = async () => {
     if (disposed || document.visibilityState === "hidden") return false;
-    const sessionId = getSessionId();
+    const now = Date.now();
+    if (completionReconcileInFlight) return false;
+    const candidateSessionId = sessionIdentityCandidate();
+    const candidateChanged = (
+      candidateSessionId
+      && candidateSessionId !== completionCandidateSessionId
+    );
+    // A cheap attribute lookup detects session switches. The geometry-based
+    // getSessionId() lookup stays on the throttled/reconcile path.
+    if (!candidateChanged && now < completionNextReconcileAt) return false;
+    completionCandidateSessionId = candidateSessionId;
+    const sessionId = candidateSessionId || getSessionId();
     if (!sessionId) {
       completionReconcileSessionId = "";
-      completionNextReconcileAt = 0;
       return false;
     }
     if (completionReconcileSessionId !== sessionId) {
       completionReconcileSessionId = sessionId;
       completionNextReconcileAt = 0;
     }
-    const now = Date.now();
-    if (completionReconcileInFlight || now < completionNextReconcileAt) return false;
-
+    if (now < completionNextReconcileAt) return false;
     completionReconcileInFlight = true;
     completionNextReconcileAt = now + completedTaskReconcileIntervalMs;
     try {
@@ -3002,15 +3381,12 @@
     });
   };
 
-  const updateToolbar = (visibleRows = null) => {
+  const updateToolbar = () => {
     const toolbar = document.getElementById(toolbarId);
     if (!toolbar) return;
     const sessionId = selectedLogicalMessageIdsByKey.size ? getSessionId() : "";
     const persistedCount = sessionId ? logicalMessageSelectionGroups(sessionId).length : 0;
-    const count = persistedCount || (visibleRows
-      ? visibleRows.filter((row) => row.dataset.codeyLogicalTurn !== "continuation"
-        && row.classList.contains(selectedClass)).length
-      : selectedRows().length);
+    const count = persistedCount || selectedRows().length;
     if (toolbar.hidden !== (count === 0)) toolbar.hidden = count === 0;
     const label = toolbar.querySelector("[data-codey-count]");
     const text = `已选 ${count} 轮`;
@@ -3043,8 +3419,8 @@
     updateSelectionButton(anchor);
   };
 
-  const syncSelectionGroups = (visibleRows = null) => {
-    const rows = visibleRows || [...document.querySelectorAll("[data-codey-message-id]")]
+  const syncSelectionGroups = () => {
+    const rows = [...document.querySelectorAll("[data-codey-message-id]")]
       .filter(isRenderedSessionElement);
     rows.forEach((row, index) => {
       const selected = row.classList?.contains(selectedClass);
@@ -3058,7 +3434,7 @@
   };
 
   const selectRow = (row, event) => {
-    refreshMessageSelection([row], true);
+    installMessageSelection(document, true);
     const anchor = logicalAnchorForMessageRow(row);
     const rows = logicalSelectionRows();
     if (event?.shiftKey && lastSelectedRow && rows.includes(lastSelectedRow)) {
@@ -3077,7 +3453,7 @@
 
   const deleteSelected = async () => {
     if (messageDeleteInFlight) return;
-    refreshMessageSelection([document], true);
+    installMessageSelection(document, true);
     const rows = selectedRows();
     const sessionId = String(getSessionId() || "").replace(/^local:/, "").trim();
     const selectedGroupsByAnchor = new Map();
@@ -3150,13 +3526,22 @@
         ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
         : messageIds;
       const deletedIds = [...new Set([...messageIds, ...resolvedMessageIds])];
+      let reloadMask = null;
       try {
         prepared = false;
+        if (controller.reloadsConversationAfterDeletion === true) {
+          // 先隐藏已删除的轮次再拍静态副本，遮罩期间看到的就是删除后的画面。
+          physicalRows.forEach((row) => { row.dataset.codeyHardDeleted = "true"; });
+          try { reloadMask = createConversationReloadMask(); } catch { reloadMask = null; }
+        }
         await controller.finishMessageDeletion(sessionId, deletedIds);
+        await reloadMask?.settle();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         window.alert(`消息已永久删除，但页面状态更新失败，请重新打开当前对话。\n\n${message}`);
         return;
+      } finally {
+        reloadMask?.release();
       }
       forgetLogicalMessageSelections(sessionId, deletedIds);
       forgetLogicalMessageIds(sessionId, deletedIds);
@@ -3187,7 +3572,7 @@
     toolbar.innerHTML = '<span data-codey-count>已选 0 轮</span><button type="button" data-codey-delete data-danger>删除</button><button type="button" data-codey-clear>取消</button>';
     toolbar.querySelector("[data-codey-delete]")?.addEventListener("click", () => void deleteSelected());
     toolbar.querySelector("[data-codey-clear]")?.addEventListener("click", () => {
-      refreshMessageSelection([document], true);
+      installMessageSelection(document, true);
       clearLogicalMessageSelections(getSessionId());
       selectedRows().forEach((row) => {
         setLogicalRowSelected(row, false);
@@ -3418,47 +3803,103 @@
     return { button, installed: true };
   };
 
-  let selectionScanRoots = null;
-  const refreshMessageSelection = (roots, forceRefresh = false) => {
+  const adjacentMessageSelectionRows = (root) => {
+    if (!(root instanceof HTMLElement)) return [];
+    const nearestRows = (elements) => {
+      const rows = [];
+      for (const element of elements) {
+        rows.push(...messageSelectionRowsWithin(element));
+      }
+      return rows.filter((row, index) => (
+        isRenderedSessionElement(row)
+        && rows.indexOf(row) === index
+        && !hasCanonicalTurnAncestor(row)
+      ));
+    };
+    let current = root;
+    for (let level = 0; level < 4 && current; level += 1) {
+      const precedingSiblings = [];
+      const followingSiblings = [];
+      let sibling = current.previousElementSibling;
+      while (sibling && precedingSiblings.length < maxAdjacentMessageSelectionRows) {
+        precedingSiblings.push(sibling);
+        sibling = sibling.previousElementSibling;
+      }
+      sibling = current.nextElementSibling;
+      while (sibling && followingSiblings.length < maxAdjacentMessageSelectionRows) {
+        followingSiblings.push(sibling);
+        sibling = sibling.nextElementSibling;
+      }
+      const preceding = nearestRows(precedingSiblings).at(-1);
+      const following = nearestRows(followingSiblings)[0];
+      if (preceding || following) {
+        // Keep a short run of nearby turns. This covers virtualized wrappers
+        // and logical continuations without returning to a full-page scan.
+        // The sibling walks above already hold that run, so reuse them
+        // instead of materialising the parent's live HTMLCollection.
+        const nearby = [...precedingSiblings].reverse().concat(current, followingSiblings);
+        const nearbyRows = nearestRows(nearby);
+        return [...new Set([preceding, ...nearbyRows, root, following].filter(Boolean))];
+      }
+      current = current.parentElement;
+    }
+    return [root];
+  };
+
+  const directMessageSelectionRoot = (root) => (
+    root instanceof HTMLElement
+    && root.matches?.(canonicalConversationTurnSelector)
+    && !hasCanonicalTurnAncestor(root)
+    && isRenderedSessionElement(root)
+  );
+
+  const installMessageSelection = (root = document, forceRefresh = false) => {
     mountToolbar();
     if (lastSelectedRow?.isConnected === false) lastSelectedRow = null;
-    let rows = [...new Set(roots.flatMap(messageSelectionRowsWithin))];
-    let completeConversationSnapshot = roots.includes(document);
+    let rows = directMessageSelectionRoot(root)
+      ? [root]
+      : messageSelectionRowsWithin(root);
     let installed = false;
-    const canonicalRoots = new Set(roots.filter((root) => (
-      root instanceof HTMLElement && root.matches?.(canonicalConversationTurnSelector)
-    )));
+    const directCanonicalRow = (
+      rows.length === 1
+      && rows[0] === root
+      && root instanceof HTMLElement
+      && root.matches?.(canonicalConversationTurnSelector)
+    );
     let sessionId = "";
-    if (rows.some((row) => canonicalRoots.has(row))) {
+    if (directCanonicalRow) {
+      const record = messageSelectionRecord(root);
+      const cachedButton = messageSelectButtons.get(root);
+      const cachedButtonMounted = (
+        cachedButton
+        && cachedButton.isConnected !== false
+        && cachedButton.parentElement === root
+      );
+      const previousLogicalAnchor = logicalAnchorForMessageRow(root);
+      const logicalTopologyChanged = (
+        previousLogicalAnchor !== root
+        && previousLogicalAnchor.isConnected === false
+      );
       sessionId = hardDeletedMessageKeys.size ? getSessionId() : "";
-      const stable = rows.every((row) => {
-        if (!canonicalRoots.has(row)) return false;
-        const record = messageSelectionRecord(row);
-        const cachedButton = messageSelectButtons.get(row);
-        const previousLogicalAnchor = logicalAnchorForMessageRow(row);
-        if (record && isHardDeletedMessage(sessionId, record.messageId)) {
-          row.remove();
-          installed = true;
-          return true;
-        }
-        return !forceRefresh && record && cachedButton
-          && cachedButton.isConnected !== false && cachedButton.parentElement === row
-          && row.dataset.codeySelectionSignature === record.signature
-          && (previousLogicalAnchor === row || previousLogicalAnchor.isConnected !== false);
-      });
-      if (stable) {
-        if (!installed) return;
+      if (record && isHardDeletedMessage(sessionId, record.messageId)) {
+        root.remove();
         syncSelectionGroups();
         updateToolbar();
         return;
       }
-      // Identity/topology changes need neighboring turns. Share this snapshot
-      // only inside one synchronous drain, never across later DOM updates.
-      const documentRows = messageSelectionRowsWithin(document);
-      if (documentRows.some((row) => canonicalRoots.has(row))) {
-        rows = documentRows;
-        completeConversationSnapshot = true;
-      }
+      if (
+        !forceRefresh
+        && record
+        && cachedButtonMounted
+        && root.dataset.codeySelectionSignature === record.signature
+        && !logicalTopologyChanged
+      ) return;
+      // A new, hydrated, completed, or virtualized physical row can change its
+      // relationship with the immediately preceding turn. Recompute the
+      // mounted conversation once for those bounded transitions; stable
+      // streaming scans retain the direct-row fast path above.
+      const adjacentRows = adjacentMessageSelectionRows(root);
+      if (adjacentRows.includes(root)) rows = adjacentRows;
     }
     // Stable scans return through the direct-row signature fast path above.
     // Resolve the session only for rows whose identity or logical grouping may
@@ -3553,30 +3994,27 @@
       updateSelectionButton(anchor);
     });
     if (installed || records.some(Boolean)) {
-      const visibleRows = completeConversationSnapshot
-        ? records.filter(Boolean).map((record) => record.row)
-        : [...document.querySelectorAll("[data-codey-message-id]")].filter(isRenderedSessionElement);
-      syncSelectionGroups(visibleRows);
-      updateToolbar(visibleRows);
+      syncSelectionGroups();
+      updateToolbar();
     }
-  };
-
-  const installMessageSelection = (root = document) => {
-    if (selectionScanRoots) selectionScanRoots.add(root);
-    else refreshMessageSelection([root]);
   };
 
   const scan = (root = document, syncTitles = true) => {
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their
     // installers there is a guaranteed-miss walk of the whole turn subtree.
-    if (
-      root instanceof HTMLElement
-      && root.matches?.(conversationTurnSelector)
-      && !root.matches?.(sidebarScanRootSelector)
-    ) {
-      installMessageSelection(root);
-      return;
+    if (root instanceof HTMLElement) {
+      const directConversationRoot = root.matches?.(conversationTurnSelector)
+        && !root.matches?.(sidebarScanRootSelector);
+      const conversationOnlyWrapper = (
+        !root.matches?.(sidebarScanRootSelector)
+        && !root.querySelector?.(sidebarScanRootSelector)
+        && Boolean(root.querySelector?.(conversationTurnSelector))
+      );
+      if (directConversationRoot || conversationOnlyWrapper) {
+        installMessageSelection(root);
+        return;
+      }
     }
     installSessionExportButtons(root);
     installTasksImportButton(root);
@@ -3636,14 +4074,79 @@
     "input",
     "label",
   ].join(", ");
+  const relevantAddedSelector = [
+    scanBoundarySelector,
+    interactiveControlSelector,
+  ].join(", ");
   const pendingScanRoots = new Set();
-  const pendingMutationTargets = new Map();
-  let overflowMutationRoot = null;
-  let mutationWalk = null;
-  let mutationDrainActive = false;
-  const maxDrainRoots = 8;
-  const maxDrainNodes = 64;
-  const drainBudgetMs = 4;
+  let pendingScanRootsByNode = new WeakMap();
+  const pendingScanRootsByIdentity = new Map();
+  const deferredMutationBatches = [];
+  const deferredMutationSourceQueue = [];
+  const deferredMutationInputQueue = [];
+  const deferredMutationIdentityIndex = new Map();
+  let deferredMutationSequence = 0;
+  const deferredMutationSequences = new WeakMap();
+  let deferredMutationTaskCount = 0;
+  let deferredMutationNodeCount = 0;
+  let deferredMutationInputRecordCount = 0;
+  let deferredMutationInputNodeCount = 0;
+  let deferredMutationFlushScheduled = false;
+  let deferredMutationFlushHandle = 0;
+  let deferredMutationFlushUsesAnimationFrame = false;
+  const deferredMutationTaskSet = new WeakSet();
+  const nowMs = () => (
+    typeof globalThis.performance === "object"
+      && typeof globalThis.performance?.now === "function"
+      ? globalThis.performance.now()
+      : Date.now()
+  );
+  const sessionMutationTelemetryKey = "codey-inject.sessionToolMutations";
+  const sessionMutationTelemetry = () => (
+    (window.__codeyObserverStats ||= {})[sessionMutationTelemetryKey]
+    || ((window.__codeyObserverStats[sessionMutationTelemetryKey] = {}))
+  );
+  const nextSessionMutationStats = () => {
+    const existing = sessionMutationTelemetry();
+    const codeyTiming = existing.__codeyTiming || {};
+    return {
+      ...existing,
+      calls: Number(codeyTiming.calls) || 0,
+      items: Number(codeyTiming.items) || 0,
+      totalMs: Number(codeyTiming.totalMs) || 0,
+      maxMs: Number(codeyTiming.maxMs) || 0,
+      mutations: Number(existing.mutations) || 0,
+      nodes: Number(existing.nodes) || 0,
+      processedNodes: Number(existing.processedNodes) || 0,
+      pending: deferredMutationTaskCount + deferredMutationInputRecordCount + pendingScanRoots.size,
+      pendingNodes: deferredMutationNodeCount + deferredMutationInputNodeCount,
+      skipped: Number(existing.skipped) || 0,
+      timing: {
+        handleMs: Number(existing.timing?.handleMs) || 0,
+        flushMs: Number(existing.timing?.flushMs) || 0,
+        scanMs: Number(existing.timing?.scanMs) || 0,
+      },
+    };
+  };
+  const recordSessionMutationStats = (changes = {}) => {
+    const stats = nextSessionMutationStats();
+    const timing = changes.timing || {};
+    Object.assign(stats, changes);
+    stats.timing = {
+      handleMs: (stats.timing.handleMs || 0) + (Number(timing.handleMs) || 0),
+      flushMs: (stats.timing.flushMs || 0) + (Number(timing.flushMs) || 0),
+      scanMs: (stats.timing.scanMs || 0) + (Number(timing.scanMs) || 0),
+    };
+    if (changes.timing) stats.__codeyTiming = { ...stats.timing };
+    stats.pending = deferredMutationTaskCount + deferredMutationInputRecordCount + pendingScanRoots.size;
+    stats.pendingNodes = deferredMutationNodeCount + deferredMutationInputNodeCount;
+    (window.__codeyObserverStats ||= {})["codey-inject.sessionToolMutations"] = stats;
+    return stats;
+  };
+  const updateSessionMutationPending = () => {
+    recordSessionMutationStats();
+  };
+
   const codeyControlIds = new Set([
     "codey-settings-button", toolbarId, toastId, sidebarActionTooltipId, styleId,
   ]);
@@ -3668,150 +4171,164 @@
       || element.closest?.(codeyOwnedSelector)
     )
   );
+  const containsRelevantElement = (
+    element,
+    relevance = new WeakMap(),
+    selector = relevantAddedSelector,
+  ) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const cached = relevance.get(element);
+    if (cached?.has(selector)) return cached.get(selector);
+    // One containment query per candidate subtree. Scoping the cache by
+    // selector keeps interactive-only additions separate from removed turns.
+    const relevantDescendant = element.querySelector?.(selector);
+    const found = Boolean(element.matches?.(selector) || relevantDescendant);
+    let current = relevantDescendant || element;
+    while (current) {
+      let currentResults = relevance.get(current);
+      if (!currentResults) {
+        currentResults = new Map();
+        relevance.set(current, currentResults);
+      }
+      currentResults.set(selector, true);
+      if (current === element) break;
+      current = current.parentElement;
+    }
+    if (!relevantDescendant) {
+      const currentResults = relevance.get(element) || new Map();
+      currentResults.set(selector, false);
+      relevance.set(element, currentResults);
+    }
+    return found;
+  };
   const nearestScanRoot = (element) => {
     if (!(element instanceof HTMLElement)) return null;
     return element.closest?.(scanBoundarySelector)
       || element.querySelector?.(scanBoundarySelector)
       || null;
   };
+  const addedSubtreeScanRoot = (element) => {
+    if (!(element instanceof HTMLElement)) return null;
+    const enclosingBoundary = element.closest?.(scanBoundarySelector);
+    if (enclosingBoundary) return enclosingBoundary;
+    // Keep the whole newly-added wrapper when it contains several sibling
+    // boundaries. nearestScanRoot() intentionally returns only one node and is
+    // still appropriate for attribute/removal mutations.
+    return element.querySelector?.(scanBoundarySelector) ? element : null;
+  };
   const threadClassMutationMayAffectStatus = (target, threadRow, oldClassName) => (
     target === threadRow
     || nativeThreadStatusClassPattern.test(String(oldClassName || ""))
     || nativeThreadStatusClassPattern.test(String(target?.className || ""))
   );
-  const queueOverflowRoot = (root) => {
-    if (!(root instanceof HTMLElement)) return;
-    if (!overflowMutationRoot) {
-      overflowMutationRoot = root;
-      return;
+  const scanRootPriority = (root) => {
+    if (root === document.documentElement || root === document.body) return 4;
+    if (root.matches?.("header, nav, [data-app-action-sidebar-section]")) return 3;
+    if (root.matches?.(sidebarThreadRowSelector)) return 2;
+    if (root.matches?.(canonicalConversationTurnSelector)) return 0;
+    return 1;
+  };
+  const scanRootIdentity = (root) => {
+    const turnKey = root.getAttribute?.("data-turn-key");
+    if (turnKey) return `turn:${turnKey}`;
+    const threadId = root.getAttribute?.("data-app-action-sidebar-thread-id");
+    if (threadId) return `thread:${threadId}`;
+    const projectId = root.getAttribute?.("data-app-action-sidebar-project-id");
+    if (projectId) return `project:${projectId}`;
+    return "";
+  };
+  const removePendingScanRoot = (root) => {
+    if (!pendingScanRoots.delete(root)) return;
+    const metadata = pendingScanRootsByNode.get(root);
+    const identity = metadata?.identity;
+    if (identity && pendingScanRootsByIdentity.get(identity) === root) {
+      pendingScanRootsByIdentity.delete(identity);
     }
-    const ancestors = new Set();
-    for (let node = overflowMutationRoot; node; node = node.parentElement) ancestors.add(node);
-    for (let node = root; node; node = node.parentElement) {
-      if (ancestors.has(node)) {
-        overflowMutationRoot = node;
-        return;
-      }
-    }
-    overflowMutationRoot = document.documentElement;
   };
   const addPendingScanRoot = (root) => {
-    if (!(root instanceof HTMLElement)) return;
+    if (!(root instanceof HTMLElement)) return false;
     // Header mounts must stay fresh even while the root budget is saturated,
     // otherwise the settings button can go stale for a whole mutation storm.
     if (root.matches?.("header, nav")) {
       window.__codeyRendererInvalidateHeaderMount?.(root);
     }
+    // Unknown/new Codex DOM shapes must degrade by skipping optional controls,
+    // not by turning a burst of virtualized rows into a synchronous full-page
+    // scan on the renderer thread.
+    if (pendingScanRoots.has(root)) return false;
+    const identity = scanRootIdentity(root);
+    const sameIdentityRoot = identity
+      ? pendingScanRootsByIdentity.get(identity)
+      : null;
+    if (sameIdentityRoot && sameIdentityRoot !== root) {
+      removePendingScanRoot(sameIdentityRoot);
+      pendingScanRoots.add(root);
+      pendingScanRootsByNode.set(root, { identity });
+      pendingScanRootsByIdentity.set(identity, root);
+      updateSessionMutationPending();
+      return true;
+    }
     if (pendingScanRoots.size >= maxPendingScanRoots) {
-      queueOverflowRoot(root);
-      return;
+      // A later mutation for the same priority replaces stale work so the
+      // newest identity, topology or interaction change is retained.
+      const staleRoot = [...pendingScanRoots]
+        .sort((left, right) => scanRootPriority(left) - scanRootPriority(right))[0];
+      if (!staleRoot || scanRootPriority(staleRoot) > scanRootPriority(root)) return false;
+      removePendingScanRoot(staleRoot);
     }
     for (const pendingRoot of pendingScanRoots) {
-      if (pendingRoot === root || pendingRoot.contains?.(root)) return;
-      if (root.contains?.(pendingRoot)) pendingScanRoots.delete(pendingRoot);
+      if (pendingRoot === root || pendingRoot.contains?.(root)) return false;
+      if (root.contains?.(pendingRoot)) removePendingScanRoot(pendingRoot);
     }
     pendingScanRoots.add(root);
+    pendingScanRootsByNode.set(root, { identity });
+    if (identity) pendingScanRootsByIdentity.set(identity, root);
+    updateSessionMutationPending();
+    return true;
   };
-  const nextMutationWalkNode = (node, root, skipChildren = false) => {
-    if (!skipChildren && node.children?.length) return node.children[0];
-    while (node && node !== root) {
-      if (node.nextElementSibling) return node.nextElementSibling;
-      node = node.parentElement;
-    }
-    return null;
-  };
-  const collectMutationScanRoots = (target, dirty) => {
-    if (target.isConnected === false || isCodeyOwned(target)) return;
-    const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
-    if (!dirty.children) {
-      if (
-        dirty.attributes
-        || (threadRow && (dirty.oldStatusClass || threadClassMutationMayAffectStatus(target, threadRow, "")))
-      ) addPendingScanRoot(threadRow || nearestScanRoot(target));
-      return;
-    }
-    const root = threadRow
-      || target.closest?.(scanBoundarySelector)
-      || target.closest?.(interactiveControlSelector);
-    if (root) {
-      if (dirty.removed) {
-        messageSelectionRowsWithin(root).forEach((row) => { delete row.dataset.codeySelectionSignature; });
-      }
-      addPendingScanRoot(root);
-    } else {
-      mutationWalk = { root: target, node: target, removed: dirty.removed };
-    }
-  };
-  const mutationWorkPending = () => pendingScanRoots.size
-    || pendingMutationTargets.size || mutationWalk || overflowMutationRoot;
   const flushIncrementalScans = () => {
     if (disposed) return;
     scanTimer = 0;
     scanDeadline = 0;
-    mutationDrainActive = true;
-    try {
-      codeyTimed("codey-inject.sessionToolDrain", pendingMutationTargets.size, () => {
-        const now = () => typeof performance === "object" && typeof performance.now === "function"
-          ? performance.now() : Date.now();
-        const startedAt = now();
-        let scanned = 0;
-        let visited = 0;
-        selectionScanRoots = new Set();
-        try {
-          while (mutationWorkPending() && scanned < maxDrainRoots && visited < maxDrainNodes) {
-            if (visited && now() - startedAt >= drainBudgetMs) break;
-            if (pendingScanRoots.size) {
-              const root = pendingScanRoots.values().next().value;
-              pendingScanRoots.delete(root);
-              // shortcut: one existing DOM scan is not preemptible; split that
-              // installer too if a single boundary still produces long tasks.
-              if (root.isConnected !== false) scan(root, true);
-              scanned += 1;
-            } else if (mutationWalk) {
-              const walk = mutationWalk;
-              const node = walk.node;
-              const skip = node.isConnected === false || isCodeyOwned(node);
-              const boundary = !skip && node.matches?.(scanBoundarySelector);
-              walk.node = nextMutationWalkNode(node, walk.root, skip || boundary);
-              if (!walk.node || walk.root.isConnected === false) mutationWalk = null;
-              if (boundary) {
-                if (walk.removed) {
-                  messageSelectionRowsWithin(node).forEach((row) => { delete row.dataset.codeySelectionSignature; });
-                }
-                addPendingScanRoot(node);
-              }
-            } else if (pendingMutationTargets.size) {
-              const [target, dirty] = pendingMutationTargets.entries().next().value;
-              pendingMutationTargets.delete(target);
-              collectMutationScanRoots(target, dirty);
-            } else {
-              const root = overflowMutationRoot;
-              overflowMutationRoot = null;
-              if (root.isConnected !== false) mutationWalk = { root, node: root, removed: true };
-            }
-            visited += 1;
-          }
-        } finally {
-          const roots = selectionScanRoots;
-          selectionScanRoots = null;
-          // shortcut: this one conversation reconciliation is not preemptible;
-          // split its grouping pass if a single batch still produces long tasks.
-          if (roots.size) refreshMessageSelection([...roots]);
+    // addPendingScanRoot() maintains a nested-free queue, so the flush must
+    // not repeat the same containment checks over every pending root.
+    const roots = [...pendingScanRoots].filter((root) => root.isConnected !== false);
+    pendingScanRoots.clear();
+    pendingScanRootsByIdentity.clear();
+    updateSessionMutationPending();
+    const startedAt = nowMs();
+    let scannedRoots = 0;
+    for (let index = 0; index < roots.length; index += 1) {
+      const root = roots[index];
+      if (scannedRoots > 0) {
+        const elapsed = nowMs() - startedAt;
+        if (
+          elapsed >= maxIncrementalScanDurationMs
+          || scannedRoots >= maxIncrementalScanRootsPerFlush
+        ) {
+          roots.slice(index).forEach(addPendingScanRoot);
+          break;
         }
-      });
-    } catch (error) {
-      window.__codeySessionToolsError = error instanceof Error
-        ? `${error.name}: ${error.message}` : String(error);
-      console.error("[Codey] incremental session tools scan failed", error);
-    } finally {
-      if (!disposed && mutationWorkPending()) scanTimer = window.setTimeout(flushIncrementalScans, 0);
-      else mutationDrainActive = false;
+      }
+      scan(root, true);
+      scannedRoots += 1;
     }
+    const stats = nextSessionMutationStats();
+    recordSessionMutationStats({
+      scannedRoots: (Number(stats.scannedRoots) || 0) + scannedRoots,
+      timing: { scanMs: nowMs() - startedAt },
+    });
+    if (pendingScanRoots.size) scheduleIncrementalScan(null);
   };
   const scheduleIncrementalScan = (root) => {
     if (disposed) return;
-    addPendingScanRoot(root);
-    if (mutationDrainActive) return;
+    if (root === null) {
+      // A flush already left its overflow roots in the queue. Do not let the
+      // root-only scheduling entry point consume the budget a second time.
+      if (!pendingScanRoots.size) return;
+    } else {
+      addPendingScanRoot(root);
+    }
     const now = Date.now();
     if (!scanDeadline) scanDeadline = now + maxScanLatencyMs;
     // The debounce restarts on every batch, so a sustained mutation stream
@@ -3849,27 +4366,551 @@
   // No behavior change; timing falls back to Date.now() where performance is
   // unavailable (test sandboxes).
   const codeyTimed = (name, count, run) => {
-    const now = () =>
-      typeof performance === "object" && typeof performance.now === "function"
-        ? performance.now()
-        : Date.now();
-    const stats = (window.__codeyObserverStats ||= {});
-    const entry = (stats[name] ||= { calls: 0, items: 0, totalMs: 0, maxMs: 0 });
-    const startedAt = now();
+    const observerStats = (window.__codeyObserverStats ||= {});
+    const entry = (observerStats[name] ||= { calls: 0, items: 0, totalMs: 0, maxMs: 0 });
+    const startedAt = nowMs();
     try {
       return run();
     } finally {
-      const elapsed = now() - startedAt;
-      entry.calls += 1;
-      entry.items += count;
-      entry.totalMs += elapsed;
-      if (elapsed > entry.maxMs) entry.maxMs = elapsed;
+      const elapsed = nowMs() - startedAt;
+      const isSessionTelemetry = name === sessionMutationTelemetryKey;
+      const current = isSessionTelemetry ? sessionMutationTelemetry() : entry;
+      const previous = isSessionTelemetry ? current.__codeyTiming || {} : current;
+      const next = {
+        calls: (Number(previous.calls) || 0) + 1,
+        items: (Number(previous.items) || 0) + count,
+        totalMs: (Number(previous.totalMs) || 0) + elapsed,
+        maxMs: Math.max(Number(previous.maxMs) || 0, elapsed),
+      };
+      if (isSessionTelemetry) {
+        observerStats[name] = {
+          ...next,
+          mutations: Number(current.mutations) || 0,
+          nodes: Number(current.nodes) || 0,
+          processedNodes: Number(current.processedNodes) || 0,
+          pending: deferredMutationTaskCount + pendingScanRoots.size,
+          pendingNodes: deferredMutationNodeCount,
+          skipped: Number(current.skipped) || 0,
+          timing: {
+            ...(current.timing || {}),
+            handleMs: (Number(current.timing?.handleMs) || 0) + elapsed,
+          },
+          __codeyTiming: next,
+        };
+      } else {
+        Object.assign(entry, next);
+      }
     }
   };
-  const handleSessionToolMutations = (mutations) =>
-    codeyTimed("codey-inject.sessionToolMutations", mutations?.length ?? 0, () => handleSessionToolMutationsImpl(mutations));
-  const handleSessionToolMutationsImpl = (mutations) => {
+  const mutationNodeCount = (mutation) => (
+    (mutation.addedNodes?.length || 0) + (mutation.removedNodes?.length || 0)
+  );
+  const mutationSequenceFor = (mutation) => {
+    if (!mutation || typeof mutation !== "object") return ++deferredMutationSequence;
+    let sequence = deferredMutationSequences.get(mutation);
+    if (sequence === undefined) {
+      sequence = ++deferredMutationSequence;
+      deferredMutationSequences.set(mutation, sequence);
+    }
+    return sequence;
+  };
+  const mutationHasBoundaryNode = (nodes, selector, probeBudget) => {
+    const length = nodes?.length || 0;
+    for (let index = 0; index < length; index += 1) {
+      if (probeBudget.remaining <= 0) return false;
+      const node = nodes[index];
+      if (!(node instanceof HTMLElement)) continue;
+      probeBudget.remaining -= 1;
+      if (node.matches?.(selector) || node.querySelector?.(selector)) return true;
+    }
+    return false;
+  };
+  const isCriticalMutation = (mutation, probeBudget) => (
+    mutation.type === "childList"
+    && (
+      mutationHasBoundaryNode(
+        mutation.addedNodes,
+        scanBoundarySelector,
+        probeBudget,
+      )
+      || mutationHasBoundaryNode(
+        mutation.removedNodes,
+        conversationTurnSelector,
+        probeBudget,
+      )
+    )
+  );
+  const mutationTaskNodeCount = (task) => {
+    const addedStart = Number(task.addedOffset) || 0;
+    const removedStart = Number(task.removedOffset) || 0;
+    return Math.max(0, (task.addedNodes?.length || 0) - addedStart)
+      + Math.max(0, (task.removedNodes?.length || 0) - removedStart);
+  };
+  const arraySlice = (values, start, end) => (
+    Array.prototype.slice.call(values || [], start, end)
+  );
+  const sliceMutationTask = (task, nodeLimit) => {
+    const addedOffset = Number(task.addedOffset) || 0;
+    const removedOffset = Number(task.removedOffset) || 0;
+    const addedCount = Math.min(
+      Math.max(0, (task.addedNodes?.length || 0) - addedOffset),
+      nodeLimit,
+    );
+    const removedCount = Math.min(
+      Math.max(0, (task.removedNodes?.length || 0) - removedOffset),
+      nodeLimit - addedCount,
+    );
+    const batchAddedNodes = arraySlice(
+      task.addedNodes,
+      addedOffset,
+      addedOffset + addedCount,
+    );
+    const batchRemovedNodes = arraySlice(
+      task.removedNodes,
+      removedOffset,
+      removedOffset + removedCount,
+    );
+    const nextAddedOffset = addedOffset + addedCount;
+    const nextRemovedOffset = removedOffset + removedCount;
+    return {
+      batch: {
+        sequence: task.sequence,
+        critical: task.critical,
+        deferredIdentity: task.deferredIdentity,
+        addedNodes: batchAddedNodes,
+        removedNodes: batchRemovedNodes,
+        mutation: {
+          type: "childList",
+          target: task.mutation.target,
+          addedNodes: batchAddedNodes,
+          removedNodes: batchRemovedNodes,
+        },
+      },
+      tail: mutationTaskNodeCount({
+        ...task,
+        addedOffset: nextAddedOffset,
+        removedOffset: nextRemovedOffset,
+      }) > 0 ? {
+        ...task,
+        addedOffset: nextAddedOffset,
+        removedOffset: nextRemovedOffset,
+      } : null,
+    };
+  };
+  const mutationBatchNodeCount = (batch) => batch
+    .reduce((count, task) => count + mutationTaskNodeCount(task), 0);
+  const deferredMutationTaskIdentity = (task) => {
+    if (task.deferredIdentity !== undefined) return task.deferredIdentity;
+    const boundaryIdentity = scanRootIdentity(task.mutation?.target);
+    if (boundaryIdentity) {
+      task.deferredIdentity = boundaryIdentity;
+      return boundaryIdentity;
+    }
+    let nodeIdentity = "";
+    const addedStart = Number(task.addedOffset) || 0;
+    const removedStart = Number(task.removedOffset) || 0;
+    const addedEnd = Math.min(task.addedNodes?.length || 0, addedStart + 16);
+    const removedEnd = Math.min(task.removedNodes?.length || 0, removedStart + 16);
+    for (let index = addedStart; index < addedEnd && !nodeIdentity; index += 1) {
+      const node = task.addedNodes[index];
+      nodeIdentity = scanRootIdentity(node instanceof HTMLElement ? node : null);
+    }
+    for (let index = removedStart; index < removedEnd && !nodeIdentity; index += 1) {
+      const node = task.removedNodes[index];
+      nodeIdentity = scanRootIdentity(node instanceof HTMLElement ? node : null);
+    }
+    task.deferredIdentity = nodeIdentity || "";
+    return task.deferredIdentity;
+  };
+  const deferredMutationEntryIdentity = (task) => {
+    if (!deferredMutationTaskSet.has(task)) return task.deferredIdentity || "";
+    const identity = deferredMutationTaskIdentity(task);
+    if (identity) task.deferredIdentity = identity;
+    return identity;
+  };
+  const deferredMutationTaskGroups = () => (
+    deferredMutationBatches.length || !deferredMutationSourceQueue.length
+      ? [...deferredMutationBatches, deferredMutationSourceQueue]
+      : [deferredMutationSourceQueue]
+  );
+  const forEachDeferredMutationTask = (callback) => {
+    for (const batch of deferredMutationTaskGroups()) {
+      for (const task of batch) callback(task);
+    }
+  };
+  const rebuildDeferredMutationIdentityIndex = () => {
+    deferredMutationIdentityIndex.clear();
+    forEachDeferredMutationTask((pending) => {
+      const identity = deferredMutationEntryIdentity(pending);
+      const indexed = identity ? deferredMutationIdentityIndex.get(identity) : null;
+      if (identity && (!indexed || indexed.sequence < pending.sequence)) {
+        deferredMutationIdentityIndex.set(identity, pending);
+      }
+    });
+  };
+  const oldestDeferredMutationTask = (predicate = () => true) => {
+    let selected = null;
+    forEachDeferredMutationTask((task) => {
+      if (
+        predicate(task)
+        && (!selected || Number(task.sequence) < Number(selected.sequence))
+      ) {
+        selected = task;
+      }
+    });
+    return selected;
+  };
+  const newestDeferredMutationTaskForIdentity = (identity) => {
+    let selected = null;
+    forEachDeferredMutationTask((task) => {
+      if (
+        deferredMutationEntryIdentity(task) === identity
+        && (!selected || Number(task.sequence) > Number(selected.sequence))
+      ) {
+        selected = task;
+      }
+    });
+    return selected;
+  };
+  const removeDeferredMutationTask = (task) => {
+    const batch = task?.deferredBatch;
+    const taskIndex = batch?.indexOf(task) ?? -1;
+    if (taskIndex < 0) return false;
+    const identity = deferredMutationEntryIdentity(task);
+    batch.splice(taskIndex, 1);
+    deferredMutationTaskCount = Math.max(0, deferredMutationTaskCount - 1);
+    deferredMutationNodeCount = Math.max(
+      0,
+      deferredMutationNodeCount - mutationTaskNodeCount(task),
+    );
+    if (batch !== deferredMutationSourceQueue && !batch.length) {
+      const batchIndex = deferredMutationBatches.indexOf(batch);
+      if (batchIndex >= 0) deferredMutationBatches.splice(batchIndex, 1);
+    }
+    task.deferredBatch = null;
+    if (identity && deferredMutationIdentityIndex.get(identity) === task) {
+      deferredMutationIdentityIndex.delete(identity);
+      const replacement = newestDeferredMutationTaskForIdentity(identity);
+      if (replacement) deferredMutationIdentityIndex.set(identity, replacement);
+    }
+    return true;
+  };
+  const trimDeferredMutationQueue = () => {
+    while (
+      deferredMutationBatches.length > maxDeferredMutationBatches
+      || deferredMutationTaskCount > maxDeferredMutationTasks
+      || deferredMutationNodeCount > maxDeferredMutationNodes
+    ) {
+      // Recomputable optional UI work goes first. For keyed work, retain the
+      // newest task of each identity and evict one older task at a time so a
+      // crowded batch cannot take unrelated identities with it.
+      const task = oldestDeferredMutationTask((pending) => !pending.critical)
+        || oldestDeferredMutationTask((pending) => (
+          deferredMutationIdentityIndex.get(deferredMutationEntryIdentity(pending)) !== pending
+        ))
+        || oldestDeferredMutationTask();
+      if (!task) break;
+      removeDeferredMutationTask(task);
+    }
+    rebuildDeferredMutationIdentityIndex();
+    updateSessionMutationPending();
+  };
+  const enqueueMutationBatchTask = (pending, identity) => {
+    const lastBatch = deferredMutationBatches.at(-1);
+    const pendingNodes = mutationTaskNodeCount(pending);
+    if (identity) pending.deferredIdentity = identity;
+    deferredMutationTaskSet.add(pending);
+    pending.sequence ??= mutationSequenceFor(pending.mutation);
+    if (
+      lastBatch?.length < maxIncrementalMutationRecordsPerBatch
+      && mutationBatchNodeCount(lastBatch) + pendingNodes <= maxIncrementalNodesPerBatch
+    ) {
+      lastBatch.push(pending);
+      pending.deferredBatch = lastBatch;
+    } else {
+      const nextBatch = [pending];
+      pending.deferredBatch = nextBatch;
+      deferredMutationBatches.push(nextBatch);
+    }
+    deferredMutationTaskCount += 1;
+    deferredMutationNodeCount += pendingNodes;
+    if (identity) deferredMutationIdentityIndex.set(identity, pending);
+  };
+  const enqueueMutationSourceTask = (task, identity) => {
+    const pendingNodes = mutationTaskNodeCount(task);
+    if (!pendingNodes) return;
+    if (identity) task.deferredIdentity = identity;
+    deferredMutationTaskSet.add(task);
+    task.sequence ??= mutationSequenceFor(task.mutation);
+    task.deferredBatch = deferredMutationSourceQueue;
+    deferredMutationSourceQueue.push(task);
+    deferredMutationTaskCount += 1;
+    deferredMutationNodeCount += pendingNodes;
+    if (identity) deferredMutationIdentityIndex.set(identity, task);
+  };
+  const enqueueMutationTask = (task) => {
+    const sourceIdentity = deferredMutationTaskIdentity(task);
+    const split = task.mutation.type === "childList"
+      ? sliceMutationTask(task, maxIncrementalNodesPerBatch)
+      : { batch: task, tail: null };
+    if (task.mutation.type !== "childList" || mutationTaskNodeCount(split.batch)) {
+      enqueueMutationBatchTask(split.batch, sourceIdentity);
+    }
+    if (split.tail) enqueueMutationSourceTask(split.tail, sourceIdentity);
+    trimDeferredMutationQueue();
+    const stats = nextSessionMutationStats();
+    recordSessionMutationStats({ skipped: stats.skipped + 1 });
+  };
+  const queueDeferredMutationInputs = (mutations, start) => {
+    let records = 0;
+    let nodes = 0;
+    for (let index = start; index < mutations.length; index += 1) {
+      records += 1;
+      nodes += mutationNodeCount(mutations[index]);
+    }
+    if (!records) return 0;
+    deferredMutationInputQueue.push({
+      mutations,
+      offset: start,
+      sequence: mutationSequenceFor(mutations[start]),
+    });
+    deferredMutationInputRecordCount += records;
+    deferredMutationInputNodeCount += nodes;
+    return nodes;
+  };
+  const nextDeferredMutationTask = () => {
+    let selected = null;
+    for (const batch of deferredMutationTaskGroups()) {
+      for (const task of batch) {
+        if (!selected || Number(task.sequence) < Number(selected.sequence)) {
+          selected = task;
+        }
+      }
+    }
+    return selected;
+  };
+  const takeDeferredMutationInput = () => {
+    const entry = deferredMutationInputQueue[0];
+    if (!entry) return null;
+    const end = Math.min(
+      entry.mutations.length,
+      entry.offset + maxIncrementalMutationRecordsPerBatch,
+    );
+    const mutations = arraySlice(entry.mutations, entry.offset, end);
+    let nodes = 0;
+    for (const mutation of mutations) nodes += mutationNodeCount(mutation);
+    deferredMutationInputRecordCount = Math.max(
+      0,
+      deferredMutationInputRecordCount - mutations.length,
+    );
+    deferredMutationInputNodeCount = Math.max(
+      0,
+      deferredMutationInputNodeCount - nodes,
+    );
+    entry.offset = end;
+    if (entry.offset >= entry.mutations.length) {
+      deferredMutationInputQueue.shift();
+    } else {
+      entry.sequence = mutationSequenceFor(entry.mutations[entry.offset]);
+    }
+    return mutations;
+  };
+  const runDeferredMutationFlush = () => {
+    deferredMutationFlushScheduled = false;
+    deferredMutationFlushHandle = 0;
+    deferredMutationFlushUsesAnimationFrame = false;
     if (disposed) return;
+    let mutations = null;
+    const nextTask = nextDeferredMutationTask();
+    const nextInput = deferredMutationInputQueue[0];
+    if (
+      nextTask
+      && (!nextInput || Number(nextTask.sequence) <= Number(nextInput.sequence))
+    ) {
+      const identity = deferredMutationEntryIdentity(nextTask);
+      removeDeferredMutationTask(nextTask);
+      const split = nextTask.mutation.type === "childList"
+        ? sliceMutationTask(nextTask, maxIncrementalNodesPerBatch)
+        : { batch: nextTask, tail: null };
+      if (split.tail) enqueueMutationSourceTask(split.tail, identity);
+      mutations = [split.batch.mutation];
+    } else {
+      mutations = takeDeferredMutationInput();
+    }
+    if (!mutations?.length) {
+      updateSessionMutationPending();
+      return;
+    }
+    rebuildDeferredMutationIdentityIndex();
+    updateSessionMutationPending();
+    const startedAt = nowMs();
+    handleSessionToolMutations(mutations, {
+      deferred: true,
+      countTotals: false,
+    });
+    if (
+      deferredMutationBatches.length
+      || deferredMutationSourceQueue.length
+      || deferredMutationInputQueue.length
+    ) scheduleDeferredMutationFlush({ yieldToFrame: true });
+  };
+  const scheduleDeferredMutationFlush = ({ yieldToFrame = false } = {}) => {
+    if (
+      disposed
+      || deferredMutationFlushScheduled
+      || (!deferredMutationBatches.length
+        && !deferredMutationSourceQueue.length
+        && !deferredMutationInputQueue.length)
+    ) return;
+    deferredMutationFlushScheduled = true;
+    if (yieldToFrame && typeof window.requestAnimationFrame === "function") {
+      deferredMutationFlushUsesAnimationFrame = true;
+      deferredMutationFlushHandle = window.requestAnimationFrame(runDeferredMutationFlush);
+    } else if (yieldToFrame || typeof window.queueMicrotask !== "function") {
+      deferredMutationFlushUsesAnimationFrame = false;
+      deferredMutationFlushHandle = window.setTimeout(runDeferredMutationFlush, 0);
+    } else {
+      window.queueMicrotask(runDeferredMutationFlush);
+    }
+  };
+  const handleSessionToolMutations = (
+    mutations,
+    { deferred = false, countTotals = !deferred } = {},
+  ) => {
+    if (!mutations?.length) {
+      if (
+        !deferred
+        && (
+          deferredMutationBatches.length
+          || deferredMutationSourceQueue.length
+          || deferredMutationInputQueue.length
+        )
+      ) scheduleDeferredMutationFlush();
+      return;
+    }
+    const startedAt = nowMs();
+    const inputCount = mutations.length;
+    const handleCount = Math.min(inputCount, maxIncrementalMutationRecordsPerBatch);
+    const currentMutations = handleCount < inputCount
+      ? arraySlice(mutations, 0, handleCount)
+      : mutations;
+    // Sequence the records that run now before assigning a sequence to the
+    // overflow entry. Otherwise later overflow work can jump ahead of an
+    // earlier record whose large node list needs a deferred tail.
+    for (const mutation of currentMutations) mutationSequenceFor(mutation);
+    const overflowNodes = handleCount < inputCount
+      ? queueDeferredMutationInputs(mutations, handleCount)
+      : 0;
+    const taskCount = currentMutations.length;
+    const nodes = currentMutations.reduce(
+      (count, mutation) => count + mutationNodeCount(mutation),
+      0,
+    );
+    if (countTotals) {
+      const initialStats = nextSessionMutationStats();
+      recordSessionMutationStats({
+        mutations: initialStats.mutations + inputCount,
+        nodes: initialStats.nodes + nodes + overflowNodes,
+      });
+    }
+    try {
+      const accepted = [];
+      const deferredTasks = [];
+      const probeBudget = { remaining: maxCriticalMutationProbeNodes };
+      let acceptedNodes = 0;
+      let deferRemainingTasks = false;
+      const tasks = currentMutations.map((mutation) => {
+        const sequence = mutationSequenceFor(mutation);
+        if (mutation.type !== "childList") {
+          return {
+            mutation,
+            sequence,
+            critical: false,
+            addedNodes: [],
+            removedNodes: [],
+          };
+        }
+        return {
+          mutation,
+          sequence,
+          critical: isCriticalMutation(mutation, probeBudget),
+          addedNodes: mutation.addedNodes || [],
+          removedNodes: mutation.removedNodes || [],
+        };
+      });
+      for (const task of tasks) {
+        // Once one record needs a deferred tail, queue every later record too.
+        // This preserves MutationRecord order while still allowing the first
+        // record to use the current batch budget.
+        if (deferRemainingTasks) {
+          deferredTasks.push(task);
+          continue;
+        }
+        const taskNodes = mutationTaskNodeCount(task);
+        const nodeCapacity = Math.max(0, maxIncrementalNodesPerBatch - acceptedNodes);
+        if (task.mutation.type !== "childList") {
+          accepted.push(task);
+        } else if (taskNodes <= nodeCapacity) {
+          const { batch } = sliceMutationTask(task, nodeCapacity);
+          accepted.push(batch);
+          acceptedNodes += mutationTaskNodeCount(batch);
+        } else if (nodeCapacity > 0 && taskNodes > 0) {
+          const { batch, tail } = sliceMutationTask(task, nodeCapacity);
+          accepted.push(batch);
+          acceptedNodes += mutationTaskNodeCount(batch);
+          deferRemainingTasks = true;
+          if (tail) deferredTasks.push(tail);
+        } else {
+          deferRemainingTasks = true;
+          deferredTasks.push(task);
+        }
+      }
+      for (const task of deferredTasks) enqueueMutationTask(task);
+      const processedNodes = codeyTimed(
+        "codey-inject.sessionToolMutations",
+        taskCount,
+        () => handleSessionToolMutationsImpl(accepted.map((task) => task.mutation)),
+      );
+      const stats = nextSessionMutationStats();
+      recordSessionMutationStats({
+        processedNodes: stats.processedNodes + processedNodes,
+      });
+    } finally {
+      recordSessionMutationStats({
+        timing: countTotals
+          ? { handleMs: nowMs() - startedAt }
+          : { flushMs: nowMs() - startedAt },
+      });
+      if (
+        !deferred
+        && (
+          deferredMutationBatches.length
+          || deferredMutationSourceQueue.length
+          || deferredMutationInputQueue.length
+        )
+      ) scheduleDeferredMutationFlush();
+    }
+  };
+  const handleSessionToolMutationsImpl = (mutations) => {
+    if (disposed) return 0;
+    let processedNodes = 0;
+    const removalTargets = new Set();
+    const relevanceCache = new WeakMap();
+    const removalRelevanceCache = new WeakMap();
+    const targetContextCache = new WeakMap();
+    const contextForTarget = (target) => {
+      if (!(target instanceof HTMLElement)) {
+        return { conversationTurn: null, threadRow: null };
+      }
+      const cached = targetContextCache.get(target);
+      if (cached) return cached;
+      const context = {
+        conversationTurn: target.closest?.(canonicalConversationTurnSelector) || null,
+        threadRow: target.closest?.(sidebarThreadRowSelector) || null,
+      };
+      targetContextCache.set(target, context);
+      return context;
+    };
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
@@ -3883,44 +4924,123 @@
         && (mutation.addedNodes?.length || mutation.removedNodes?.length)
         && nodesAreCodeyControls(mutation.addedNodes)
         && nodesAreCodeyControls(mutation.removedNodes)) continue;
-      let dirty = pendingMutationTargets.get(target);
-      if (!dirty) {
-        if (pendingMutationTargets.size >= maxPendingScanRoots) {
-          queueOverflowRoot(target);
+      if (mutation.type === "attributes") {
+        if (target && !isCodeyOwned(target)) {
+          const { threadRow } = contextForTarget(target);
+          const relevantThreadClassChange = threadRow
+            && mutation.attributeName === "class"
+            && threadClassMutationMayAffectStatus(target, threadRow, mutation.oldValue);
+          const pureUiAttributeChange = [
+            "aria-label",
+            "aria-hidden",
+            "disabled",
+            "hidden",
+          ].includes(mutation.attributeName);
+          if (relevantThreadClassChange || (
+            mutation.attributeName !== "class"
+            && !pureUiAttributeChange
+          )) {
+            const topologyRoot = (
+              threadRow
+              || nearestScanRoot(target)
+              || (sessionIdentityAttributes.includes(mutation.attributeName)
+                ? document.body
+                : null)
+            );
+            if (addPendingScanRoot(topologyRoot)) {
+              processedNodes += 1;
+            }
+          }
+        }
+        continue;
+      }
+      const targetContext = contextForTarget(target);
+      // Mutation storms inside one mounted turn do not need sidebar or toolbar
+      // discovery. Rejecting the whole record before inspecting every added or
+      // removed node keeps streaming churn off the optional tool path.
+      if (targetContext.conversationTurn) continue;
+      // Depends only on mutation.target, so it is identical for every node in
+      // this record; streaming appends many text nodes per record.
+      let interactiveRoot;
+      const interactiveRootFor = () => {
+        if (interactiveRoot === undefined) {
+          interactiveRoot = target?.closest?.(interactiveControlSelector) || null;
+        }
+        return interactiveRoot;
+      };
+      for (const node of mutation.addedNodes || []) {
+        const element = node instanceof HTMLElement ? node : null;
+        if (!element) {
+          if (node?.nodeType !== Node.TEXT_NODE) continue;
+          const root = interactiveRootFor();
+          if (root && !isCodeyOwned(root)) {
+            if (addPendingScanRoot(root)) processedNodes += 1;
+          }
           continue;
         }
-        dirty = { attributes: false, oldStatusClass: false, children: false, removed: false };
-        pendingMutationTargets.set(target, dirty);
+        if (isCodeyOwned(element)) continue;
+        const threadRow = element.closest?.(sidebarThreadRowSelector)
+          || targetContext.threadRow;
+        if (threadRow) {
+          if (addPendingScanRoot(threadRow)) processedNodes += 1;
+          continue;
+        }
+        if (!containsRelevantElement(element, relevanceCache)) continue;
+        if (addPendingScanRoot(addedSubtreeScanRoot(element))) processedNodes += 1;
       }
-      if (mutation.type === "attributes") {
-        dirty.attributes ||= mutation.attributeName !== "class";
-        dirty.oldStatusClass ||= nativeThreadStatusClassPattern.test(String(mutation.oldValue || ""));
-      } else if (mutation.type === "childList") {
-        dirty.children = true;
-        dirty.removed ||= Boolean(mutation.removedNodes?.length);
+      for (const node of mutation.removedNodes || []) {
+        const element = node instanceof HTMLElement ? node : null;
+        if (!element) continue;
+        if (targetContext.threadRow && !isCodeyOwned(target)) {
+          if (addPendingScanRoot(targetContext.threadRow)) processedNodes += 1;
+          continue;
+        }
+        if (!containsRelevantElement(element, removalRelevanceCache, conversationTurnSelector)) {
+          continue;
+        }
+        if (target && !isCodeyOwned(target)) removalTargets.add(target);
       }
     }
-    scheduleIncrementalScan(null);
+    removalTargets.forEach((target) => {
+      const topologyRoot = addedSubtreeScanRoot(target) || nearestScanRoot(target);
+      if (!topologyRoot) return;
+      messageSelectionRowsWithin(topologyRoot).forEach((row) => {
+        delete row.dataset.codeySelectionSignature;
+      });
+      if (addPendingScanRoot(topologyRoot)) processedNodes += 1;
+    });
+    if (pendingScanRoots.size) {
+      scheduleIncrementalScan(null);
+    }
     if (!completionReconcileCheckTimer && !completionReconcileInFlight) {
       completionReconcileCheckTimer = window.setTimeout(() => {
         completionReconcileCheckTimer = 0;
         void reconcileStaleCompletedTask();
       }, completionReconcileMutationDelayMs);
     }
+    return processedNodes;
   };
   const sessionToolMutationOptions = {
+
     attributes: true,
     attributeOldValue: true,
     attributeFilter: [
-      "aria-label",
       "aria-expanded",
-      "aria-hidden",
+      "class",
       "data-turn-key",
       "data-message-id",
       "data-messageid",
       "data-item-id",
       "data-id",
+      "data-message-author-role",
+      "data-testid",
+      "data-above-composer-conversation-id",
+      "data-session-id",
+      "data-conversation-id",
+      "data-thread-id",
       "data-request-user-input-auto-resolution-conversation-id",
+      "data-response-annotation-conversation",
+      "data-app-action-sidebar-thread-active",
       "data-app-action-sidebar-thread-host-id",
       "data-app-action-sidebar-thread-id",
       "data-app-action-sidebar-thread-kind",
@@ -3928,11 +5048,9 @@
       "data-app-action-sidebar-project-id",
       "data-app-action-sidebar-project-list-id",
       "data-app-action-sidebar-project-row",
+      "data-app-action-sidebar-section-heading",
+      "data-app-action-sidebar-section-toggle",
       sidebarProjectShowAllAttribute,
-      "data-testid",
-      "disabled",
-      "hidden",
-      "class",
     ],
     childList: true,
     subtree: true,
@@ -3957,16 +5075,30 @@
     ]) {
       window.clearTimeout(id);
     }
+    if (deferredMutationFlushUsesAnimationFrame) {
+      window.cancelAnimationFrame?.(deferredMutationFlushHandle);
+    } else {
+      window.clearTimeout(deferredMutationFlushHandle);
+    }
     if (initialScanUsesIdleCallback) window.cancelIdleCallback?.(initialScanHandle);
     else window.clearTimeout(initialScanHandle);
     hideSidebarActionTooltip();
     for (const id of threadRunningRecheckTimers.values()) window.clearTimeout(id);
     threadRunningRecheckTimers.clear();
     pendingScanRoots.clear();
-    pendingMutationTargets.clear();
-    overflowMutationRoot = null;
-    mutationWalk = null;
-    mutationDrainActive = false;
+    pendingScanRootsByIdentity.clear();
+    pendingScanRootsByNode = new WeakMap();
+    deferredMutationBatches.length = 0;
+    deferredMutationSourceQueue.length = 0;
+    deferredMutationInputQueue.length = 0;
+    deferredMutationTaskCount = 0;
+    deferredMutationNodeCount = 0;
+    deferredMutationInputRecordCount = 0;
+    deferredMutationInputNodeCount = 0;
+    deferredMutationFlushScheduled = false;
+    deferredMutationFlushUsesAnimationFrame = false;
+    deferredMutationIdentityIndex.clear();
+    updateSessionMutationPending();
     pendingThreadUpdatedAtRefs.clear();
     threadUpdatedAtRows.clear();
     // Native-operation timeout promises must still settle after disposal.

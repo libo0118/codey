@@ -390,15 +390,35 @@
       && !source.includes("/*codey-local-quota-gate*/")) {
       // 只改变 Codex 本机发送按钮的额度条件。保留共享额度状态、官方警告
       // 和其他禁用条件；每次渲染读取当前模型，避免模型切换后复用旧判断。
+      const localSendGate = (marker, host, mode) =>
+        `/*${marker}*/(()=>{try{return globalThis.__codeyQuotaUnlock?.allowsLocalSend?.({hostId:${host},model:${mode}.settings.model})!==true}catch{return true}})()`;
+      let quotaGate = null;
       patched = replaceUniqueRendererGate(
         patched,
         /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===`gpt-reserve`[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\((?<host>[$A-Z_a-z][$\w]*)===`local`&&[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:[$A-Z_a-z][$\w]*,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let (?<disabled>[$A-Z_a-z][$\w]*)=[^;]{0,512}?\|\|\k<quota>,[\s\S]{0,6000}?submitDisabled:\k<disabled>,)/g,
         (...args) => {
-          const { host, mode } = args.at(-1);
-          return `${args[0]}&&/*codey-local-quota-gate*/(()=>{try{return globalThis.__codeyQuotaUnlock?.allowsLocalSend?.({hostId:${host},model:${mode}.settings.model})!==true}catch{return true}})()`;
+          quotaGate = args.at(-1);
+          return `${args[0]}&&${localSendGate("codey-local-quota-gate", quotaGate.host, quotaGate.mode)}`;
         },
         "local third-party composer quota",
       );
+      // Codex 26.1021 起 Team 等工作空间额度耗尽时另有按主机的硬阻断，
+      // 在禁用表达式中紧挨额度条件；旧版没有该条件时保持不变。
+      if (quotaGate != null && patched.includes("/*codey-local-quota-gate*/")) {
+        const { disabled, host, mode, quota } = quotaGate;
+        const name = value => value.replace(/\$/g, "\\$");
+        const ident = "[$A-Z_a-z][$\\w]*";
+        const disabledMatches = [...patched.matchAll(new RegExp(`let ${name(disabled)}=[^;]{0,512}?\\|\\|(${ident})\\|\\|${name(quota)},`, "g"))];
+        const hard = disabledMatches.length === 1 ? disabledMatches[0][1] : null;
+        if (hard != null
+          && hard !== host
+          && patched.match(new RegExp(`[,;{]${name(hard)}=${ident}\\(${ident},${name(host)}\\)[,;]`, "g"))?.length === 1) {
+          const [{ 0: matched, index }] = disabledMatches;
+          const term = `||${hard}||${quota},`;
+          const offset = index + matched.length - term.length;
+          patched = `${patched.slice(0, offset)}||${hard}&&${localSendGate("codey-local-hard-block-gate", host, mode)}||${quota},${patched.slice(offset + term.length)}`;
+        }
+      }
     }
     if (
       source.includes("codex-message-from-view")
@@ -473,6 +493,87 @@
       patched = replacePetRendererResourceImports(
         patched,
         "pet settings avatar resources",
+      );
+    }
+    if (
+      disablePet
+      && source.includes("`electron-avatar-overlay-restore-ready`")
+      && source.includes("shouldPrewarmAvatarOverlay:")
+    ) {
+      // Once the app is ready and realtime voice is available, Codex asks main
+      // to prewarm the hidden avatar overlay window, which keeps a full renderer
+      // resident. With the pet slimmed, only skip that prewarm; main still
+      // creates the shared overlay on demand for voice.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(`electron-avatar-overlay-restore-ready`,\{[^{}]*?\bshouldPrewarmAvatarOverlay:)[^,{}]+/g,
+        (_match, prefix) => `${prefix}!1`,
+        "avatar overlay prewarm",
+      );
+    }
+    if (
+      source.includes("forcePricingRefreshInBackground")
+      && source.includes("`use_embedded_checkout`")
+    ) {
+      // 账号命中内嵌结账实验时，Codex 会在后台把 chatgpt.com 定价页预载进隐藏
+      // webview 并常驻（独立渲染进程）。只去掉这份后台预取：打开定价页时原生仍按
+      // 路由直接加载，离开后不再保留隐藏副本。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /([$A-Z_a-z][$\w]*)=![$A-Z_a-z][$\w]*\(\)&&[^;]{0,600}?\.get\(`use_embedded_checkout`,!1\)\?[$A-Z_a-z][$\w]*\(\{currentPlan:[^;]{0,200}?\}\):null/g,
+        (_match, desired) => `${desired}=null`,
+        "pricing webview prewarm",
+      );
+    }
+    if (
+      source.includes("isPrewarm:")
+      && source.includes("`use_embedded_credit_checkout`")
+      && !/&&\(!0\|\|[^;]{0,600}?`use_embedded_credit_checkout`/.test(source)
+    ) {
+      // 额度购买页同理：未展示时不再挂载隐藏的预热 webview，展示时照常加载。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /,!([$A-Z_a-z][$\w]*)&&\((?=[^;]{0,600}?\.get\(`use_embedded_credit_checkout`,!1\)\)\)return null;)/g,
+        (_match, presented) => `,!${presented}&&(!0||`,
+        "credit checkout webview prewarm",
+      );
+    }
+    if (
+      source.includes("Desktop host did not provide its AppServerManager service")
+      && !source.includes("__codeyAppServerManagerHosted")
+    ) {
+      // 新版把 AppServerManager 放在桌面宿主进程，页面只拿到 RPC 存根，页面里
+      // 打在请求客户端上的门禁不会经过。在宿主服务实际接入时留下标记供诊断。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(if\(([$A-Z_a-z][$\w]*)==null\)throw Error\(`Desktop host did not provide its AppServerManager service`\);)/g,
+        (_match, check) => `${check}globalThis.__codeyAppServerManagerHosted=true;`,
+        "hosted app server manager marker",
+      );
+    }
+    // 宿主托管时输入框发送经 RPC 存根直达宿主，页面请求客户端上的跨线路交接
+    // 不再经过。把两个发送入口改为先交给模型请求校验，缺少校验时原样调用。
+    const hostedTurnCall = "(globalThis.__codeyModelWhitelistPatch?.hostedTurnCall??((t,m,...a)=>t[m](...a)))";
+    const hostedFollowUpSend = /\b([$A-Z_a-z][$\w]*)\.sendFollowUpMessage\((?=[$A-Z_a-z][$\w]*,\{\.\.\.[$A-Z_a-z][$\w]*,useUserMessageAdmission:)/g;
+    // 以字面量开头的预检让大包快速跳过；只有命中的小模块才运行带接收者的匹配。
+    const hostedSendAnchor = (method, rest) => new RegExp(`\\.${method}\\([$A-Z_a-z][$\\w]*,\\{\\.\\.\\.[$A-Z_a-z][$\\w]*,${rest}`);
+    if (!source.includes("__codeyModelWhitelistPatch?.hostedTurnCall")
+      && hostedSendAnchor("sendFollowUpMessage", "useUserMessageAdmission:").test(source)) {
+      patched = replaceUniqueRendererGate(
+        patched,
+        hostedFollowUpSend,
+        (_match, rpc) => `${hostedTurnCall}(${rpc},"sendFollowUpMessage",`,
+        "hosted follow-up portable handoff",
+      );
+    }
+    const hostedTurnStart = /\b([$A-Z_a-z][$\w]*)\.startTurn\((?=[$A-Z_a-z][$\w]*,\{\.\.\.[$A-Z_a-z][$\w]*,context:\{\.\.\.[$A-Z_a-z][$\w]*\.context,onRequestDispatched:)/g;
+    if (!source.includes("__codeyModelWhitelistPatch?.hostedTurnCall")
+      && hostedSendAnchor("startTurn", "context:\\{\\.\\.\\.[$A-Z_a-z][$\\w]*\\.context,onRequestDispatched:").test(source)) {
+      patched = replaceUniqueRendererGate(
+        patched,
+        hostedTurnStart,
+        (_match, rpc) => `${hostedTurnCall}(${rpc},"startTurn",`,
+        "hosted turn start portable handoff",
       );
     }
     if (
@@ -587,12 +688,12 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|initialize-app-host-services)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+          /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|initialize-app-host-services|renderer-app-server-managers|send-follow-up-message|start-turn|webview-page)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
           ) ||
           (
             disablePet &&
-            /\/(?:(?:pets-settings)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
+            /\/(?:(?:pets-settings|app-runtime)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
               url.pathname,
             )
           )

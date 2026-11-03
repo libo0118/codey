@@ -267,27 +267,106 @@ where
     F: std::future::Future<Output = T> + Send,
 {
     tokio::pin!(future);
-    let mut monitor_read = true;
-    let mut byte = [0; 1];
-    loop {
-        tokio::select! {
-            biased;
-            result = stream.peek(&mut byte), if monitor_read => {
-                match result {
-                    // FIN 同时表示合法的 HTTP 写半关闭，不能据此取消。
-                    // 停止读监听，避免 EOF 或流水线字节造成持续唤醒。
-                    Ok(_) => monitor_read = false,
-                    Err(error) => return Err(anyhow::Error::new(error).context(DownstreamClosed)),
+    tokio::select! {
+        biased;
+        result = await_http_reset(stream) => {
+            Err(anyhow::Error::new(result.unwrap_err()).context(DownstreamClosed))
+        }
+        result = &mut future => {
+            match http_reset_error(stream) {
+                Ok(None) => Ok(result),
+                Ok(Some(error)) | Err(error) => {
+                    Err(anyhow::Error::new(error).context(DownstreamClosed))
                 }
-            }
-            result = &mut future => {
-                if let Some(error) = stream.take_error()? {
-                    return Err(anyhow::Error::new(error).context(DownstreamClosed));
-                }
-                return Ok(result);
             }
         }
     }
+}
+
+fn http_reset_error(stream: &TcpStream) -> std::io::Result<Option<std::io::Error>> {
+    if let Some(error) = stream.take_error()? {
+        return Ok(Some(error));
+    }
+    // Mio 将 Windows 的 AFD_POLL_ABORT 映射成 WRITE_CLOSED，SO_ERROR 可能仍为空。
+    // FIN 仅设置 READ_CLOSED；检查写关闭不会消费流水线字节或误判写入半关闭。
+    #[cfg(windows)]
+    if let Some(ready) =
+        futures_util::FutureExt::now_or_never(stream.ready(tokio::io::Interest::WRITABLE))
+        && ready?.is_write_closed()
+    {
+        return Ok(Some(std::io::ErrorKind::ConnectionReset.into()));
+    }
+    // 补查 TCP 状态；CLOSE_WAIT 仍可写回响应，只有 CLOSED 才取消等待。
+    #[cfg(windows)]
+    if windows_http_tcp_state(stream)? == Some(windows::Win32::Networking::WinSock::TCPSTATE_CLOSED)
+    {
+        return Ok(Some(std::io::ErrorKind::ConnectionReset.into()));
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn windows_http_tcp_state(
+    stream: &TcpStream,
+) -> std::io::Result<Option<windows::Win32::Networking::WinSock::TCPSTATE>> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{
+        SIO_TCP_INFO, SOCKET, SOCKET_ERROR, TCP_INFO_v0, WSAEINVAL, WSAEOPNOTSUPP, WSAGetLastError,
+        WSAIoctl,
+    };
+
+    let version = 0u32;
+    let mut info = TCP_INFO_v0::default();
+    let mut returned = 0u32;
+    // 同步查询只写入栈上的固定大小缓冲区，不发送或读取 HTTP 字节，
+    // 也不改变 Tokio/Mio 的就绪注册。SIO_TCP_INFO 不需要管理员权限。
+    let result = unsafe {
+        WSAIoctl(
+            SOCKET(stream.as_raw_socket() as usize),
+            SIO_TCP_INFO,
+            Some(std::ptr::from_ref(&version).cast()),
+            std::mem::size_of_val(&version) as u32,
+            Some(std::ptr::from_mut(&mut info).cast()),
+            std::mem::size_of_val(&info) as u32,
+            &mut returned,
+            None,
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        let error = unsafe { WSAGetLastError() };
+        // 旧版 Windows 或第三方 Winsock provider 不支持此查询时保留原有监测。
+        if error == WSAEOPNOTSUPP || error == WSAEINVAL {
+            return Ok(None);
+        }
+        return Err(std::io::Error::from_raw_os_error(error.0));
+    }
+    if returned < std::mem::size_of_val(&info.State) as u32 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(info.State))
+}
+
+async fn await_http_reset(stream: &TcpStream) -> std::io::Result<()> {
+    #[cfg(windows)]
+    loop {
+        if let Some(error) = http_reset_error(stream)? {
+            return Err(error);
+        }
+        // 普通可写就绪会一直保留；定时重查关闭标记和 TCP 状态，不清除就绪。
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Unix 的错误就绪不受 FIN 或未消费字节影响，虚假唤醒由 WouldBlock 清除。
+    #[cfg(not(windows))]
+    stream
+        .async_io(tokio::io::Interest::ERROR, || {
+            Err::<(), _>(
+                stream
+                    .take_error()?
+                    .unwrap_or_else(|| std::io::ErrorKind::WouldBlock.into()),
+            )
+        })
+        .await
 }
 
 impl RouterServer {
@@ -426,4 +505,4 @@ impl std::fmt::Display for AdmissionEnded {
 impl std::error::Error for AdmissionEnded {}
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

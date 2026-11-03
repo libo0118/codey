@@ -30,15 +30,19 @@ use crate::error_log;
 /// 补丁脚本注入页面后暴露的纯函数入口：`(url, source) => patched | null`。
 const RENDERER_ASSET_PATCH_SCRIPT: &str = include_str!("renderer_asset_patch.js");
 /// 需要改写的脚本名前缀，与页面侧 isCodexRendererAssetUrl 的名单保持一致。
-const PATCHABLE_ASSET_PREFIXES: [&str; 5] = [
+const PATCHABLE_ASSET_PREFIXES: [&str; 9] = [
     "app-initial",
     "app-primary",
     "app-shared",
     "codex-composer-adapter",
     "initialize-app-host-services",
+    "renderer-app-server-managers",
+    "send-follow-up-message",
+    "start-turn",
+    "webview-page",
 ];
-/// 仅在关闭宠物时改写的设置页脚本。
-const PET_ASSET_PREFIXES: [&str; 1] = ["pets-settings"];
+/// 仅在关闭宠物时改写的脚本：设置页预览资源，以及决定是否预热隐藏浮窗的运行时。
+const PET_ASSET_PREFIXES: [&str; 2] = ["pets-settings", "app-runtime"];
 /// 等 Codex 调试端点就绪的总预算；超时后由下一次注入重新拉起服务。
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
 /// 端点未就绪时的重连间隔：主窗口通常在端点出现后数百毫秒内导航，间隔要短。

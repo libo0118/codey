@@ -58,6 +58,8 @@ const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
+const QUOTA_NOTICE_DISMISS_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/quota-notice-dismiss.js");
 const QUOTA_UNLOCK_SCRIPT: &str = include_str!("../../dist-overlay/inject/quota-unlock.js");
 pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
     include_str!("../../dist-overlay/codey-overlay.js");
@@ -343,6 +345,17 @@ pub fn prepare_injection_scripts(
             Feature,
         ),
         (
+            "quota-notice-dismiss",
+            "额度提示关闭",
+            QUOTA_NOTICE_DISMISS_SCRIPT,
+            r#"window.__codeyQuotaNoticeDismissInstalled === true
+              && typeof window.__codeyQuotaNoticeDismiss?.scan === "function"
+              && typeof window.__codeyQuotaNoticeDismiss?.dismiss === "function"
+              ? "额度提示关闭按钮已就绪" : """#
+                .to_string(),
+            Feature,
+        ),
+        (
             "settings-overlay-loader",
             "配置面板加载器",
             lazy_settings_overlay_loader_script(),
@@ -428,6 +441,7 @@ pub fn prepare_injection_scripts(
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
             + SECURITY_WARNING_SHIELD_SCRIPT.len()
+            + QUOTA_NOTICE_DISMISS_SCRIPT.len()
             + QUOTA_UNLOCK_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + PROMPT_OPTIMIZE_SCRIPT.len()
@@ -1127,6 +1141,8 @@ struct RequestGateVerdict {
     #[serde(default)]
     module_gate: bool,
     #[serde(default)]
+    host_managed: bool,
+    #[serde(default)]
     patch_present: bool,
 }
 
@@ -1160,6 +1176,7 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
     polls,
     sourceGate: window.__codeyModelRequestSourceGateInstalled === true,
     moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
+    hostManaged: window.__codeyAppServerManagerHosted === true,
   });
   for (;;) {
     if (!patchPresent()) {
@@ -1308,6 +1325,9 @@ fn record_request_gate_verdict(
     // sourceGate/moduleGate 区分源码补丁、模块级 DI 直取与 React 遍历三条
     // 就绪路径；patchSession 记录补丁服务是否赶在首个文档前挂上该页面，
     // attachedBeforeLoad 为 false 时主 bundle 没有补丁，属于预期内的降级。
+    // hostManaged 表示请求由桌面宿主进程发出，页面里的源码门禁不在请求路径上：
+    // 线路由 CLI 输入中继固定，跨线路交接改由输入框发送入口的补丁完成，
+    // sourceGate 不代表请求已被页面校验。
     let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
         event,
         serde_json::json!({
@@ -1318,6 +1338,7 @@ fn record_request_gate_verdict(
             "settleMs": settle_ms,
             "sourceGate": verdict.source_gate,
             "moduleGate": verdict.module_gate,
+            "hostManaged": verdict.host_managed,
             "patchSession": crate::renderer_asset_patch::page_stats(target_id),
         }),
     );
@@ -2036,6 +2057,7 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
   // 高于后端连接加求值的预算；桥接失联时不能让加载永远挂起、吞掉后续点击。
   const loadTimeoutMs = 15000;
   let loading = null;
+  let opening = false;
   const formatError = (error) => error instanceof Error
     ? `${error.name}: ${error.message}`
     : String(error || "未知错误");
@@ -2067,22 +2089,29 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
       if (typeof window.__codexSessionDeleteBridge !== "function") {
         return Promise.reject(new Error("Codey bridge 尚未就绪"));
       }
-      loading = requestLoad(false);
+      // 失败的加载不能留在缓存里，否则悬停预加载失败后点击再也无法重试。
+      loading = requestLoad(false).catch((error) => {
+        loading = null;
+        throw error;
+      });
       return loading;
     },
     open() {
       this.toggle();
     },
     toggle() {
-      if (loading) return;
+      // 预加载进行中的点击等同一次加载完成后再打开，只防止重复打开。
+      if (opening) return;
+      opening = true;
       void this.load().then((overlay) => {
         if (typeof overlay.open === "function") overlay.open();
         else overlay.toggle();
       }).catch((error) => {
         const message = formatError(error);
         window.__codeyOverlayError = message;
-        loading = null;
         window.alert(`Codey 内嵌配置面板加载失败：${message}`);
+      }).finally(() => {
+        opening = false;
       });
     },
   };
@@ -3343,7 +3372,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors.len(), 12);
         let user_script = prepared
             .descriptors
             .iter()
@@ -3354,10 +3383,16 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
             prepared.descriptors[0].visibility,
             InjectionScriptVisibility::Internal
         );
-        assert_eq!(prepared.descriptors[5].id, "renderer-controls");
+        assert_eq!(prepared.descriptors[6].id, "renderer-controls");
         assert_eq!(
-            prepared.descriptors[5].visibility,
+            prepared.descriptors[6].visibility,
             InjectionScriptVisibility::Internal
+        );
+        assert!(
+            prepared
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.id == "quota-notice-dismiss")
         );
         assert!(
             prepared

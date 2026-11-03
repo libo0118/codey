@@ -1,6 +1,39 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) async fn reset_http_test_client(
+    client: TcpStream,
+    server: &socket2::Socket,
+    after_fin: bool,
+) {
+    #[cfg(windows)]
+    if after_fin {
+        // SD_SEND 已启动正常关闭，随后零 linger 的 closesocket 不保证另发 RST。
+        // 测试端先确认接收缓冲区有数据，再 SD_RECEIVE，按 Winsock 语义强制重置。
+        // 临时响应由测试发送，监测逻辑仍不得写入 HTTP 数据。
+        let interim = b"HTTP/1.1 100 Continue\r\n\r\n";
+        assert_eq!(server.send(interim).unwrap(), interim.len());
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.peek(&mut byte))
+                .await
+                .expect("reset fixture byte did not reach client")
+                .unwrap(),
+            1
+        );
+        assert_eq!(byte, [b'H']);
+        socket2::SockRef::from(&client)
+            .shutdown(std::net::Shutdown::Read)
+            .unwrap();
+    }
+    #[cfg(not(windows))]
+    let _ = (server, after_fin);
+    socket2::SockRef::from(&client)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(client);
+}
+
 fn registry(limit: u32) -> Arc<OfficialConcurrency> {
     let registry = Arc::new(OfficialConcurrency::default());
     registry.gates.lock().unwrap().insert(
@@ -144,7 +177,7 @@ async fn http_write_half_close_does_not_cancel_admission() {
     client.shutdown().await.unwrap();
     assert_eq!(
         await_http_admission(&mut server, async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(75)).await;
             7
         })
         .await
@@ -155,6 +188,108 @@ async fn http_write_half_close_does_not_cancel_admission() {
 
 #[tokio::test]
 async fn http_reset_cancels_queued_request_without_upstream_work() {
+    for prefix in ["none", "fin", "pipelined", "pipelined_fin"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let reset_sender = socket2::SockRef::from(&server).try_clone().unwrap();
+        if prefix.starts_with("pipelined") {
+            client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        }
+        if prefix.ends_with("fin") {
+            client.shutdown().await.unwrap();
+        }
+        if prefix != "none" {
+            let mut byte = [0];
+            assert_eq!(
+                server.peek(&mut byte).await.unwrap(),
+                usize::from(prefix != "fin"),
+                "{prefix}"
+            );
+        }
+        let registry = registry(1);
+        let first = ready(&registry);
+        let waiter = queued(&registry);
+        let admission = await_http_admission(&mut server, waiter.wait());
+        tokio::pin!(admission);
+        // 先保留 FIN / 流水线数据等待一轮监测周期，再发送 reset。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), admission.as_mut())
+                .await
+                .is_err(),
+            "{prefix}: admission ended before reset"
+        );
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), client.read(&mut byte))
+                .await
+                .is_err(),
+            "{prefix}: admission monitoring wrote unexpected response bytes"
+        );
+        reset_http_test_client(client, &reset_sender, prefix.ends_with("fin")).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .unwrap_or_else(|_| panic!("{prefix}: reset did not cancel queued admission"))
+            .err()
+            .unwrap();
+        assert!(error.is::<DownstreamClosed>(), "{prefix}: {error:#}");
+        assert_eq!(counts(&registry), (1, 0), "{prefix}");
+        drop(first);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn http_tcp_state_distinguishes_half_close_from_reset() {
+    use windows::Win32::Networking::WinSock::{TCPSTATE_CLOSE_WAIT, TCPSTATE_CLOSED};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut byte = [0];
+    assert_eq!(server.peek(&mut byte).await.unwrap(), 0);
+    assert_eq!(
+        windows_http_tcp_state(&server).unwrap(),
+        Some(TCPSTATE_CLOSE_WAIT)
+    );
+    let reset_sender = socket2::SockRef::from(&server).try_clone().unwrap();
+    reset_http_test_client(client, &reset_sender, true).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            // SO_ERROR 可以始终为空；此处直接验证 TCP 状态，不依赖 reactor 标记。
+            let _ = server.take_error().unwrap();
+            match windows_http_tcp_state(&server) {
+                Ok(Some(TCPSTATE_CLOSED)) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    break;
+                }
+                state => assert!(
+                    matches!(state, Ok(Some(TCPSTATE_CLOSE_WAIT))),
+                    "unexpected state after reset: {state:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("TCP state did not report reset after FIN");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn http_reset_with_empty_so_error_still_cancels_admission() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
         .await
@@ -164,20 +299,68 @@ async fn http_reset_cancels_queued_request_without_upstream_work() {
         .set_linger(Some(Duration::ZERO))
         .unwrap();
     drop(client);
-    let registry = registry(1);
-    let first = ready(&registry);
-    let waiter = queued(&registry);
+    // 确认 Windows reactor 已收到 AFD_POLL_ABORT，随后清空 SO_ERROR。
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .ready(tokio::io::Interest::WRITABLE)
+                .await
+                .unwrap()
+                .is_write_closed()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("Windows reactor did not report WRITE_CLOSED after reset");
+    let _ = server.take_error().unwrap();
+    assert!(server.take_error().unwrap().is_none());
     let error = tokio::time::timeout(
         Duration::from_secs(1),
-        await_http_admission(&mut server, waiter.wait()),
+        await_http_admission(&mut server, std::future::pending::<()>()),
     )
     .await
-    .unwrap()
-    .err()
-    .unwrap();
-    assert!(error.is::<DownstreamClosed>());
-    assert_eq!(counts(&registry), (1, 0));
-    drop(first);
+    .expect("reset with empty SO_ERROR did not cancel admission")
+    .unwrap_err();
+    assert!(error.is::<DownstreamClosed>(), "{error:#}");
+}
+
+#[tokio::test]
+async fn http_admission_preserves_pipelined_bytes() {
+    for fin in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let pipelined = b"GET / HTTP/1.1\r\n\r\n";
+        client.write_all(pipelined).await.unwrap();
+        if fin {
+            client.shutdown().await.unwrap();
+        }
+        assert_eq!(
+            await_http_admission(&mut server, async {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                7
+            })
+            .await
+            .unwrap(),
+            7
+        );
+        let mut received = vec![0; pipelined.len()];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, pipelined);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        server.write_all(response).await.unwrap();
+        let mut received = vec![0; response.len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(
+            received, response,
+            "fin={fin}: monitoring changed the HTTP response"
+        );
+    }
 }
 
 #[test]

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { FakeElementCore } from "./helpers/fake-element.mjs";
+import { FakeElementCore, liveCollection } from "./helpers/fake-element.mjs";
 
 const MODEL_CONFIG_ID = "107580212";
 
@@ -16,8 +16,8 @@ const mixedCompactionCatalog = {
   ],
 };
 const compactionRequest = (method, params, id = method) => ({ type: "mcp-request", request: { id, method, params } });
-const compactionReply = (runtime, id, result) => runtime.dispatchWindowEvent("message", {
-  data: { type: "mcp-response", message: { id, result } },
+const compactionReply = (runtime, id, result, responseKey = "message") => runtime.dispatchWindowEvent("message", {
+  data: { type: "mcp-response", [responseKey]: { id, result } },
 });
 
 test("third-party classification requires a current local catalog route and excludes official routes", async () => {
@@ -225,6 +225,153 @@ for (const returnedProvider of [undefined, "codey_router", "codey_router_remote"
   });
 }
 
+for (const wrapped of [false, true]) {
+  for (const responseKey of ["message", "response"]) {
+    test(`marked compatibility resumes restore the page carrier (wrapped=${wrapped}, ${responseKey})`, async () => {
+      const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+      const threadId = "page-compatibility-thread";
+      const request = compactionRequest("thread/resume", { threadId, model: "gpt-6-astra" });
+      if (wrapped) request.request = { method: "send-cli-request-for-host", params: {
+        hostId: "local", method: "thread/resume", params: request.request.params,
+      } };
+      delete request.request.id;
+      const outgoing = runtime.patch.rewriteOutgoingMessage(request);
+      outgoing.request.id = `thread/resume:${threadId}`;
+      runtime.patch.trackOutgoingMessage(outgoing);
+      const result = compatibilityResumeResult(threadId);
+      const historicalProvider = wrapped ? "openai" : "codey_router";
+      result.thread.modelProvider = historicalProvider;
+      if (wrapped) Object.freeze(result);
+      const message = { id: outgoing.request.id, result };
+      if (!wrapped && responseKey === "response") Object.freeze(message);
+      runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", [responseKey]: message } });
+      const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
+      assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), false,
+        "the explicit runtime marker must prevent a false OpenAI migration block");
+      assert.equal(message.result.modelProvider, "codey_router");
+      assert.equal(Object.hasOwn(message.result, "codeyRuntimeModelProvider"), false);
+      assert.equal(message.result.thread.modelProvider, historicalProvider, "rollout history stays unchanged");
+      runtime.patch.dispose();
+    });
+  }
+}
+
+function compatibilityResumeResult(threadId, overrides = {}) {
+  return {
+    modelProvider: "openai", codeyRuntimeModelProvider: "codey_router",
+    thread: { id: threadId, model: "gpt-6-astra", modelProvider: "openai" },
+    ...overrides,
+  };
+}
+
+test("the source result hook restores marked compatibility resumes before promise consumers run", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+  for (const method of ["thread/resume", "send-cli-request-for-host"]) {
+    const threadId = `source-${method}`;
+    const original = Object.freeze(compatibilityResumeResult(threadId));
+    const result = runtime.patch.rewriteIncomingResult(method, original, "local");
+    assert.equal(result.modelProvider, "codey_router");
+    assert.equal(Object.hasOwn(result, "codeyRuntimeModelProvider"), false);
+    assert.equal(result.thread, original.thread);
+    assert.equal(original.modelProvider, "openai");
+    assert.equal(original.codeyRuntimeModelProvider, "codey_router");
+    const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), false, "the guard sees the carrier before the response event");
+  }
+  runtime.patch.dispose();
+});
+
+test("the fallback request resolver restores marked compatibility resumes for local clients", async () => {
+  class NativeClient {
+    constructor(hostId = "local") { this.hostId = hostId; this.requestPromises = new Map(); this.sent = []; }
+    enqueueRequest(method, params) {
+      const created = this.createRequest(method, params);
+      this.sent.push(created.request);
+      return created.promise;
+    }
+    createRequest(method, params) {
+      const id = `thread/resume:${params.threadId}`;
+      const promise = new Promise((resolve) => this.requestPromises.set(id, { method, resolve }));
+      return { request: { id, method, params }, promise };
+    }
+    onResult(id, result) { this.requestPromises.get(id)?.resolve(result); this.requestPromises.delete(id); }
+  }
+  const client = new NativeClient();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { requestClient: client });
+  await runtime.patch.ensureRequestGate();
+  for (const hostId of ["local", "remote-host"]) {
+    const target = hostId === "local" ? client : new NativeClient(hostId);
+    const threadId = `fallback-${hostId}`;
+    const pending = target.enqueueRequest("thread/resume", { threadId, model: "gpt-6-astra" });
+    assert.equal(target.sent[0].params.modelProvider, hostId === "local" ? "codey_router" : undefined);
+    const original = Object.freeze(compatibilityResumeResult(threadId));
+    target.onResult(target.sent[0].id, original);
+    const result = await pending;
+    assert.equal(result.modelProvider, hostId === "local" ? "codey_router" : "openai");
+    assert.equal(Object.hasOwn(result, "codeyRuntimeModelProvider"), hostId !== "local");
+    assert.equal(result.thread.modelProvider, "openai");
+    const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), hostId !== "local");
+    if (hostId !== "local") assert.equal(result, original);
+  }
+  runtime.patch.dispose();
+});
+
+test("unmarked, mismatched and remote compatibility replies do not relax provider protection", async () => {
+  for (const [overrides, hostId] of [
+    [{ codeyRuntimeModelProvider: undefined }, "local"],
+    [{ codeyRuntimeModelProvider: "unknown-provider" }, "local"],
+    [{ modelProvider: "external-provider" }, "local"],
+    [{}, "remote-host"],
+  ]) {
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+    const threadId = "protected-compatibility-thread";
+    const original = compatibilityResumeResult(threadId, overrides);
+    if (original.codeyRuntimeModelProvider === undefined) delete original.codeyRuntimeModelProvider;
+    const sourceResult = runtime.patch.rewriteIncomingResult("thread/resume", original, hostId);
+    assert.equal(sourceResult, original);
+    runtime.patch.trackOutgoingMessage(compactionRequest("thread/resume", { threadId }, `thread/resume:${threadId}`));
+    const message = { id: `thread/resume:${threadId}`, result: original };
+    runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", hostId, message } });
+    assert.equal(message.result.modelProvider, original.modelProvider);
+    const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), true);
+    runtime.patch.dispose();
+  }
+});
+
+test("late marked resumes preserve runtime evidence alongside thread lists and started notifications", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+  const threadId = "late-compatibility-thread";
+  const turn = () => runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
+  for (const responseKey of ["message", "response"]) {
+    compactionReply(runtime, `thread/resume:${threadId}`, compatibilityResumeResult(threadId), responseKey);
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false, "late replies need no pending request");
+    compactionReply(runtime, "thread-list", { data: [{ id: threadId, model: "gpt-6-astra", modelProvider: "openai" }] });
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false, "thread lists only update persisted providers");
+  }
+  compactionReply(runtime, `thread/resume:${threadId}`, compatibilityResumeResult(threadId, { codeyRuntimeModelProvider: undefined }));
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), true, "unmarked late OpenAI replies remain authoritative");
+  runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: {
+    method: "thread/started", params: { thread: { id: threadId, modelProvider: "codey_router" } },
+  } } });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false);
+  const listed = runtime.patch.rewriteIncomingResult("model/list", compatibilityResumeResult("model-list-thread"), "local");
+  assert.equal(listed.modelProvider, "openai", "model/list never restores a thread carrier");
+  runtime.patch.trackOutgoingMessage(compactionRequest("model/list", {}, "marked-model-list"));
+  compactionReply(runtime, "marked-model-list", compatibilityResumeResult("model-list-thread"));
+  const listTurn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "model-list-thread", model: "gpt-6-astra" }));
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(listTurn), true, "model/list markers cannot confirm a router carrier");
+  const history = runtime.patch.rewriteIncomingResult("thread/list", {
+    modelProvider: "openai", codeyRuntimeModelProvider: "codey_router",
+    data: [{ id: threadId, model: "gpt-6-astra", modelProvider: "openai" }],
+  }, "local");
+  assert.equal(history.modelProvider, "openai");
+  assert.equal(history.data[0].modelProvider, "openai");
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false);
+  runtime.patch.dispose();
+});
+
 test("a resume response without any provider cannot confirm the requested carrier", async () => {
   const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
   runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "unknown", model: "remote/shared" }));
@@ -406,10 +553,13 @@ async function loadPatch(
   ]);
   let nextTimer = 0;
   const timers = new Map();
+  const timerDelays = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
   const mutationObserverInstalls = [];
   const dispatchedEvents = [];
+  const selectorScanCounts = new Map();
+  const elementQueryCounts = new Map();
   let wildcardScanCount = 0;
   const body = documentBody || {};
   if (queryClient) {
@@ -437,7 +587,9 @@ async function loadPatch(
     },
     querySelectorAll(selector) {
       if (selector === "*") wildcardScanCount += 1;
-      return documentBody ? body.querySelectorAll(selector) : [];
+      if (!documentBody) return [];
+      selectorScanCounts.set(selector, (selectorScanCounts.get(selector) || 0) + 1);
+      return body.querySelectorAll(selector);
     },
     addEventListener(name, listener) {
       const listeners = documentListeners.get(name) || new Set();
@@ -448,9 +600,9 @@ async function loadPatch(
       documentListeners.get(name)?.delete(listener);
     },
   };
-  const bridge = async (path, params) => {
+  const bridge = async (path, params, bridgeOptions) => {
     if (path === "/session/model") return sessionModelBridge ? sessionModelBridge(params) : { status: "error" };
-    if (path.startsWith("/session/portable-compaction/")) return portableBridge ? portableBridge(path, params) : { status: "ok", required: false };
+    if (path.startsWith("/session/portable-compaction/")) return portableBridge ? portableBridge(path, params, bridgeOptions) : { status: "ok", required: false };
     assert.equal(path, "/codex-model-catalog");
     return typeof catalogResponse === "function"
       ? catalogResponse()
@@ -476,13 +628,15 @@ async function loadPatch(
     removeEventListener(name, listener) {
       windowListeners.get(name)?.delete(listener);
     },
-    setTimeout(callback) {
+    setTimeout(callback, delay) {
       nextTimer += 1;
       timers.set(nextTimer, callback);
+      timerDelays.set(nextTimer, delay);
       return nextTimer;
     },
     clearTimeout(id) {
       timers.delete(id);
+      timerDelays.delete(id);
     },
     dispatchEvent(event) {
       dispatchedEvents.push(event);
@@ -522,12 +676,33 @@ async function loadPatch(
     { warn() {} },
   );
   const originalDispatchEvent = window.dispatchEvent;
+  let trackedBodyChildren = [];
+  if (documentBody) {
+    trackedBodyChildren = [...body.children];
+    Object.defineProperty(body, "children", {
+      configurable: true,
+      get: () => trackedBodyChildren,
+      set: (children) => { trackedBodyChildren = children; },
+    });
+  }
   Function("window", "document", "globalThis", "console", source)(
     window,
     document,
     window,
     { warn() {} },
   );
+  for (const element of documentBody ? allDocumentRoots().flatMap((root) => [root, ...root.querySelectorAll("*")]) : []) {
+    for (const method of ["querySelector", "querySelectorAll"]) {
+      const original = element[method];
+      if (typeof original !== "function") continue;
+      element[method] = function (selector) {
+        elementQueryCounts.set(element, new Map(elementQueryCounts.get(element) || []));
+        const bySelector = elementQueryCounts.get(element);
+        bySelector.set(selector, (bySelector.get(selector) || 0) + 1);
+        return original.call(this, selector);
+      };
+    }
+  }
   const patch = window.__codeyModelWhitelistPatch;
   if (bridgeReady) await patch.refresh();
   return {
@@ -558,6 +733,31 @@ async function loadPatch(
     wildcardScanCount() {
       return wildcardScanCount;
     },
+    selectorScanCount(selector) {
+      return selectorScanCounts.get(selector) || 0;
+    },
+    elementQueryCount(element, selector) {
+      return elementQueryCounts.get(element)?.get(selector) || 0;
+    },
+    recordElementQuery(element, selector) {
+      const bySelector = elementQueryCounts.get(element) || new Map();
+      bySelector.set(selector, (bySelector.get(selector) || 0) + 1);
+      elementQueryCounts.set(element, bySelector);
+    },
+    trackElementQueries(...elements) {
+      for (const element of elements) {
+        for (const method of ["querySelector", "querySelectorAll"]) {
+          const original = element?.[method];
+          if (typeof original !== "function") continue;
+          element[method] = function (selector) {
+            const bySelector = elementQueryCounts.get(element) || new Map();
+            bySelector.set(selector, (bySelector.get(selector) || 0) + 1);
+            elementQueryCounts.set(element, bySelector);
+            return original.call(this, selector);
+          };
+        }
+      }
+    },
     mutationObserverInstalls() {
       return mutationObserverInstalls;
     },
@@ -575,11 +775,38 @@ async function loadPatch(
       assert.ok(next, "a retry timer should be pending");
       const [id, callback] = next;
       timers.delete(id);
+      timerDelays.delete(id);
       callback();
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
     },
+    async runTimer(delay) {
+      const next = [...timers].find(([id]) => timerDelays.get(id) === delay);
+      assert.ok(next, `a ${delay}ms timer should be pending`);
+      const [id, callback] = next;
+      timers.delete(id);
+      timerDelays.delete(id);
+      callback();
+      await new Promise(setImmediate);
+    },
+    async runTimers(delay) {
+      for (let round = 0; round < 16; round += 1) {
+        const next = [...timers].find(([id]) => timerDelays.get(id) === delay);
+        if (!next) return;
+        const [id, callback] = next;
+        timers.delete(id);
+        timerDelays.delete(id);
+        callback();
+        await new Promise(setImmediate);
+      }
+      assert.fail(`more than 16 ${delay}ms timers remained pending`);
+    },
+    timerCount() {
+      return timers.size;
+    },
+    portableQueueCount() { return window.__codeyPortableCompactionQueues?.size || 0; },
+    setWindowValue(name, value) { window[name] = value; },
   };
 }
 
@@ -1005,7 +1232,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "83");
+  assert.equal(patch.version, "84");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -3679,7 +3906,7 @@ test("an open model picker hides a route row removed by a hot catalog update", a
   runtime.patch.dispose();
 });
 
-test("model picker observes row text changes after a route rename", async () => {
+test("model picker row text changes scan only their menu and deduplicate queued roots", async () => {
   const body = new FakeElementCore("body", { connected: true });
   const menu = body.appendChild(new FakeElementCore("div", {
     attributes: { role: "menu" },
@@ -3730,6 +3957,8 @@ test("model picker attaches text observers when a menu mounts later", async () =
     }],
   }, [statsigClient()], { documentBody: body });
 
+  // Drain the startup catalog delivery before measuring mutations.
+  await runtime.runTimers(0);
   assert.equal(runtime.mutationObserverInstalls().length, 1);
   const menu = new FakeElementCore("div", {
     attributes: { role: "menu" },
@@ -3745,36 +3974,231 @@ test("model picker attaches text observers when a menu mounts later", async () =
   assert.equal(installs.length, 2);
   assert.equal(installs[1].target, menu);
   assert.equal(installs[1].options.characterData, true);
+  const groupedMenuSelector = "[role='menu'], [role='listbox']";
+  const scansBefore = runtime.selectorScanCount(groupedMenuSelector);
+  const item = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  item.textContent = "relay/gpt-5.6-sol";
+  runtime.dispatchObserverMutations(menu, [{
+    type: "childList",
+    target: menu,
+    addedNodes: [item],
+    removedNodes: [],
+  }]);
+  await runtime.runTimers(0);
+  assert.equal(item.dataset.codeyRouteModel, "relay/gpt-5.6-sol");
+  assert.equal(runtime.selectorScanCount(groupedMenuSelector), scansBefore);
   runtime.patch.dispose();
 });
 
-test("model picker ignores streaming mutations outside the picker", async () => {
+test("model picker text changes scan only their menu and deduplicate queued roots", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const firstMenu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const firstItem = firstMenu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  firstItem.textContent = composerRouteModel;
+  const secondMenu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const secondItem = secondMenu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  secondItem.textContent = composerOtherRouteModel;
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], {
+    documentBody: body,
+  });
+  // Drain the startup catalog delivery so only text mutations create timers.
+  await runtime.runTimers(0);
+  runtime.patch.enhanceModelMenus();
+  for (const item of [firstItem, secondItem]) {
+    item.textContent = composerRouteModel;
+    delete item.dataset.codeyRouteModel;
+    delete item.dataset.codeyRouteName;
+  }
+  const groupedMenuSelector = "[role='menu'], [role='listbox']";
+  const scansBefore = runtime.selectorScanCount(groupedMenuSelector);
+  const textNode = { nodeType: 3, nodeValue: composerRouteModel, parentElement: firstItem };
+  firstItem.childNodes = [textNode];
+
+  runtime.dispatchObserverMutations(firstMenu, [{
+    type: "characterData",
+    target: textNode,
+  }]);
+  runtime.dispatchObserverMutations(firstMenu, [{
+    type: "childList",
+    target: firstItem,
+    addedNodes: [],
+    removedNodes: [],
+  }]);
+  await runtime.runTimer(0);
+
+  assert.equal(runtime.selectorScanCount(groupedMenuSelector), scansBefore);
+  assert.equal(firstItem.textContent, "gpt-6-astra");
+  assert.equal(firstItem.dataset.codeyRouteModel, composerRouteModel);
+  assert.equal(secondItem.dataset.codeyRouteModel, undefined);
+  assert.equal(runtime.timerCount(), 1);
+  runtime.patch.dispose();
+});
+
+test("nested turn wrappers enhance a menu and picker mounted after patch startup", async () => {
   const body = new FakeElementCore("body", { connected: true });
   const turn = body.appendChild(new FakeElementCore("div", {
-    attributes: { "data-turn-key": "t1" },
+    attributes: { "data-turn-key": "model-in-turn" },
   }));
-  const runtime = await loadPatch({
-    status: "ok",
-    models: ["relay/gpt-5.6-sol"],
-    default_model: "relay/gpt-5.6-sol",
-    model_metadata: [{
-      model: "relay/gpt-5.6-sol",
-      display_name: "[新线] gpt-5.6-sol",
-      route_name: "新线路",
-      route_prefix: "新线",
-      provider_id: "relay",
-      source_model: "gpt-5.6-sol",
-    }],
-  }, [statsigClient()], { documentBody: body });
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], {
+    documentBody: body,
+  });
+  const wrapper = turn.appendChild(new FakeElementCore("div"));
+  const nested = wrapper.appendChild(new FakeElementCore("div"));
+  const menu = wrapper.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const item = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  item.textContent = composerRouteModel;
+  const { trigger, textNode } = composerModelTrigger(wrapper, composerRouteModel);
 
-  assert.equal(runtime.mutationObserverInstalls().length, 1);
   runtime.dispatchObserverMutations(body, [{
-    addedNodes: [new FakeElementCore("span")],
+    addedNodes: [wrapper],
     removedNodes: [],
     target: turn,
     type: "childList",
   }]);
+
+  assert.ok(runtime.mutationObserverInstalls().some((entry) => entry.target === menu));
+  assert.ok(runtime.mutationObserverInstalls().some((entry) => entry.target === trigger));
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  assert.equal(nested.isConnected, true);
+  assert.equal(runtime.timerCount(), 2);
+  await runtime.runTimer(0);
+  assert.equal(item.textContent, "gpt-6-astra");
+  assert.equal(item.dataset.codeyRouteModel, composerRouteModel);
+  assert.equal(menu.children.find((child) => child.dataset.codeyRouteHeading)?.dataset.codeyRouteHeading, "[主] 主");
+  runtime.patch.dispose();
+  assert.equal(textNode.nodeValue, composerRouteModel);
+});
+
+test("turn mutations accept NodeList-shaped added nodes", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const turn = body.appendChild(new FakeElementCore("div", {
+    attributes: { "data-turn-key": "model-in-turn-nodelist" },
+  }));
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], {
+    documentBody: body,
+  });
+  const wrapper = turn.appendChild(new FakeElementCore("div"));
+  const { textNode } = composerModelTrigger(wrapper, composerRouteModel);
+
+  runtime.dispatchObserverMutations(body, [{
+    addedNodes: liveCollection([wrapper]),
+    removedNodes: liveCollection([]),
+    target: turn,
+    type: "childList",
+  }]);
+
+  assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
+  runtime.patch.dispose();
+});
+
+test("repeated catalog delivery updates tracked pickers without another document picker scan", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const { textNode } = composerModelTrigger(body, composerRouteModel);
+  const runtime = await loadPatch(composerCatalog(), [statsigClient()], {
+    documentBody: body,
+  });
+  const selector = "button[aria-haspopup='menu'], button[aria-haspopup='listbox'], [data-model-picker-view-toggle]";
+  const scansBefore = runtime.selectorScanCount(selector);
+
+  await runtime.patch.setCatalog(composerCatalog("甲"));
+  await runtime.patch.setCatalog(composerCatalog("乙"));
+
+  assert.equal(runtime.selectorScanCount(selector), scansBefore);
+  assert.equal(textNode.nodeValue, "[乙] gpt-6-astra");
+
+  const late = composerModelTrigger(body, composerOtherRouteModel);
+  runtime.dispatchObserverMutations(body, [{
+    addedNodes: [late.trigger],
+    removedNodes: [],
+    target: body,
+    type: "childList",
+  }]);
+  assert.equal(late.textNode.nodeValue, "[备] gpt-6-astra");
+  assert.equal(runtime.selectorScanCount(selector), scansBefore);
+  runtime.patch.dispose();
+});
+
+test("ordinary streaming wrappers are probed with a bounded subtree budget", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const turn = body.appendChild(new FakeElementCore("div", {
+    attributes: { "data-turn-key": "t1" },
+  }));
+  const content = turn.appendChild(new FakeElementCore("div"));
+  const catalog = composerCatalog("流式");
+  const runtime = await loadPatch({
+    ...catalog,
+  }, [statsigClient()], { documentBody: body });
+
   assert.equal(runtime.mutationObserverInstalls().length, 1);
+  const timersBefore = runtime.timerCount();
+  const added = new FakeElementCore("div");
+  for (let index = 0; index < 36; index += 1) {
+    const branch = added.appendChild(new FakeElementCore("div"));
+    branch.appendChild(new FakeElementCore("span")).textContent = `token-${index}`;
+  }
+  const branchChildren = added.children.map((branch) => branch.children);
+  let childListReads = 0;
+  added.children.forEach((branch, index) => {
+    Object.defineProperty(branch, "children", {
+      configurable: true,
+      get: () => {
+        childListReads += 1;
+        return branchChildren[index];
+      },
+      set: (children) => { branchChildren[index] = children; },
+    });
+  });
+  const originalTargetQuerySelectorAll = content.querySelectorAll;
+  const originalTargetQuerySelector = content.querySelector;
+  const originalAddedQuerySelectorAll = added.querySelectorAll;
+  const originalAddedQuerySelector = added.querySelector;
+  let targetSubtreeQueries = 0;
+  let targetDocumentSearches = 0;
+  let addedSubtreeQueries = 0;
+  let addedDocumentSearches = 0;
+  content.querySelectorAll = function (selector) {
+    targetSubtreeQueries += 1;
+    return originalTargetQuerySelectorAll.call(this, selector);
+  };
+  content.querySelector = function (selector) {
+    targetDocumentSearches += 1;
+    return originalTargetQuerySelector.call(this, selector);
+  };
+  added.querySelectorAll = function (selector) {
+    addedSubtreeQueries += 1;
+    return originalAddedQuerySelectorAll.call(this, selector);
+  };
+  added.querySelector = function (selector) {
+    addedDocumentSearches += 1;
+    return originalAddedQuerySelector.call(this, selector);
+  };
+  runtime.dispatchObserverMutations(body, [{
+    addedNodes: [added],
+    removedNodes: [],
+    target: content,
+    type: "childList",
+  }]);
+  assert.equal(targetSubtreeQueries, 0);
+  assert.equal(targetDocumentSearches, 0);
+  assert.equal(addedSubtreeQueries, 0);
+  assert.equal(addedDocumentSearches, 0);
+  assert.ok(childListReads < 24, `probe read ${childListReads} child lists`);
+  assert.equal(runtime.mutationObserverInstalls().length, 1);
+  assert.equal(runtime.timerCount(), timersBefore);
   runtime.patch.dispose();
 });
 
@@ -4154,6 +4578,76 @@ test("unchanged catalog retries and interactions do not repeat full React discov
   });
   assert.equal(runtime.wildcardScanCount(), 2);
   assert.equal(runtime.patch.delivery().revision, 2);
+  runtime.patch.dispose();
+});
+
+test("a recent successful discovery reuses mounted roots before the next full scan", async () => {
+  const catalog = {
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  };
+  const body = new FakeElementCore("body", { connected: true });
+  const modelButton = body.appendChild(new FakeElementCore("button", {
+    attributes: { "aria-haspopup": "menu" },
+  }));
+  const queryClient = activeModelQueryClient(["stale-model"]);
+  const replacementQueryClient = activeModelQueryClient(["stale-model"]);
+  const runtime = await loadPatch(catalog, [statsigClient()], {
+    documentBody: body,
+    queryClient,
+  });
+
+  assert.equal(runtime.wildcardScanCount(), 1);
+  assert.deepEqual(queryClient.models(), catalog.models);
+  body.__reactFiber$codeyTest = {
+    memoizedProps: { queryClient: replacementQueryClient },
+  };
+  runtime.dispatchDocumentEvent("pointerdown", { target: modelButton });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(runtime.wildcardScanCount(), 1, "the mounted-root pass must avoid the full document scan");
+  assert.deepEqual(replacementQueryClient.models(), catalog.models);
+  assert.deepEqual(queryClient.models(), catalog.models);
+
+  await runtime.patch.setCatalog({
+    ...catalog,
+    models: ["gpt-5.6-sol", "provider-new"],
+  });
+  assert.equal(runtime.wildcardScanCount(), 1, "a recent discovery does not repeat the full document walk");
+  assert.deepEqual(replacementQueryClient.models(), ["gpt-5.6-sol", "provider-new"]);
+  runtime.patch.dispose();
+});
+
+test("losing every known QueryClient re-enables the next forced discovery", async () => {
+  const catalog = {
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  };
+  const body = new FakeElementCore("body", { connected: true });
+  const firstQueryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const replacementQueryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const runtime = await loadPatch(catalog, [statsigClient()], {
+    documentBody: body,
+    queryClient: firstQueryClient,
+  });
+
+  firstQueryClient.getQueriesData = () => null;
+  delete body.__reactFiber$codeyTest;
+  await runtime.patch.setCatalog(catalog);
+  assert.equal(runtime.wildcardScanCount(), 1, "a missing client alone does not force a scan");
+
+  body.__reactFiber$codeyTest = {
+    memoizedProps: { queryClient: replacementQueryClient },
+  };
+  await runtime.patch.setCatalog({
+    ...catalog,
+    models: ["gpt-5.6-sol", "provider-recovered"],
+  });
+  assert.equal(runtime.wildcardScanCount(), 2, "new graph evidence can rediscover after the cache is lost");
+  assert.deepEqual(replacementQueryClient.models(), ["gpt-5.6-sol", "provider-recovered"]);
   runtime.patch.dispose();
 });
 
@@ -5368,7 +5862,7 @@ test("composer trigger handles mounting, removal and hot reload without full sca
   assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
   assert.equal(runtime.wildcardScanCount(), scans);
   const previousObservers = [...runtime.mutationObserverInstalls()];
-  runtime.patch.version = "previous";
+  runtime.patch.version = "83";
   const nextPatch = await runtime.reload();
   assert.ok(previousObservers.every(entry => entry.observer.disconnected));
   assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
@@ -6276,4 +6770,796 @@ test("direct source bridge prepares before tracking and sends once, including st
     if (["same-route", "missing-binding", "approved"].includes(mode)) assert.deepEqual(calls, ["prepare"]);
     runtime.patch.dispose();
   }
+});
+
+const portableDeferred = () => {
+  let resolve, reject;
+  const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+};
+const flushPortable = () => new Promise(setImmediate);
+async function portableStopHarness(entry, options = {}) {
+  const sent = [];
+  let runtime;
+  const transport = (method, params, hostId) => {
+    sent.push({ method, params, hostId });
+    if (options.send) return options.send(method, params, hostId);
+    return Promise.resolve({ sent: method });
+  };
+  class NativeClient {
+    constructor(hostId = "local") { this.hostId = hostId; }
+    enqueueRequest(method, params) {
+      // Exercise the source bridge after the prototype gate, including reentry.
+      const guarded = runtime.patch.guardDirectBridgeMessage(
+        { ...compactionRequest(method, params), hostId: this.hostId },
+        () => transport(method, params, this.hostId),
+      );
+      return guarded === true ? transport(method, params, this.hostId) : guarded;
+    }
+    createRequest() {}
+    onResult() {}
+  }
+  const client = new NativeClient();
+  const body = new FakeElementCore("body");
+  runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    ...options, requestClient: client, documentBody: body,
+  });
+  if (entry === "native") await runtime.patch.ensureRequestGate();
+  const dispatch = (method, params, hostId = "local", wrapped = false) => {
+    if (hostId === "local" && method === "turn/start") compactionReply(runtime, "stop-test-carrier", {
+      thread: { id: params.threadId, modelProvider: "codey_router" },
+    });
+    if (entry === "native" && !wrapped) return (hostId === "local" ? client : new NativeClient(hostId)).enqueueRequest(method, params);
+    const detail = wrapped ? compactionRequest("send-cli-request-for-host", { method, params, hostId })
+      : { ...compactionRequest(method, params), hostId };
+    const guarded = runtime.patch.guardDirectBridgeMessage(detail, () => transport(method, params, hostId));
+    return guarded === true ? transport(method, params, hostId) : guarded;
+  };
+  return { ...runtime, dispatch, sent, body };
+}
+
+for (const entry of ["native", "direct"]) {
+  test(`${entry} stop waits for active compaction before retrying token cleanup`, async () => {
+    const interrupt = portableDeferred();
+    let preparations = 0, cancellations = 0, state = "prepared";
+    const runtime = await portableStopHarness(entry, {
+      portableBridge: async (path) => {
+        if (path.endsWith("prepare")) return ++preparations === 1
+          ? { status: "ok", required: true, token: "running-token" }
+          : { status: "ok", required: false };
+        if (path.endsWith("interrupt")) return interrupt.promise;
+        if (path.endsWith("status")) return { status: "ok", state };
+        if (path.endsWith("cancel")) {
+          cancellations++;
+          return state === "running" ? { status: "failed", message: "仍在执行" } : { status: "ok" };
+        }
+        assert.fail(path);
+      },
+      send: async (method) => {
+        if (method === "thread/read") return { thread: { status: "idle" } };
+        if (method === "thread/compact/start") state = "running";
+        return { sent: method };
+      },
+    });
+    try {
+      const original = runtime.dispatch("turn/start", { threadId: "running-stop", model: "remote/shared" });
+      const cancelled = assert.rejects(original, { name: "AbortError" });
+      await flushPortable();
+      assert.equal(state, "running");
+      await runtime.dispatch("turn/interrupt", { threadId: "running-stop", turnId: "native" });
+      await cancelled;
+      const edited = runtime.dispatch("turn/start", { threadId: "running-stop", model: "local/shared" });
+      await flushPortable();
+      assert.equal(cancellations, 1, "running tickets reject an early token cleanup");
+      state = "failed";
+      interrupt.resolve({ status: "ok" });
+      assert.deepEqual(await edited, { sent: "turn/start" });
+      assert.equal(cancellations, 2, "cleanup is retried only after the active request has stopped");
+      assert.equal(runtime.sent.filter((call) => call.method === "turn/start").length, 1);
+    } finally { runtime.patch.dispose(); }
+  });
+}
+
+for (const entry of ["native", "direct"]) {
+  test(`${entry} stop cancels every queued send and waits for late prepare cleanup before a new send`, async () => {
+    const prepare = portableDeferred(), interrupt = portableDeferred(), cancel = portableDeferred();
+    const calls = [];
+    const runtime = await portableStopHarness(entry, { portableBridge: (path, params, bridgeOptions) => {
+      const action = path.split("/").at(-1);
+      calls.push({ action, params });
+      if (action === "prepare") return calls.filter((call) => call.action === action).length === 1
+        ? prepare.promise : Promise.resolve({ status: "ok", required: false });
+      if (action === "interrupt") {
+        assert.equal(bridgeOptions?.timeoutMs, 10_000, "the bridge allows the backend's five-second cleanup window");
+        return interrupt.promise;
+      }
+      if (action === "cancel") return cancel.promise;
+      assert.fail(action);
+    } });
+    const pending = ["original", "queued-a", "queued-b"].map((text) => runtime.dispatch("turn/start", {
+      threadId: "stop-queue", model: "remote/shared", input: [{ text }],
+    }));
+    const rejected = Promise.all(pending.map((promise) => assert.rejects(promise, { name: "AbortError", message: "发送已取消" })));
+    await flushPortable();
+    const stopParams = Object.freeze({ threadId: "stop-queue", turnId: "original-native-turn" });
+    assert.deepEqual(await runtime.dispatch("turn/interrupt", stopParams), { sent: "turn/interrupt" });
+    await rejected;
+    assert.equal(runtime.sent.length, 1, "native stop is sent before any cleanup service responds");
+    assert.equal(runtime.sent[0].params, stopParams, "the original native turn id is preserved");
+    const edited = runtime.dispatch("turn/start", { threadId: "stop-queue", model: "local/shared", input: [{ text: "edited" }] });
+    const other = runtime.dispatch("turn/start", { threadId: "other-thread", model: "local/shared" });
+    assert.deepEqual(await other, { sent: "turn/start" }, "another thread remains independent");
+    interrupt.resolve({ status: "ok" });
+    await flushPortable();
+    assert.equal(calls.filter((call) => call.action === "prepare" && call.params.threadId === "stop-queue").length, 1);
+    prepare.resolve({ status: "ok", required: true, token: "late-token" });
+    await flushPortable();
+    assert.deepEqual(calls.filter((call) => call.action === "cancel").map((call) => call.params), [{ threadId: "stop-queue", token: "late-token" }]);
+    assert.equal(runtime.sent.filter((call) => call.params.threadId === "stop-queue").length, 1, "late token cancellation is a barrier too");
+    cancel.resolve({ status: "ok" });
+    assert.deepEqual(await edited, { sent: "turn/start" });
+    assert.equal(runtime.sent.at(-1).params.input[0].text, "edited");
+    assert.equal(calls.filter((call) => call.action === "interrupt").length, 1, "nested gates share the same interrupt");
+    assert.equal(runtime.body.children.some((child) => child.id === "codey-provider-mismatch-notice"), false);
+    runtime.patch.dispose();
+  });
+
+  for (const stage of ["read", "compact", "status", "poll", "confirm"]) {
+    test(`${entry} stop during ${stage} prevents a late dispatch and preserves the next generation`, async () => {
+      const delayed = portableDeferred();
+      const calls = [];
+      let runtime, preparations = 0;
+      const notify = () => {
+        for (const method of ["item/started", "item/completed"]) runtime.dispatchWindowEvent("message", {
+          data: { type: "mcp-notification", hostId: "local", method, params: {
+            threadId: "stage-stop", turnId: "compaction-turn", item: { type: "contextCompaction", id: "item" },
+          } },
+        });
+      };
+      runtime = await portableStopHarness(entry, {
+        portableBridge: async (path) => {
+          const action = path.split("/").at(-1);
+          calls.push(action);
+          if (action === "prepare") return { status: "ok", required: ++preparations === 1, token: "old-token" };
+          if (action === stage) return delayed.promise;
+          if (action === "status") return { status: "ok", state: stage === "poll" ? "running" : "completed" };
+          return { status: "ok" };
+        },
+        send: async (method) => {
+          calls.push(method);
+          if (method === "thread/read") return stage === "read" ? delayed.promise : { thread: { status: "idle" } };
+          if (method === "thread/compact/start") {
+            if (stage === "compact") return delayed.promise;
+            notify();
+          }
+          return { sent: method };
+        },
+      });
+      const original = runtime.dispatch("turn/start", { threadId: "stage-stop", model: "remote/shared" });
+      const rejected = assert.rejects(original, { name: "AbortError" });
+      await flushPortable();
+      assert.ok(calls.includes({ read: "thread/read", compact: "thread/compact/start", poll: "status" }[stage] || stage), `${stage} must be reached`);
+      await runtime.dispatch("turn/interrupt", { threadId: "stage-stop", turnId: "user-turn" });
+      await rejected;
+      const newer = runtime.dispatch("turn/start", { threadId: "stage-stop", model: "local/shared", input: [{ text: "new" }] });
+      assert.deepEqual(await newer, { sent: "turn/start" });
+      delayed.resolve(stage === "read" ? { thread: { status: "idle" } } : { status: "ok", state: "completed" });
+      await flushPortable();
+      assert.equal(runtime.sent.filter((call) => call.method === "turn/start").length, 1);
+      assert.equal(calls.filter((action) => action === "cancel").length, 1);
+      assert.equal(runtime.body.children.some((child) => child.id === "codey-provider-mismatch-notice"), false);
+      runtime.patch.dispose();
+    });
+  }
+
+  test(`${entry} stop cancels a historical model restore without applying its late result`, async () => {
+    const saved = portableDeferred();
+    const storage = memoryStorage();
+    const runtime = await portableStopHarness(entry, { storage, sessionModelBridge: () => saved.promise });
+    const resume = runtime.dispatch("thread/resume", { threadId: "restore-stop", model: "local/shared" });
+    const rejected = assert.rejects(resume, { name: "AbortError" });
+    await flushPortable();
+    await runtime.dispatch("turn/interrupt", { threadId: "restore-stop", turnId: "native" });
+    await rejected;
+    await runtime.dispatch("turn/start", { threadId: "restore-stop", model: "gpt-6-astra" });
+    const before = storage.getItem("codey.thread-route-bindings.v1");
+    saved.resolve({ status: "ok", threadId: "restore-stop", model: "remote/shared", modelProvider: "codey_router", reasoningEffort: "high" });
+    await flushPortable();
+    assert.equal(storage.getItem("codey.thread-route-bindings.v1"), before);
+    assert.equal(runtime.sent.some((call) => call.method === "thread/resume"), false);
+    runtime.patch.dispose();
+  });
+
+  for (const rejectedBridge of [false, true]) {
+    test(`${entry} cleanup failure still sends native stop and explicit sends can retry (${rejectedBridge})`, async () => {
+      let interrupts = 0;
+      const runtime = await portableStopHarness(entry, { portableBridge: async (path) => {
+        if (path.endsWith("interrupt")) {
+          if (++interrupts === 3) return { status: "ok" };
+          if (rejectedBridge) throw new Error("清理服务暂时不可用");
+          return { status: "failed", message: "摘要仍在退出" };
+        }
+        return { status: "ok", required: false };
+      } });
+      const params = { threadId: "failed-stop", turnId: "keep-native-id" };
+      assert.deepEqual(await runtime.dispatch("turn/interrupt", params), { sent: "turn/interrupt" });
+      await flushPortable();
+      assert.equal(runtime.body.children.some((child) => child.id === "codey-provider-mismatch-notice"), false, "stop failures do not show a route failure notice");
+      await assert.rejects(runtime.dispatch("turn/start", { threadId: "failed-stop", model: "local/shared" }), /上次停止后的摘要清理未完成.*请再次发送重试/);
+      assert.equal(runtime.sent.length, 1);
+      assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "failed-stop", model: "remote/shared" }), { sent: "turn/start" });
+      assert.equal(interrupts, 3);
+      assert.equal(runtime.sent[0].params, params);
+      runtime.patch.dispose();
+    });
+  }
+
+  test(`${entry} remote and wrapped remote stop do not cancel local pending requests`, async () => {
+    const prepare = portableDeferred();
+    const calls = [];
+    const runtime = await portableStopHarness(entry, { portableBridge: (path) => {
+      calls.push(path);
+      return prepare.promise;
+    } });
+    const local = runtime.dispatch("turn/start", { threadId: "same-id", model: "local/shared" });
+    await flushPortable();
+    for (const wrapped of [false, true]) await runtime.dispatch("turn/interrupt", { threadId: "same-id", turnId: "remote" }, "remote-host", wrapped);
+    prepare.resolve({ status: "ok", required: false });
+    assert.deepEqual(await local, { sent: "turn/start" });
+    assert.deepEqual(calls, ["/session/portable-compaction/prepare"]);
+    runtime.patch.dispose();
+  });
+}
+
+test("native selection mode sends stop without invoking the portable service", async () => {
+  const runtime = await portableStopHarness("direct", { nativeSelectionOnly: true,
+    portableBridge: () => assert.fail("native selection cannot use portable cleanup"),
+  });
+  const params = { threadId: "native", turnId: "native-turn" };
+  await runtime.dispatch("turn/interrupt", params);
+  assert.equal(runtime.sent[0].params, params);
+  runtime.patch.dispose();
+});
+
+for (const entry of ["native", "direct"]) {
+  test(`${entry} stop cancels a queue behind an already sent request without waiting for its reply`, async () => {
+    const sentTurn = portableDeferred(), newPrepare = portableDeferred();
+    let prepares = 0, turns = 0;
+    const runtime = await portableStopHarness(entry, {
+      portableBridge: (path) => path.endsWith("prepare") && ++prepares === 2 ? newPrepare.promise
+        : Promise.resolve({ status: "ok", required: false }),
+      send: (method) => method === "turn/start" && ++turns === 1 ? sentTurn.promise : Promise.resolve({ sent: method }),
+    });
+    const original = runtime.dispatch("turn/start", { threadId: "sent-stop", model: "local/shared" });
+    await flushPortable();
+    const queued = runtime.dispatch("turn/start", { threadId: "sent-stop", model: "local/shared" });
+    const rejected = assert.rejects(queued, { name: "AbortError" });
+    await runtime.dispatch("turn/interrupt", { threadId: "sent-stop", turnId: "native" });
+    await rejected;
+    const edited = runtime.dispatch("turn/start", { threadId: "sent-stop", model: "remote/shared" });
+    await flushPortable();
+    assert.equal(prepares, 2, "a sent request's pending native reply does not hold the cleanup barrier");
+    sentTurn.resolve({ sent: "original" });
+    assert.deepEqual(await original, { sent: "original" }, "stop does not cancel an already sent request promise");
+    newPrepare.resolve({ status: "ok", required: false });
+    assert.deepEqual(await edited, { sent: "turn/start" });
+    assert.equal(turns, 2, "the older finally must not resume the cancelled queue");
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} a failed late token cancellation blocks sending and retries on the next explicit send`, async () => {
+    const prepare = portableDeferred();
+    let prepares = 0, cancels = 0;
+    const runtime = await portableStopHarness(entry, { portableBridge: async (path) => {
+      if (path.endsWith("prepare")) return ++prepares === 1 ? prepare.promise : { status: "ok", required: false };
+      if (path.endsWith("cancel")) return { status: ++cancels === 1 ? "failed" : "ok" };
+      return { status: "ok" };
+    } });
+    const original = runtime.dispatch("turn/start", { threadId: "cancel-failure", model: "local/shared" });
+    const rejected = assert.rejects(original, { name: "AbortError" });
+    await flushPortable();
+    await runtime.dispatch("turn/interrupt", { threadId: "cancel-failure", turnId: "native" });
+    await rejected;
+    const edited = runtime.dispatch("turn/start", { threadId: "cancel-failure", model: "remote/shared" });
+    const blocked = assert.rejects(edited, /摘要清理未完成.*凭据清理尚未确认/);
+    prepare.resolve({ status: "ok", required: true, token: "retry-token" });
+    await blocked;
+    assert.equal(prepares, 1);
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "cancel-failure", model: "remote/shared" }), { sent: "turn/start" });
+    assert.equal(cancels, 2, "explicit send retries the same failed token cancellation");
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} stop survives a missing bridge and a later explicit send retries after reconnection`, async () => {
+    const runtime = await portableStopHarness(entry, { bridgeReady: false });
+    await runtime.dispatch("turn/interrupt", { threadId: "disconnected", turnId: "native" });
+    await flushPortable();
+    runtime.connectBridge();
+    await runtime.patch.refresh();
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "disconnected", model: "local/shared" }), { sent: "turn/start" });
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} disposal cancels pending sends and handles a late rejected prepare`, async () => {
+    const prepare = portableDeferred();
+    const calls = [];
+    const runtime = await portableStopHarness(entry, { portableBridge: (path) => {
+      calls.push(path);
+      return prepare.promise;
+    } });
+    const pending = runtime.dispatch("turn/start", { threadId: "dispose-stop", model: "local/shared" });
+    const rejected = assert.rejects(pending, /已重新加载/);
+    await flushPortable();
+    runtime.patch.dispose();
+    await rejected;
+    prepare.reject(new Error("late bridge failure"));
+    await flushPortable();
+    assert.equal(runtime.sent.length, 0);
+    assert.deepEqual(calls, ["/session/portable-compaction/prepare"]);
+    assert.equal(runtime.patch.guardDirectBridgeMessage(compactionRequest("turn/interrupt", { threadId: "dispose-stop" })), true);
+    await flushPortable();
+    assert.equal(calls.length, 1, "a disposed gate must not initiate new cleanup work");
+  });
+}
+
+test("direct stop prevents a request client loaded after cancellation from sending thread/read", async () => {
+  const client = portableDeferred();
+  const sent = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    requestClient: client.promise,
+    portableBridge: async (path) => ({ status: "ok", required: path.endsWith("prepare"), token: "loader-token" }),
+  });
+  const pending = runtime.patch.guardDirectBridgeMessage(compactionRequest("turn/start", { threadId: "loader-stop", model: "local/shared" }), () => assert.fail("cancelled"));
+  const rejected = assert.rejects(pending, { name: "AbortError" });
+  await flushPortable();
+  assert.equal(runtime.patch.guardDirectBridgeMessage(compactionRequest("turn/interrupt", { threadId: "loader-stop", turnId: "native" })), true);
+  await rejected;
+  client.resolve({ hostId: "local", enqueueRequest: (method) => { sent.push(method); return {}; } });
+  await flushPortable();
+  assert.deepEqual(sent, []);
+  runtime.patch.dispose();
+});
+
+test("a stop during reentry cannot let a distinct send bypass cleanup or reuse an old approval", async () => {
+  const interruption = portableDeferred();
+  const client = { hostId: "local" };
+  let prepares = 0, newer;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { cachedRequestClient: client,
+    portableBridge: async (path) => {
+      if (path.endsWith("interrupt")) return interruption.promise;
+      if (path.endsWith("prepare")) prepares++;
+      return { status: "ok", required: false };
+    },
+  });
+  const originalParams = { threadId: "reentry-stop", model: "local/shared" };
+  let approved;
+  await runtime.patch.guardOutgoingRequest(client, "turn/start", originalParams, () => {
+    approved = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", originalParams));
+    assert.equal(runtime.patch.guardDirectBridgeMessage(approved), true);
+    assert.equal(runtime.patch.guardOutgoingRequest(client, "turn/interrupt", { threadId: "reentry-stop", turnId: "native" }), null);
+    newer = runtime.patch.guardOutgoingRequest(client, "turn/start", { threadId: "reentry-stop", model: "remote/shared" }, () => "new");
+    assert.ok(newer instanceof Promise, "a different request during reentry still goes through the queue");
+  });
+  await flushPortable();
+  assert.equal(prepares, 1);
+  const repeated = runtime.patch.guardDirectBridgeMessage(approved, () => "repeated");
+  assert.ok(repeated instanceof Promise, "a previously approved object cannot bypass a later generation");
+  interruption.resolve({ status: "ok" });
+  assert.equal(await newer, "new");
+  assert.equal(await repeated, "repeated");
+  assert.equal(prepares, 3);
+  runtime.patch.dispose();
+});
+
+for (const entry of ["native", "direct"]) {
+  test(`${entry} even a turn with no portable target waits for the preceding stop cleanup`, async () => {
+    const interruption = portableDeferred();
+    let prepares = 0;
+    const runtime = await portableStopHarness(entry, { portableBridge: async (path) => {
+      if (path.endsWith("interrupt")) return interruption.promise;
+      prepares++;
+      return { status: "ok", required: false };
+    } });
+    await runtime.dispatch("turn/interrupt", { threadId: "no-target", turnId: "native" });
+    const pending = runtime.dispatch("turn/start", { threadId: "no-target", model: null,
+      collaborationMode: { mode: "default", settings: { model: "shared" } },
+    });
+    await flushPortable();
+    assert.equal(runtime.sent.length, 1);
+    interruption.resolve({ status: "ok" });
+    assert.deepEqual(await pending, { sent: "turn/start" });
+    assert.equal(prepares, 0, "waiting for cleanup does not guess a portable target");
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} stop while a failed preflight is cleaning up suppresses its late failure notice`, async () => {
+    const cancellation = portableDeferred();
+    let cancelling = false;
+    const runtime = await portableStopHarness(entry, {
+      portableBridge: async (path) => {
+        if (path.endsWith("prepare")) return { status: "ok", required: true, token: "busy-token" };
+        if (path.endsWith("cancel")) { cancelling = true; return cancellation.promise; }
+        return { status: "ok" };
+      },
+      send: async () => ({ thread: { status: "active" } }),
+    });
+    const pending = runtime.dispatch("turn/start", { threadId: "busy-cleanup", model: "local/shared" });
+    const rejected = assert.rejects(pending, { name: "AbortError" });
+    await flushPortable();
+    assert.equal(cancelling, true);
+    await runtime.dispatch("turn/interrupt", { threadId: "busy-cleanup", turnId: "native" });
+    await rejected;
+    cancellation.resolve({ status: "ok" });
+    await flushPortable();
+    assert.equal(runtime.body.children.some((child) => child.id === "codey-provider-mismatch-notice"), false);
+    runtime.patch.dispose();
+  });
+}
+
+for (const entry of ["native", "direct"]) {
+  test(`${entry} stop between observing a prepare token and resuming its caller still cancels that token`, async () => {
+    let runtime, scheduledStop = false, prepares = 0;
+    const cancelled = [];
+    const prepared = { status: "ok", required: true, get token() {
+      if (!scheduledStop) {
+        scheduledStop = true;
+        queueMicrotask(() => { void runtime.dispatch("turn/interrupt", { threadId: "observed-token", turnId: "native" }); });
+      }
+      return "observed-token";
+    } };
+    runtime = await portableStopHarness(entry, { portableBridge: async (path, params) => {
+      if (path.endsWith("prepare")) return ++prepares === 1 ? prepared : { status: "ok", required: false };
+      if (path.endsWith("cancel")) cancelled.push(params.token);
+      return { status: "ok" };
+    } });
+    await assert.rejects(runtime.dispatch("turn/start", { threadId: "observed-token", model: "local/shared" }), { name: "AbortError" });
+    await flushPortable();
+    assert.deepEqual(cancelled, ["observed-token"]);
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "observed-token", model: "remote/shared" }), { sent: "turn/start" });
+    assert.equal(runtime.body.children.some((child) => child.id === "codey-provider-mismatch-notice"), false);
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} an unanswered prepare has a bounded cleanup barrier and keeps its thread blocked`, async () => {
+    const prepare = portableDeferred();
+    let prepares = 0;
+    const runtime = await portableStopHarness(entry, { portableBridge: (path, params) => {
+      if (path.endsWith("prepare")) {
+        prepares++;
+        return params.threadId === "lost-prepare" ? prepare.promise : Promise.resolve({ status: "ok", required: false });
+      }
+      return Promise.resolve({ status: "ok" });
+    } });
+    const original = runtime.dispatch("turn/start", { threadId: "lost-prepare", model: "local/shared" });
+    const aborted = assert.rejects(original, { name: "AbortError" });
+    await flushPortable();
+    const stopParams = Object.freeze({ threadId: "lost-prepare", turnId: "keep-native" });
+    const stop = runtime.dispatch("turn/interrupt", stopParams);
+    assert.equal(runtime.sent[0].params, stopParams, "native stop is synchronous while prepare is unresolved");
+    await stop;
+    await aborted;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const blocked = assert.rejects(runtime.dispatch("turn/start", { threadId: "lost-prepare", model: "remote/shared" }), /摘要清理未完成.*超时/);
+      await flushPortable();
+      await runtime.runTimer(10_000);
+      await blocked;
+      assert.equal(prepares, 1, "a timeout must not approve another prepare");
+    }
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "unrelated", model: "local/shared" }), { sent: "turn/start" });
+    assert.equal(runtime.portableQueueCount(), 1, "the unknown prepare remains tracked and the unrelated thread is released");
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} an unanswered cancel times out and a late acknowledgement can release a retry`, async () => {
+    const firstCancel = portableDeferred(), retryCancel = portableDeferred();
+    const calls = [];
+    let prepares = 0, cancels = 0;
+    const runtime = await portableStopHarness(entry, {
+      portableBridge: (path, params) => {
+        const action = path.split("/").at(-1);
+        calls.push({ action, params });
+        if (action === "prepare") return Promise.resolve({ status: "ok", required: ++prepares === 1, token: prepares === 1 ? "lost-cancel-token" : undefined });
+        if (action === "cancel") return ++cancels === 1 ? firstCancel.promise : retryCancel.promise;
+        return Promise.resolve({ status: "ok" });
+      },
+      send: async (method) => method === "thread/read" ? { thread: { status: "active" } } : { sent: method },
+    });
+    const failed = assert.rejects(runtime.dispatch("turn/start", { threadId: "lost-cancel", model: "local/shared" }), /任务仍在运行/);
+    await flushPortable();
+    await runtime.runTimer(10_000);
+    await failed;
+    assert.equal(runtime.portableQueueCount(), 1);
+    const blocked = assert.rejects(runtime.dispatch("turn/start", { threadId: "lost-cancel", model: "remote/shared" }), /摘要清理未完成.*超时/);
+    await flushPortable();
+    assert.equal(cancels, 2, "the explicit send retries the token even when its original reply is missing");
+    await runtime.runTimer(10_000);
+    await blocked;
+    assert.equal(prepares, 1);
+    const edited = runtime.dispatch("turn/start", { threadId: "lost-cancel", model: "remote/shared", input: [{ text: "edited" }] });
+    await flushPortable();
+    firstCancel.resolve({ status: "ok" });
+    assert.deepEqual(await edited, { sent: "turn/start" }, "any successful token acknowledgement confirms cleanup");
+    retryCancel.reject(new Error("late cancelled bridge response"));
+    await flushPortable();
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "lost-cancel", model: "local/shared" }), { sent: "turn/start" });
+    assert.ok(calls.filter((call) => call.action === "cancel").every((call) => call.params.token === "lost-cancel-token"));
+    assert.equal(runtime.portableQueueCount(), 0, "late failures cannot recreate a cleaned generation");
+    runtime.patch.dispose();
+  });
+
+  test(`${entry} an ordinary preflight failure retains a failed cancel for the next explicit send`, async () => {
+    const retry = portableDeferred();
+    let prepares = 0, cancels = 0;
+    const tokens = [];
+    const runtime = await portableStopHarness(entry, {
+      portableBridge: async (path, params) => {
+        if (path.endsWith("prepare")) return { status: "ok", required: ++prepares === 1, token: prepares === 1 ? "ordinary-failure" : undefined };
+        if (path.endsWith("cancel")) {
+          tokens.push(params.token);
+          return ++cancels === 1 ? { status: "failed" } : retry.promise;
+        }
+        return { status: "ok" };
+      },
+      send: async (method) => method === "thread/read" ? { thread: { status: "active" } } : { sent: method },
+    });
+    await assert.rejects(runtime.dispatch("turn/start", { threadId: "ordinary-failure", model: "local/shared" }), /任务仍在运行/);
+    assert.equal(runtime.portableQueueCount(), 1, "a task rejection cannot discard its failed token cleanup");
+    const edited = runtime.dispatch("turn/start", { threadId: "ordinary-failure", model: "remote/shared" });
+    await flushPortable();
+    assert.equal(prepares, 1);
+    assert.equal(runtime.sent.some((call) => call.method === "turn/start"), false);
+    retry.resolve({ status: "ok" });
+    assert.deepEqual(await edited, { sent: "turn/start" });
+    assert.deepEqual(tokens, ["ordinary-failure", "ordinary-failure"]);
+    assert.equal(runtime.portableQueueCount(), 0);
+    runtime.patch.dispose();
+  });
+
+  for (const lateCancelFails of [false, true]) {
+    test(`${entry} a preflight timeout retains late prepare cleanup after its first barrier expires (${lateCancelFails})`, async () => {
+      const prepare = portableDeferred(), retry = portableDeferred();
+      let prepares = 0, cancels = 0;
+      const tokens = [];
+      const runtime = await portableStopHarness(entry, { portableBridge: async (path, params) => {
+        if (path.endsWith("prepare")) return ++prepares === 1 ? prepare.promise : { status: "ok", required: false };
+        if (path.endsWith("cancel")) {
+          tokens.push(params.token);
+          if (++cancels === 1) return { status: lateCancelFails ? "failed" : "ok" };
+          return retry.promise;
+        }
+        return { status: "ok" };
+      } });
+      const timedOut = assert.rejects(runtime.dispatch("turn/start", { threadId: "preflight-timeout", model: "local/shared" }), /生成交接摘要超时/);
+      await flushPortable();
+      await runtime.runTimer(180_000);
+      await timedOut;
+      assert.equal(runtime.portableQueueCount(), 1);
+      const blocked = assert.rejects(runtime.dispatch("turn/start", { threadId: "preflight-timeout", model: "remote/shared" }), /摘要清理未完成.*超时/);
+      await flushPortable();
+      await runtime.runTimer(10_000);
+      await blocked;
+      prepare.resolve({ status: "ok", required: true, token: "timed-out-prepare" });
+      await flushPortable();
+      assert.equal(cancels, 1, "the original prepare observer still cleans a token after both timeouts");
+      const edited = runtime.dispatch("turn/start", { threadId: "preflight-timeout", model: "remote/shared" });
+      await flushPortable();
+      if (lateCancelFails) {
+        assert.equal(prepares, 1, "a late cancel failure is retained before the next prepare");
+        assert.equal(cancels, 2);
+        retry.resolve({ status: "ok" });
+      }
+      assert.deepEqual(await edited, { sent: "turn/start" });
+      assert.equal(prepares, 2);
+      assert.ok(tokens.every((token) => token === "timed-out-prepare"));
+      assert.equal(runtime.portableQueueCount(), 0);
+      runtime.patch.dispose();
+    });
+  }
+
+  test(`${entry} an unanswered interrupt is bounded even when the bridge ignores its timeout option`, async () => {
+    const interrupt = portableDeferred();
+    let interrupts = 0;
+    const runtime = await portableStopHarness(entry, { portableBridge: async (path) => {
+      if (path.endsWith("interrupt")) return ++interrupts === 1 ? interrupt.promise : { status: "ok" };
+      return { status: "ok", required: false };
+    } });
+    await runtime.dispatch("turn/interrupt", { threadId: "lost-interrupt", turnId: "native" });
+    const blocked = assert.rejects(runtime.dispatch("turn/start", { threadId: "lost-interrupt", model: "local/shared" }), /摘要清理未完成.*超时/);
+    await flushPortable();
+    await runtime.runTimer(10_000);
+    await blocked;
+    assert.equal(runtime.sent.length, 1);
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "lost-interrupt", model: "remote/shared" }), { sent: "turn/start" });
+    interrupt.reject(new Error("late interrupt failure"));
+    await flushPortable();
+    assert.equal(runtime.portableQueueCount(), 0);
+    runtime.patch.dispose();
+  });
+}
+
+test("patch replacement preserves a disposed generation until its late token cancellation is confirmed", async () => {
+  const prepare = portableDeferred();
+  let prepares = 0, cancels = 0;
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { portableBridge: async (path) => {
+    if (path.endsWith("prepare")) return ++prepares === 1 ? prepare.promise : { status: "ok", required: false };
+    if (path.endsWith("cancel")) return { status: ++cancels === 1 ? "failed" : "ok" };
+    return { status: "ok" };
+  } });
+  const client = { hostId: "local" }, params = { threadId: "replaced-preflight", model: "local/shared" };
+  const aborted = assert.rejects(runtime.patch.guardOutgoingRequest(client, "turn/start", params, () => assert.fail("disposed send")), { name: "AbortError" });
+  await flushPortable();
+  runtime.patch.version = "previous";
+  const replacement = await runtime.reload();
+  await aborted;
+  const blocked = assert.rejects(replacement.guardOutgoingRequest(client, "turn/start", { ...params }, () => assert.fail("unconfirmed send")), /摘要清理未完成.*超时/);
+  await flushPortable();
+  await runtime.runTimer(10_000);
+  await blocked;
+  prepare.resolve({ status: "ok", required: true, token: "disposed-token" });
+  await flushPortable();
+  assert.equal(cancels, 1);
+  assert.equal(await replacement.guardOutgoingRequest(client, "turn/start", { ...params }, () => "edited"), "edited");
+  assert.equal(cancels, 2);
+  assert.equal(runtime.portableQueueCount(), 0);
+  replacement.dispose();
+});
+
+test("completed preflights and successfully cancelled failures release their thread states", async () => {
+  let prepares = 0;
+  const runtime = await portableStopHarness("native", {
+    portableBridge: async (path) => path.endsWith("prepare") ? { status: "ok", required: ++prepares === 2, token: prepares === 2 ? "cleaned" : undefined } : { status: "ok" },
+    send: async (method) => method === "thread/read" ? { thread: { status: "active" } } : { sent: method },
+  });
+  await runtime.dispatch("turn/start", { threadId: "clean-completion", model: "local/shared" });
+  await flushPortable();
+  assert.equal(runtime.portableQueueCount(), 0);
+  await assert.rejects(runtime.dispatch("turn/start", { threadId: "clean-failure", model: "local/shared" }), /任务仍在运行/);
+  await flushPortable();
+  assert.equal(runtime.portableQueueCount(), 0);
+  runtime.patch.dispose();
+});
+
+test("late rejected cleanup attempts leave no unhandled promise rejections after a confirmed retry", async () => {
+  const prepare = portableDeferred(), interrupt = portableDeferred(), cancellation = portableDeferred();
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  let runtime, prepares = 0, interrupts = 0, cancels = 0;
+  try {
+    runtime = await portableStopHarness("native", { portableBridge: async (path) => {
+      if (path.endsWith("prepare")) return ++prepares === 1 ? prepare.promise : { status: "ok", required: false };
+      if (path.endsWith("interrupt")) return ++interrupts === 1 ? interrupt.promise : { status: "ok" };
+      if (path.endsWith("cancel")) return ++cancels === 1 ? cancellation.promise : { status: "ok" };
+      return { status: "ok" };
+    } });
+    const original = assert.rejects(runtime.dispatch("turn/start", { threadId: "late-rejections", model: "local/shared" }), { name: "AbortError" });
+    await flushPortable();
+    await runtime.dispatch("turn/interrupt", { threadId: "late-rejections", turnId: "native" });
+    await original;
+    const blocked = assert.rejects(runtime.dispatch("turn/start", { threadId: "late-rejections", model: "remote/shared" }), /摘要清理未完成.*超时/);
+    await flushPortable();
+    await runtime.runTimer(10_000);
+    await blocked;
+    prepare.resolve({ status: "ok", required: true, token: "late-rejections" });
+    await flushPortable();
+    assert.deepEqual(await runtime.dispatch("turn/start", { threadId: "late-rejections", model: "remote/shared" }), { sent: "turn/start" });
+    cancellation.reject(new Error("late cancellation rejection"));
+    interrupt.reject(new Error("late interruption rejection"));
+    await flushPortable();
+    await flushPortable();
+    assert.deepEqual(unhandled, []);
+    assert.equal(runtime.portableQueueCount(), 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    runtime?.patch.dispose();
+  }
+});
+
+// Codex 26.1027 hosts the session manager in the desktop process. The composer
+// calls the host RPC stub directly; the asset patch routes those sends here.
+function hostedRpc({ running = false, settleAfter = 0, failCompact = false } = {}) {
+  const calls = [];
+  let compacting = false;
+  let pendingPolls = settleAfter;
+  return {
+    calls,
+    getThreadExecutionState(threadId) {
+      calls.push(["state", threadId]);
+      if (compacting && pendingPolls-- > 0) return Promise.resolve({ inProgress: true });
+      return Promise.resolve({ inProgress: running });
+    },
+    sendRequest(method, params) {
+      calls.push([method, params.threadId]);
+      if (method === "thread/read") return Promise.resolve({ thread: { status: { type: "idle" } } });
+      if (method === "thread/compact/start") {
+        if (failCompact) return Promise.reject(new Error("compact rejected"));
+        compacting = true;
+      }
+      return Promise.resolve({});
+    },
+    sendFollowUpMessage(threadId, options) {
+      calls.push(["sendFollowUpMessage", threadId, options.prompt]);
+      return Promise.resolve("turn-1");
+    },
+    startTurn(threadId, options) {
+      calls.push(["startTurn", threadId, options.request.input]);
+      return Promise.resolve({ turn: { id: "turn-2" } });
+    },
+  };
+}
+
+function hostedPortableBridge(bridgeCalls, prepare = { status: "ok", required: true, token: "ticket" }) {
+  return async (path, params) => {
+    const operation = path.split("/").at(-1);
+    bridgeCalls.push(operation === "prepare" ? [operation, params] : [operation]);
+    if (operation === "prepare") return prepare;
+    if (operation === "status") return { status: "ok", state: "completed" };
+    return { status: "ok" };
+  };
+}
+
+test("hosted sends summarize on the source route before the host starts the turn", async () => {
+  const bridgeCalls = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { portableBridge: hostedPortableBridge(bridgeCalls) });
+  runtime.setWindowValue("__codeyAppServerManagerHosted", true);
+  const rpc = hostedRpc({ settleAfter: 1 });
+  const sent = runtime.patch.hostedTurnCall(rpc, "sendFollowUpMessage", "hosted-thread", { prompt: "hi", model: "remote/shared" });
+  await new Promise(setImmediate);
+  assert.ok(!rpc.calls.some(([name]) => name === "sendFollowUpMessage"), "the host must not start the turn while compaction runs");
+  await runtime.runTimers(300);
+  assert.equal(await sent, "turn-1");
+  assert.deepEqual(bridgeCalls, [
+    ["prepare", { threadId: "hosted-thread", targetProviderId: "remote", targetModel: "shared" }],
+    ["status"], ["status"], ["confirm"],
+  ]);
+  assert.deepEqual(rpc.calls.map(([name]) => name), [
+    "state", "thread/read", "thread/compact/start", "state", "state", "sendFollowUpMessage",
+  ]);
+  runtime.patch.dispose();
+});
+
+test("hosted turn starts use the saved thread model when the composer keeps it", async () => {
+  const bridgeCalls = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+    portableBridge: hostedPortableBridge(bridgeCalls, { status: "ok", required: false }),
+    sessionModelBridge: ({ threadId }) => ({ status: "ok", threadId, model: "local/shared", modelProvider: "codey_router" }),
+  });
+  runtime.setWindowValue("__codeyAppServerManagerHosted", true);
+  const rpc = hostedRpc();
+  const result = await runtime.patch.hostedTurnCall(rpc, "startTurn", "kept-model", { request: { threadId: "kept-model", input: ["go"] } });
+  assert.deepEqual(result, { turn: { id: "turn-2" } });
+  assert.deepEqual(bridgeCalls, [["prepare", { threadId: "kept-model", targetProviderId: "local", targetModel: "shared" }]]);
+  assert.deepEqual(rpc.calls, [["state", "kept-model"], ["startTurn", "kept-model", ["go"]]]);
+  runtime.patch.dispose();
+});
+
+test("hosted sends skip handoff for running threads, unknown targets and non-hosted pages", async () => {
+  for (const scenario of ["running", "unknown-model", "not-hosted"]) {
+    const bridgeCalls = [];
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      portableBridge: hostedPortableBridge(bridgeCalls),
+      sessionModelBridge: () => ({ status: "error" }),
+    });
+    if (scenario !== "not-hosted") runtime.setWindowValue("__codeyAppServerManagerHosted", true);
+    const rpc = hostedRpc({ running: scenario === "running" });
+    const options = { prompt: scenario, ...(scenario === "unknown-model" ? {} : { model: "remote/shared" }) };
+    assert.equal(await runtime.patch.hostedTurnCall(rpc, "sendFollowUpMessage", "skip", options), "turn-1", scenario);
+    // A prepared ticket would block requests of a turn that is still running.
+    assert.deepEqual(bridgeCalls, [], scenario);
+    assert.equal(rpc.calls.at(-1)[0], "sendFollowUpMessage", scenario);
+    assert.equal(rpc.calls.some(([name]) => name === "state"), scenario !== "not-hosted", scenario);
+    runtime.patch.dispose();
+  }
+});
+
+test("hosted handoff failures keep the source route and never reach the host", async () => {
+  const bridgeCalls = [];
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { portableBridge: hostedPortableBridge(bridgeCalls) });
+  runtime.setWindowValue("__codeyAppServerManagerHosted", true);
+  const rpc = hostedRpc({ failCompact: true });
+  await assert.rejects(runtime.patch.hostedTurnCall(rpc, "sendFollowUpMessage", "failed", { prompt: "hi", model: "remote/shared" }),
+    /compact rejected/);
+  assert.ok(!rpc.calls.some(([name]) => name === "sendFollowUpMessage"));
+  assert.deepEqual(bridgeCalls.map(([name]) => name), ["prepare", "cancel"]);
+  runtime.patch.dispose();
 });

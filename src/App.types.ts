@@ -138,6 +138,7 @@ export type Config = {
   codexLaunchProxy: string;
   fastContextTools: boolean;
   subagentOptimization: boolean;
+  scopeGuard: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;
   subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;

@@ -445,6 +445,38 @@ test("reconciles the current session through AppServerManager without a completi
   assert.equal(events.length, 1);
 });
 
+test("uses the visible retained session for initial reconciliation", async () => {
+  const events = [];
+  const hidden = new FakeElement({
+    "data-response-annotation-conversation": "session-hidden",
+  });
+  hidden.layoutHidden = true;
+  const visible = new FakeElement({
+    "data-response-annotation-conversation": "session-visible",
+  });
+  const selector = [
+    "[data-above-composer-conversation-id]",
+    "[data-session-id]",
+    "[data-conversation-id]",
+    "[data-thread-id]",
+    "[data-request-user-input-auto-resolution-conversation-id]",
+    "[data-response-annotation-conversation]",
+  ].join(", ");
+  loadInjection({
+    codexSessionController: createRecoveryController(events),
+    sessionElements: {
+      [selector]: [hidden, visible],
+    },
+  });
+
+  await flushMicrotasks();
+
+  assert.deepEqual(
+    events.map((event) => event.payload.conversationId),
+    ["session-visible"],
+  );
+});
+
 test("reconciles when the conversation appears after renderer startup", async () => {
   const events = [];
   const runtime = loadInjection({
@@ -614,6 +646,54 @@ test("native model routing discovers a cached manager when its registry is no lo
     assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
     assert.equal(runtime.window.__codeyPageCapabilities.modelRouting.status, "available");
     assert.equal(runtime.reads.length, 1, "reuse the verified manager on subsequent calls");
+  }
+});
+
+test("React manager discovery enumerates an object shared by many fibers once per scan", () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  let enumerations = 0;
+  const shared = new Proxy(Object.fromEntries(Array.from({ length: 2_000 }, (_, index) => [`k${index}`, index])), {
+    ownKeys(target) {
+      enumerations += 1;
+      return Reflect.ownKeys(target);
+    },
+  });
+  const manager = { sendRequest() { throw Error("must not send"); } };
+  const scope = { query: null, get() {}, set() {}, watch() {}, when() {} };
+  let fiber = { memoizedState: { scope }, memoizedProps: { shared }, return: null };
+  for (let depth = 1; depth < 24; depth += 1) {
+    fiber = { memoizedProps: { shared }, return: fiber };
+  }
+  runtime.document.body.__reactFiber$shared = fiber;
+  const found = runtime.window.__codeyAppServerManagerFromReact((candidate, hostId) => (
+    candidate === scope && hostId === "local" ? manager : null
+  ));
+  assert.equal(found, manager, "the deepest fiber is still scanned");
+  assert.equal(enumerations, 1);
+});
+
+test("background completion reconcile backs off longer than other failed capabilities", async () => {
+  for (const [feature, capMs] of [["reconcile", 300_000], ["usage", 30_000]]) {
+    const runtime = loadInjection({ initialSessionId: "" });
+    let discoveries = 0;
+    runtime.document.scripts.push({ src: "app://-/assets/app-initial-unsupported.js" });
+    runtime.window.__codeyImportCodexAsset = async () => {
+      discoveries += 1;
+      return {};
+    };
+    const load = () => runtime.window.__codeyLoadCodexSessionController({ feature });
+    for (let failure = 0; failure < 10; failure += 1) {
+      await assert.rejects(load(), /暂不支持/);
+      runtime.advanceTime(600_000);
+    }
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 11, `${feature} retries after each expired backoff`);
+    runtime.advanceTime(capMs - 1);
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 11, `${feature} skips discovery inside its backoff cap`);
+    runtime.advanceTime(1);
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 12, `${feature} rediscovers once its backoff cap expires`);
   }
 });
 
@@ -2663,22 +2743,16 @@ test("rescans every canonical sibling inside one newly added subtree", () => {
   assert.equal(second.dataset.codeyMessageId, "turn-new-second");
 });
 
-test("session mutations coalesce repeated targets without synchronous DOM discovery", async () => {
+test("session mutation batches coalesce scan roots without synchronous session discovery", async () => {
   const runtime = loadInjection({ turnIds: [] });
   await flushMicrotasks();
   const container = new TreeElement();
   container.isConnected = true;
   const row = container.appendChild(new TreeElement({ "data-turn-key": "turn-streamed" }));
-  const counters = { dom: 0, session: 0 };
-  for (const element of [container, row]) {
-    for (const method of ["matches", "closest", "querySelector", "querySelectorAll"]) {
-      const original = element[method].bind(element);
-      element[method] = (...args) => { counters.dom += 1; return original(...args); };
-    }
-  }
+  let sessionQueries = 0;
   const queryAll = runtime.document.querySelectorAll.bind(runtime.document);
   runtime.document.querySelectorAll = (...args) => {
-    counters.session += 1;
+    sessionQueries += 1;
     return queryAll(...args);
   };
   for (let batch = 0; batch < 20; batch += 1) {
@@ -2686,15 +2760,15 @@ test("session mutations coalesce repeated targets without synchronous DOM discov
       type: "childList", target: container, addedNodes: [row], removedNodes: [],
     })));
   }
-  assert.equal(counters.dom, 0, "the observer must only collect dirty targets");
-  assert.equal(counters.session, 0, "session discovery must be deferred and coalesced");
+  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].pending, 1, "repeated targets must share one pending root");
+  assert.equal(sessionQueries, 0, "session discovery must be deferred and coalesced");
   assert.equal(row.dataset.codeyMessageId, undefined);
   runtime.flushTimers();
   assert.equal(row.dataset.codeyMessageId, "turn-streamed");
-  assert.ok(counters.dom < 100, `repeated records must share discovery: ${counters.dom}`);
+  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].pending, 0, "the bounded queue must settle");
 });
 
-test("session mutation overflow yields and eventually discovers every mounted turn", () => {
+test("session mutation overflow yields, keeps recent controls and permits explicit discovery of every turn", () => {
   const runtime = loadInjection({ turnIds: [] });
   const parent = new TreeElement();
   parent.isConnected = true;
@@ -2708,11 +2782,14 @@ test("session mutation overflow yields and eventually discovers every mounted tu
   runtime.flushNextTimer();
   assert.ok(rows.some((row) => !row.dataset.codeyMessageId), "one deferred task must yield before the whole burst");
   runtime.flushTimers();
+  assert.equal(rows.at(-1).dataset.codeyMessageId, "turn-burst-89", "keep recent optional controls when the root budget is full");
+  // Overflow may skip optional UI discovery, never an explicit selection/deletion refresh.
+  runtime.window.__codeyInstallMessageSelection(parent);
   assert.deepEqual(rows.map((row) => row.dataset.codeyMessageId),
     rows.map((_, index) => `turn-burst-${index}`));
 });
 
-test("one mutation drain shares conversation discovery and selection layout across dirty rows", () => {
+test("streaming mutations within mounted turns skip conversation discovery and selection layout", () => {
   const runtime = loadInjection({ turnIds: [] });
   const wrapper = new TreeElement();
   wrapper.isConnected = true;
@@ -2740,9 +2817,9 @@ test("one mutation drain shares conversation discovery and selection layout acro
     type: "childList", target, addedNodes: [], removedNodes: [{}],
   })));
   runtime.flushTimers();
-  assert.ok(discovery <= 1, `one atomic drain must share full conversation discovery, got ${discovery}`);
-  assert.ok(grouping <= 2, `one atomic drain must share adjacency and toolbar synchronization, got ${grouping}`);
-  assert.ok(layoutReads <= rows.length * 3, `layout reads must be linear in visible rows, got ${layoutReads}`);
+  assert.equal(discovery, 0, "streaming children do not change turn identity");
+  assert.equal(grouping, 0, "streaming children do not change selection grouping");
+  assert.equal(layoutReads, 0, "stable streaming turns must not trigger selection layout");
   rows.forEach((row) => assert.ok(messageSelectButton(row)));
 });
 
@@ -2807,6 +2884,32 @@ test("selection before the deferred drain reads a reused row in its current sess
   });
 });
 
+test("shift selection cannot reuse a distant anchor from another session", async () => {
+  const runtime = loadInjection({
+    turnIds: [], codexSessionController: createRecoveryController([]),
+    bridgeHandler: async (path) => path === "/session/delete-messages"
+      ? { status: "ok", deleted: 1 } : { status: "ok" },
+  });
+  const rows = Array.from({ length: 3 }, (_, index) => {
+    const row = new TreeElement({ "data-turn-key": `same-${index}` });
+    row.isConnected = true;
+    runtime.appendExistingRow(row);
+    return row;
+  });
+  runtime.window.__codeyInstallMessageSelection();
+  const click = (row, shiftKey = false) => messageSelectButton(row).dispatchEvent({
+    type: "click", shiftKey, preventDefault() {}, stopPropagation() {},
+  });
+  click(rows[0]);
+  runtime.setSessionId("new-session");
+  click(rows[2], true);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  const deletion = runtime.bridgeCalls.find(({ path }) => path === "/session/delete-messages");
+  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.payload)), {
+    sessionId: "new-session", messageIds: ["same-2"],
+  });
+});
+
 test("a reused row cannot carry its selected class into another session with the same turn id", () => {
   const runtime = loadInjection({ turnIds: [] });
   const row = new TreeElement({ "data-turn-key": "same-turn-id" });
@@ -2868,7 +2971,8 @@ test("session mutations ignore selection controls and class writebacks before th
   runtime.emitMutations(records);
   runtime.flushTimers();
   assert.equal(discoveries, 0, "our own rendering must not refill the discovery queue");
-  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolDrain"].items, 0);
+  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].processedNodes, 0);
+  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].pending, 0);
 });
 
 test("installs selection on mixed Codex turn row shapes", () => {
@@ -3167,4 +3271,283 @@ test("imports from the tasks header using the project stored in the file", async
     projectPath: "",
   });
   assert.equal(button.disabled, false);
+});
+
+// Codex 26.1027+ keeps AppServerManager in the desktop host. Its RPC stub is a
+// callable proxy: every property looks callable, only the prototype is real.
+function fakeRpcStub(handlers) {
+  const proto = Object.create(Function.prototype, {
+    dup: { value() { return this; } },
+    onRpcBroken: { value() {} },
+  });
+  const target = Object.setPrototypeOf(function stub() {}, proto);
+  return new Proxy(target, {
+    get: (stubTarget, key) => (Object.hasOwn(handlers, key) ? handlers[key] : Reflect.get(stubTarget, key)),
+  });
+}
+
+function loadHostedManagerInjection(handlers, options = {}) {
+  const runtime = loadInjection({ initialSessionId: "", ...options });
+  const connection = { kind: "signal-family" };
+  const account = { kind: "signal-family" };
+  const calls = [];
+  const rpcHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, (...args) => {
+    calls.push([name, ...args]);
+    return Promise.resolve().then(() => handler(...args));
+  }]));
+  let current = { status: "ready", client: { hostId: "local", rpc: fakeRpcStub(rpcHandlers) } };
+  let connectionReads = 0;
+  const scope = {
+    query: null,
+    node: { familyBindings: new Map([[account, new Map([["local", {}]])], [connection, new Map([["local", {}]])]]) },
+    chain: new Map(),
+    get(family, hostId) {
+      assert.equal(hostId, "local");
+      if (family === account) return { hostId, rpc: fakeRpcStub({}) };
+      assert.equal(family, connection);
+      connectionReads += 1;
+      return current;
+    },
+    set() { throw Error("discovery must not change signals"); },
+    watch() { throw Error("discovery must not create RPC watchers"); },
+    when() {},
+  };
+  runtime.document.body.__reactFiber$hosted = { memoizedState: { scope }, return: null };
+  runtime.document.scripts.push({ src: "app://-/assets/app-initial-hosted.js" });
+  let imports = 0;
+  runtime.window.__codeyImportCodexAsset = async () => {
+    imports += 1;
+    return {};
+  };
+  return {
+    ...runtime,
+    calls,
+    connectionReads: () => connectionReads,
+    imports: () => imports,
+    setConnection: (value) => { current = value; },
+  };
+}
+
+test("hosted AppServerManager serves MCP reload, usage, and refresh through its RPC stub", async () => {
+  const runtime = loadHostedManagerInjection({
+    sendRequest: (method) => ({ method }),
+    refreshRecentConversations: () => undefined,
+  });
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+  assert.deepEqual(await runtime.window.__codeyReadAccountRateLimits(), { method: "account/rateLimits/read" });
+  const refresh = await runtime.window.__codeyLoadCodexSessionController({ feature: "refresh" });
+  await refresh.refreshRecentConversations();
+  assert.deepEqual(JSON.parse(JSON.stringify(runtime.calls)), [
+    ["sendRequest", "config/mcpServer/reload", {}],
+    ["sendRequest", "account/rateLimits/read"],
+    ["refreshRecentConversations"],
+  ]);
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "available");
+  assert.equal(runtime.imports(), 0, "a hosted manager needs no asset imports");
+
+  // A host reconnect replaces the stub; calls follow the current connection.
+  const replaced = [];
+  runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: fakeRpcStub({ sendRequest: (method) => replaced.push(method) }) } });
+  await runtime.window.__codeyReloadMcpServers();
+  assert.deepEqual(replaced, ["config/mcpServer/reload"]);
+  runtime.setConnection({ status: "disconnected", client: null });
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), /宿主会话接口未连接/);
+});
+
+test("hosted AppServerManager rejects page-only capabilities once without rescanning", async () => {
+  const runtime = loadHostedManagerInjection({ sendRequest: () => assert.fail("must not send") });
+  for (const feature of ["modelRouting", "modelRouting"]) {
+    await assert.rejects(
+      runtime.window.__codeyLoadCodexSessionController({ feature }),
+      (error) => error.code === "codey_capability_unavailable" && /桌面宿主进程/.test(error.message),
+    );
+  }
+  await assert.rejects(runtime.window.__codeyLoadCodexRequestClient(), /模型请求校验/);
+  assert.equal(runtime.connectionReads(), 1, "only the first discovery scans React");
+  assert.equal(runtime.imports(), 0);
+});
+
+function hostedReconcileHandlers(overrides = {}) {
+  const state = { execution: { inProgress: true, activeTurnId: "turn-1" }, role: { role: "owner" }, status: "idle", unsubscribed: false };
+  const handlers = {
+    getThreadExecutionState: () => state.execution,
+    getStreamRole: () => state.role,
+    sendRequest: (method, params) => {
+      assert.equal(method, "thread/read");
+      assert.deepEqual({ ...params }, { threadId: "thread-1", includeTurns: false });
+      return { thread: { status: typeof state.status === "function" ? state.status() : { type: state.status } } };
+    },
+    getConversationCwd: () => "/repo",
+    unsubscribeInactiveConversation: () => {
+      state.unsubscribed = true;
+      state.execution = { inProgress: false, activeTurnId: "turn-1" };
+    },
+    resumeConversation: () => {},
+    ...overrides,
+  };
+  return { state, handlers };
+}
+
+async function runHostedReconcile(runtime) {
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "reconcile" });
+  const pending = controller.reconcileCompletedConversation({
+    conversationId: "thread-1",
+    model: null,
+    workspaceRoots: [],
+  });
+  for (let round = 0; round < 4; round += 1) {
+    await flushMicrotasks();
+    runtime.flushTimers();
+  }
+  return pending;
+}
+
+test("hosted completion reconcile confirms idle twice, then unsubscribes and resumes the thread", async () => {
+  const { handlers } = hostedReconcileHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  assert.equal(await runHostedReconcile(runtime), true);
+  const names = runtime.calls.map(([name]) => name);
+  assert.ok(names.indexOf("unsubscribeInactiveConversation") < names.indexOf("resumeConversation"));
+  assert.equal(names.at(-1), "getThreadExecutionState", "the result reflects the resumed state");
+  assert.equal(names.filter((name) => name === "sendRequest").length, 2, "native status is read twice");
+  const resume = runtime.calls.find(([name]) => name === "resumeConversation")[1];
+  assert.deepEqual({ ...resume, workspaceRoots: [...resume.workspaceRoots] }, {
+    conversationId: "thread-1",
+    model: null,
+    workspaceRoots: ["/repo"],
+  });
+  assert.equal(runtime.window.__codeyPageCapabilities.reconcile.status, "available");
+});
+
+test("hosted completion reconcile leaves live, pending, follower, changing, and unowned threads alone", async () => {
+  let reads = 0;
+  for (const [label, setup] of [
+    ["still running", ({ state }) => { state.status = "active"; }],
+    ["pending submission has no turn id", ({ state }) => { state.execution = { inProgress: true, activeTurnId: null }; }],
+    ["follower window", ({ state }) => { state.role = { role: "follower" }; }],
+    ["status changes between reads", ({ state }) => {
+      state.status = () => ({ type: reads++ === 0 ? "idle" : "active" });
+    }],
+    ["new turn between reads", ({ state, handlers }) => {
+      let executions = 0;
+      handlers.getThreadExecutionState = () => ({ inProgress: true, activeTurnId: executions++ === 0 ? "turn-1" : "turn-2" });
+      void state;
+    }],
+    ["host skips the unsubscribe", ({ handlers }) => {
+      handlers.unsubscribeInactiveConversation = () => {};
+    }],
+  ]) {
+    reads = 0;
+    const fixture = hostedReconcileHandlers();
+    setup(fixture);
+    const runtime = loadHostedManagerInjection(fixture.handlers);
+    assert.equal(await runHostedReconcile(runtime), false, label);
+    const names = runtime.calls.map(([name]) => name);
+    assert.ok(!names.includes("resumeConversation"), `${label}: no resume`);
+    if (label !== "host skips the unsubscribe") {
+      assert.ok(!names.includes("unsubscribeInactiveConversation"), `${label}: no unsubscribe`);
+    }
+  }
+});
+
+function hostedDeletionHandlers(overrides = {}) {
+  const state = { execution: { inProgress: false, activeTurnId: null }, role: { role: "owner" } };
+  const handlers = {
+    getThreadExecutionState: () => state.execution,
+    getStreamRole: () => state.role,
+    unsubscribeInactiveConversation: () => {},
+    sendRequest: (method, params) => {
+      assert.equal(method, "thread/unsubscribe");
+      assert.deepEqual({ ...params }, { threadId: "thread-1" });
+      return { status: "unsubscribed" };
+    },
+    getConversationCwd: () => "/repo",
+    resumeConversation: () => ({ status: "ready" }),
+    discardConversationFromCache: () => {},
+    refreshRecentConversations: () => {},
+    ...overrides,
+  };
+  return { state, handlers };
+}
+
+test("hosted message deletion releases the thread before files change and reloads the rewritten history afterwards", async () => {
+  const { handlers } = hostedDeletionHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  await controller.prepareMessageDeletion("thread-1");
+  // The host call updates its own state; the direct call covers streams it skips.
+  assert.deepEqual(runtime.calls.map(([name, arg]) => name === "sendRequest" ? arg : name), [
+    "getThreadExecutionState", "getStreamRole", "unsubscribeInactiveConversation", "thread/unsubscribe",
+  ]);
+  runtime.calls.length = 0;
+  // Host resume merges loaded turns back in; evicting the cache makes the open
+  // view reload the rewritten history, and the list refresh restores its row.
+  await controller.finishMessageDeletion("thread-1", ["turn-1"]);
+  assert.deepEqual(runtime.calls.map(([name, arg]) => [name, arg]), [
+    ["discardConversationFromCache", "thread-1"], ["refreshRecentConversations", undefined],
+  ]);
+  runtime.calls.length = 0;
+  // A failed delete changes no files; restore the stream without dropping the view.
+  await controller.finishMessageDeletion("thread-1", []);
+  assert.ok(!runtime.calls.some(([name]) => name === "discardConversationFromCache"));
+  const resume = runtime.calls.find(([name]) => name === "resumeConversation")[1];
+  assert.deepEqual({ ...resume, workspaceRoots: [...resume.workspaceRoots] }, {
+    conversationId: "thread-1", model: null, reasoningEffort: null, workspaceRoots: ["/repo"],
+  });
+  assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "available");
+});
+
+test("hosted message deletion leaves running, unloaded, and follower threads untouched", async () => {
+  for (const [label, setup, pattern] of [
+    ["running", ({ state }) => { state.execution = { inProgress: true, activeTurnId: "turn-1" }; }, /仍在运行/],
+    ["follower", ({ state }) => { state.role = { role: "follower" }; }, /拥有当前会话的窗口/],
+    ["not loaded", ({ state }) => { state.execution = null; }, /尚未加载/],
+  ]) {
+    const fixture = hostedDeletionHandlers();
+    setup(fixture);
+    const runtime = loadHostedManagerInjection(fixture.handlers);
+    const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+    await assert.rejects(controller.prepareMessageDeletion("thread-1"), pattern, label);
+    assert.ok(!runtime.calls.some(([name]) => name === "unsubscribeInactiveConversation" || name === "sendRequest"), label);
+  }
+  const notReady = hostedDeletionHandlers({ resumeConversation: () => ({ status: "not-ready", reason: "inactive-window" }) });
+  const notReadyRuntime = loadHostedManagerInjection(notReady.handlers);
+  const notReadyController = await notReadyRuntime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  await assert.rejects(notReadyController.finishMessageDeletion("thread-1", []), /无法重新载入/);
+});
+
+test("a reinjected script replaces a cached hosted adapter that lacks deletion", async () => {
+  const { handlers } = hostedDeletionHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  runtime.window.__codeyCodexSessionController = { kind: "manager", manager: { codeyHostedAppServerManager: true, sendRequest() {} } };
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(typeof controller.prepareMessageDeletion, "function");
+});
+
+test("hosted deletion hides the deleted turns at once and reloads the conversation behind them", async () => {
+  const events = [];
+  const { handlers } = hostedDeletionHandlers({
+    sendRequest: () => { events.push("unsubscribe"); return { status: "unsubscribed" }; },
+    discardConversationFromCache: (id) => { events.push(`discard:${id}`); },
+    refreshRecentConversations: () => { events.push("refresh"); },
+  });
+  const runtime = loadHostedManagerInjection(handlers, {
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    bridgeHandler: async (path) => {
+      if (path !== "/session/delete-messages") return { status: "ok" };
+      events.push("persist");
+      return { status: "ok", deleted: 1 };
+    },
+  });
+  runtime.setSessionId("session-1");
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(controller.reloadsConversationAfterDeletion, true);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.deepEqual(events, ["unsubscribe", "persist", "discard:session-1", "refresh"]);
+  // Until the host reloads, the stale row stays hidden instead of reappearing.
+  assert.equal(runtime.getTurnRow(0).dataset.codeyHardDeleted, "true");
+  assert.equal(runtime.getTurnRow(1).dataset.codeyHardDeleted, undefined);
+  assert.deepEqual(runtime.alerts, []);
+  assert.equal(runtime.getReloadCount(), 0);
 });

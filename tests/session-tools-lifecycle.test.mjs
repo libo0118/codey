@@ -186,7 +186,11 @@ test("dispose cancels scan, watcher, sidebar tooltip and running recheck timers"
   spinner.remove();
   runtime.window.__codeyInstallThreadUpdatedTimes(row);
   runtime.document.dispatchEvent({ type: "pointerdown" });
-  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: row }]);
+  runtime.observers[0].callback([{
+    type: "attributes",
+    attributeName: "data-app-action-sidebar-thread-title",
+    target: row,
+  }]);
 
   const archive = new FakeElement("button", { "aria-label": "归档任务" });
   row.appendChild(archive);
@@ -195,7 +199,7 @@ test("dispose cancels scan, watcher, sidebar tooltip and running recheck timers"
   assert.ok(button);
   button.dispatchEvent({ type: "mouseenter" });
   const delays = [...runtime.timeouts.values()].map(({ delay }) => delay);
-  for (const delay of [40, 60, 250, 400, 2_000, 30_000]) assert.ok(delays.includes(delay), `missing ${delay} timer`);
+  for (const delay of [40, 60, 400, 2_000, 30_000]) assert.ok(delays.includes(delay), `missing ${delay} timer`);
   const callbacks = [...runtime.timeouts.values()].map(({ callback }) => callback);
   runtime.window.__codeySessionToolsInstall.dispose();
   const queries = runtime.queries();
@@ -224,10 +228,10 @@ test("coalesced status mutations preserve an earlier old class value", () => {
   runtime.window.__codeySessionToolsInstall.dispose();
 });
 
-test("overflow keeps header invalidation and cancellation of later drain chunks", () => {
+test("overflow keeps header invalidation and cancellation of later bounded scan chunks", () => {
   const runtime = fixture();
-  const targets = Array.from({ length: 90 }, () => {
-    const target = new FakeElement();
+  const targets = Array.from({ length: 90 }, (_, index) => {
+    const target = new FakeElement("nav", { "data-app-action-sidebar-thread-id": `overflow-${index}` });
     runtime.document.body.appendChild(target);
     return target;
   });
@@ -237,21 +241,21 @@ test("overflow keeps header invalidation and cancellation of later drain chunks"
   runtime.window.__codeyRendererInvalidateHeaderMount = (root) => invalidated.push(root);
   runtime.load();
   runtime.observers[0].callback([...targets, header].map((target) => ({
-    type: "childList", target, addedNodes: [], removedNodes: [],
+    type: "childList", target: runtime.document.body, addedNodes: [target], removedNodes: [],
   })));
   runtime.runTimeout(60);
-  assert.ok([...runtime.timeouts.values()].some(({ delay }) => delay === 0), "overflow must yield");
+  assert.ok([...runtime.timeouts.values()].some(({ delay }) => delay === 60), "overflow must yield");
   let chunks = 0;
-  while ([...runtime.timeouts.values()].some(({ delay }) => delay === 0)) {
+  while ([...runtime.timeouts.values()].some(({ delay }) => delay === 60)) {
     assert.ok(++chunks < 100, "overflow must catch up");
-    runtime.runTimeout(0);
+    runtime.runTimeout(60);
   }
   assert.ok(invalidated.includes(header), "header discovery cannot be dropped at the target budget");
   runtime.observers[0].callback(targets.map((target) => ({
-    type: "childList", target, addedNodes: [], removedNodes: [],
+    type: "childList", target: runtime.document.body, addedNodes: [target], removedNodes: [],
   })));
   runtime.runTimeout(60);
-  const stale = [...runtime.timeouts.values()].filter(({ delay }) => delay === 0);
+  const stale = [...runtime.timeouts.values()].filter(({ delay }) => delay === 60);
   assert.ok(stale.length);
   runtime.window.__codeySessionToolsInstall.dispose();
   const queries = runtime.queries();
@@ -266,14 +270,14 @@ test("a throwing scan cannot leave subsequent mutations without a drain timer", 
   runtime.load();
   const queryAll = row.querySelectorAll.bind(row);
   row.querySelectorAll = () => { throw new Error("injected row scan failure"); };
-  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: row }]);
+  runtime.observers[0].callback([{ type: "attributes", attributeName: "data-app-action-sidebar-thread-title", target: row }]);
   try { runtime.runTimeout(60); } catch (error) { assert.match(error.message, /injected row scan failure/); }
   row.querySelectorAll = queryAll;
   const next = thread(runtime.document, "next-thread").row;
   let queries = 0;
   const nextQueryAll = next.querySelectorAll.bind(next);
   next.querySelectorAll = (...args) => { queries += 1; return nextQueryAll(...args); };
-  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: next }]);
+  runtime.observers[0].callback([{ type: "attributes", attributeName: "data-app-action-sidebar-thread-title", target: next }]);
   const drainDelay = [...runtime.timeouts.values()].find(({ delay }) => delay === 60 || delay === 0)?.delay;
   assert.notEqual(drainDelay, undefined, "an exception must release or reschedule the active drain");
   runtime.runTimeout(drainDelay);
