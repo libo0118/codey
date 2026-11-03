@@ -560,7 +560,8 @@ mod tests {
         .unwrap();
         assert!(!auth.authorized(&login.token));
         assert!(auth.issue(&revision, true).is_err());
-        let login = auth.issue(&auth.revision().to_owned(), true).unwrap();
+        let current_revision = auth.revision().to_owned();
+        let login = auth.issue(&current_revision, true).unwrap();
         auth.revoke("*").unwrap();
         assert!(!Auth::load(path).unwrap().authorized(&login.token));
     }
@@ -798,7 +799,8 @@ mod tests {
     fn expiry_is_enforced_without_extending_the_remembered_lifetime() {
         let temp = tempfile::tempdir().unwrap();
         let mut auth = configured(temp.path().join("remote.json"));
-        let login = auth.issue(&auth.revision().to_owned(), true).unwrap();
+        let current_revision = auth.revision().to_owned();
+        let login = auth.issue(&current_revision, true).unwrap();
         assert_eq!(
             auth.document.sessions[0].expires_at - auth.document.sessions[0].created_at,
             REMEMBER_SECONDS
