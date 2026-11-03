@@ -297,11 +297,10 @@ mod tests {
     use super::*;
 
     fn fixture(path: std::path::PathBuf) -> Arc<AppState> {
-        Arc::new(AppState {
-            store: crate::config::ConfigStore::new(path),
-            config: tokio::sync::RwLock::new(crate::config::CodeyConfig::default()),
-            ..AppState::default()
-        })
+        let mut state = AppState::default();
+        state.store = crate::config::ConfigStore::new(path);
+        state.config = tokio::sync::RwLock::new(crate::config::CodeyConfig::default());
+        Arc::new(state)
     }
 
     #[tokio::test]
