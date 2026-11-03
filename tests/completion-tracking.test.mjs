@@ -355,6 +355,7 @@ function loadInjection({
     MutationObserver,
     Node: { TEXT_NODE: 3 },
     performance: { now: () => now },
+    Symbol, // Node 22 VM globals lack the dispose symbol used by the host RPC fixture.
     TextEncoder,
     URL,
     URLSearchParams,
