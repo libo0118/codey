@@ -1621,6 +1621,7 @@ async fn native_stats_overrides_keep_direct_provider_and_user_monitoring_unchang
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
                 subagent_roles: None,
+                scope_guard: false,
                 marker: &marker,
                 backup_root: &backups,
             },
