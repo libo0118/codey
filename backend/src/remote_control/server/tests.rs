@@ -791,9 +791,16 @@ async fn a_slow_socket_keeps_reading_native_revokes_hidden_refs_and_delivers_the
     );
     native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":3,"revision":4,"patches":[]}}})).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(150), socket.next())
-            .await
-            .is_err()
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    event => return event,
+                }
+            }
+        })
+        .await
+        .is_err()
     );
     socket
         .send(Message::Text(r#"{"type":"history"}"#.into()))
