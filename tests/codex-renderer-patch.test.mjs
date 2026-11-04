@@ -438,7 +438,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     for (const [requestUrl, requestSource] of [
       ["app://-/assets/app-initial-app-server-request-current-build.js", appServerRequestSource],
       ["app://-/assets/async/24191.589dcc9878.js", appServerRequestSource.replaceAll("`", '"')],
-      ["app://-/webview/assets/84721.a456bc9870.js", appServerRequestSource.replaceAll("`", "'")],
+      ["app://-/assets/84721.a456bc9870.js", appServerRequestSource.replaceAll("`", "'")],
     ]) {
       const patchedAppServerRequestSource = patch(requestUrl, requestSource);
       assert.match(
@@ -600,6 +600,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     for (const [url, source] of [
       ["https://-/assets/async/24191.589dcc9878.js", appServerRequestSource],
       ["app://-/other/async/24191.589dcc9878.js", appServerRequestSource],
+      ["app://-/webview/assets/84721.a456bc9870.js", appServerRequestSource],
       ["app://-/assets/async/50001.012345abcd.js", "const unrelated=1;"],
     ]) assert.equal(patch(url, source), source);
 

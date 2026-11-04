@@ -70,5 +70,5 @@ test("count changes stay pending restart while role transactions retain the laun
   assert.match(transaction, /begin_runtime_subagent_policy_update\([\s\S]*?state\.subagent_max_threads/);
   assert.match(transaction, /commit_policy\([\s\S]*?state\.subagent_max_threads/);
   assert.doesNotMatch(transaction, /state\.subagent_max_threads\s*=|config\.subagent_max_threads/);
-  assert.match(apply, /runtime_config_requires_restart\(state, config\)\.await\s*\{\s*json!\(\{"state":"restart_required"\}\)/);
+  assert.match(apply, /if subagents\.requires_restart\(\) \|\| runtime_config_requires_restart\(state, config\)\.await\s*\{\s*return json!\(\{"state":"restart_required"\}\);/);
 });

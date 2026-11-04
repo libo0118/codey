@@ -57,12 +57,7 @@ async fn subagent_count_save_preserves_omitted_fields_and_rejects_invalid_values
     runtime_config.subagent_optimization = true;
     let mut desired = runtime_config.clone();
     desired.subagent_max_threads = 1;
-    assert!(config_requires_restart(
-        &runtime_config,
-        &RuntimeModelConfig::from_config(&runtime_config),
-        &RuntimeSubagentConfig::from_config(&desired),
-        &desired
-    ));
+    assert!(config_requires_restart(&runtime_config, &desired));
 }
 
 fn custom() -> SubagentRoleConfig {

@@ -12,6 +12,22 @@ const script = template
   .replaceAll("__CODEY_GATE_STEP_MS__", "200")
   .replaceAll("__CODEY_GATE_NOTIFY__", "true");
 
+test("the actual Fetch service narrows official scan candidates without the fork numeric wildcards", () => {
+  const read = path => readFileSync(new URL(`../backend/src/${path}`, import.meta.url), "utf8");
+  const patch = read("renderer_asset_patch.rs");
+  const scan = read("renderer_asset_scan.rs");
+  const launcher = read("launcher.rs");
+  assert.match(launcher, /renderer_asset_patch::start_service\([\s\S]*?Some\(crate::renderer_asset_patch::CodexPaths\s*\{/);
+  assert.match(patch, /renderer_asset_scan::load_or_scan\(&app_dir, &cache_file, &anchors\)/);
+  assert.match(patch, /fetch_patterns\(self\.disable_pet, Some\(&outcome\.scan\)\)/);
+  assert.match(patch, /context\.apply_asset_scan\(scan\.await, started\)[\s\S]*?refresh_fetch_patterns\(&connection, &context\)/);
+  const patterns = patch.slice(patch.indexOf("fn fetch_patterns("), patch.indexOf("fn pet_sprite_id("));
+  assert.match(patterns, /Some\(scan\) => scan\s*\.candidates/);
+  assert.match(patterns, /None => vec!\[NUMERIC_ASSET_URL_PATTERN\.to_string\(\)\]/);
+  assert.doesNotMatch(patterns, /0\.\.=9|assets\/\*\{digit\}/);
+  assert.match(scan, /numeric_asset_name/);
+});
+
 async function probe(patch, change) {
   let now = 0, sequence = 0, result, failure, settled = false;
   const timers = new Map();

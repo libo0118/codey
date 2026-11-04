@@ -193,8 +193,7 @@ pub struct RuntimeModelConfig {
 }
 
 impl RuntimeModelConfig {
-    /// Equivalent to `*self == Self::from_config(config)` without cloning the
-    /// six model maps; the runtime-status poll calls this on every request.
+    /// 比较热更新后的配置是否完整送达，避免克隆模型映射。
     pub fn matches(&self, config: &CodeyConfig) -> bool {
         self.routes.len() == config.profiles.len()
             && self
@@ -299,6 +298,7 @@ pub struct CodeyRuntime {
     pub applied_config: CodeyConfig,
     applied_model_config: RwLock<AppliedModelConfig>,
     applied_subagent_config: RwLock<Arc<RuntimeSubagentConfig>>,
+    subagent_restart_config: RwLock<Option<RuntimeSubagentConfig>>,
     subagent_route_catalog_installed: bool,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
     injection_scripts: cdp::PreparedInjectionScripts,
@@ -2091,7 +2091,14 @@ async fn spawn_and_inject_runtime(
     // 资产补丁服务先于 Codex 拉起：端点一出现就挂上页面，Fetch 拦截赶在主窗口
     // 首次导航之前落位。调试端口在 Chromium 主进程就绪后先于 CLI 包装器握手
     // 可用，与其并行预取页面目标；spawn 失败时直接放弃即可。
-    crate::renderer_asset_patch::start_service(patch.debug_port, config.slim_codex_pet);
+    crate::renderer_asset_patch::start_service(
+        patch.debug_port,
+        config.slim_codex_pet,
+        Some(crate::renderer_asset_patch::CodexPaths {
+            app_dir: storage.app_dir.clone(),
+            codex_home: home.to_path_buf(),
+        }),
+    );
     let target_prefetch = cdp::spawn_injectable_target_prefetch(patch.debug_port);
     let mut spawned = match spawn_codex(
         &mut storage.app_dir,
@@ -2225,6 +2232,14 @@ impl CodeyRuntime {
     }
 
     pub(crate) fn validate_subagent_route_hot_reload(&self, config: &CodeyConfig) -> Result<()> {
+        anyhow::ensure!(
+            !self.subagent_routes_require_restart(config),
+            "当前子代理使用内置模型目录，线路或模型变化需重启 Codex 后生效；已保留当前路由和角色配置"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn subagent_routes_require_restart(&self, config: &CodeyConfig) -> bool {
         if self.applied_config.local_router_enabled
             && self.applied_config.subagent_optimization
             && !self.subagent_route_catalog_installed
@@ -2238,12 +2253,9 @@ impl CodeyRuntime {
                     .map(|target| (target.provider_id, target.upstream_model, target.official))
                     .collect::<std::collections::BTreeSet<_>>()
             };
-            anyhow::ensure!(
-                routes(&self.applied_config) == routes(config),
-                "当前子代理使用内置模型目录，线路或模型变化需重启 Codex 后生效；已保留当前路由和角色配置"
-            );
+            return routes(&self.applied_config) != routes(config);
         }
-        Ok(())
+        false
     }
 
     pub(crate) fn sync_local_router_routes(
@@ -2324,6 +2336,16 @@ impl CodeyRuntime {
     pub async fn mark_subagent_config_applied(&self, config: &CodeyConfig) {
         *self.applied_subagent_config.write().await =
             Arc::new(RuntimeSubagentConfig::from_config(config));
+        *self.subagent_restart_config.write().await = None;
+    }
+
+    pub(crate) async fn mark_subagent_config_requires_restart(&self, config: &CodeyConfig) {
+        *self.subagent_restart_config.write().await =
+            Some(RuntimeSubagentConfig::from_config(config));
+    }
+
+    pub(crate) async fn subagent_restart_config(&self) -> Option<RuntimeSubagentConfig> {
+        self.subagent_restart_config.read().await.clone()
     }
 
     pub fn supports_subagent_config_hot_reload(&self, config: &CodeyConfig) -> bool {
@@ -2331,7 +2353,6 @@ impl CodeyRuntime {
             && config.subagent_optimization
             && self.applied_config.local_router_enabled == config.local_router_enabled
             && self.applied_config.fast_context_tools == config.fast_context_tools
-            && self.applied_config.active_profile() == config.active_profile()
     }
 
     pub(crate) fn subagent_reconcile_config(&self, config: &CodeyConfig) -> Result<CodeyConfig> {
@@ -2540,6 +2561,7 @@ impl CodeyRuntime {
                 applied_subagent_config: RwLock::new(Arc::new(RuntimeSubagentConfig::from_config(
                     &runtime_config,
                 ))),
+                subagent_restart_config: RwLock::new(None),
                 subagent_route_catalog_installed: runtime_config_overrides
                     .iter()
                     .any(|entry| entry.starts_with("model_catalog_json=")),
