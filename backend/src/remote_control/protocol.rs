@@ -369,13 +369,22 @@ pub(super) fn item_view(item: &Value, turn_id: &Value, index: usize) -> Value {
                 text.truncate(end);
                 true
             }
-            Value::Array(values) => values
-                .iter_mut()
-                .fold(false, |cut, value| bound(value) || cut),
-            Value::Object(values) => values
-                .iter_mut()
-                .filter(|(key, _)| key.as_str() != "url")
-                .fold(false, |cut, (_, value)| bound(value) || cut),
+            Value::Array(values) => {
+                let mut cut = false;
+                for value in values {
+                    cut |= bound(value);
+                }
+                cut
+            }
+            Value::Object(values) => {
+                let mut cut = false;
+                for (key, value) in values {
+                    if key != "url" {
+                        cut |= bound(value);
+                    }
+                }
+                cut
+            }
             _ => false,
         }
     }
@@ -537,6 +546,34 @@ mod tests {
         );
         assert_eq!(projected["turns"][0]["messages"][1]["text"], "公开摘要");
         assert_eq!(projected["requests"][0]["params"]["command"], "echo safe");
+    }
+
+    #[test]
+    fn public_text_limits_visit_all_array_and_object_siblings() {
+        let long = "公".repeat(MAX_PUBLIC_TEXT);
+        let command = item_view(
+            &json!({"id":"cmd","type":"commandExecution","command":long,"cwd":long,"aggregatedOutput":long}),
+            &json!("turn"),
+            0,
+        );
+        assert_eq!(command["truncated"], true);
+        for value in [
+            &command["text"],
+            &command["command"]["command"],
+            &command["command"]["cwd"],
+            &command["command"]["output"],
+        ] {
+            assert!(value.as_str().unwrap().len() <= MAX_PUBLIC_TEXT);
+        }
+        let plan = item_view(
+            &json!({"id":"plan","type":"plan","plan":[{"step":long},{"step":long}]}),
+            &json!("turn"),
+            1,
+        );
+        assert_eq!(plan["truncated"], true);
+        for step in plan["plan"].as_array().unwrap() {
+            assert!(step["step"].as_str().unwrap().len() <= MAX_PUBLIC_TEXT);
+        }
     }
 
     #[test]

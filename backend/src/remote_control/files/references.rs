@@ -158,10 +158,10 @@ fn markdown_references(text: &str) -> Vec<String> {
         rest = &rest[start + 2..];
         let body = rest.trim_start();
         if let Some(body) = body.strip_prefix('<') {
-            if let Some(end) = body.find('>') {
-                if body[end + 1..].trim_start().starts_with(')') {
-                    result.push(body[..end].to_string());
-                }
+            if let Some(end) = body.find('>')
+                && body[end + 1..].trim_start().starts_with(')')
+            {
+                result.push(body[..end].to_string());
             }
         } else {
             let mut depth = 0usize;
