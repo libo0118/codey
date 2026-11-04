@@ -9,7 +9,7 @@ Status: implemented
 ## Decision
 
 - 保留既有 JSON 字段，按已知原生 item 白名单投影公开文本、命令、工具结果、计划、Diff、图片和审批。未知 item 固定占位；隐藏推理、原始 RPC、配置和凭据不参与投影。审批摘要不足的结构在显示与 respond 校验中一致拒绝，不盲批；异步问题按同一请求尚未回答的完整集合验证，非法问题或选项使整组 unsupported，不过滤后部分答题，已回答项仍使用原始索引身份。
-- `POST /remote/files/resolve` 接受 `threadId/reference`，使用现有 cookie、Origin、Host、CSRF；只查询已绑定原生会话的私有引用，不启动或切换桌面。解析只读取文件版本、大小及最多 12 字节格式头，不预先复制或整文件 hash。公开 Markdown 链接只是候选，必须另满足原生 cwd 内的安全工作区边界；仅明确用户输入的原生结构化附件允许 cwd 外的精确引用，普通原生 path 不按 Markdown URL 百分号解码。
+- `POST /remote/files/resolve` 接受 `threadId/reference`，使用现有 cookie、Origin、Host、CSRF；只查询已绑定原生会话的私有引用，不启动或切换桌面。解析只读取文件版本、大小及最多 12 字节格式头，不预先复制或整文件 hash。Markdown 候选复用手机实际可见的截断公开投影，包括工具结果、公开摘要和协作结果，不从隐藏 prompt 或未知事件取链接；候选必须另满足原生 cwd 内的安全工作区边界；仅明确用户输入的原生结构化附件允许 cwd 外的精确引用，普通原生 path 不按 Markdown URL 百分号解码。
 - `GET /api/sessions/{UUID}/files/{64hex}` 使用同源 cookie 重新授权，检查会话、引用、源文件身份和边界。只下载普通文件，不跟随 symlink/reparse、不访问 UNC 或外部 URL；不映射 sandbox、cloud、SSH 路径，不浏览目录。
 - 显式 GET 在响应头前重验解析时记录的版本，使用现有 `tempfile`、`sha2`、`http-body-util` 和 Tokio 创建私有磁盘快照，再分块发送；变化返回 409，不暗中换版本。单文件 200 MiB、并行下载 2 个、快照总额 400 MiB；元数据引用最多 64 项并保留 10 分钟，快照在发送完成、取消、撤销或停止后释放，不占满元数据 TTL。生产仅解析受保护目录的路径元数据和真实目标，父工作区中的配置目录同样不能下载；保护根存在却无法确认时失败，不静默放行。
 - 同一登录和会话的多个窗口各持独立 binding；单个窗口关闭仅释放自己的 lease，引用至少存在于一个在线窗口且各窗口的工作区与引用授权不能冲突。配置保护根按真实目标核验，不能借父工作区或符号链接绕过。

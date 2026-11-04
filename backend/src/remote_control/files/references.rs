@@ -30,28 +30,12 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
                 kind,
                 "agentMessage" | "assistantMessage" | "userMessage" | "steeringUserMessage"
             ) {
-                let mut text = match kind {
+                let text = match kind {
                     "agentMessage" | "assistantMessage" => protocol::text_content(&item["text"]),
                     "userMessage" => protocol::text_content(&item["content"]),
                     _ => protocol::text_content(&item["input"]),
                 };
-                if text.len() > protocol::MAX_PUBLIC_TEXT {
-                    let mut end = protocol::MAX_PUBLIC_TEXT;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                }
-                for value in markdown_references(&text) {
-                    result.insert(
-                        value.clone(),
-                        Reference {
-                            value,
-                            native: false,
-                            markdown: true,
-                        },
-                    );
-                }
+                add_markdown(&mut result, &text);
                 let content = item
                     .get("content")
                     .or(item.get("input"))
@@ -65,26 +49,41 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
                     matches!(kind, "userMessage" | "steeringUserMessage"),
                 );
             }
+            if matches!(
+                kind,
+                "mcpToolCall"
+                    | "dynamicToolCall"
+                    | "collabAgentToolCall"
+                    | "subAgentActivity"
+                    | "reasoning"
+            ) {
+                let public = protocol::item_view(item, &turn["turnId"], index);
+                for text in public["tool"]["output"]
+                    .as_str()
+                    .into_iter()
+                    .chain(
+                        (kind == "reasoning")
+                            .then(|| public["text"].as_str())
+                            .flatten(),
+                    )
+                    .chain(
+                        public["collaboration"]["agents"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|agent| agent["message"].as_str()),
+                    )
+                {
+                    add_markdown(&mut result, text);
+                }
+            }
             if result.len() > 4096 {
                 return Err("会话文件引用过多，请在电脑端下载".into());
             }
         }
         if !has_user {
             let text = protocol::text_content(&turn["params"]["input"]);
-            let mut end = text.len().min(protocol::MAX_PUBLIC_TEXT);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            for value in markdown_references(&text[..end]) {
-                result.insert(
-                    value.clone(),
-                    Reference {
-                        value,
-                        native: false,
-                        markdown: true,
-                    },
-                );
-            }
+            add_markdown(&mut result, &text);
             add_parts(
                 &mut result,
                 &turn["turnId"],
@@ -99,6 +98,23 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
         }
     }
     Ok(result)
+}
+
+fn add_markdown(result: &mut HashMap<String, Reference>, text: &str) {
+    let mut end = text.len().min(protocol::MAX_PUBLIC_TEXT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    for value in markdown_references(&text[..end]) {
+        result.insert(
+            value.clone(),
+            Reference {
+                value,
+                native: false,
+                markdown: true,
+            },
+        );
+    }
 }
 
 fn add_parts(

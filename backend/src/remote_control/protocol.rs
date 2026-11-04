@@ -222,7 +222,7 @@ fn public_tool_arguments(value: &Value) -> Value {
     }
 }
 
-fn item_view(item: &Value, turn_id: &Value, index: usize) -> Value {
+pub(super) fn item_view(item: &Value, turn_id: &Value, index: usize) -> Value {
     let kind = item["type"].as_str().unwrap_or("unknown");
     let collaboration = activities::collaboration(item);
     let (role, text) = match kind {

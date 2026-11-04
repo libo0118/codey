@@ -52,6 +52,56 @@ fn descriptor(fixture: &Fixture, reference: &str) -> Descriptor {
 }
 
 #[test]
+fn public_activity_file_links_use_the_same_projection_without_widening_authority() {
+    let message = "[结果](outputs/activity.txt) [越界](../outside.txt)";
+    for item in [
+        json!({"id":"activity","type":"collabAgentToolCall","tool":"wait","status":"completed","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"completed","message":message}},"prompt":"[private](outputs/private.txt)"}),
+        json!({"id":"activity","type":"mcpToolCall","tool":"inspect_local_file","result":{"content":[{"type":"text","text":message}],"_meta":{"text":"[private](outputs/private.txt)"}}}),
+        json!({"id":"activity","type":"dynamicToolCall","tool":"test","contentItems":[{"type":"inputText","text":message}],"arguments":{"private":"[private](outputs/private.txt)"}}),
+        json!({"id":"activity","type":"reasoning","summary":[message],"content":"[private](outputs/private.txt)"}),
+    ] {
+        let mut fixture = fixture("");
+        std::fs::write(fixture.root.join("outputs/activity.txt"), b"public result").unwrap();
+        std::fs::write(
+            fixture.root.parent().unwrap().join("outside.txt"),
+            b"outside",
+        )
+        .unwrap();
+        fixture.state["turns"][0]["items"] = json!([item]);
+        fixture.binding.update(&fixture.state).unwrap();
+        assert!(
+            super::super::protocol::view(&fixture.state)
+                .to_string()
+                .contains("outputs/activity.txt")
+        );
+        assert_eq!(
+            snapshot(&fixture, "outputs/activity.txt").read(0).unwrap(),
+            b"public result"
+        );
+        assert!(describe(select(&fixture, "../outside.txt"), || Ok(())).is_err());
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .selection("token", &fixture.thread, "outputs/private.txt")
+                .is_err()
+        );
+    }
+    let mut fixture = fixture("");
+    fixture.state["turns"][0]["items"] = json!([{"id":"unknown","type":"collabAgentToolCall","tool":"futureAction","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"completed","message":message}}}]);
+    fixture.binding.update(&fixture.state).unwrap();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .selection("token", &fixture.thread, "outputs/activity.txt")
+            .is_err()
+    );
+}
+
+#[test]
 fn generated_markdown_download_is_a_private_exact_byte_snapshot() {
     let fixture = fixture("[文档](outputs/result.docx) [空格](<outputs/a b.pdf>)");
     let bytes = b"PK\x03\x04synthetic document\0bytes";

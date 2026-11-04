@@ -26,12 +26,13 @@ impl Opened {
             use std::os::fd::AsRawFd;
             let _ = path;
             std::fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
-                .map_err(|_| "无法核验文件真实位置")
+                .map_err(|_| "无法核验文件真实位置".to_string())
         }
         #[cfg(not(target_os = "linux"))]
         {
             // Windows holds no-delete handles for this file and every parent.
-            path.canonicalize().map_err(|_| "无法核验文件真实位置")
+            path.canonicalize()
+                .map_err(|_| "无法核验文件真实位置".to_string())
         }
     }
 }
