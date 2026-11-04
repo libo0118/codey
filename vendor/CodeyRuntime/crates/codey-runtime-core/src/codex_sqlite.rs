@@ -14,6 +14,26 @@ pub fn codex_session_db_paths_from_home(home: &Path) -> Vec<PathBuf> {
     CodexSessionDbDiscoveryCache::default().session_db_paths_from_home(home)
 }
 
+/// Unprobed candidates for callers that must not hide an unreadable identity database.
+pub fn codex_session_db_candidate_paths_from_home(home: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    match fs::read_dir(home.join("sqlite")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_file() && is_sqlite_candidate(&entry.path()) {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    sort_database_candidates(&mut candidates);
+    candidates.push(legacy_state_db_path(home));
+    Ok(candidates)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionDbFileSignature {
     len: u64,
@@ -159,6 +179,11 @@ fn codex_sqlite_dir_candidates(home: &Path) -> Vec<PathBuf> {
         })
         .filter(|path| is_sqlite_candidate(path))
         .collect::<Vec<_>>();
+    sort_database_candidates(&mut candidates);
+    candidates
+}
+
+fn sort_database_candidates(candidates: &mut [PathBuf]) {
     candidates.sort_by_key(|path| {
         (
             path.file_name()
@@ -167,7 +192,6 @@ fn codex_sqlite_dir_candidates(home: &Path) -> Vec<PathBuf> {
             path.file_name().map(|name| name.to_os_string()),
         )
     });
-    candidates
 }
 
 fn is_sqlite_candidate(path: &Path) -> bool {
@@ -199,7 +223,38 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::{CodexSessionDbDiscoveryCache, codex_session_db_paths_from_home};
+    use super::{
+        CodexSessionDbDiscoveryCache, codex_session_db_candidate_paths_from_home,
+        codex_session_db_paths_from_home,
+    };
+
+    #[test]
+    fn unprobed_candidates_retain_an_exclusively_locked_database() {
+        let home = tempdir().unwrap();
+        std::fs::create_dir(home.path().join("sqlite")).unwrap();
+        let path = home.path().join("sqlite/codex-dev.db");
+        let database = Connection::open(&path).unwrap();
+        database
+            .execute_batch("CREATE TABLE threads (id TEXT); BEGIN EXCLUSIVE")
+            .unwrap();
+        assert!(
+            codex_session_db_candidate_paths_from_home(home.path())
+                .unwrap()
+                .contains(&path)
+        );
+        database.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn unprobed_candidates_distinguish_missing_and_unreadable_directories() {
+        let home = tempdir().unwrap();
+        assert_eq!(
+            codex_session_db_candidate_paths_from_home(home.path()).unwrap(),
+            vec![home.path().join("state_5.sqlite")]
+        );
+        std::fs::write(home.path().join("sqlite"), b"not a directory").unwrap();
+        assert!(codex_session_db_candidate_paths_from_home(home.path()).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

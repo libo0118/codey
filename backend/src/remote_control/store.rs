@@ -1,7 +1,18 @@
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::params;
 use serde_json::{Value, json};
+
+mod inventory;
+
+#[cfg(test)]
+#[path = "store/tests.rs"]
+mod inventory_tests;
 
 pub(super) fn projects(home: &Path) -> Result<Value, String> {
     let path = home.join(".codex-global-state.json");
@@ -35,17 +46,15 @@ pub(super) fn threads(home: &Path, search: &str, archived: bool) -> Result<Value
     if search.len() > 200 {
         return Err("会话搜索内容过长".into());
     }
-    let paths = codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home(home);
+    let paths = codey_runtime_core::codex_sqlite::codex_session_db_candidate_paths_from_home(home)
+        .map_err(|_| "无法发现 Codex 会话身份数据库")?;
+    let inventory = Arc::new(Mutex::new(inventory::ThreadInventory::new(home, &paths)?));
     let mut rows = HashMap::<String, Value>::new();
     let mut read_database = false;
     for path in &paths {
-        let Ok(connection) = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
+        let Ok(connection) = inventory::open_database(path) else {
             continue;
         };
-        let _ = connection.busy_timeout(Duration::from_millis(250));
         let Ok(columns) = crate::sqlite_util::table_columns(&connection, "threads") else {
             continue;
         };
@@ -59,18 +68,15 @@ pub(super) fn threads(home: &Path, search: &str, archived: bool) -> Result<Value
                 fallback.to_string()
             }
         };
-        let title = format!(
-            "COALESCE(NULLIF({}, ''), {}, '')",
-            field("name", "NULL"),
-            field("title", "NULL")
-        );
+        inventory::register_inventory_functions(&connection, Arc::clone(&inventory))
+            .map_err(|_| "无法读取 Codex 会话元数据")?;
         let updated = field(
             "updated_at_ms",
             &format!("{} * 1000", field("updated_at", "0")),
         );
         let archived_column = field("archived", "0");
         let query = format!(
-            "SELECT id, COALESCE({title}, ''), cwd, COALESCE({updated}, 0) FROM threads WHERE {archived_column} = ?1 AND (instr(lower(COALESCE({title}, '')), lower(?2)) > 0 OR instr(lower(cwd), lower(?2)) > 0) ORDER BY {updated} DESC LIMIT 200"
+            "SELECT id, cwd, COALESCE({updated}, 0) FROM threads WHERE {archived_column} = ?1 AND codey_root_thread(id) AND (?2 = '' OR instr(lower(cwd), lower(?2)) > 0 OR instr(lower(codey_thread_title(id)), lower(?2)) > 0) ORDER BY {updated} DESC LIMIT 200"
         );
         let mut statement = connection
             .prepare(&query)
@@ -80,17 +86,17 @@ pub(super) fn threads(home: &Path, search: &str, archived: bool) -> Result<Value
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(2)?,
                 ))
             })
             .map_err(|_| "读取 Codex 会话列表失败")?;
         for record in records {
-            let (id, title, cwd, updated) = record.map_err(|_| "读取 Codex 会话记录失败")?;
-            if super::desktop::validate_thread(&id).is_err() {
-                continue;
-            }
-            let entry = json!({"id":id,"title":if title.trim().is_empty() { "未命名会话" } else { &title },"cwd":cwd,"updatedAt":updated});
+            let (id, cwd, updated) = record.map_err(|_| "读取 Codex 会话记录失败")?;
+            let title = inventory
+                .lock()
+                .map_err(|_| "读取 Codex 会话元数据失败")?
+                .title(&id);
+            let entry = json!({"id":id,"title":title,"cwd":cwd,"updatedAt":updated});
             if rows
                 .get(&id)
                 .is_none_or(|old| old["updatedAt"].as_i64().unwrap_or(0) < updated)
@@ -112,6 +118,7 @@ pub(super) fn threads(home: &Path, search: &str, archived: bool) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn lists_saved_projects_and_parameterized_thread_search() {
