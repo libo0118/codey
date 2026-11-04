@@ -9,6 +9,7 @@ use super::protocol;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub(super) const UNCERTAIN: &str = "桌面响应中断或超时，操作可能已提交；请先查看会话，不要重复发送";
+pub(super) const OWNER_UNAVAILABLE: &str = "尚未取得桌面会话，请点击重新连接以在电脑中打开会话";
 
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
@@ -106,7 +107,7 @@ impl Desktop {
             Ok::<_, String>(())
         })
         .await
-        .map_err(|_| "尚未取得桌面会话，请点击重新连接以在电脑中打开会话")??;
+        .map_err(|_| OWNER_UNAVAILABLE)??;
         Ok(desktop)
     }
 
@@ -287,13 +288,39 @@ impl Desktop {
         Ok(true)
     }
 
-    pub async fn action(&mut self, action: &str, args: &Value) -> Result<Value, String> {
+    pub async fn action(
+        &mut self,
+        action: &str,
+        args: &Value,
+        request_gate: impl std::future::Future<Output = Result<(), String>>,
+    ) -> Result<Value, String> {
         let (method, version, mut params) = action_params(&self.state, action, args)?;
+        // 问题与计划的答复也可能开始新一轮；按实际 RPC 而不是 UI 操作名校验。
+        if matches!(
+            method,
+            "thread-follower-start-turn"
+                | "thread-follower-steer-turn"
+                | "thread-follower-update-thread-settings"
+        ) {
+            request_gate.await?;
+        }
         params["conversationId"] = json!(self.thread);
         let result = self
             .request(method, version, params, action != "history")
             .await?;
-        Ok(result["result"].clone())
+        let result = &result["result"];
+        if result["ok"] == false || result["applied"] == false {
+            return Err(UNCERTAIN.into());
+        }
+        let status = match result.get("status") {
+            None | Some(Value::Null) => "ok", // Native RPCs acknowledge with ok/applied/revision or a result.
+            Some(status) => match status.as_str() {
+                Some("ok") => "ok",
+                Some("accepted") => "accepted",
+                _ => return Err(UNCERTAIN.into()),
+            },
+        };
+        Ok(json!({"status":status}))
     }
 }
 
@@ -301,6 +328,36 @@ pub(super) fn validate_thread(thread: &str) -> Result<(), String> {
     Uuid::parse_str(thread)
         .map(|_| ())
         .map_err(|_| "会话标识无效".into())
+}
+
+fn question_answers<'a>(
+    questions: &'a [Value],
+    answers: &'a Value,
+) -> Result<Vec<(&'a str, &'a str)>, String> {
+    let answers = answers.as_object().ok_or("请填写问题答案")?;
+    let ids = questions
+        .iter()
+        .map(|question| question["id"].as_str().filter(|id| !id.trim().is_empty()))
+        .collect::<Option<std::collections::HashSet<_>>>()
+        .ok_or("问题标识无效")?;
+    if questions.is_empty()
+        || ids.len() != questions.len()
+        || answers.len() != ids.len()
+        || answers.keys().any(|id| !ids.contains(id.as_str()))
+    {
+        return Err("请准确回答所有问题".into());
+    }
+    questions
+        .iter()
+        .map(|question| {
+            let id = question["id"].as_str().ok_or("问题标识无效")?;
+            let answer = answers[id]
+                .as_str()
+                .filter(|s| !s.trim().is_empty() && s.len() <= 20_000)
+                .ok_or("问题答案为空或过长")?;
+            Ok((id, answer))
+        })
+        .collect()
 }
 
 pub(super) fn action_params(
@@ -436,21 +493,17 @@ pub(super) fn action_params(
                 .into_iter()
                 .find(|r| r["id"] == args["approvalId"])
             {
-                let answers = args["answers"].as_object().ok_or("请填写问题答案")?;
+                if request["supported"] != true {
+                    return Err("此类请求请在电脑端处理".into());
+                }
                 let questions = request["params"]["questions"]
                     .as_array()
                     .ok_or("问题格式无效")?;
-                if answers.len() != questions.len() {
-                    return Err("请回答所有问题".into());
-                }
                 let mut replies = Vec::new();
-                for question in questions {
-                    let id = question["id"].as_str().ok_or("问题标识无效")?;
-                    let answer = answers
-                        .get(id)
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty() && s.len() <= 20_000)
-                        .ok_or("答案为空或过长")?;
+                for (question, (id, answer)) in questions
+                    .iter()
+                    .zip(question_answers(questions, &args["answers"])?)
+                {
                     replies.push(json!({"questionItemId":id,"question":question["question"],"answer":answer}));
                 }
                 let text = format!(
@@ -469,7 +522,7 @@ pub(super) fn action_params(
                 .flatten()
                 .find(|r| r["id"] == args["approvalId"] && !r["id"].is_null())
                 .ok_or("该请求已处理或已过期，请刷新会话")?;
-            if !protocol::request_supported(request) {
+            if !protocol::request_supported(state, request) {
                 return Err("此类请求请在电脑端处理".into());
             }
             if request["method"] == "item/plan/requestImplementation" {
@@ -538,18 +591,8 @@ pub(super) fn action_params(
                     let questions = request["params"]["questions"]
                         .as_array()
                         .ok_or("请求问题无效")?;
-                    let answers = args["answers"].as_object().ok_or("请填写问题答案")?;
-                    if questions.is_empty() || questions.len() != answers.len() {
-                        return Err("请回答所有问题".into());
-                    }
                     let mut response = serde_json::Map::new();
-                    for question in questions {
-                        let id = question["id"].as_str().ok_or("问题标识无效")?;
-                        let text = answers
-                            .get(id)
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.trim().is_empty() && s.len() <= 20_000)
-                            .ok_or("问题答案为空或过长")?;
+                    for (id, text) in question_answers(questions, &args["answers"])? {
                         response.insert(id.into(), json!({"answers":[text]}));
                     }
                     payload["response"] = json!({"answers":response});
@@ -680,7 +723,7 @@ mod tests {
 
     #[test]
     fn actions_keep_desktop_settings_and_validate_live_turns_and_approvals() {
-        let state = json!({"id":"t","turns":[],"requests":[{"id":7,"method":"item/commandExecution/requestApproval","params":{"availableDecisions":["decline"]}}]});
+        let state = json!({"id":"t","cwd":"workspace","turns":[],"requests":[{"id":7,"method":"item/commandExecution/requestApproval","params":{"command":"echo safe","cwd":"workspace","availableDecisions":["decline"]}}]});
         let (_, version, payload) = action_params(
             &state,
             "send",
@@ -703,6 +746,16 @@ mod tests {
                 &state,
                 "respond",
                 &json!({"approvalId":7,"decision":"accept"})
+            )
+            .is_err()
+        );
+        let unknown = json!({"id":"t","requests":[{"id":9,"method":"item/permissions/requestApproval","params":{"permissions":{"futureScope":{"private":"secret"}}}}]});
+        assert_eq!(protocol::view(&unknown)["requests"][0]["supported"], false);
+        assert!(
+            action_params(
+                &unknown,
+                "respond",
+                &json!({"approvalId":9,"decision":"accept"})
             )
             .is_err()
         );
@@ -756,6 +809,104 @@ mod tests {
         stream.write_all(&bytes).await.unwrap();
     }
 
+    fn action_fixture(state: Value) -> (Desktop, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(8192);
+        (
+            Desktop {
+                stream: Box::new(client),
+                buffer: Vec::new(),
+                outgoing: Vec::new(),
+                written: 0,
+                client: Some("mobile".into()),
+                owner: Some("owner".into()),
+                thread: "t".into(),
+                state,
+                revision: None,
+                projection: Default::default(),
+                urgent: true,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn unverified_model_actions_send_no_desktop_request_including_replies() {
+        let active = json!({"id":"t","turns":[{"turnId":"turn","status":"inProgress","items":[{"id":"q","type":"agentMessage","questions":[{"title":"如何连接？","options":["外网"]}]}]}]});
+        let question = protocol::async_requests(&active).remove(0);
+        let question_id = question["params"]["questions"][0]["id"].as_str().unwrap();
+        let message = json!({"text":"test","requestId":Uuid::new_v4().to_string()});
+        for (state, action, args) in [
+            (json!({"id":"t"}), "send", message.clone()),
+            (active.clone(), "steer", message),
+            (
+                json!({"id":"t"}),
+                "settings",
+                json!({"model":"route/model"}),
+            ),
+            (
+                active,
+                "respond",
+                json!({"approvalId":question["id"],"requestId":Uuid::new_v4().to_string(),"answers":{question_id:"外网"}}),
+            ),
+            (
+                json!({"id":"t","latestModel":"route/model","requests":[{"id":5,"method":"item/plan/requestImplementation","params":{"planContent":"运行测试"}}]}),
+                "respond",
+                json!({"approvalId":5,"requestId":Uuid::new_v4().to_string(),"decision":"implement"}),
+            ),
+        ] {
+            let (mut desktop, mut server) = action_fixture(state);
+            let error = desktop
+                .action(action, &args, async { Err("gate unavailable".into()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error, "gate unavailable", "{action}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), server.read_u8())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_stop_and_scoped_approval_do_not_poll_the_model_gate() {
+        for (state, action, args, expected_method) in [
+            (
+                json!({"id":"t"}),
+                "history",
+                json!({}),
+                "thread-follower-load-complete-history",
+            ),
+            (
+                json!({"id":"t","turns":[{"turnId":"turn","status":"inProgress"}]}),
+                "interrupt",
+                json!({"turnId":"turn"}),
+                "thread-follower-interrupt-turn",
+            ),
+            (
+                json!({"id":"t","requests":[{"id":7,"method":"item/commandExecution/requestApproval","params":{"command":"echo safe","cwd":"/workspace","availableDecisions":["decline"]}}]}),
+                "respond",
+                json!({"approvalId":7,"decision":"decline"}),
+                "thread-follower-command-approval-decision",
+            ),
+        ] {
+            let (mut desktop, mut server) = action_fixture(state);
+            let response = tokio::spawn(async move {
+                let request = read_frame(&mut server).await;
+                assert_eq!(request["method"], expected_method);
+                write_frame(&mut server, json!({"type":"response","requestId":request["requestId"],"resultType":"success","result":{"status":"accepted"}})).await;
+            });
+            let result = desktop
+                .action(action, &args, async {
+                    panic!("the model gate must not run")
+                })
+                .await
+                .unwrap();
+            assert_eq!(result, json!({"status":"accepted"}));
+            response.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn follows_desktop_owner_and_sends_to_original_workspace() {
         let (client, mut server) = tokio::io::duplex(8192);
@@ -787,7 +938,7 @@ mod tests {
             );
             let discovery = read_frame(&mut server).await;
             assert_eq!(discovery["response"]["canHandle"], false);
-            write_frame(&mut server,json!({"type":"response","requestId":action["requestId"],"resultType":"success","result":{"status":"accepted"}})).await;
+            write_frame(&mut server,json!({"type":"response","requestId":action["requestId"],"resultType":"success","result":{"status":"accepted","message":"PRIVATE_ACK_CANARY","config":"PRIVATE_ACK_CANARY"}})).await;
         });
         let mut desktop = Desktop::subscribe(
             Desktop::initialize(Box::new(client)).await.unwrap(),
@@ -795,17 +946,184 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            desktop
-                .action(
+        let ack = desktop.action(
                     "send",
-                    &json!({"text":"test","images":[{"url":"data:image/gif;base64,R0lGODlh"}],"requestId":Uuid::new_v4().to_string()})
+                    &json!({"text":"test","images":[{"url":"data:image/gif;base64,R0lGODlh"}],"requestId":Uuid::new_v4().to_string()}),
+                    async { Ok(()) },
                 )
                 .await
-                .unwrap()["status"],
-            "accepted"
-        );
+                .unwrap();
+        assert_eq!(ack["status"], "accepted");
+        assert!(!ack.to_string().contains("PRIVATE_ACK_CANARY"));
         fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_allow_only_confirmed_public_statuses_and_never_native_messages() {
+        let cases = vec![
+            (json!({"status":"accepted"}), Some("accepted")),
+            (json!({"status":"ok"}), Some("ok")),
+            (json!({"ok":true}), Some("ok")),
+            (json!({"applied":true}), Some("ok")),
+            (json!({"revision":3}), Some("ok")),
+            (
+                json!({"result":{"turn":{"status":"inProgress","config":"PRIVATE_ACK_CANARY"}}}),
+                Some("ok"),
+            ),
+            (json!({"status":"PRIVATE_ACK_CANARY"}), None),
+            (json!({"status":"not-ready"}), None),
+            (json!({"status":"failed"}), None),
+            (json!({"status":{"auth":"PRIVATE_ACK_CANARY"}}), None),
+            (json!({"status":true}), None),
+            (json!({"ok":false}), None),
+            (json!({"applied":false}), None),
+        ];
+        let (client, mut server) = tokio::io::duplex(4096);
+        let responses = cases.clone();
+        let fixture = tokio::spawn(async move {
+            let initialize = read_frame(&mut server).await;
+            write_frame(&mut server, json!({"type":"response","requestId":initialize["requestId"],"resultType":"success","result":{"clientId":"mobile"}})).await;
+            for (mut result, _) in responses {
+                let request = read_frame(&mut server).await;
+                assert_eq!(request["method"], "thread-follower-load-complete-history");
+                result["message"] = json!("PRIVATE_ACK_CANARY");
+                write_frame(&mut server, json!({"type":"response","requestId":request["requestId"],"resultType":"success","result":result})).await;
+            }
+        });
+        let mut desktop = Desktop::initialize(Box::new(client)).await.unwrap();
+        for (_, status) in cases {
+            let result = desktop
+                .action("history", &json!({}), async { Ok(()) })
+                .await;
+            match status {
+                Some(status) => assert_eq!(result.unwrap(), json!({"status":status})),
+                None => assert_eq!(result.unwrap_err(), UNCERTAIN),
+            }
+        }
+        fixture.await.unwrap();
+    }
+
+    #[test]
+    fn command_approval_scope_is_visible_and_required_for_the_same_respond_capability() {
+        let mut state = json!({"id":"t","cwd":"/workspace","turns":[{"turnId":"turn","items":[{"id":"i","type":"commandExecution","command":"rm report","cwd":"/important"},{"id":"other","type":"commandExecution","command":"unrelated","cwd":"/wrong"}]}],"requests":[{"id":7,"method":"item/commandExecution/requestApproval","params":{"itemId":"i"}}]});
+        let args = json!({"approvalId":7,"decision":"accept"});
+        let view = protocol::view(&state);
+        assert_eq!(view["requests"][0]["supported"], true);
+        assert_eq!(view["requests"][0]["params"]["command"], "rm report");
+        assert_eq!(view["requests"][0]["params"]["cwd"], "/important");
+        let (method, _, payload) = action_params(&state, "respond", &args).unwrap();
+        assert_eq!(method, "thread-follower-command-approval-decision");
+        assert_eq!(payload, json!({"requestId":7,"decision":"accept"}));
+        state["requests"][0]["params"]["cwd"] = json!("/explicit");
+        assert_eq!(
+            protocol::view(&state)["requests"][0]["params"]["cwd"],
+            "/explicit"
+        );
+        state["requests"][0]["params"]["cwd"] = Value::Null;
+        state["turns"][0]["items"][0]["cwd"] = Value::Null;
+        assert_eq!(protocol::view(&state)["requests"][0]["supported"], false);
+        assert!(action_params(&state, "respond", &args).is_err());
+        for invalid in [
+            Value::Null,
+            json!(""),
+            json!(" "),
+            json!({"env":"PRIVATE_SCOPE_CANARY"}),
+        ] {
+            state["cwd"] = invalid;
+            assert_eq!(protocol::view(&state)["requests"][0]["supported"], false);
+            assert!(action_params(&state, "respond", &args).is_err());
+        }
+        state["cwd"] = json!("/workspace");
+        state["turns"][0]["items"][0]["cwd"] = json!({"config":"PRIVATE_SCOPE_CANARY"});
+        assert_eq!(protocol::view(&state)["requests"][0]["supported"], false);
+        assert!(action_params(&state, "respond", &args).is_err());
+    }
+
+    #[test]
+    fn synchronous_questions_require_unique_valid_ids_and_exact_string_answers() {
+        for method in ["item/tool/requestUserInput", "tool/requestUserInput"] {
+            let mut state = json!({"id":"t","requests":[{"id":7,"method":method,"params":{"questions":[{"id":"q","question":"first"},{"id":"q","question":"second"}]}}]});
+            let duplicate = json!({"approvalId":7,"answers":{"q":"yes","extra":"x"}});
+            assert_eq!(protocol::view(&state)["requests"][0]["supported"], false);
+            assert!(action_params(&state, "respond", &duplicate).is_err());
+            for invalid in [
+                Value::Null,
+                json!(""),
+                json!("  "),
+                json!(7),
+                json!({"private":"PRIVATE_QUESTION_CANARY"}),
+            ] {
+                state["requests"][0]["params"]["questions"][1]["id"] = invalid;
+                assert_eq!(protocol::view(&state)["requests"][0]["supported"], false);
+                assert!(action_params(&state, "respond", &duplicate).is_err());
+            }
+            state["requests"][0]["params"]["questions"][1]["id"] = json!("other");
+            assert_eq!(protocol::view(&state)["requests"][0]["supported"], true);
+            for answers in [
+                json!({"q":"yes","extra":"x"}),
+                json!({"q":"yes"}),
+                json!({"q":"yes","other":"ok","extra":"x"}),
+                json!({"q":"yes","other":true}),
+                json!({"q":"yes","other":7}),
+                json!({"q":"yes","other":null}),
+                json!({"q":"yes","other":["x"]}),
+                json!({"q":"yes","other":{"answers":["x"]}}),
+                json!({"q":"yes","other":" "}),
+            ] {
+                assert!(
+                    action_params(
+                        &state,
+                        "respond",
+                        &json!({"approvalId":7,"answers":answers})
+                    )
+                    .is_err()
+                );
+            }
+            let (method, _, payload) = action_params(
+                &state,
+                "respond",
+                &json!({"approvalId":7,"answers":{"q":"yes","other":"ok"}}),
+            )
+            .unwrap();
+            assert_eq!(method, "thread-follower-submit-user-input");
+            assert_eq!(
+                payload["response"]["answers"],
+                json!({"q":{"answers":["yes"]},"other":{"answers":["ok"]}})
+            );
+        }
+    }
+
+    #[test]
+    fn asynchronous_answers_keep_generated_question_ids_and_reject_extra_or_non_string_answers() {
+        let state = json!({"id":"t","turns":[{"turnId":"turn","status":"inProgress","items":[{"id":"item","type":"agentMessage","questions":[{"title":"first"},{"title":"second"}]}]}]});
+        let request = protocol::async_requests(&state).remove(0);
+        let first = json!(["request_user_input_async", "item", 0]).to_string();
+        let second = json!(["request_user_input_async", "item", 1]).to_string();
+        assert_eq!(request["params"]["questions"][0]["id"], first);
+        assert_eq!(request["params"]["questions"][1]["id"], second);
+        for answers in [
+            json!({first.clone():"yes","extra":"x"}),
+            json!({first.clone():"yes",second.clone():7}),
+            json!({first.clone():"yes",second.clone():"ok","extra":"x"}),
+        ] {
+            assert!(action_params(&state, "respond", &json!({"approvalId":request["id"],"requestId":Uuid::new_v4().to_string(),"answers":answers})).is_err());
+        }
+        let (method, _, payload) = action_params(&state, "respond", &json!({"approvalId":request["id"],"requestId":Uuid::new_v4().to_string(),"answers":{first.clone():"yes",second.clone():"ok"}})).unwrap();
+        assert_eq!(method, "thread-follower-steer-turn");
+        let text = payload["input"][0]["text"].as_str().unwrap();
+        let replies: Value = serde_json::from_str(
+            text.trim()
+                .strip_prefix("<send_user_message_question_reply>")
+                .unwrap()
+                .strip_suffix("</send_user_message_question_reply>")
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(
+            replies,
+            json!([{"questionItemId":first,"question":"first","answer":"yes"},{"questionItemId":second,"question":"second","answer":"ok"}])
+        );
     }
 
     #[test]
@@ -836,5 +1154,29 @@ mod tests {
             payload["turnStart"]["request"]["collaborationMode"]["settings"]["model"],
             "test-model"
         );
+    }
+
+    #[test]
+    fn mixed_async_question_schemas_cannot_be_answered_as_a_visible_subset() {
+        for bad in [
+            json!({"title":{"private":"ASYNC_RESPOND_CANARY"}}),
+            json!({"title":"第二题","options":["合法",{"private":"ASYNC_RESPOND_CANARY"}]}),
+        ] {
+            let state = json!({"id":"t","turns":[{"turnId":"turn","status":"inProgress","items":[{"id":"q","type":"agentMessage","questions":[{"title":"确认？"},bad]}]}]});
+            let request = protocol::async_requests(&state).remove(0);
+            assert_eq!(request["supported"], false);
+            assert!(
+                !protocol::view(&state)
+                    .to_string()
+                    .contains("ASYNC_RESPOND_CANARY")
+            );
+            let key = json!(["request_user_input_async", "q", 0]).to_string();
+            let result = action_params(
+                &state,
+                "respond",
+                &json!({"approvalId":request["id"],"requestId":Uuid::new_v4().to_string(),"answers":{key:"yes"}}),
+            );
+            assert!(result.err().unwrap().contains("电脑端"));
+        }
     }
 }

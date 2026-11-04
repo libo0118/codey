@@ -16,6 +16,33 @@ const fixture = () => ({
     .map(({ id }) => [id, { enabled: true, model: "route/model", reasoningEffort: "low" }])),
 });
 
+test("subagent concurrency defaults to two and accepts only integers from 1 to 64", () => {
+  assert.equal(state.validateSubagents(fixture()), null);
+  for (const limit of [1, 2, 64]) assert.equal(state.validateSubagents({ ...fixture(), subagentMaxThreads: limit }), null);
+  for (const limit of [0, 65, -1, 1.5, NaN, Infinity, "2"]) {
+    for (const enabled of [false, true]) {
+      assert.match(state.validateSubagents({ ...fixture(), subagentOptimization: enabled, subagentMaxThreads: limit }), /1 到 64/);
+    }
+  }
+});
+
+test("count drafts survive incoming revisions without losing explicit role deletion", () => {
+  const base = state.addCustomSubagent({ ...fixture(), subagentMaxThreads: 2 }, model);
+  const draft = { ...state.removeCustomSubagent(base, "custom_agent_1"), subagentMaxThreads: 4 };
+  const incoming = { ...base, settingsRevision: 2, scopeGuard: true };
+  const merged = reconcileConfigDraft(base, draft, incoming);
+  assert.equal(merged.config.subagentMaxThreads, 4);
+  assert.equal(merged.config.settingsRevision, 2);
+  assert.equal(merged.config.scopeGuard, true);
+  assert.deepEqual(merged.config.deletedSubagentRoles, ["custom_agent_1"]);
+  assert.equal(merged.dirty, true);
+  const { deletedSubagentRoles: _, ...saved } = merged.config;
+  const adopted = reconcileConfigDraft(merged.config, merged.config, { ...saved, settingsRevision: 3 });
+  assert.equal(adopted.config.subagentMaxThreads, 4);
+  assert.equal(adopted.config.deletedSubagentRoles, undefined);
+  assert.equal(adopted.dirty, false);
+});
+
 test("custom roles default to read-only, use free IDs and stop at 32 without altering builtins", () => {
   const original = fixture();
   let config = state.addCustomSubagent(original, model);
@@ -110,7 +137,34 @@ test("real role controls keep drafts local, require deletion confirmation and di
   const unchanged = config; add.onClick(); assert.equal(config, unchanged);
 });
 
-test("App save failures keep custom drafts and never emit a saved notice", async () => {
+test("real concurrency control edits only the local count draft and stays disabled while busy", () => {
+  const ui = autoStubModule("ui");
+  const h = createControllerHarness(new URL("../src/FeaturePolicyCard.tsx", import.meta.url), "SubagentPolicyCardComponent", {
+    "./components/ui": ui, "./components/ModelCombobox": autoStubModule("combobox"),
+    "./SettingsPageHeader": autoStubModule("header"), "@tabler/icons-react": autoStubModule("icons"),
+    "./notifications/NotificationChannelsCard": autoStubModule("notifications"),
+  });
+  let config = state.addCustomSubagent(fixture(), model);
+  const roles = config.subagentRoles;
+  const render = (isBusy = false) => h.render({ config, isBusy, subagentModelOptions: [model],
+    onConfigChange: next => { config = next; }, onSubagentOptimizationChange() {}, onRequestConfirmation() {} });
+  const control = tree => elementProps(collectElements(tree, node => elementType(node) === ui.NumberInput)[0]);
+  let tree = render();
+  assert.equal(control(tree).value, 2);
+  assert.deepEqual([control(tree).minValue, control(tree).maxValue, control(tree).step], [1, 64, 1]);
+  assert.match(textContent(tree), /不包含主代理.*保存并重启 Codex 后生效.*不会中止已运行任务/);
+  for (const limit of [1, 64, 4]) { control(tree).onChange(limit); tree = render(); assert.equal(control(tree).value, limit); }
+  for (const limit of [0, 65, 1.5, NaN]) { control(tree).onChange(limit); tree = render(); assert.equal(control(tree).value, 4); }
+  assert.equal(config.subagentRoles, roles);
+  assert.equal(config.settingsRevision, 1, "editing the count must not persist the draft");
+  const previous = config;
+  tree = render(true);
+  assert.equal(control(tree).disabled, true);
+  control(tree).onChange(8);
+  assert.equal(config, previous);
+});
+
+test("App save failures keep count and custom drafts and never emit a saved notice", async () => {
   const source = ts.createSourceFile("App.tsx", readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const declarations = new Map();
   const visit = node => {
@@ -124,10 +178,11 @@ test("App save failures keep custom drafts and never emit a saved notice", async
   const createSave = new Function("dependencies", `const { config, validateSubagents, invoke, setNotice, setBusy, persistedConfigRef, applyCommandResult } = dependencies;
     const useCallback = callback => callback, isBusy = false, errorText = error => error.message;
     ${compiled}\nreturn saveCurrent;`);
-  for (const invalid of [false, true]) {
-    let config = state.addCustomSubagent(fixture(), model);
+  for (const invalid of [false, "role", "count"]) {
+    let config = state.addCustomSubagent({ ...fixture(), subagentMaxThreads: 4 }, model);
     config = state.removeCustomSubagent(state.addCustomSubagent(config, model), "custom_agent_2");
-    if (invalid) config = state.updateSubagent(config, "custom_agent_1", { name: "" });
+    if (invalid === "role") config = state.updateSubagent(config, "custom_agent_1", { name: "" });
+    if (invalid === "count") config = { ...config, subagentMaxThreads: 65 };
     const snapshot = structuredClone(config), notices = [], calls = [];
     const save = createSave({ config, validateSubagents: state.validateSubagents,
       persistedConfigRef: { current: fixture() }, setBusy() {}, setNotice: notice => notices.push(notice),
@@ -137,6 +192,9 @@ test("App save failures keep custom drafts and never emit a saved notice", async
     await save();
     assert.equal(calls.length, invalid ? 0 : 1);
     if (!invalid) {
+      assert.equal(calls[0].command, "save_codey_config");
+      assert.equal(calls[0].args.config.settingsRevision, 1);
+      assert.equal(calls[0].args.config.subagentMaxThreads, 4);
       assert.equal(calls[0].args.config.subagentRoles.custom_agent_1.name, snapshot.subagentRoles.custom_agent_1.name);
       assert.deepEqual(calls[0].args.config.deletedSubagentRoles, ["custom_agent_2"]);
       assert.equal(calls[0].args.deletedSubagentRoles, undefined);

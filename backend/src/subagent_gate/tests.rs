@@ -36,10 +36,43 @@ fn write_test_runtime_policy(state_root: &Path) {
         runtime_policy::runtime_subagent_policy_bytes(
             &crate::config::default_subagent_roles(),
             &BTreeMap::new(),
+            2,
         )
         .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn runtime_policy_count_defaults_and_invalid_wire_values_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = temp.path().join(STATE_DIRECTORY);
+    write_test_runtime_policy(&state_root);
+    let path = state_root.join(RUNTIME_SUBAGENT_POLICY_FILE);
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("maxThreads");
+    fs::write(&path, legacy.to_string()).unwrap();
+    assert_eq!(
+        load_runtime_subagent_policy(&state_root)
+            .unwrap()
+            .unwrap()
+            .max_threads,
+        2
+    );
+    for value in [
+        json!(0),
+        json!(65),
+        json!(-1),
+        json!(1.5),
+        json!("4"),
+        json!(true),
+        Value::Null,
+    ] {
+        let mut invalid = legacy.clone();
+        invalid["maxThreads"] = value;
+        fs::write(&path, invalid.to_string()).unwrap();
+        assert!(load_runtime_subagent_policy(&state_root).is_err());
+    }
 }
 
 // Authorization tests model children whose runtime configuration was already attested.
@@ -108,7 +141,7 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
     fs::create_dir_all(&sessions).unwrap();
     let roles = crate::config::default_subagent_roles();
     let hashes = BTreeMap::new();
-    commit_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+    commit_runtime_subagent_policy(home, &roles, &hashes, 2).unwrap();
     let role = crate::config::SUBAGENT_ROLE_QUICK_SCAN;
     let expected = roles.get(role).unwrap();
     let session_id = "attestation-parent";
@@ -159,7 +192,7 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
         None
     );
 
-    begin_runtime_subagent_policy_update(home, &roles, &hashes).unwrap();
+    begin_runtime_subagent_policy_update(home, &roles, &hashes, 2).unwrap();
     // Already-attested children may finish their existing turn while new
     // children are fenced until the pending generation is committed.
     assert_eq!(
@@ -180,7 +213,7 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
     .unwrap()
     .unwrap();
     assert!(pending.contains("CODEY_SUBAGENT_RUNTIME_UPDATE_IN_PROGRESS"));
-    commit_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+    commit_runtime_subagent_policy(home, &roles, &hashes, 2).unwrap();
 
     let wrong_agent = "01a01f94-0000-7000-8000-000000000003";
     let wrong_transcript = write_transcript(
@@ -211,7 +244,7 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
 
     let mut disabled = roles.clone();
     disabled.remove(role);
-    commit_runtime_subagent_policy(home, &disabled, &hashes).unwrap();
+    commit_runtime_subagent_policy(home, &disabled, &hashes, 2).unwrap();
     assert!(
         runtime_role_admission_denial(&state_root, role)
             .unwrap()
@@ -231,7 +264,7 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
         .unwrap()
         .is_some()
     );
-    commit_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+    commit_runtime_subagent_policy(home, &roles, &hashes, 2).unwrap();
     assert_eq!(
         runtime_role_admission_denial(&state_root, role).unwrap(),
         None
@@ -355,7 +388,7 @@ fn disabled_runtime_role_is_rejected_before_spawn_reservation() {
     let state_root = home.join(STATE_DIRECTORY);
     let mut roles = crate::config::default_subagent_roles();
     roles.remove(crate::config::SUBAGENT_ROLE_WORKER);
-    commit_runtime_subagent_policy(home, &roles, &BTreeMap::new()).unwrap();
+    commit_runtime_subagent_policy(home, &roles, &BTreeMap::new(), 2).unwrap();
 
     let mut spawn = input("PreToolUse", "disabled-role-session");
     spawn.turn_id = Some("root-turn-a".to_string());

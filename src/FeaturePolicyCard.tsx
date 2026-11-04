@@ -21,6 +21,7 @@ import {
   Button,
   Badge,
   Input,
+  NumberInput,
   Select,
   Switch,
   TextArea,
@@ -308,6 +309,15 @@ export function SubagentPolicyCardComponent({
         <div className="module-card-body subagent-policy-body">
           {config.subagentOptimization ? (
             <>
+              <div className="subagent-group-card codey-card p-4">
+                <div className="grid gap-2">
+                  <span className="text-xs font-semibold">最大并发子代理数量</span>
+                  <NumberInput aria-label="最大并发子代理数量"
+                    aria-describedby="subagent-max-threads-hint" minValue={1} maxValue={64} step={1}
+                    value={config.subagentMaxThreads ?? 2} disabled={isBusy} onChange={controller.changeMaxThreads} />
+                  <small id="subagent-max-threads-hint" className="field-hint">不包含主代理；保存并重启 Codex 后生效。仅修改上限不会中止已运行任务，重启前请先等待任务结束。</small>
+                </div>
+              </div>
               <div className="subagent-group-card subagent-group-card--default codey-card">
                 {renderRoleCard(DEFAULT_SUBAGENT_TASK)}
               </div>
@@ -410,7 +420,7 @@ export function SubagentPolicyCardComponent({
               </div>
               <div className="module-disabled-text">
                 <strong>子代理优化已关闭</strong>
-                <p>开启后选择性委派给五类内置角色或自定义角色，并分别配置模型与思考深度。</p>
+                <p>开启后选择性委派给五类内置角色或自定义角色，并配置并发数量、模型与思考深度。</p>
               </div>
             </div>
           )}

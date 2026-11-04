@@ -12,6 +12,7 @@ fn start(home: &Path, marker: &Path, config: &CodeyConfig) -> Result<AppliedRunt
     apply_isolated_runtime_router_config(
         home,
         RouterApplyOptions {
+            subagent_max_threads: config.subagent_max_threads,
             local_router: None,
             remote_compaction_models: None,
             stream_max_retries: 5,
@@ -40,6 +41,91 @@ fn config() -> CodeyConfig {
         .subagent_roles
         .insert("custom_agent_1".into(), custom());
     config.normalize()
+}
+
+#[test]
+fn configured_count_reaches_native_overrides_policy_and_prompts_only_on_restart() {
+    for limit in [1, 4, 64] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let marker = temp.path().join("state/lease.json");
+        let mut config = config();
+        config.subagent_max_threads = limit;
+        let applied = start(&home, &marker, &config).unwrap();
+        for key in [
+            "agents.max_threads",
+            "agents.max_concurrent_threads_per_session",
+        ] {
+            assert!(
+                applied
+                    .runtime_config_overrides
+                    .contains(&format!("{key}={limit}"))
+            );
+        }
+        for (key, expected) in [
+            (
+                "root_agent_usage_hint_text",
+                format!("concurrency limit of {limit} sub-agents (excluding the root)"),
+            ),
+            (
+                "multi_agent_mode_hint_text",
+                format!("At most {limit} sub-agents run at once (excluding the root)"),
+            ),
+        ] {
+            let prefix = format!("features.multi_agent_v2.{key}=");
+            let entry = applied
+                .runtime_config_overrides
+                .iter()
+                .find(|entry| entry.starts_with(&prefix))
+                .unwrap();
+            let document = parse_document(entry).unwrap();
+            let prompt = document["features"]["multi_agent_v2"][key]
+                .as_str()
+                .unwrap();
+            assert!(prompt.contains(&expected));
+            assert!(!prompt.contains("limit of two"));
+            assert!(!prompt.contains("At most two"));
+            if key == "multi_agent_mode_hint_text" {
+                assert!(prompt.len() <= 1600);
+            }
+        }
+        let state_root = home.join(crate::subagent_gate::STATE_DIRECTORY);
+        assert_eq!(
+            crate::subagent_gate::load_runtime_subagent_policy(&state_root)
+                .unwrap()
+                .unwrap()
+                .max_threads,
+            limit
+        );
+        config.subagent_max_threads = if limit == 1 { 4 } else { 1 };
+        config
+            .subagent_roles
+            .get_mut("codey_worker")
+            .unwrap()
+            .reasoning_effort = "max".into();
+        reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+        let policy = crate::subagent_gate::load_runtime_subagent_policy(&state_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy.max_threads, limit,
+            "role reload cannot change launch-scoped concurrency"
+        );
+        assert_eq!(policy.roles["codey_worker"].reasoning_effort, "max");
+        restore_runtime_config_at(&home, &marker, false).unwrap();
+        let restarted = start(&home, &marker, &config).unwrap();
+        assert!(restarted.runtime_config_overrides.contains(&format!(
+            "agents.max_threads={}",
+            config.subagent_max_threads
+        )));
+        assert_eq!(
+            crate::subagent_gate::load_runtime_subagent_policy(&state_root)
+                .unwrap()
+                .unwrap()
+                .max_threads,
+            config.subagent_max_threads
+        );
+    }
 }
 
 #[test]
@@ -154,7 +240,7 @@ fn custom_role_transaction_restores_files_policy_and_lease_when_final_commit_fai
         &config,
         &marker,
         None,
-        |_, _, _| anyhow::bail!("injected final policy commit failure"),
+        |_, _, _, _| anyhow::bail!("injected final policy commit failure"),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("已恢复原配置"));

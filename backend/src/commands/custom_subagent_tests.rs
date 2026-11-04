@@ -1,5 +1,70 @@
 use super::*;
 
+#[tokio::test]
+async fn subagent_count_save_preserves_omitted_fields_and_rejects_invalid_values_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = CodeyConfig {
+        subagent_max_threads: 8,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let state = Arc::new(AppState {
+        config: RwLock::new(config.clone()),
+        store: ConfigStore::new(temp.path().join("config.json")),
+        ..AppState::default()
+    });
+    state.store.save(&config).unwrap();
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    legacy.as_object_mut().unwrap().remove("subagentMaxThreads");
+    save_codey_config_locked(
+        &state,
+        codey_config_save_input(&json!({"config":legacy})).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.store.load().unwrap().subagent_max_threads, 8);
+    let current = state.config.read().await.clone();
+    let original = std::fs::read(state.store.path()).unwrap();
+    for invalid in [
+        json!(0),
+        json!(65),
+        json!(-1),
+        json!(1.5),
+        json!("4"),
+        json!(true),
+        Value::Null,
+    ] {
+        let mut payload = serde_json::to_value(&current).unwrap();
+        payload["subagentMaxThreads"] = invalid;
+        if let Ok(input) = codey_config_save_input(&json!({"config":payload})) {
+            assert!(save_codey_config_locked(&state, input).await.is_err());
+        }
+        assert_eq!(*state.config.read().await, current);
+        assert_eq!(std::fs::read(state.store.path()).unwrap(), original);
+    }
+    let mut payload = serde_json::to_value(&current).unwrap();
+    payload["subagentMaxThreads"] = json!(1);
+    save_codey_config_locked(
+        &state,
+        codey_config_save_input(&json!({"config":payload})).unwrap(),
+    )
+    .await
+    .unwrap();
+    let saved = state.store.load().unwrap();
+    assert_eq!(saved.subagent_max_threads, 1);
+    assert_eq!(saved.settings_revision, current.settings_revision + 1);
+    let mut runtime_config = current.clone();
+    runtime_config.subagent_optimization = true;
+    let mut desired = runtime_config.clone();
+    desired.subagent_max_threads = 1;
+    assert!(config_requires_restart(
+        &runtime_config,
+        &RuntimeModelConfig::from_config(&runtime_config),
+        &RuntimeSubagentConfig::from_config(&desired),
+        &desired
+    ));
+}
+
 fn custom() -> SubagentRoleConfig {
     serde_json::from_value(
         json!({"name":"检查", "description":"用途", "developerInstructions":"返回证据"}),

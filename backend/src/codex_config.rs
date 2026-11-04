@@ -75,7 +75,7 @@ const CODEY_FASTCTX_GREP_TOKEN_BUDGET: usize = 10_800;
 const CODEY_FASTCTX_GLOB_TOKEN_BUDGET: usize = 5_400;
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 120;
 const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
-const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
+const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = crate::config::default_subagent_max_threads() as i64;
 const APPLIED_HOOKS_JSON_FILE: &str = "applied-hooks.json";
 const CODEY_CONSTRAINTS_DIR: &str = "codex-constraints";
 const CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE: &str = "root-instructions.md";
@@ -111,6 +111,8 @@ struct RuntimeConfigLease {
     subagent_roles: BTreeMap<String, SubagentRoleConfig>,
     #[serde(default)]
     registered_subagent_roles: Vec<String>,
+    #[serde(default = "crate::config::default_subagent_max_threads")]
+    subagent_max_threads: u32,
     #[serde(default)]
     runtime_home: PathBuf,
     #[serde(default)]
@@ -222,6 +224,7 @@ impl Drop for RuntimeConfigLock {
 }
 
 pub(crate) struct RuntimeRouterConfigOptions<'a> {
+    pub subagent_max_threads: u32,
     pub local_router: Option<&'a RuntimeRouterEndpoint>,
     pub remote_compaction_models: Option<&'a [String]>,
     pub use_official_catalog: bool,
@@ -282,6 +285,7 @@ pub(crate) struct FastContextToolsStatus {
 }
 
 struct RouterApplyOptions<'a> {
+    subagent_max_threads: u32,
     local_router: Option<&'a RuntimeRouterEndpoint>,
     remote_compaction_models: Option<&'a [String]>,
     stream_max_retries: u32,
@@ -345,6 +349,7 @@ pub(crate) fn apply_runtime_router_config(
     let applied = apply_isolated_runtime_router_config(
         home,
         RouterApplyOptions {
+            subagent_max_threads: options.subagent_max_threads,
             local_router: options.local_router,
             remote_compaction_models: options.remote_compaction_models,
             stream_max_retries: options.stream_max_retries,
@@ -430,6 +435,7 @@ fn apply_isolated_runtime_router_config(
     options: RouterApplyOptions<'_>,
 ) -> Result<AppliedRuntimeRouterConfig> {
     let RouterApplyOptions {
+        subagent_max_threads,
         local_router,
         remote_compaction_models,
         stream_max_retries,
@@ -446,6 +452,8 @@ fn apply_isolated_runtime_router_config(
         marker,
         backup_root,
     } = options;
+    crate::config::validate_subagent_max_threads(subagent_max_threads)
+        .map_err(anyhow::Error::msg)?;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let hooks_path = home.join("hooks.json");
@@ -555,11 +563,14 @@ fn apply_isolated_runtime_router_config(
         // rewritten from the current definitions; nothing there needs an
         // upgrade path. Only text injected into Codex's `config.toml` keeps
         // migration lists, because that file belongs to the user.
+        let collaboration_hint = ROOT_AGENT_COLLABORATION_USAGE_HINT.replace(
+            "concurrency limit of two",
+            &format!("concurrency limit of {subagent_max_threads} sub-agents (excluding the root)"),
+        );
         rebuild_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
-            ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            &collaboration_hint,
         )?;
-        let collaboration_hint = ROOT_AGENT_COLLABORATION_USAGE_HINT.to_string();
         let registration_roles = runtime_registration_roles(
             &runtime_roles,
             &registered_subagent_roles,
@@ -581,6 +592,9 @@ fn apply_isolated_runtime_router_config(
         fastctx_instructions.as_deref(),
         collaboration_hint.as_deref(),
     )?;
+    if subagent_optimization {
+        apply_subagent_max_threads(&mut effective_document, subagent_max_threads)?;
+    }
 
     let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some() || scope_guard;
     let original_hooks = if runtime_hooks_enabled {
@@ -668,6 +682,7 @@ fn apply_isolated_runtime_router_config(
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
         subagent_roles: runtime_roles,
         registered_subagent_roles,
+        subagent_max_threads,
         runtime_home: home.to_path_buf(),
         runtime_agent_schema_version: if subagent_optimization {
             RUNTIME_AGENT_SCHEMA_VERSION
@@ -722,6 +737,7 @@ fn apply_isolated_runtime_router_config(
             home,
             &state.subagent_roles,
             &state.runtime_agent_hashes,
+            state.subagent_max_threads,
         )
     } else {
         crate::subagent_gate::clear_runtime_subagent_policy(home)
@@ -778,6 +794,7 @@ fn apply_isolated_test_runtime_config(
     apply_isolated_runtime_router_config(
         home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             local_router: Some(test_runtime_router_endpoint()),
             remote_compaction_models: None,
             stream_max_retries: 5,
@@ -1319,6 +1336,7 @@ fn reconcile_runtime_subagent_roles_with_compaction(
         &runtime_home,
         &runtime_roles,
         &expected_hashes,
+        state.subagent_max_threads,
     )?;
     let mut reasons = Vec::new();
     if !lease_matches {
@@ -2369,6 +2387,7 @@ fn enable_subagent_optimization(
     if !has_valid_concurrency {
         agents["max_concurrent_threads_per_session"] = value(DEFAULT_SUBAGENT_MAX_CONCURRENCY);
     }
+    agents["max_threads"] = agents["max_concurrent_threads_per_session"].clone();
     agents["default_subagent_model"] = value(subagent_model);
     agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
     let features = ensure_root_table(doc, "features")?;
@@ -2416,6 +2435,20 @@ fn enable_subagent_optimization(
         )?;
     }
     features["hooks"] = value(true);
+    Ok(())
+}
+
+fn apply_subagent_max_threads(doc: &mut DocumentMut, limit: u32) -> Result<()> {
+    let agents = ensure_root_table(doc, "agents")?;
+    agents["max_threads"] = value(i64::from(limit));
+    agents["max_concurrent_threads_per_session"] = value(i64::from(limit));
+    let multi_agent = doc["features"]["multi_agent_v2"]
+        .as_table_mut()
+        .context("features.multi_agent_v2 必须是 TOML table")?;
+    multi_agent["multi_agent_mode_hint_text"] = value(ROOT_AGENT_MULTI_AGENT_MODE_HINT.replace(
+        "At most two sub-agents run at once",
+        &format!("At most {limit} sub-agents run at once (excluding the root)"),
+    ));
     Ok(())
 }
 
@@ -2823,6 +2856,7 @@ fn build_isolated_runtime_overrides(
         }
         for (path, key) in [
             (&["agents", "enabled"][..], "agents.enabled"),
+            (&["agents", "max_threads"][..], "agents.max_threads"),
             (
                 &["agents", "max_concurrent_threads_per_session"][..],
                 "agents.max_concurrent_threads_per_session",

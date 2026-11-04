@@ -441,7 +441,7 @@
     if (
       source.includes("AppServerRequestClient is missing a message dispatcher")
       && source.includes("mcp_request_enqueued")
-      && source.includes("this.dispatchMessage?.(`mcp-request`")
+      && /this\.dispatchMessage\?\.\((["'`])mcp-request\1/.test(source)
     ) {
       // Current Codex can create threads through AppServerRequestClient without
       // touching the renderer bridge helper above. Rewrite at enqueue time so
@@ -450,7 +450,7 @@
       // config/mcpServer/reload without walking the React tree.
       patched = replaceUniqueRendererGate(
         patched,
-        /(enqueueRequest\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*=>\{this\.dispatchMessage\?\.\(`mcp-request`,\{request:[$A-Z_a-z][$\w]*,hostId:this\.hostId,[\s\S]{0,700}?widget:\4\?\.widget\}\)\},[$A-Z_a-z][$\w]*=null\)\{)let /g,
+        /(enqueueRequest\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*=>\{this\.dispatchMessage\?\.\((["'`])mcp-request\6,\{request:[$A-Z_a-z][$\w]*,hostId:this\.hostId,[\s\S]{0,700}?widget:\4\?\.widget\}\)\},[$A-Z_a-z][$\w]*=null\)\{)let /g,
         (_match, prefix, methodName, paramsName) =>
           `${prefix}let __codeyGuard=globalThis.__codeyModelWhitelistPatch?.guardOutgoingRequest?.(this,${methodName},${paramsName},()=>this.enqueueRequest(...arguments));if(__codeyGuard)return __codeyGuard;(globalThis.__codeyAppServerRequestClients??(globalThis.__codeyAppServerRequestClients=new Map)).set(this.hostId,this);let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage?.({type:\`mcp-request\`,hostId:this.hostId,request:{method:${methodName},params:${paramsName}}});if(__codeyRoute?.request){if(globalThis.__codeyModelWhitelistPatch?.isBlockedOutgoingMessage?.(__codeyRoute)){globalThis.__codeyModelWhitelistPatch?.notifyBlockedOutgoingMessage?.(__codeyRoute);return Promise.reject(Error(\`Codey blocked cross-provider model request\`))}${methodName}=__codeyRoute.request.method??${methodName},${paramsName}=__codeyRoute.request.params??${paramsName}}let `,
         "app server request route preflight",
@@ -471,7 +471,7 @@
       // result can never replace Codey's current route catalog.
       patched = replaceUniqueRendererGate(
         patched,
-        /(([$A-Z_a-z][$\w]*)\.resolve\()([$A-Z_a-z][$\w]*)(\),this\.emitRequestLifecycleEvent\(\{type:`completed`,hostId:this\.hostId,method:\2\.method)/g,
+        /(([$A-Z_a-z][$\w]*)\.resolve\()([$A-Z_a-z][$\w]*)(\),this\.emitRequestLifecycleEvent\(\{type:(["'`])completed\5,hostId:this\.hostId,method:\2\.method)/g,
         (_match, prefix, requestName, resultName, suffix) =>
           `${prefix}${resultName}=globalThis.__codeyModelWhitelistPatch?.rewriteIncomingResult?.(${requestName}.method,${resultName},this.hostId)??${resultName}${suffix}`,
         "app server model result rewrite",
@@ -684,6 +684,8 @@
     }
     return patched;
   };
+  const isNumberedCodexRendererAssetPath = (pathname) =>
+    /\/[0-9]+\.[a-f0-9]+\.(?:c|m)?js$/i.test(pathname);
   const isCodexRendererAssetUrl = (requestUrl) => {
     try {
       const url = new URL(requestUrl);
@@ -693,7 +695,7 @@
         (
           /\/(?:(?:app-initial|app-primary|app-shared|codex-composer-adapter|initialize-app-host-services|renderer-app-server-managers|send-follow-up-message|start-turn|webview-page)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
-          ) ||
+          ) || isNumberedCodexRendererAssetPath(url.pathname) ||
           (
             disablePet &&
             /\/(?:(?:pets-settings|app-runtime)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
@@ -713,6 +715,9 @@
         return null;
       }
       if (!isCodexRendererAssetUrl(requestUrl)) return null;
+      // 26.1029 把请求客户端移到数字 chunk；其它数字 chunk 不运行补丁匹配。
+      if (isNumberedCodexRendererAssetPath(new URL(requestUrl).pathname)
+        && !source.includes("AppServerRequestClient is missing a message dispatcher")) return null;
       let patched;
       const fingerprint = rendererPatchFingerprint(source);
       if (

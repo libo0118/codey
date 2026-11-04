@@ -110,7 +110,10 @@ test("the native request client sends route changes through its frozen bridge", 
   const originals = [NativeClient.prototype.enqueueRequest, NativeClient.prototype.createRequest, NativeClient.prototype.onResult];
   const client = new NativeClient();
   const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { requestClient: client });
+  assert.equal(runtime.patch.requestGateReady(), false);
   assert.equal(await runtime.patch.ensureRequestGate(), true);
+  assert.equal(runtime.patch.requestGateReady(), true);
+  assert.equal(runtime.patch.notifyRequestGateUnavailable(), false);
   assert.equal(await runtime.patch.ensureRequestGate(), true);
   const started = client.enqueueRequest("thread/start", { model: "remote/shared" }, "widget", 7);
   assert.equal(sends[0].params.modelProvider, "codey_router");
@@ -139,6 +142,7 @@ test("the native request client sends route changes through its frozen bridge", 
   assert.ok(models.data.some((entry) => entry.model === "remote/shared"));
   assert.equal(models.data.some((entry) => entry.model === "stale"), false);
   runtime.patch.dispose();
+  assert.equal(runtime.patch.requestGateReady(), false);
   assert.deepEqual([NativeClient.prototype.enqueueRequest, NativeClient.prototype.createRequest, NativeClient.prototype.onResult], originals);
 });
 
@@ -160,7 +164,66 @@ test("disposing before a cached native gate installs leaves the client unchanged
 test("native request gate fails when the client cannot be verified", async () => {
   const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { requestClient: { hostId: "local" } });
   await assert.rejects(runtime.patch.ensureRequestGate(), /不可校验/);
+  assert.equal(runtime.patch.requestGateReady(), false);
   runtime.patch.dispose();
+});
+
+test("an enqueue marker alone cannot certify a complete request gate", async () => {
+  class Client {
+    constructor() { this.hostId = "local"; }
+    enqueueRequest(method, params) { const marker = "__codeyModelWhitelistPatch"; return marker && { method, params }; }
+    createRequest() {}
+    onResult() {}
+  }
+  const original = Client.prototype.enqueueRequest;
+  const client = new Client();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { requestClient: client });
+  assert.equal(runtime.patch.requestGateReady(), false);
+  assert.equal(await runtime.patch.ensureRequestGate(), true);
+  assert.notEqual(Client.prototype.enqueueRequest, original);
+  assert.equal(runtime.patch.requestGateReady(), true);
+  assert.equal(client.enqueueRequest("thread/start", { model: "local/shared" }).params.modelProvider, "codey_router");
+  runtime.patch.dispose();
+  assert.equal(Client.prototype.enqueueRequest, original);
+});
+
+test("a failed partial gate installation rolls back and never certifies readiness", async () => {
+  class Client {
+    constructor() { this.hostId = "local"; }
+    enqueueRequest() {}
+    createRequest() {}
+    onResult() {}
+  }
+  const prototype = Client.prototype;
+  const original = prototype.enqueueRequest;
+  let rejectInstall = true;
+  const proxy = new Proxy(prototype, {
+    defineProperty(target, key, descriptor) {
+      if (rejectInstall && key === "createRequest") throw Error("read-only client");
+      return Reflect.defineProperty(target, key, descriptor);
+    },
+  });
+  const client = Object.setPrototypeOf(new Client(), proxy);
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { requestClient: client });
+  await assert.rejects(runtime.patch.ensureRequestGate(), /read-only client/);
+  assert.equal(runtime.patch.requestGateReady(), false);
+  assert.equal(prototype.enqueueRequest, original);
+  rejectInstall = false;
+  assert.equal(await runtime.patch.ensureRequestGate(), true);
+  assert.equal(runtime.patch.requestGateReady(), true);
+  runtime.patch.dispose();
+  assert.equal(prototype.enqueueRequest, original);
+});
+
+test("unavailable routing reuses the existing alert independently of model presentation", async () => {
+  const body = new FakeElementCore("body");
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { documentBody: body });
+  assert.equal(runtime.patch.notifyRequestGateUnavailable(), true);
+  const notice = body.querySelector("[id]");
+  assert.equal(notice.getAttribute("role"), "alert");
+  assert.equal(notice.textContent, "模型线路尚未就绪，部分线路功能暂不可用；请更新或修复 Codey 后重试");
+  runtime.patch.dispose();
+  assert.equal(runtime.patch.notifyRequestGateUnavailable(), false);
 });
 
 test("resume and fork retain the saved route after remote compaction is disabled", async () => {
@@ -1089,7 +1152,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "82");
+  assert.equal(patch.version, "83");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -4505,6 +4568,21 @@ test("losing every known QueryClient re-enables the next forced discovery", asyn
   });
   assert.equal(runtime.wildcardScanCount(), 2, "new graph evidence can rediscover after the cache is lost");
   assert.deepEqual(replacementQueryClient.models(), ["gpt-5.6-sol", "provider-recovered"]);
+  runtime.patch.dispose();
+});
+
+test("query discovery ignores unknown getters while finding inherited native methods", async () => {
+  const queryClient = Object.create(activeModelQueryClient(["stale"]));
+  let getterCalls = 0;
+  const decoy = Object.defineProperties({}, {
+    getQueriesData: { enumerable: true, get() { getterCalls++; return () => []; } },
+    lazySignal: { enumerable: true, get() { getterCalls++; return {}; } },
+  });
+  const runtime = await loadPatch({ status: "ok", models: ["current"], default_model: "current" },
+    [statsigClient()], { queryClient: decoy, reactModelState: { queryClient } });
+  assert.equal(getterCalls, 0);
+  assert.deepEqual(queryClient.models(), ["current"]);
+  assert.equal(runtime.patch.delivery().queryClients, 1);
   runtime.patch.dispose();
 });
 

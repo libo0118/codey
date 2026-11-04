@@ -761,6 +761,9 @@ pub struct CodeyConfig {
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
     pub subagent_optimization: bool,
+    /// Maximum concurrent subagents, excluding the root; applied on restart.
+    #[serde(default = "default_subagent_max_threads")]
+    pub subagent_max_threads: u32,
     /// Injects Codey's proportionality rule into new and compacted Codex
     /// sessions and spawned subagents through runtime hooks. Opt-in.
     #[serde(default)]
@@ -906,6 +909,7 @@ impl Default for CodeyConfig {
             codex_launch_proxy: String::new(),
             fast_context_tools: false,
             subagent_optimization: false,
+            subagent_max_threads: default_subagent_max_threads(),
             scope_guard: false,
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
@@ -932,6 +936,9 @@ pub(super) fn default_true() -> bool {
 
 pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-terra";
 pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
+pub const fn default_subagent_max_threads() -> u32 {
+    2
+}
 pub const UPSTREAM_PROTOCOL_OFFICIAL: &str = "official";
 pub const UPSTREAM_PROTOCOL_OPENAI_RESPONSES: &str = "openaiResponses";
 pub const UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS: &str = "openaiChatCompletions";

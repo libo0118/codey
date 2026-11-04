@@ -25,5 +25,8 @@ export function useSubagentsController({ config, isBusy, subagentModelOptions, o
     const option = subagentModelOptions.find(candidate => candidate.value === value);
     if (option) commit(selectSubagentModel(config, id, option));
   });
-  return { preferredProviderId, addRole, updateRole, removeRole, changeModel, error: validateSubagents(config) };
+  const changeMaxThreads = useStableEvent((value: number) => {
+    if (Number.isInteger(value) && value >= 1 && value <= 64) commit({ ...config, subagentMaxThreads: value });
+  });
+  return { preferredProviderId, addRole, updateRole, removeRole, changeModel, changeMaxThreads, error: validateSubagents(config) };
 }

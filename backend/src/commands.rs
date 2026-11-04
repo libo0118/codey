@@ -1754,6 +1754,7 @@ struct CodeyConfigSaveInput {
     route_request_log_present: bool,
     stream_max_retries_present: bool,
     subagent_roles_present: bool,
+    subagent_max_threads_present: bool,
     subagent_model_present: bool,
     subagent_reasoning_effort_present: bool,
     deleted_subagent_roles: Vec<String>,
@@ -1772,6 +1773,7 @@ impl CodeyConfigSaveInput {
             route_request_log_present: true,
             stream_max_retries_present: true,
             subagent_roles_present: true,
+            subagent_max_threads_present: true,
             subagent_model_present: true,
             subagent_reasoning_effort_present: true,
             deleted_subagent_roles: Vec::new(),
@@ -1796,6 +1798,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let route_request_log_present = fields.contains_key("routeRequestLog");
     let stream_max_retries_present = fields.contains_key("streamMaxRetries");
     let subagent_roles_present = fields.contains_key("subagentRoles");
+    let subagent_max_threads_present = fields.contains_key("subagentMaxThreads");
     let subagent_model_present = fields.contains_key("subagentModel");
     let subagent_reasoning_effort_present = fields.contains_key("subagentReasoningEffort");
     let misc_model_present = fields.contains_key("miscModel");
@@ -1816,6 +1819,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         route_request_log_present,
         stream_max_retries_present,
         subagent_roles_present,
+        subagent_max_threads_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
         deleted_subagent_roles,
@@ -1856,6 +1860,7 @@ async fn save_codey_config_locked(
         route_request_log_present,
         stream_max_retries_present,
         subagent_roles_present,
+        subagent_max_threads_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
         deleted_subagent_roles,
@@ -1866,6 +1871,7 @@ async fn save_codey_config_locked(
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
     }
     // Validate raw role updates and explicit deletions before normalization or any side effects.
+    crate::config::validate_subagent_max_threads(config_input.subagent_max_threads)?;
     let merged_subagent_roles = crate::config::merge_subagent_role_updates(
         &previous.subagent_roles,
         &config_input.subagent_roles,
@@ -2015,6 +2021,9 @@ async fn save_codey_config_locked(
         &fast_context_tools_status,
     );
     config.subagent_optimization = config_input.subagent_optimization;
+    if subagent_max_threads_present {
+        config.subagent_max_threads = config_input.subagent_max_threads;
+    }
     let mut explicitly_configured_subagent_models = Vec::new();
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
@@ -3193,6 +3202,8 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.codex_launch_proxy != current.codex_launch_proxy
         || applied.fast_context_tools != current.fast_context_tools
         || applied.subagent_optimization != current.subagent_optimization
+        || ((applied.subagent_optimization || current.subagent_optimization)
+            && applied.subagent_max_threads != current.subagent_max_threads)
         || applied.scope_guard != current.scope_guard
         || !applied
             .misc_model

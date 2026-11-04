@@ -85,6 +85,8 @@ export function selectSubagentModel(config: Config, id: string, option: Subagent
 }
 
 export function validateSubagents(config: Config): string | null {
+  const limit = config.subagentMaxThreads ?? 2;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 64) return "最大子代理数量必须是 1 到 64 之间的整数";
   if (config.subagentOptimization && enabledSubagentCount(config) === 0) return "至少需要保留一个启用的子代理角色";
   const custom = Object.entries(config.subagentRoles).filter(([id]) => isCustomSubagent(id));
   if (custom.length > 32) return "最多可配置 32 个自定义子代理";

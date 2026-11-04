@@ -196,9 +196,12 @@ fn fetch_patterns(disable_pet: bool) -> Value {
     PATCHABLE_ASSET_PREFIXES
         .iter()
         .chain(pet)
-        .map(|prefix| {
+        .map(|prefix| format!("app://*/assets/{prefix}*"))
+        // CDP 只支持 glob；末位数字覆盖顶层和 async/ 下的数字 chunk。
+        .chain((0..=9).map(|digit| format!("app://*/assets/*{digit}.*")))
+        .map(|url| {
             json!({
-                "urlPattern": format!("app://*/assets/{prefix}*"),
+                "urlPattern": url,
                 "resourceType": "Script",
                 "requestStage": "Request",
             })
@@ -1270,6 +1273,9 @@ mod tests {
         let without_pet = urls(fetch_patterns(false));
         assert!(with_pet.contains(&"app://*/assets/app-initial*".to_string()));
         assert!(with_pet.contains(&"app://*/assets/pets-settings*".to_string()));
+        for digit in 0..=9 {
+            assert!(without_pet.contains(&format!("app://*/assets/*{digit}.*")));
+        }
         assert!(!without_pet.iter().any(|url| url.contains("pets-settings")));
         assert_eq!(with_pet.len(), without_pet.len() + PET_ASSET_PREFIXES.len());
     }
@@ -1293,6 +1299,7 @@ mod tests {
             "app-initial-90eb42395b7d.js",
             "app-primary~b4ce9e46.mjs",
             "general-settings-679bf39c78a4.js",
+            "24191.589dcc9878.js",
         ] {
             assert!(cacheable_asset_name(name), "{name}");
         }

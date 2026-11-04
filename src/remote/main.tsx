@@ -6,12 +6,14 @@ import { codeyApiPath } from "../api";
 import { Workspace } from "./workspace";
 import { remoteRequest } from "./transport";
 import { useRemoteAuth } from "./useRemoteAuth";
+import { installRemoteClipboard } from "./clipboard";
 import "../tailwind.css";
 import "../styles.css";
 import "../styles.integrations.css";
 import "./styles.css";
 
 window.__codeyRemoteMode = true;
+installRemoteClipboard();
 window.__codeyInvokeApi = (command, args) => remoteRequest(codeyApiPath(command), args);
 
 function RemoteApp() {

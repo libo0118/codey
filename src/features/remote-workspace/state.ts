@@ -1,5 +1,6 @@
 import type { DraftImage } from "../../remote/images";
 import type { Approval, Message, ThreadSettings, Turn, View } from "../../remote/workspace-data";
+import { isAttachment } from "../../remote/workspace-data";
 import type { ConversationEvent, Submission, WorkspaceDraft } from "./types";
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -38,8 +39,20 @@ export function firstTurnDraft(draft: WorkspaceDraft, firstTurn: string): Worksp
 function message(value: unknown): value is Message {
   return record(value) && nullableString(value.id) && typeof value.role === "string" && typeof value.kind === "string"
     && typeof value.text === "string" && nullableString(value.status)
-    && (value.attachments === undefined || (Array.isArray(value.attachments) && value.attachments.every(attachment =>
-      record(attachment) && typeof attachment.name === "string" && nullableString(attachment.url))));
+    && (value.attachments === undefined || Array.isArray(value.attachments) && value.attachments.every(isAttachment))
+    && (value.truncated === undefined || typeof value.truncated === "boolean")
+    && (value.command === undefined || record(value.command) && typeof value.command.command === "string"
+      && optionalString(value.command.cwd) && typeof value.command.output === "string"
+      && (value.command.exitCode === undefined || Number.isInteger(value.command.exitCode)))
+    && (value.tool === undefined || record(value.tool) && typeof value.tool.name === "string"
+      && [value.tool.input, value.tool.output, value.tool.error].every(optionalString))
+    && (value.collaboration === undefined || record(value.collaboration) && typeof value.collaboration.action === "string"
+      && Array.isArray(value.collaboration.agents) && value.collaboration.agents.every(agent =>
+        record(agent) && typeof agent.id === "string" && [agent.name, agent.status, agent.message].every(optionalString)))
+    && (value.changes === undefined || Array.isArray(value.changes) && value.changes.every(change =>
+      record(change) && typeof change.path === "string" && optionalString(change.kind) && typeof change.diff === "string"))
+    && (value.plan === undefined || Array.isArray(value.plan) && value.plan.every(step =>
+      record(step) && typeof step.step === "string" && optionalString(step.status)));
 }
 
 function turn(value: unknown): value is Turn {
@@ -53,7 +66,8 @@ function approval(value: unknown): value is Approval {
   if (!record(value) || (typeof value.id !== "string" && typeof value.id !== "number")
     || typeof value.method !== "string" || typeof value.supported !== "boolean" || !record(value.params)) return false;
   const params = value.params;
-  return [params.command, params.reason, params.message, params.planContent].every(nullableString)
+  return [params.command, params.cwd, params.grantRoot, params.reason, params.message, params.planContent].every(nullableString)
+    && (params.networkApprovalContext === undefined || record(params.networkApprovalContext) && typeof params.networkApprovalContext.host === "string" && typeof params.networkApprovalContext.protocol === "string")
     && (params.availableDecisions == null || (Array.isArray(params.availableDecisions) && params.availableDecisions.every(item => typeof item === "string")))
     && (params.questions == null || (Array.isArray(params.questions) && params.questions.every(question =>
       record(question) && typeof question.id === "string" && typeof question.question === "string"

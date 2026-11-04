@@ -1,6 +1,6 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 2;
+  const version = 3;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
@@ -132,8 +132,34 @@
   // particular, its creation-input reader installs the same tools, project
   // instructions and permission defaults as the desktop composer.
   const remoteControl = async (args, expiresAt) => {
+    const requestGateMessage = "模型线路尚未就绪，远程操作未发送，请稍后重试";
+    let requestPatch = null;
     const assertCurrent = () => {
       if (disposed || Date.now() >= expiresAt) throw new Error("远程操作已过期，请检查会话状态");
+      if (requestPatch && (window.__codeyModelWhitelistPatch !== requestPatch
+        || requestPatch.requestGateReady?.() !== true)) {
+        throw remoteError("codey_remote_request_gate_not_ready", requestGateMessage);
+      }
+    };
+    const ensureRequestGate = async () => {
+      const patch = window.__codeyModelWhitelistPatch;
+      let ready = false;
+      let timer;
+      try {
+        ready = typeof patch?.ensureRequestGate === "function"
+          && await Promise.race([
+            Promise.resolve().then(() => patch.ensureRequestGate()),
+            new Promise(resolve => { timer = window.setTimeout(() => resolve(false), 2_000); }),
+          ]) === true
+          && patch.requestGateReady?.() === true
+          && window.__codeyModelWhitelistPatch === patch;
+      } catch {} finally { window.clearTimeout(timer); }
+      assertCurrent();
+      if (!ready) {
+        if (window.__codeyModelWhitelistPatch === patch) patch?.notifyRequestGateUnavailable?.();
+        throw remoteError("codey_remote_request_gate_not_ready", requestGateMessage);
+      }
+      requestPatch = patch;
     };
     assertCurrent();
     if (args.action === "resume") {
@@ -145,6 +171,8 @@
       assertCurrent();
       // resumeConversation also discovers an owner in another window and
       // follows it. Never steal ownership with a second app-server process.
+      await ensureRequestGate();
+      assertCurrent();
       const result = await manager.resumeConversation({
         conversationId: args.threadId, model: null, serviceTier: null,
         reasoningEffort: null, workspaceRoots: [], collaborationMode: null,
@@ -175,6 +203,8 @@
         serviceTier: tier === "priority" ? "priority" : "default",
       };
     }
+    await ensureRequestGate();
+    assertCurrent();
     const result = await manager.startConversation(args.params, {
       readThreadCreationInputs: async (...values) => {
         assertCurrent();

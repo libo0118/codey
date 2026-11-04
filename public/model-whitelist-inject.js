@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "82";
+  const patchVersion = "83";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -1962,11 +1962,13 @@
       visitedCount += 1;
 
       try {
-        if (
-          typeof value.getQueriesData === "function"
-          && typeof value.setQueryData === "function"
-          && typeof value.invalidateQueries === "function"
-        ) {
+        if (["getQueriesData", "setQueryData", "invalidateQueries"].every((name) => {
+          for (let current = value, hops = 0; current && hops < 8; current = Object.getPrototypeOf(current), hops += 1) {
+            const descriptor = Object.getOwnPropertyDescriptor(current, name);
+            if (descriptor) return typeof descriptor.value === "function";
+          }
+          return false;
+        })) {
           queryClients.add(value);
           rememberBounded(
             knownModelQueryClients,
@@ -1998,7 +2000,8 @@
         ) continue;
         let child;
         try {
-          child = value[key];
+          // 未知 getter 可能启动原生信号；发现能力只读取数据字段。
+          child = Object.getOwnPropertyDescriptor(value, key)?.value;
         } catch {
           continue;
         }
@@ -3271,12 +3274,8 @@
     return params?.[blockedProviderRequestKey] || null;
   };
 
-  const showBlockedProviderNotice = (detail) => {
-    const blocked = blockedProviderRequest(detail);
-    if (!blocked) return false;
-    const target = blocked.routeName || "所选线路";
-    const message = blocked.message || `暂时无法确认此任务的线路配置。请重启 Codex 后恢复任务，或用 ${target} 新建任务。`;
-    console.warn("[Codey] provider migration required before routed turn", blocked);
+  const showModelRequestNotice = (message) => {
+    if (disposed) return false;
     try {
       const noticeId = "codey-provider-mismatch-notice";
       let notice = document.getElementById?.(noticeId);
@@ -3309,6 +3308,15 @@
       // Console warning remains available if the renderer DOM is unavailable.
     }
     return true;
+  };
+
+  const showBlockedProviderNotice = (detail) => {
+    const blocked = blockedProviderRequest(detail);
+    if (!blocked) return false;
+    const target = blocked.routeName || "所选线路";
+    const message = blocked.message || `暂时无法确认此任务的线路配置。请重启 Codex 后恢复任务，或用 ${target} 新建任务。`;
+    console.warn("[Codey] provider migration required before routed turn", blocked);
+    return showModelRequestNotice(message);
   };
 
   const patchOutgoingModelRequest = (detail) => {
@@ -3918,6 +3926,11 @@
   };
   let requestGatePending = null;
   const requestGateRestorers = [];
+  const requestGateReady = () => !disposed && (nativeSelectionOnly
+    || window.__codeyModelRequestSourceGateInstalled === true || requestGateRestorers.length === 3);
+  const restoreRequestGate = () => {
+    for (const restore of requestGateRestorers.splice(0).reverse()) restore();
+  };
   // 门禁只改 prototype：实例与类共享同一原型，描述符与替换逻辑完全一致。
   const installRequestClientGateOnPrototype = (prototype) => {
     const methods = ["enqueueRequest", "createRequest", "onResult"];
@@ -3926,9 +3939,6 @@
       throw new Error("当前客户端的模型请求入口不可校验");
     }
     const [enqueue, create, result] = descriptors.map((descriptor) => descriptor.value);
-    // Electron may already have the synchronous source gate. Its identity and
-    // response events remain authoritative; avoid wrapping it a second time.
-    if (Function.prototype.toString.call(enqueue).includes("__codeyModelWhitelistPatch")) return true;
     const replacements = [
       function (method, params, ...args) {
         if (this.hostId !== "local" || disposed) return enqueue.call(this, method, params, ...args);
@@ -3967,12 +3977,17 @@
         return result.call(this, id, value, ...args);
       },
     ];
-    methods.forEach((name, index) => {
-      Object.defineProperty(prototype, name, { ...descriptors[index], value: replacements[index] });
-      requestGateRestorers.push(() => {
-        if (prototype[name] === replacements[index]) Object.defineProperty(prototype, name, descriptors[index]);
+    try {
+      methods.forEach((name, index) => {
+        Object.defineProperty(prototype, name, { ...descriptors[index], value: replacements[index] });
+        requestGateRestorers.push(() => {
+          if (prototype[name] === replacements[index]) Object.defineProperty(prototype, name, descriptors[index]);
+        });
       });
-    });
+    } catch (error) {
+      restoreRequestGate();
+      throw error;
+    }
     return true;
   };
   const installRequestClientGate = (client) => {
@@ -3984,8 +3999,7 @@
   };
   const ensureRequestGate = () => {
     if (disposed) return Promise.reject(new Error("模型请求校验已重新加载"));
-    if (nativeSelectionOnly || window.__codeyModelRequestSourceGateInstalled === true) return Promise.resolve(true);
-    if (requestGateRestorers.length) return Promise.resolve(true);
+    if (requestGateReady()) return Promise.resolve(true);
     if (requestGatePending) return requestGatePending;
     requestGatePending = Promise.resolve().then(async () => {
       const knownClient = window.__codeyAppServerRequestClients?.get?.("local");
@@ -4024,6 +4038,10 @@
     setCatalog: setModelCatalog,
     isThirdPartyModel,
     ensureRequestGate,
+    requestGateReady,
+    notifyRequestGateUnavailable: () => requestGateReady() ? false : showModelRequestNotice(
+      "模型线路尚未就绪，部分线路功能暂不可用；请更新或修复 Codey 后重试",
+    ),
     guardOutgoingRequest,
     guardDirectBridgeMessage,
     hostedTurnCall,
@@ -4055,8 +4073,7 @@
     dispose() {
       disposed = true;
       for (const cancel of portableCancels) cancel();
-      requestGateRestorers.reverse().forEach((restore) => restore());
-      requestGateRestorers.length = 0;
+      restoreRequestGate();
       window.clearTimeout(refreshTimer);
       refreshTimer = 0;
       window.clearTimeout(groupedMenuTimer);

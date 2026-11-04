@@ -120,6 +120,65 @@ mod tests {
     }
 
     #[test]
+    fn cached_frames_use_the_same_safe_rich_projection_after_patches() {
+        let mut state = json!({"id":"t","turns":[{"turnId":"a","items":[
+            {"id":"tool","type":"mcpToolCall","tool":"test","result":{"content":[{"type":"text","text":"before"}],"_meta":{"config":"CACHE_SECRET_CANARY"}}},
+            {"id":"new","type":"newPrivateItem","auth":"CACHE_SECRET_CANARY"}
+        ]}],"requests":[{"id":1,"method":"item/commandExecution/requestApproval","params":{"command":"safe","env":"CACHE_SECRET_CANARY"}}]});
+        let mut projection = Projection::default();
+        check(&mut projection, &state);
+        assert!(!projection.frame(&state).contains("CACHE_SECRET_CANARY"));
+        let patches = json!([{"op":"replace","path":"/turns/0/items/0/result/content/0/text","value":"after"}]);
+        projection.invalidate(&state, &patches).unwrap();
+        protocol::apply_patches(&mut state, &patches).unwrap();
+        check(&mut projection, &state);
+        let frame = projection.frame(&state);
+        assert!(frame.contains("after"));
+        assert!(!frame.contains("CACHE_SECRET_CANARY"));
+    }
+
+    #[test]
+    fn collaboration_patches_keep_native_identity_order_and_cached_turns() {
+        let mut state = json!({"turns":[{"turnId":"a","items":[
+            {"id":"start","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/mock_review"},
+            {"id":"middle","type":"agentMessage","text":"公开进度"},
+            {"id":"wait","type":"collabAgentToolCall","tool":"wait","status":"inProgress","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"running","message":null}},
+                "receiverThreads":[{"threadId":"child","thread":{"agentNickname":"Mock","title":"CACHE_COLLAB_CANARY"}}],"prompt":"CACHE_COLLAB_CANARY"}
+        ]},{"turnId":"b","items":[]}]});
+        let mut projection = Projection::default();
+        check(&mut projection, &state);
+        for patches in [
+            json!([{"op":"replace","path":"/turns/0/items/2/agentsStates/child","value":{"status":"completed","message":"公开结果","_meta":"CACHE_COLLAB_CANARY"}},{"op":"replace","path":"/turns/0/items/2/status","value":"completed"}]),
+            json!([{"op":"replace","path":"/turns/0/items/2/receiverThreads/0/thread/agentNickname","value":"Mock Reviewer"}]),
+            json!([{"op":"add","path":"/turns/0/items/-","value":{"id":"finish","type":"subAgentActivity","kind":"completed","agentThreadId":"child","agentPath":"/root/mock_review"}}]),
+        ] {
+            assert!(projection.invalidate(&state, &patches).unwrap());
+            assert!(!projection.turns.contains_key("a"));
+            assert!(projection.turns.contains_key("b"));
+            protocol::apply_patches(&mut state, &patches).unwrap();
+            check(&mut projection, &state);
+        }
+        let frame: Value = serde_json::from_str(&projection.frame(&state)).unwrap();
+        let items = frame["state"]["turns"][0]["messages"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["start", "middle", "wait", "finish"]
+        );
+        assert_eq!(
+            items[2]["collaboration"]["agents"][0]["message"],
+            "公开结果"
+        );
+        assert_eq!(
+            items[2]["collaboration"]["agents"][0]["name"],
+            "Mock Reviewer"
+        );
+        assert!(!frame.to_string().contains("CACHE_COLLAB_CANARY"));
+    }
+
+    #[test]
     fn cached_projection_tracks_text_deletion_reordering_and_approvals() {
         let mut state = json!({"turns":[{"turnId":"a","items":[{"type":"agentMessage","text":"history"}]},{"turnId":"b","status":"inProgress","items":[{"id":"item","type":"agentMessage","text":"live"}]}],"requests":[]});
         let mut projection = Projection::default();

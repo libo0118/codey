@@ -13,6 +13,7 @@ fn configured() -> CodeyConfig {
 fn backup_roundtrip_preserves_credentials_and_preferences() {
     let mut config = configured();
     config.stream_max_retries = 3;
+    config.subagent_max_threads = 8;
     let id = config.profiles[0].id.clone();
     config
         .selected_models_by_provider
@@ -27,6 +28,38 @@ fn backup_roundtrip_preserves_credentials_and_preferences() {
         vec!["test-model"]
     );
     assert_eq!(restored.stream_max_retries, 3);
+    assert_eq!(restored.subagent_max_threads, 8);
+}
+
+#[test]
+fn backup_subagent_count_defaults_for_old_files_and_rejects_invalid_values() {
+    let valid: Value = serde_json::from_str(&export(configured()).unwrap()).unwrap();
+    let mut legacy = valid.clone();
+    legacy["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("subagentMaxThreads");
+    assert_eq!(
+        parse(&legacy.to_string())
+            .unwrap()
+            .prepare(&configured())
+            .unwrap()
+            .subagent_max_threads,
+        2
+    );
+    for invalid in [
+        json!(0),
+        json!(65),
+        json!(-1),
+        json!(1.5),
+        json!("4"),
+        json!(true),
+        Value::Null,
+    ] {
+        let mut changed = valid.clone();
+        changed["config"]["subagentMaxThreads"] = invalid;
+        assert!(parse(&changed.to_string()).is_err());
+    }
 }
 
 #[test]

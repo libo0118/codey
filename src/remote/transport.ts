@@ -6,32 +6,41 @@ export type RemoteSession = { authenticated: boolean; username?: string; csrfTok
 let csrfToken = "";
 export function clearRemoteSession() { csrfToken = ""; }
 
-export async function remoteRequest<T>(path: string, args?: unknown): Promise<T> {
+export async function remoteRequest<T>(path: string, args?: unknown, signal?: AbortSignal): Promise<T> {
   if (!path.startsWith("/remote/") && !path.startsWith("/api/")) throw new Error("不允许的远程请求地址");
   const mutation = args !== undefined;
   const login = path === "/remote/login";
+  const requestSession = csrfToken;
   if (mutation && !login && !csrfToken) throw new RemoteError("请先登录后再操作", 401);
-  const response = await fetch(path, {
-    method: mutation ? "POST" : "GET",
-    credentials: "same-origin",
-    redirect: "error",
-    headers: mutation ? { "Content-Type": "application/json", ...(!login ? { "X-CSRF-Token": csrfToken } : {}) } : undefined,
-    body: mutation ? JSON.stringify(args) : undefined,
-    signal: AbortSignal.timeout(90_000),
-  });
-  if (response.status === 401) {
-    clearRemoteSession();
-    window.dispatchEvent(new Event("codey-remote-unauthorized"));
-  }
-  let result: { status?: string; message?: string } & Partial<RemoteSession>;
-  try { result = await response.json(); }
-  catch { throw new RemoteError(`远程服务返回了无效响应 (${response.status})`, response.status); }
-  if (!response.ok || result?.status === "failed") throw new RemoteError(result?.message || `请求失败 (${response.status})`, response.status);
-  if (path === "/remote/session" || login) {
-    if (typeof result?.authenticated !== "boolean" || result.authenticated && (typeof result.csrfToken !== "string" || !result.csrfToken)) { clearRemoteSession(); throw new RemoteError("登录响应缺少安全校验信息，请重新登录", 502); }
-    csrfToken = result.authenticated ? result.csrfToken! : "";
-  }
-  return result as T;
+  const timeout = AbortSignal.timeout(90_000), controller = new AbortController();
+  const abort = () => controller.abort(signal?.aborted ? signal.reason : timeout.reason);
+  signal?.addEventListener("abort", abort, { once: true }); timeout.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  try {
+    const response = await fetch(path, {
+      method: mutation ? "POST" : "GET",
+      credentials: "same-origin",
+      redirect: "error",
+      headers: mutation ? { "Content-Type": "application/json", ...(!login ? { "X-CSRF-Token": csrfToken } : {}) } : undefined,
+      body: mutation ? JSON.stringify(args) : undefined,
+      signal: controller.signal,
+    });
+    signal?.throwIfAborted();
+    if (response.status === 401 && csrfToken === requestSession) {
+      clearRemoteSession();
+      window.dispatchEvent(new Event("codey-remote-unauthorized"));
+    }
+    let result: { status?: string; message?: string } & Partial<RemoteSession>;
+    try { result = await response.json(); }
+    catch { throw new RemoteError(`远程服务返回了无效响应 (${response.status})`, response.status); }
+    signal?.throwIfAborted();
+    if (!response.ok || result?.status === "failed") throw new RemoteError(result?.message || `请求失败 (${response.status})`, response.status);
+    if (path === "/remote/session" || login) {
+      if (typeof result?.authenticated !== "boolean" || result.authenticated && (typeof result.csrfToken !== "string" || !result.csrfToken)) { clearRemoteSession(); throw new RemoteError("登录响应缺少安全校验信息，请重新登录", 502); }
+      csrfToken = result.authenticated ? result.csrfToken! : "";
+    }
+    return result as T;
+  } finally { signal?.removeEventListener("abort", abort); timeout.removeEventListener("abort", abort); }
 }
 
 // randomUUID is unavailable on plain HTTP LAN origins; getRandomValues is

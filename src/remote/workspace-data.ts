@@ -1,9 +1,17 @@
 export type Thread = { id: string; title: string; cwd: string; updatedAt: number };
 export type Project = { id: string; name: string; cwd: string; rootPaths?: string[] };
 export type Question = { id: string; question: string; options?: { label: string; description?: string | null }[] | null };
-export type Approval = { id: string | number; method: string; supported: boolean; params: { command?: string | null; reason?: string | null; questions?: Question[] | null; availableDecisions?: string[] | null; message?: string | null; permissions?: unknown; changes?: unknown; planContent?: string | null } };
-export type Attachment = { name: string; url?: string | null };
-export type Message = { id?: string | null; role: string; kind: string; text: string; status?: string | null; attachments?: Attachment[] };
+export type RequestedPermissions = { network?: { enabled: boolean }; fileSystem?: { read?: string[]; write?: string[] } };
+export type Approval = { id: string | number; method: string; supported: boolean; params: { command?: string | null; cwd?: string | null; grantRoot?: string | null; networkApprovalContext?: { host: string; protocol: string }; reason?: string | null; questions?: Question[] | null; availableDecisions?: string[] | null; message?: string | null; permissions?: unknown; changes?: unknown; planContent?: string | null } };
+export type Attachment = { name: string; url?: string | null; id?: string; downloadUrl?: string; size?: number; mime?: string; unavailableReason?: string };
+export type FileChange = { path: string; kind?: string; diff: string };
+export type Message = {
+  id?: string | null; role: string; kind: string; text: string; status?: string | null; attachments?: Attachment[];
+  command?: { command: string; cwd?: string; output: string; exitCode?: number };
+  tool?: { name: string; input?: string; output?: string; error?: string };
+  collaboration?: { action: string; agents: { id: string; name?: string; status?: string; message?: string }[] };
+  changes?: FileChange[]; plan?: { step: string; status?: string }[]; truncated?: boolean;
+};
 export type Turn = { id: string | null; status: string | null; error?: unknown; startedAt?: number | null; completedAt?: number | null; messages: Message[] };
 export type ThreadSettings = { model?: string | null; effort?: string | null; serviceTier?: string | null; permissionMode?: string };
 export type View = ThreadSettings & { id: string; title?: string | null; cwd?: string | null; status?: string | null; turns: Turn[]; requests: Approval[]; historyComplete: boolean };
@@ -76,12 +84,28 @@ export function relativeTime(timestamp: number, now = Date.now()): string {
   return new Date(timestamp).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
-// Desktop filesystem links are labels on the phone, never requests against the
-// remote API. Keep executable protocols and embedded HTML out of message links.
+// Local references are resolved separately; never navigate to a model's path.
 export function messageUrl(url: string): string {
-  return /^(https?:\/\/|mailto:)/i.test(url) ? url : "";
+  if (/[\u0000-\u0020\u007f]/.test(url) || !/^(https?:\/\/|mailto:)/i.test(url)) return "";
+  try { const parsed = new URL(url); return parsed.username || parsed.password ? "" : url; } catch { return ""; }
 }
 
 export function imageUrl(url: string): string {
   return /^https:\/\//i.test(url) || /^data:image\/(png|jpeg|gif|webp);base64,[a-z0-9+/=]+$/i.test(url) ? url : "";
+}
+
+export function isAttachment(value: unknown): value is Attachment {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const file = value as Record<string, unknown>;
+  return typeof file.name === "string" && (file.url == null || typeof file.url === "string")
+    && [file.id, file.downloadUrl, file.mime, file.unavailableReason].every(part => part === undefined || typeof part === "string")
+    && (file.size === undefined || typeof file.size === "number" && Number.isSafeInteger(file.size) && file.size >= 0);
+}
+
+export function isRequestedPermissions(value: unknown): value is RequestedPermissions {
+  const record = (part: unknown): part is Record<string, unknown> => !!part && typeof part === "object" && !Array.isArray(part);
+  if (!record(value) || !Object.keys(value).length || Object.keys(value).some(key => key !== "network" && key !== "fileSystem")) return false;
+  if (value.network !== undefined && (!record(value.network) || typeof value.network.enabled !== "boolean" || Object.keys(value.network).some(key => key !== "enabled"))) return false;
+  if (value.fileSystem !== undefined && (!record(value.fileSystem) || !Object.keys(value.fileSystem).length || Object.entries(value.fileSystem).some(([key, paths]) => key !== "read" && key !== "write" || !Array.isArray(paths) || paths.some(path => typeof path !== "string")))) return false;
+  return value.network !== undefined || value.fileSystem !== undefined;
 }

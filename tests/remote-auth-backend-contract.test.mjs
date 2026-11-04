@@ -9,6 +9,8 @@ const auth = fs.readFileSync(new URL("../backend/src/remote_control/auth.rs", im
 
 function runtime(manager = {}) {
   const window = {
+    setTimeout, clearTimeout,
+    __codeyModelWhitelistPatch: { ensureRequestGate: async () => true, requestGateReady: () => true },
     __codeyLoadCodexSessionController: Object.assign(async () => ({ kind: "manager", manager }), { remoteVersion: 1 }),
     __codeyAppServerManagerResolverFromModule: () => () => manager,
     __codeyAppServerManagerRegistryResolverFromModule: () => null,
@@ -60,6 +62,7 @@ test("native creation retains creation-input tools while defaults expose no cred
     },
   };
   const app = runtime(manager);
+  delete app.window.__codeyModelWhitelistPatch;
   app.context.document.scripts.push({ src: "app://codex/assets/app-initial-test.js" });
   app.window.__codeyImportCodexAsset = async () => ({
     factory: function (scope, hostId) {
@@ -69,11 +72,96 @@ test("native creation retains creation-input tools while defaults expose no cred
   const defaults = await app.window.__codeyRemoteControl({ action: "defaults", cwd: "/project" }, Date.now() + 10000);
   assert.deepEqual(JSON.parse(JSON.stringify(defaults)), { model: "current-model", effort: "high", serviceTier: "default" });
   assert.ok(!JSON.stringify(defaults).includes("secret"));
+  app.window.__codeyModelWhitelistPatch = { ensureRequestGate: async () => true, requestGateReady: () => true };
   const params = { input: ["task"], useAppServerPermissionDefault: true };
   const result = await app.window.__codeyRemoteControl({ action: "create", params }, Date.now() + 10000);
   assert.equal(result.id, "created");
   assert.equal(submitted.params, params);
   assert.equal(submitted.inputs, creationInputs);
+});
+
+function modelWriteRuntime() {
+  const writes = [];
+  const inputs = { readCreationInputs: async () => "native inputs" };
+  const app = runtime({
+    async resumeConversation() { writes.push("resume"); return { status: "ready" }; },
+    async startConversation(_params, options) {
+      await options.readThreadCreationInputs();
+      writes.push("create");
+      return { status: "created", conversationId: "created" };
+    },
+  });
+  app.context.document.scripts.push({ src: "app://codex/assets/app-initial-fixture.js" });
+  app.window.__codeyImportCodexAsset = async () => ({
+    factory: function (scope, hostId) {
+      return { scope: scope, hostId: hostId, requestClient: scope.get("client"), dynamicTools: new Map(), readCreationInputs: (...args) => inputs.readCreationInputs(...args) };
+    },
+  });
+  const run = action => app.window.__codeyRemoteControl({ action, threadId: "thread", params: {} }, Date.now() + 10_000);
+  return { ...app, inputs, writes, run };
+}
+
+test("remote create and resume refuse missing, failed, false or uncertified routing before native submission", async () => {
+  for (const action of ["resume", "create"]) {
+    for (const invalid of ["missing-patch", "missing", "rejected", "false", "unverified", "not-ready"]) {
+      const app = modelWriteRuntime();
+      const patch = app.window.__codeyModelWhitelistPatch;
+      let notices = 0;
+      patch.notifyRequestGateUnavailable = () => { notices++; };
+      if (invalid === "missing-patch") delete app.window.__codeyModelWhitelistPatch;
+      if (invalid === "missing") delete patch.ensureRequestGate;
+      if (invalid === "rejected") patch.ensureRequestGate = async () => { throw Error("PRIVATE_GATE_ERROR"); };
+      if (invalid === "false") patch.ensureRequestGate = async () => false;
+      if (invalid === "unverified") delete patch.requestGateReady;
+      if (invalid === "not-ready") patch.requestGateReady = () => false;
+      await assert.rejects(app.run(action), { code: "codey_remote_request_gate_not_ready", message: "模型线路尚未就绪，远程操作未发送，请稍后重试" });
+      assert.deepEqual(app.writes, []);
+      assert.equal(notices, invalid === "missing-patch" ? 0 : 1);
+    }
+  }
+});
+
+test("late or replaced gate results never resume, create, or automatically replay", async () => {
+  for (const action of ["resume", "create"]) {
+    for (const invalid of ["timeout", "disposed", "replaced"]) {
+      const app = modelWriteRuntime();
+      let finish, timeout, cleared = 0;
+      app.window.setTimeout = callback => { timeout = callback; return 1; };
+      app.window.clearTimeout = () => { cleared++; };
+      app.window.__codeyModelWhitelistPatch.ensureRequestGate = () => new Promise(resolve => { finish = resolve; });
+      const pending = app.run(action);
+      await new Promise(setImmediate);
+      assert.equal(typeof finish, "function");
+      if (invalid === "timeout") timeout();
+      else {
+        if (invalid === "disposed") app.window.__codeyRemoteControl.dispose();
+        else app.window.__codeyModelWhitelistPatch = { requestGateReady: () => true };
+        finish(true);
+      }
+      await assert.rejects(pending, /过期|模型线路尚未就绪/);
+      finish(true);
+      await new Promise(setImmediate);
+      assert.deepEqual(app.writes, []);
+      assert.equal(cleared, 1);
+    }
+    const app = modelWriteRuntime();
+    app.window.__codeyModelWhitelistPatch.requestGateReady = () => {
+      queueMicrotask(() => { app.window.__codeyModelWhitelistPatch = { requestGateReady: () => true }; });
+      return true;
+    };
+    await assert.rejects(app.run(action), /模型线路尚未就绪/);
+    assert.deepEqual(app.writes, []);
+  }
+});
+
+test("native creation input reads cannot continue after request-gate replacement", async () => {
+  const app = modelWriteRuntime();
+  app.inputs.readCreationInputs = async () => {
+    app.window.__codeyModelWhitelistPatch = { requestGateReady: () => true };
+    return "native inputs";
+  };
+  await assert.rejects(app.run("create"), /模型线路尚未就绪/);
+  assert.deepEqual(app.writes, []);
 });
 
 test("backend account contracts use an existing KDF and separate CSRF instead of pairing", () => {

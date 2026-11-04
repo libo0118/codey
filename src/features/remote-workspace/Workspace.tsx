@@ -3,7 +3,10 @@ import { IconArrowDown, IconArrowLeft, IconDeviceLaptop, IconRefresh, IconSquare
 import type { Approval } from "../../remote/workspace-data";
 import { Sidebar } from "../../remote/sidebar";
 import { Composer } from "../../remote/composer";
-import { ConversationTurn, RichText } from "../../remote/messages";
+import { ConversationTurn, FileChanges, RichText } from "../../remote/messages";
+import { MessageFilesContext } from "../../remote/files";
+import type { FileChange } from "../../remote/workspace-data";
+import { isRequestedPermissions } from "../../remote/workspace-data";
 import { useRemoteWorkspaceController } from "./useRemoteWorkspaceController";
 
 export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { active: boolean; onUnauthorized: () => void; onPanel: () => void; onLogout: () => void }) {
@@ -30,17 +33,17 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
         {!creating && <button className="remote-icon-button" disabled={busy} aria-label="重新连接" onClick={c.reconnect}><IconRefresh size={18} /></button>}
       </header>
       {connectionError && <p className="remote-connection" role="status">{connectionError}</p>}
-      <div className="remote-transcript">
+      <MessageFilesContext.Provider value={{ threadId: view?.id || "", enabled: active && connected && view?.id === selectedId }}><div className="remote-transcript">
         <div className="remote-messages" ref={scroll} onScroll={event => { const element = event.currentTarget; pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); }}>
           {view && !view.historyComplete && <button disabled={busy || !connected} onClick={() => void c.loadHistory()}>加载完整历史</button>}
           {!creating && !view && <p className="remote-chat-loading">{connectionError ? "暂时无法读取会话，请点击重新连接。" : "正在获取桌面会话…"}</p>}
           {(creating || view?.turns.length === 0) && <div className="remote-chat-empty"><h2>从一个想法开始</h2><p>{creating && !draftProject ? "请先在电脑 Codex 中保存本地项目。" : `描述任务，让 Codex 在 ${draftProject && creating ? draftProject.name : selectedProject?.name || "当前工作区"} 中开始工作。`}</p></div>}
-          {view?.turns.map((turn, index) => <ConversationTurn key={turn.id || index} turn={turn} />)}
+          {view?.turns.map((turn, index) => <ConversationTurn key={`${view.id}:${turn.id || index}`} turn={turn} />)}
           {view?.requests.map(request => <ApprovalCard key={String(request.id)} request={request} disabled={busy || !connected} onRespond={args => c.respond(request.id, args)} />)}
           {activeTurn && <p className="remote-working" role="status"><span className="remote-chat-status-dot is-connected" />Codex 正在工作…</p>}
         </div>
         {!atBottom && <button className="remote-jump remote-icon-button" aria-label="滚动到最新消息" onClick={() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; pinned.current = true; setAtBottom(true); }}><IconArrowDown size={20} /></button>}
-      </div>
+      </div></MessageFilesContext.Provider>
       {error && <p className="remote-client-error" role="alert">{error}</p>}
       {uncertain && !busy && <div className="remote-uncertain"><p>消息未确认。请查看会话是否已收到，确认后再决定是否重新发送。</p><button onClick={c.confirmSubmission}>已核对，允许再次发送</button></div>}
       <Composer key={draftScope} draft={draft} onDraft={c.changeDraft} images={images} onImages={c.changeImages} view={composerView} models={models} connected={creating ? !!draftProject && defaultsReady : connected} busy={busy} uncertain={uncertain}
@@ -50,12 +53,19 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
   </div>;
 }
 
-function ApprovalCard({ request, disabled, onRespond }: { request: Approval; disabled: boolean; onRespond: (args: Record<string, unknown>) => Promise<unknown> }) {
+export function ApprovalCard({ request, disabled, onRespond }: { request: Approval; disabled: boolean; onRespond: (args: Record<string, unknown>) => Promise<unknown> }) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [revision, setRevision] = useState("");
   if (!request.supported) return <section className="remote-approval"><p>{request.params.message || "请在电脑端处理此请求"}</p></section>;
   if (request.method === "item/plan/requestImplementation") return <section className="remote-approval"><h3>确认工作计划</h3><RichText text={request.params.planContent || ""} /><label>修改意见<textarea value={revision} disabled={disabled} onChange={event => setRevision(event.target.value)} /></label><div><button className="remote-primary" disabled={disabled || !request.params.planContent} onClick={() => void onRespond({ decision: "implement" })}>执行计划</button><button disabled={disabled || !revision.trim()} onClick={() => void onRespond({ decision: "revise", text: revision })}>修改计划</button></div></section>;
-  if (request.params.questions) return <form className="remote-approval" onSubmit={event => { event.preventDefault(); void onRespond({ answers }); }}><h3>Codex 需要你的回答</h3>{request.params.questions.map(question => <label key={question.id}>{question.question}{question.options?.map(option => <button key={option.label} type="button" disabled={disabled} onClick={() => setAnswers(current => ({ ...current, [question.id]: option.label }))}>{option.label}{option.description && <small>{option.description}</small>}</button>)}<input required disabled={disabled} value={answers[question.id] || ""} onChange={event => setAnswers(current => ({ ...current, [question.id]: event.target.value }))} /></label>)}<button disabled={disabled} className="remote-primary">提交回答</button></form>;
+  if (["item/tool/requestUserInput", "tool/requestUserInput", "codey/requestUserInputAsync"].includes(request.method) && request.params.questions) return <form className="remote-approval" onSubmit={event => { event.preventDefault(); void onRespond({ answers }); }}><h3>Codex 需要你的回答</h3>{request.params.questions.map(question => <label key={question.id}>{question.question}{question.options?.map(option => <button key={option.label} type="button" disabled={disabled} onClick={() => setAnswers(current => ({ ...current, [question.id]: option.label }))}>{option.label}{option.description && <small>{option.description}</small>}</button>)}<input required disabled={disabled} value={answers[question.id] || ""} onChange={event => setAnswers(current => ({ ...current, [question.id]: event.target.value }))} /></label>)}<button disabled={disabled} className="remote-primary">提交回答</button></form>;
   const available = request.params.availableDecisions || ["accept", "decline"];
-  return <section className="remote-approval"><h3>等待你的批准</h3><p>{request.params.reason}</p>{request.params.command && <pre>{request.params.command}</pre>}{request.params.permissions !== undefined && <pre>{JSON.stringify(request.params.permissions, null, 2)}</pre>}{request.params.changes !== undefined && <pre>{JSON.stringify(request.params.changes, null, 2)}</pre>}<div>{available.includes("accept") && <button disabled={disabled} className="remote-primary" onClick={() => void onRespond({ decision: "accept" })}>本次允许</button>}{available.includes("decline") && <button disabled={disabled} onClick={() => void onRespond({ decision: "decline" })}>拒绝</button>}{available.includes("cancel") && <button disabled={disabled} onClick={() => void onRespond({ decision: "cancel" })}>取消</button>}</div></section>;
+  const changes = request.params.changes;
+  const knownChanges = Array.isArray(changes) && changes.every((change): change is FileChange => !!change && typeof change === "object" && typeof change.path === "string" && typeof change.diff === "string" && (change.kind === undefined || typeof change.kind === "string"));
+  const permissions = isRequestedPermissions(request.params.permissions) ? request.params.permissions : undefined;
+  const detailed = request.method === "item/commandExecution/requestApproval" && !!request.params.command?.trim()
+    || request.method === "item/fileChange/requestApproval" && knownChanges && changes.length > 0
+    || request.method === "item/permissions/requestApproval" && !!permissions;
+  if (!detailed) return <section className="remote-approval"><p>此请求缺少可核对的公开详情，请在电脑端处理。</p></section>;
+  return <section className="remote-approval"><h3>等待你的批准</h3><p>{request.params.reason}</p>{request.params.cwd && <p>工作目录：<code>{request.params.cwd}</code></p>}{request.params.command && <pre tabIndex={0}>{request.params.command}</pre>}{request.params.networkApprovalContext && <p>网络目标：{request.params.networkApprovalContext.protocol} · {request.params.networkApprovalContext.host}</p>}{request.params.grantRoot && <p>授权根目录：<code>{request.params.grantRoot}</code></p>}{permissions && <dl className="remote-permission-summary">{permissions.network && <><dt>网络访问</dt><dd>{permissions.network.enabled ? "允许" : "不允许"}</dd></>}{(["read", "write"] as const).map(key => permissions.fileSystem?.[key] && <div key={key}><dt>{key === "read" ? "读取路径" : "写入路径"}</dt><dd>{permissions.fileSystem[key]!.map(path => <code key={path}>{path}</code>)}</dd></div>)}</dl>}{knownChanges && <FileChanges changes={changes} />}<div>{available.includes("accept") && <button disabled={disabled} className="remote-primary" onClick={() => void onRespond({ decision: "accept" })}>本次允许</button>}{available.includes("decline") && <button disabled={disabled} onClick={() => void onRespond({ decision: "decline" })}>拒绝</button>}{available.includes("cancel") && <button disabled={disabled} onClick={() => void onRespond({ decision: "cancel" })}>取消</button>}</div></section>;
 }

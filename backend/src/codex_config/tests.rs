@@ -188,8 +188,8 @@ fn discarding_a_cancelled_startup_clears_active_and_pending_runtime_policy() {
     fs::write(&marker, b"lease").unwrap();
     let roles = crate::config::uniform_subagent_roles("provider-model", "high");
     let hashes = BTreeMap::from([("default".to_string(), "digest".to_string())]);
-    crate::subagent_gate::commit_runtime_subagent_policy(&home, &roles, &hashes).unwrap();
-    crate::subagent_gate::begin_runtime_subagent_policy_update(&home, &roles, &hashes).unwrap();
+    crate::subagent_gate::commit_runtime_subagent_policy(&home, &roles, &hashes, 2).unwrap();
+    crate::subagent_gate::begin_runtime_subagent_policy_update(&home, &roles, &hashes, 2).unwrap();
 
     discard_runtime_lease(&home, &marker, &backup_dir).unwrap();
 
@@ -684,6 +684,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -850,6 +851,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -904,6 +906,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -1510,6 +1513,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -1557,6 +1561,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -1609,6 +1614,7 @@ async fn native_stats_overrides_keep_direct_provider_and_user_monitoring_unchang
         let mut applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                subagent_max_threads: crate::config::default_subagent_max_threads(),
                 local_router: None,
                 remote_compaction_models: None,
                 stream_max_retries: 5,
@@ -1777,6 +1783,7 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                subagent_max_threads: crate::config::default_subagent_max_threads(),
                 remote_compaction_models: None,
                 local_router: router.then(test_runtime_router_endpoint),
                 use_official_catalog: router,
@@ -1848,6 +1855,7 @@ fn runtime_context_overlay_required_models_respect_router_and_catalog_selection(
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                subagent_max_threads: crate::config::default_subagent_max_threads(),
                 remote_compaction_models: None,
                 local_router: router.then(test_runtime_router_endpoint),
                 use_official_catalog: use_catalog,
@@ -1922,6 +1930,7 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             local_router: Some(test_runtime_router_endpoint()),
             use_official_catalog: true,
@@ -1996,6 +2005,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                subagent_max_threads: crate::config::default_subagent_max_threads(),
                 remote_compaction_models: None,
                 model_contexts: None,
                 required_catalog_models: &[],
@@ -2045,6 +2055,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -2104,6 +2115,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
             let applied = apply_isolated_runtime_router_config(
                 &home,
                 RouterApplyOptions {
+                    subagent_max_threads: crate::config::default_subagent_max_threads(),
                     remote_compaction_models: None,
                     model_contexts: None,
                     required_catalog_models: &[],
@@ -2159,6 +2171,7 @@ wire_api = "responses"
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -2331,6 +2344,7 @@ service_tier = "flex"
             let applied = apply_isolated_runtime_router_config(
                 &home,
                 RouterApplyOptions {
+                    subagent_max_threads: crate::config::default_subagent_max_threads(),
                     remote_compaction_models: None,
                     model_contexts: None,
                     required_catalog_models: &[],
@@ -3568,6 +3582,7 @@ experimental_bearer_token = "upstream-secret-token"
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -3706,6 +3721,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -3748,6 +3764,7 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
             local_router: Some(test_runtime_router_endpoint()),
             stream_max_retries: 5,
@@ -3803,6 +3820,7 @@ wire_api = "responses"
     let error = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             remote_compaction_models: None,
             model_contexts: None,
             required_catalog_models: &[],
@@ -3958,6 +3976,7 @@ fn isolated_scope_guard_adds_start_hooks_beside_the_subagent_gate() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            subagent_max_threads: crate::config::default_subagent_max_threads(),
             local_router: Some(test_runtime_router_endpoint()),
             remote_compaction_models: None,
             stream_max_retries: 5,
@@ -4190,6 +4209,7 @@ wire_api = "responses"
         "mcp_servers.codey_fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
         "tool_output_token_limit",
         "agents.enabled",
+        "agents.max_threads",
         "agents.max_concurrent_threads_per_session",
         "agents.default_subagent_model",
         "agents.default_subagent_reasoning_effort",
@@ -4290,7 +4310,10 @@ wire_api = "responses"
     );
     assert_eq!(
         fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
-        ROOT_AGENT_COLLABORATION_USAGE_HINT
+        ROOT_AGENT_COLLABORATION_USAGE_HINT.replace(
+            "concurrency limit of two",
+            "concurrency limit of 2 sub-agents (excluding the root)"
+        )
     );
     assert!(constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE).exists());
     assert!(
@@ -4376,7 +4399,10 @@ wire_api = "responses"
     );
     assert_eq!(
         fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
-        ROOT_AGENT_COLLABORATION_USAGE_HINT
+        ROOT_AGENT_COLLABORATION_USAGE_HINT.replace(
+            "concurrency limit of two",
+            "concurrency limit of 2 sub-agents (excluding the root)"
+        )
     );
     let developer_override = reapplied
         .runtime_config_overrides
@@ -4401,7 +4427,14 @@ wire_api = "responses"
         .unwrap();
     assert_eq!(
         collaboration_override["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
-        Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
+        Some(
+            ROOT_AGENT_COLLABORATION_USAGE_HINT
+                .replace(
+                    "concurrency limit of two",
+                    "concurrency limit of 2 sub-agents (excluding the root)"
+                )
+                .as_str()
+        )
     );
     let runtime_agent =
         fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();

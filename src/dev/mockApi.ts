@@ -250,6 +250,7 @@ if (import.meta.env.DEV) {
       codexLaunchProxy: "",
       fastContextTools: false,
       subagentOptimization: false,
+      subagentMaxThreads: 2,
       scopeGuard: false,
       subagentModel: "gpt-5.6-terra",
       subagentReasoningEffort: "medium",
@@ -1158,6 +1159,7 @@ if (import.meta.env.DEV) {
         const subagentError = validateSubagents({ ...incoming, subagentRoles });
         if (subagentError) return { status: "failed", message: subagentError };
         const restartRequired = incoming.codexLaunchProxy !== previewConfig.codexLaunchProxy
+          || (incoming.subagentOptimization && incoming.subagentMaxThreads !== previewConfig.subagentMaxThreads)
           || Object.keys(subagentRoles).some(id => !previewConfig.subagentRoles[id]);
         for (const profile of incoming.profiles) {
           const error = profile.authMode === "officialAccount"

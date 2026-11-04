@@ -37,7 +37,6 @@ const LEDGER_SCHEMA_VERSION: u32 = 19;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 14;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
-const CONCURRENCY_LIMIT: usize = 2;
 const MAX_RESERVATIONS_PER_LEDGER: usize = 1_024;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
 const LEDGER_CAPACITY_ERROR_CODE: &str = "CODEY_SUBAGENT_LEDGER_CAPACITY";
@@ -761,7 +760,11 @@ fn is_canonical_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn concurrency_denial(ledger: &SessionLedger, active_agents: usize) -> Option<String> {
+fn concurrency_denial(
+    ledger: &SessionLedger,
+    active_agents: usize,
+    limit: usize,
+) -> Option<String> {
     let tracked_active = ledger
         .reservations
         .values()
@@ -769,11 +772,11 @@ fn concurrency_denial(ledger: &SessionLedger, active_agents: usize) -> Option<St
         .collect::<Vec<_>>();
     let tracked_active_count = tracked_active.len();
     let observed_active = active_agents.max(tracked_active_count);
-    if observed_active < CONCURRENCY_LIMIT {
+    if observed_active < limit {
         return None;
     }
     Some(format!(
-        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：当前已有 {observed_active} 个活动代理，达到并发上限 {CONCURRENCY_LIMIT}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
+        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：当前已有 {observed_active} 个活动代理，达到并发上限 {limit}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
     ))
 }
 
@@ -881,7 +884,11 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     if let Some(reason) = ledger_capacity_denial(&ledger) {
         return Ok(Some(reason));
     }
-    if let Some(reason) = concurrency_denial(&ledger, active_agents) {
+    let limit = runtime_policy.as_ref().map_or_else(
+        || crate::config::default_subagent_max_threads() as usize,
+        |policy| policy.max_threads as usize,
+    );
+    if let Some(reason) = concurrency_denial(&ledger, active_agents, limit) {
         return Ok(Some(reason));
     }
 

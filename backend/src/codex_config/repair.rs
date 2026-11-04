@@ -227,6 +227,7 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
             .collect();
         let applied = CodeyConfig {
             subagent_optimization: true,
+            subagent_max_threads: lease.subagent_max_threads,
             subagent_model: lease.subagent_model.clone(),
             subagent_reasoning_effort: lease.subagent_reasoning_effort.clone(),
             subagent_roles: applied_roles,
@@ -734,6 +735,7 @@ mod tests {
         apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                subagent_max_threads: crate::config::default_subagent_max_threads(),
                 remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
                 model_contexts: None,
                 required_catalog_models: &[],

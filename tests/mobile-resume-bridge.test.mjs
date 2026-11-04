@@ -34,6 +34,7 @@ test("CDP remote diagnostics expose only allowlisted stage messages", async () =
     codey_remote_not_ready: "桌面尚未就绪，暂时无法读取此会话",
     codey_remote_disconnected: "Codex 宿主会话接口未连接，请稍后重试",
     codey_remote_restart_required: "桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接",
+    codey_remote_request_gate_not_ready: "模型线路尚未就绪，远程操作未发送，请稍后重试",
   };
   for (const [code, message] of Object.entries(messages)) {
     const error = Object.assign(Error("private prompt https://private.invalid/?token=secret"), { code });
@@ -78,6 +79,8 @@ test("CDP readiness requires the current remote and session-controller generatio
   const ready = () => vm.runInNewContext(probe[1], { window });
   assert.equal(ready(), false, "an old remote adapter is not ready");
   window.__codeyRemoteControl.version = 2;
+  assert.equal(ready(), false, "an adapter without request readiness is not ready");
+  window.__codeyRemoteControl.version = 3;
   assert.equal(ready(), true);
   delete window.__codeyLoadCodexSessionController.remoteVersion;
   assert.equal(ready(), false, "a legacy session loader is not ready");

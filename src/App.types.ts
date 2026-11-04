@@ -144,6 +144,7 @@ export type Config = {
   codexLaunchProxy: string;
   fastContextTools: boolean;
   subagentOptimization: boolean;
+  subagentMaxThreads?: number;
   scopeGuard: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;

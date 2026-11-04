@@ -35,6 +35,8 @@ export function createControllerHarness(url, name, stubs = {}) {
     },
     useCallback(callback, deps) { return react.useMemo(() => callback, deps); },
     useDeferredValue(value) { return value; },
+    createContext(value) { return { value }; },
+    useContext(context) { return context.value; },
     useId() { return react.useRef(":controller:").current; },
     useEffect(effect, deps) {
       const index = cursor++;

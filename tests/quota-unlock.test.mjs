@@ -65,6 +65,24 @@ test("ordinary business data and JSON.parse revivers remain unchanged", () => {
   assert.equal(vm.runInContext('JSON.parse(\'{"count":2}\', (key, value) => key === "count" ? value + 1 : value).count', context), 3);
 });
 
+test("Codex 26.1029 usage push and reconnect catchups preserve every real limit, reset and balance", () => {
+  const { context, window, api } = createRuntime();
+  window.__codeyModelWhitelistPatch = { isThirdPartyModel: ({ model }) => model === "third-party" };
+  const snapshot = { type: "usage.snapshot", payload: {
+    version: 1, stream_id: "fixture", sequence: 1, generated_at_ms: 1800000000000,
+    usage_by_client: { electron: usage, browser: structuredClone(usage) },
+  } };
+  const message = { type: "message", topic_id: "codex-work-usage-push-v1", payload: snapshot };
+  for (const payload of [snapshot, [message], [{ id: 1, reply: {
+    type: "subscribe", topic_id: message.topic_id, recovered: true, catchups: [message],
+  } }]]) {
+    const serialized = JSON.stringify(payload);
+    assert.equal(vm.runInContext(`JSON.stringify(JSON.parse(${JSON.stringify(serialized)}))`, context), serialized);
+    assert.equal(api.allowsLocalSend({ hostId: "local", model: "third-party" }), true);
+    assert.equal(api.allowsLocalSend({ hostId: "local", model: "official" }), false);
+  }
+});
+
 test("only confirmed third-party models on the local host allow sending", () => {
   const { window, api } = createRuntime();
   const calls = [];

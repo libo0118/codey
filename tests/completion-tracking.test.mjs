@@ -21,6 +21,10 @@ const remotePrepareSource = formatSessionToolsScript(
 );
 
 function loadRemoteControl(runtime) {
+  runtime.window.__codeyModelWhitelistPatch = {
+    ensureRequestGate: async () => true,
+    requestGateReady: () => true,
+  };
   vm.runInNewContext(remoteControlSource, { window: runtime.window, document: runtime.document, URL });
   return (threadId = "thread-1") => runtime.window.__codeyRemoteControl(
     { action: "resume", threadId }, Date.now() + 10_000,
@@ -693,6 +697,32 @@ test("React manager discovery enumerates an object shared by many fibers once pe
   assert.equal(found, manager, "the deepest fiber is still scanned");
   assert.equal(enumerations, 1);
 });
+
+for (const topology of ["wide earlier ancestors", "shared values at different depths"]) {
+  test(`native request discovery reaches a provider after ${topology} without running getters or sending`, async () => {
+    const client = { hostId: "local", enqueueRequest() { assert.fail("must not send"); }, createRequest() {}, onResult() {} };
+    const manager = { requestClient: client, sendRequest() { assert.fail("must not send"); } };
+    const runtime = loadInjection({ initialSessionId: "", localAppServerManager: manager });
+    const scope = { query: null, get() { return manager; }, set() {}, watch() {}, when() {} };
+    let getterCalls = 0;
+    const decoy = Object.defineProperties({}, {
+      get: { enumerable: true, get() { getterCalls++; return () => {}; } },
+      lazy: { enumerable: true, get() { getterCalls++; return scope; } },
+    });
+    let roots;
+    if (topology === "wide earlier ancestors") {
+      roots = [...Array.from({ length: 4 }, () => ({ noise: Array.from({ length: 120 }, () => ({ children: Array.from({ length: 120 }, () => ({})) })) })), { decoy, scope }];
+    } else {
+      const shared = { decoy, nested: { scope } };
+      let deep = shared;
+      for (let index = 0; index < 6; index++) deep = { nested: deep };
+      roots = [deep, shared];
+    }
+    runtime.document.body.__reactFiber$test = roots.reduceRight((parent, memoizedProps) => ({ memoizedProps, return: parent }), null);
+    assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
+    assert.equal(getterCalls, 0);
+  });
+}
 
 test("background completion reconcile backs off longer than other failed capabilities", async () => {
   for (const [feature, capMs] of [["reconcile", 300_000], ["usage", 30_000]]) {

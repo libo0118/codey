@@ -1,6 +1,116 @@
 use super::super::auth::{Auth, Credentials};
 use super::*;
-use std::sync::Mutex;
+
+#[tokio::test]
+async fn existing_desktop_owners_are_followed_without_resuming_and_only_unowned_threads_open() {
+    let owner = follow_or_open(async { Ok("existing owner") }, async {
+        panic!("an existing owner must not be resumed or checked against the model gate")
+    })
+    .await
+    .unwrap();
+    assert_eq!(owner, "existing owner");
+    for error in [
+        "登录会话已撤销",
+        "Codey 正在退出",
+        "Codex 桌面连接已断开",
+        "桌面快照会话不匹配",
+    ] {
+        let result = follow_or_open::<()>(async { Err(error.into()) }, async {
+            panic!("unknown follow failures must not resume the thread")
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), error);
+    }
+    let owner = follow_or_open(
+        async { Err(super::super::desktop::OWNER_UNAVAILABLE.into()) },
+        async { Ok("opened owner") },
+    )
+    .await
+    .unwrap();
+    assert_eq!(owner, "opened owner");
+    assert_eq!(
+        follow_or_open::<()>(
+            async { Err(super::super::desktop::OWNER_UNAVAILABLE.into()) },
+            async { Err("模型请求校验尚未就绪".into()) },
+        )
+        .await
+        .unwrap_err(),
+        "模型请求校验尚未就绪"
+    );
+}
+
+#[tokio::test]
+async fn remote_model_gate_requires_true_and_hides_transport_errors() {
+    for result in [
+        json!({"result":{"type":"boolean","value":true}}),
+        json!({"result":{"type":"boolean","value":false}}),
+        json!({"result":{"type":"string","value":"true"}}),
+        json!({"exceptionDetails":{"text":"PRIVATE_TRANSPORT_DETAILS"}}),
+        Value::Null,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let ready = result["result"]["value"] == true;
+        let fixture = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "Runtime.evaluate");
+            assert_eq!(
+                request["params"]["expression"],
+                "window.__codeyModelWhitelistPatch?.requestGateReady?.() === true"
+            );
+            assert_eq!(request["params"]["awaitPromise"], false);
+            if !result.is_null() {
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = require_model_request_gate(&url).await;
+        assert_eq!(result.is_ok(), ready);
+        if !ready {
+            assert_eq!(
+                result.unwrap_err(),
+                "模型请求校验尚未就绪，远程操作未发送，请稍后重试"
+            );
+        }
+        fixture.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn remote_model_gate_times_out_without_retrying_or_sending_a_mutation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (observed, received) = tokio::sync::oneshot::channel();
+    let fixture = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let request: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "Runtime.evaluate");
+        observed.send(()).unwrap();
+        let _socket = socket;
+        std::future::pending::<()>().await;
+    });
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        require_model_request_gate(&url).await.unwrap_err(),
+        "模型请求校验尚未就绪，远程操作未发送，请稍后重试"
+    );
+    received.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    fixture.abort();
+    let _ = fixture.await;
+}
 
 struct Server {
     core: Arc<Core>,
@@ -38,6 +148,11 @@ async fn fixture() -> Server {
         shutdown: tokio::sync::watch::channel(false).0,
         streams: Arc::new(Semaphore::new(8)),
         logins: Arc::new(Semaphore::new(2)),
+        files: Arc::new(Mutex::new(super::super::files::Registry::with_protection(
+            None,
+            vec![directory.path().join("synthetic-codex-home")],
+        ))),
+        file_transfers: Arc::new(Semaphore::new(2)),
     });
     let task = tokio::spawn(serve(listener, Arc::clone(&core)));
     Server {
@@ -438,4 +553,324 @@ async fn state_coalescing_does_not_delay_urgent_changes() {
     assert_eq!(pending, initial);
     schedule_state(&mut pending, true);
     assert_eq!(pending, Some(tokio::time::Instant::now()));
+}
+
+fn bind_download_fixture(
+    server: &Server,
+    cookie: &str,
+    bytes: &[u8],
+) -> (
+    String,
+    super::super::files::BindingGuard,
+    std::path::PathBuf,
+    Value,
+) {
+    let root = server
+        ._directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(root.join("outputs")).unwrap();
+    let path = root.join("outputs/result.bin");
+    std::fs::write(&path, bytes).unwrap();
+    let thread = uuid::Uuid::new_v4().to_string();
+    let state = json!({"id":thread,"cwd":root,"turns":[{"turnId":"turn","items":[{"id":"answer","type":"agentMessage","text":"[生成文件](outputs/result.bin)"}]}]});
+    let token = cookie.split_once('=').unwrap().1;
+    let binding =
+        super::super::files::BindingGuard::new(server.core.files.clone(), token, &thread, &state)
+            .unwrap();
+    (thread, binding, path, state)
+}
+
+async fn resolve_download(server: &Server, cookie: &str, session: &Value, thread: &str) -> Value {
+    let reply = client()
+        .post(format!("{}/remote/files/resolve", server.base))
+        .header("origin", &server.base)
+        .header("cookie", cookie)
+        .header("x-csrf-token", session["csrfToken"].as_str().unwrap())
+        .json(&json!({"threadId":thread,"reference":"outputs/result.bin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    reply.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn file_routes_require_cookie_origin_csrf_and_an_existing_bound_projection() {
+    let server = fixture().await;
+    let thread = uuid::Uuid::new_v4().to_string();
+    let route = format!("/api/sessions/{thread}/files/{}", "a".repeat(64));
+    assert_eq!(
+        client()
+            .get(format!("{}{route}", server.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client()
+            .post(format!("{}/remote/files/resolve", server.base))
+            .header("origin", &server.base)
+            .json(&json!({"threadId":thread,"reference":"x"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (cookie, session) = login_session(&server, false).await;
+    for (origin, csrf) in [
+        (
+            "https://evil.invalid",
+            session["csrfToken"].as_str().unwrap(),
+        ),
+        (server.base.as_str(), "wrong"),
+    ] {
+        assert_eq!(
+            client()
+                .post(format!("{}/remote/files/resolve", server.base))
+                .header("origin", origin)
+                .header("cookie", &cookie)
+                .header("x-csrf-token", csrf)
+                .json(&json!({"threadId":thread,"reference":"x"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let reply = client()
+        .post(format!("{}/remote/files/resolve", server.base))
+        .header("origin", &server.base)
+        .header("cookie", &cookie)
+        .header("x-csrf-token", session["csrfToken"].as_str().unwrap())
+        .json(&json!({"threadId":thread,"reference":"x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        reply.json::<Value>().await.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("先打开")
+    );
+    assert_eq!(
+        client()
+            .get(format!("{}{route}", server.base))
+            .header("origin", "https://evil.invalid")
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client()
+            .get(format!("{}{route}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let reply = client()
+        .post(format!("{}/remote/files/resolve", server.base))
+        .header("origin", &server.base)
+        .header("cookie", &cookie)
+        .header("x-csrf-token", session["csrfToken"].as_str().unwrap())
+        .json(&json!({"threadId":thread,"reference":"x","cwd":"C:/","owner":"fake"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+    // The fixture has no AppState/desktop owner; metadata must not launch either.
+    assert!(server.core.state.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn real_download_bytes_headers_sha_cross_thread_changes_and_revocation_are_checked() {
+    let server = fixture().await;
+    let (cookie, session) = login_session(&server, false).await;
+    let bytes = b"synthetic artifact\0actual bytes";
+    let (thread, binding, path, mut state) = bind_download_fixture(&server, &cookie, bytes);
+    let resolved = resolve_download(&server, &cookie, &session, &thread).await;
+    let file = &resolved["file"];
+    assert_eq!(file["size"], bytes.len());
+    assert_eq!(file["name"], "result.bin");
+    assert!(!resolved.to_string().contains("workspace"));
+    let url = file["downloadUrl"].as_str().unwrap();
+    let reply = client()
+        .get(format!("{}{url}", server.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(reply.headers()["content-length"], bytes.len().to_string());
+    assert_eq!(reply.headers()["cache-control"], "no-store");
+    assert_eq!(reply.headers()["x-content-type-options"], "nosniff");
+    assert!(
+        reply.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    assert_eq!(
+        reply.headers()["etag"],
+        format!("\"sha256-{}\"", crate::fs_util::sha256_hex(bytes))
+    );
+    assert_eq!(reply.bytes().await.unwrap().as_ref(), bytes);
+    let other = url.replace(&thread, &uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        client()
+            .get(format!("{}{other}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let (another, _) = login_session(&server, false).await;
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", another)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", &cookie)
+            .header("range", "bytes=0-1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    std::fs::write(&path, b"changed source").unwrap();
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    state["turns"][0]["items"][0]["text"] = json!("[replacement](outputs/other.bin)");
+    binding.update(&state).unwrap();
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    server.core.auth.lock().unwrap().revoke("*").unwrap();
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"changed source");
+}
+
+#[tokio::test]
+async fn dropped_or_revoked_download_bodies_stop_producers_and_release_transfer_slots() {
+    let server = fixture().await;
+    let (cookie, session) = login_session(&server, false).await;
+    let bytes = vec![b'x'; 1024 * 1024];
+    let (thread, _binding, _, _) = bind_download_fixture(&server, &cookie, &bytes);
+    let resolved = resolve_download(&server, &cookie, &session, &thread).await;
+    let id = resolved["file"]["id"].as_str().unwrap().to_string();
+    let token = cookie.split_once('=').unwrap().1.to_string();
+    for _ in 0..3 {
+        resolve_download(&server, &cookie, &session, &thread).await;
+    }
+    assert_eq!(server.core.file_transfers.available_permits(), 2);
+    let first = downloads::download(
+        server.core.clone(),
+        token.clone(),
+        thread.clone(),
+        id.clone(),
+    )
+    .await;
+    let second = downloads::download(
+        server.core.clone(),
+        token.clone(),
+        thread.clone(),
+        id.clone(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let busy = downloads::download(
+        server.core.clone(),
+        token.clone(),
+        thread.clone(),
+        id.clone(),
+    )
+    .await;
+    assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop((first, second, busy));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.core.file_transfers.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let reply = downloads::download(
+        server.core.clone(),
+        token.clone(),
+        thread.clone(),
+        id.clone(),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    drop(reply);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.core.file_transfers.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let reply = downloads::download(server.core.clone(), token, thread, id).await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    let mut body = reply.into_body();
+    assert!(body.frame().await.unwrap().is_ok());
+    server.core.auth.lock().unwrap().revoke("*").unwrap();
+    assert!(body.frame().await.unwrap().is_err());
+    drop(body);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.core.file_transfers.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

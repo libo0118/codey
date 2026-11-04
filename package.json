@@ -20,6 +20,7 @@
     "@heroui/styles": "3.2.6",
     "@internationalized/date": "3.12.4",
     "@tabler/icons-react": "^3.45.0",
+    "markdown-it": "15.0.3",
     "react": "^19.0.0",
     "react-aria": "^3.53.0",
     "react-aria-components": "^1.22.0",

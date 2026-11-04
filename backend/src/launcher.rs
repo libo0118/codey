@@ -1031,6 +1031,7 @@ async fn prepare_codex_startup_state(
         home,
     );
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
+    let subagent_max_threads = runtime_subagent_config.subagent_max_threads;
     let subagent_model = runtime_roles_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
     let subagent_roles = runtime_roles_config.subagent_roles.clone();
@@ -1038,6 +1039,7 @@ async fn prepare_codex_startup_state(
         apply_runtime_router_config(
             &runtime_config_home,
             RuntimeRouterConfigOptions {
+                subagent_max_threads,
                 local_router: Some(&runtime_local_router),
                 remote_compaction_models: Some(&remote_compaction_models),
                 use_official_catalog,
@@ -1977,6 +1979,7 @@ async fn prepare_native_runtime_state(
         apply_runtime_router_config(
             &runtime_config_home,
             RuntimeRouterConfigOptions {
+                subagent_max_threads: native_subagent_config.subagent_max_threads,
                 local_router: None,
                 remote_compaction_models: None,
                 use_official_catalog: false,

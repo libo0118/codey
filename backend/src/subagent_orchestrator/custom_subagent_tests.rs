@@ -24,7 +24,7 @@ fn custom_access_is_enforced_by_real_tool_gate_and_cannot_be_overridden_by_task_
             custom(SubagentAccess::ReadWrite),
         ),
     ]);
-    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new())
+    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new(), 2)
         .unwrap();
     let state_root = temp.path().join(crate::subagent_gate::STATE_DIRECTORY);
     for (id, agent, task, denied) in [
@@ -98,6 +98,7 @@ fn custom_access_is_enforced_by_real_tool_gate_and_cannot_be_overridden_by_task_
         temp.path(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        2,
     )
     .unwrap();
     let input =
@@ -137,7 +138,7 @@ fn maximum_custom_matrix_still_fits_the_bounded_policy_reader_after_json_escapin
     let roles = (0..32)
         .map(|i| (format!("custom_agent_{i}"), role.clone()))
         .collect();
-    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new())
+    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new(), 2)
         .unwrap();
     let (path, _) = crate::subagent_gate::runtime_subagent_policy_paths(temp.path());
     assert!(fs::metadata(path).unwrap().len() > 256 * 1024);

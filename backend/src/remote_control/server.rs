@@ -1,7 +1,7 @@
 use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, Mutex, RwLock, Weak},
     time::Duration,
 };
 
@@ -30,7 +30,9 @@ use tokio_tungstenite::{
 use super::desktop::Desktop;
 use crate::commands::AppState;
 
-type Body = UnsyncBoxBody<Bytes, Infallible>;
+mod downloads;
+
+type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = Response<Body>;
 const MAX_BODY: usize = 1024 * 1024;
 // Four MiB of images expanded as base64, plus escaped message text and metadata.
@@ -58,6 +60,8 @@ pub(super) struct Core {
     pub shutdown: tokio::sync::watch::Sender<bool>,
     pub streams: Arc<Semaphore>,
     pub logins: Arc<Semaphore>,
+    pub files: Arc<Mutex<super::files::Registry>>,
+    pub file_transfers: Arc<Semaphore>,
 }
 
 pub(super) fn validate_public_url(value: &str) -> Result<Option<String>, String> {
@@ -184,7 +188,11 @@ fn response(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> R
     Response::builder()
         .status(status)
         .header("content-type", content_type)
-        .body(Full::new(body.into()).boxed_unsync())
+        .body(
+            Full::new(body.into())
+                .map_err(|never| -> std::io::Error { match never {} })
+                .boxed_unsync(),
+        )
         .expect("static response headers")
 }
 
@@ -280,8 +288,14 @@ async fn login(core: Arc<Core>, ip: IpAddr, args: Value, secure: bool) -> Reply 
 pub(super) async fn serve(listener: TcpListener, core: Arc<Core>) {
     let permits = Arc::new(Semaphore::new(32));
     let mut connections = JoinSet::new();
+    let mut shutdown = core.shutdown.subscribe();
+    let mut expiry = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = expiry.tick() => {
+                core.files.lock().unwrap_or_else(|e|e.into_inner()).prune(|token|authorized(&core,token));
+            }
             accepted = listener.accept() => {
                 let Ok((stream,peer)) = accepted else { tokio::time::sleep(Duration::from_millis(100)).await; continue; };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
@@ -296,6 +310,7 @@ pub(super) async fn serve(listener: TcpListener, core: Arc<Core>) {
             _ = connections.join_next(), if !connections.is_empty() => {}
         }
     }
+    core.files.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // A boxed service boundary also breaks the recursive type from the local
@@ -396,6 +411,12 @@ async fn route(core: Arc<Core>, mut request: Request<Incoming>, peer: SocketAddr
     if !login_request && !authorized(&core, &token) {
         return failure(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录");
     }
+    if get && let Some((thread, id)) = super::files::download_route(&path) {
+        if request.headers().contains_key("range") {
+            return failure(StatusCode::BAD_REQUEST, "暂不支持分段下载，请请求完整文件");
+        }
+        return downloads::download(core, token, thread.to_string(), id.to_string()).await;
+    }
     if get && let Some(id) = path.strip_prefix("/remote/events/") {
         if !request.headers().contains_key("origin") {
             return failure(StatusCode::FORBIDDEN, "实时连接缺少来源");
@@ -491,6 +512,7 @@ async fn route(core: Arc<Core>, mut request: Request<Incoming>, peer: SocketAddr
             super::create::defaults(&state, &args).await
         }
         "/remote/action" | "/remote/create" => action_once(&core, &token, &path, &args).await,
+        "/remote/files/resolve" => downloads::resolve(&core, &token, args).await,
         _ if path.starts_with("/api/") => {
             let command = path.strip_prefix("/api/").unwrap_or_default();
             if !panel_command(command) || !panel_arguments_allowed(command, &args) {
@@ -571,9 +593,8 @@ fn event_stream(
         .await;
         let result = async {
             if *shutdown.borrow() || !authorized(&core,&token) { return Err("登录会话已撤销".to_string()); }
-            let state = core.state.upgrade().ok_or("Codey 正在退出")?;
-            super::create::open(&state, &thread).await?;
-            let mut desktop = Desktop::follow(&thread).await?;
+            let mut desktop = follow_desktop(&core, &token, &thread).await?;
+            let binding = super::files::BindingGuard::new(Arc::clone(&core.files),&token,&thread,&desktop.state)?;
             let mut pending = Some(tokio::time::Instant::now());
             let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
             let mut ticks = 0u8;
@@ -595,7 +616,7 @@ fn event_stream(
                                 .map_err(|_|"手机连接超时")?.map_err(|_|"手机连接已断开")?;
                         }
                     },
-                    result = desktop.update() => { if result? { schedule_state(&mut pending, desktop.urgent); } },
+                    result = desktop.update() => { if result? { binding.update(&desktop.state)?; schedule_state(&mut pending, desktop.urgent); } },
                     message = socket.next() => match message {
                         Some(Ok(Message::Ping(bytes))) => { socket.send(Message::Pong(bytes)).await.map_err(|_|"手机连接已断开")?; },
                         Some(Ok(Message::Pong(_))) => {},
@@ -622,7 +643,11 @@ fn event_stream(
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .header("sec-websocket-accept", accept)
-        .body(Full::new(Bytes::new()).boxed_unsync())
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never| -> std::io::Error { match never {} })
+                .boxed_unsync(),
+        )
         .unwrap()
 }
 
@@ -680,14 +705,35 @@ fn authorize_action(core: &Core, token: &str) -> Result<(), String> {
     Ok(())
 }
 
+async fn follow_desktop(core: &Core, token: &str, thread: &str) -> Result<Desktop, String> {
+    authorize_action(core, token)?;
+    let desktop = follow_or_open(Desktop::follow(thread), async {
+        authorize_action(core, token)?;
+        let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+        super::create::open(&state, thread).await?;
+        Desktop::follow(thread).await
+    })
+    .await?;
+    authorize_action(core, token)?;
+    Ok(desktop)
+}
+
+async fn follow_or_open<T>(
+    following: impl std::future::Future<Output = Result<T, String>>,
+    open: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match following.await {
+        Err(error) if error == super::desktop::OWNER_UNAVAILABLE => open.await,
+        result => result,
+    }
+}
+
 async fn perform_action(core: &Core, token: &str, args: &Value) -> Result<Value, String> {
     let thread = args["threadId"].as_str().ok_or("缺少会话标识")?;
     super::desktop::validate_thread(thread)?;
     let action = args["action"].as_str().ok_or("缺少会话操作")?;
     if action == "open" {
-        let state = core.state.upgrade().ok_or("Codey 正在退出")?;
-        super::create::open(&state, thread).await?;
-        Desktop::follow(thread).await?;
+        follow_desktop(core, token, thread).await?;
         return Ok(json!({"status":"ok"}));
     }
     let mut desktop = Desktop::follow(thread).await?;
@@ -699,7 +745,36 @@ async fn perform_action(core: &Core, token: &str, args: &Value) -> Result<Value,
         validate_model_settings(&catalog, &desktop.state, args)?;
     }
     authorize_action(core, token)?;
-    desktop.action(action, args).await
+    desktop
+        .action(action, args, async {
+            let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+            let runtime = state
+                .runtime
+                .lock()
+                .await
+                .clone()
+                .ok_or("Codex 桌面尚未启动")?;
+            let websocket = runtime.renderer_websocket_url().await;
+            require_model_request_gate(&websocket).await?;
+            authorize_action(core, token)
+        })
+        .await
+}
+
+async fn require_model_request_gate(websocket_url: &str) -> Result<(), String> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        codey_runtime_core::bridge::evaluate_script(
+            websocket_url,
+            "window.__codeyModelWhitelistPatch?.requestGateReady?.() === true",
+        ),
+    )
+    .await;
+    if matches!(response, Ok(Ok(ref value)) if value["result"]["result"]["value"] == true) {
+        Ok(())
+    } else {
+        Err("模型请求校验尚未就绪，远程操作未发送，请稍后重试".into())
+    }
 }
 
 fn validate_model_settings(catalog: &Value, desktop: &Value, args: &Value) -> Result<(), String> {

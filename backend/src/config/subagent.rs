@@ -5,6 +5,13 @@ use super::{SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_IDS, SubagentRoleConfig};
 
 pub(crate) const MAX_CUSTOM_SUBAGENT_ROLES: usize = 32;
 
+pub(crate) fn validate_subagent_max_threads(limit: u32) -> Result<(), String> {
+    if !(1..=64).contains(&limit) {
+        return Err("最大子代理数量必须是 1 到 64 之间的整数".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn valid_subagent_role_id(role: &str) -> bool {
     !role.is_empty()
         && role.len() <= 64

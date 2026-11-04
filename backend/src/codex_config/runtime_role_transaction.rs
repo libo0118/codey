@@ -32,6 +32,7 @@ pub(super) fn refresh_runtime_subagent_roles_with_commit(
         &Path,
         &BTreeMap<String, SubagentRoleConfig>,
         &BTreeMap<String, String>,
+        u32,
     ) -> Result<()>,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -89,6 +90,7 @@ pub(super) fn refresh_runtime_subagent_roles_with_commit(
             &runtime_home,
             &runtime_roles,
             &expected_hashes,
+            state.subagent_max_threads,
         )?;
         let registrations = prepare_runtime_agent_files(
             &constraints_dir,
@@ -110,7 +112,13 @@ pub(super) fn refresh_runtime_subagent_roles_with_commit(
         state.runtime_agent_hashes.clone_from(&expected_hashes);
         state.remote_compaction_models = remote_compaction_models.cloned().unwrap_or_default();
         write_lease(marker, &state)?;
-        commit_policy(&runtime_home, &runtime_roles, &expected_hashes)
+        // Native concurrency and prompts are launch-scoped; role reloads keep the same limit.
+        commit_policy(
+            &runtime_home,
+            &runtime_roles,
+            &expected_hashes,
+            state.subagent_max_threads,
+        )
     })();
 
     if let Err(error) = update {

@@ -2208,14 +2208,7 @@
     } catch {
       return null;
     }
-    const hasFunction = (name) => {
-      if (typeof descriptors[name]?.value === "function") return true;
-      try {
-        return typeof value[name] === "function";
-      } catch {
-        return false;
-      }
-    };
+    const hasFunction = (name) => Boolean(declaredMethod(value, name));
     return {
       candidate: hasFunction("get")
         && hasFunction("set")
@@ -2230,7 +2223,7 @@
   const appServerScopeChildren = (inspection) => {
     if (inspection.children) return inspection.children;
     const children = [];
-    for (const [key, descriptor] of Object.entries(inspection.descriptors)) {
+    for (const [key, descriptor] of Object.entries(inspection.descriptors).slice(0, 120)) {
       if (
         !Object.prototype.hasOwnProperty.call(descriptor, "value")
         || ["return", "child", "sibling", "alternate", "stateNode", "_owner"].includes(key)
@@ -2243,14 +2236,12 @@
     return children;
   };
 
-  // `inspections` memoizes per-object results for one synchronous scan. Fibers
-  // share large objects (one has ~35k own keys), and re-enumerating them for
-  // every fiber blocked the main thread for ~2 s per failed discovery.
-  const collectAppServerScopeCandidates = (root, candidates, seen, inspections) => {
-    const queue = [{ depth: 0, value: root }];
+  const collectAppServerScopeCandidates = (roots, candidates) => {
+    const queue = roots.filter(Boolean).map((value) => ({ depth: 0, value }));
+    const seen = new WeakSet();
     let cursor = 0;
     let inspected = 0;
-    while (cursor < queue.length && inspected < 600 && candidates.length < 48) {
+    while (cursor < queue.length && inspected < 2_400 && candidates.length < 48) {
       const { depth, value } = queue[cursor];
       cursor += 1;
       if (
@@ -2260,11 +2251,7 @@
       ) continue;
       seen.add(value);
       inspected += 1;
-      let inspection = inspections.get(value);
-      if (inspection === undefined) {
-        inspection = inspectAppServerScopeValue(value);
-        inspections.set(value, inspection);
-      }
+      const inspection = inspectAppServerScopeValue(value);
       if (!inspection) continue;
       if (inspection.candidate) candidates.push(value);
       if (depth >= 6) continue;
@@ -2283,31 +2270,26 @@
       document.querySelector("#root"),
       document.body,
     ].filter((element) => element instanceof HTMLElement))].slice(0, 32);
-    const seenScopes = new WeakSet();
-    const inspections = new WeakMap();
+    const seenFibers = new WeakSet();
+    const roots = [];
     for (const element of elements) {
       let fiber = reactFiberFromElement(element);
       for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
-        const candidates = [];
-        const seenValues = new WeakSet();
-        collectAppServerScopeCandidates(fiber.memoizedState, candidates, seenValues, inspections);
-        collectAppServerScopeCandidates(fiber.memoizedProps, candidates, seenValues, inspections);
-        collectAppServerScopeCandidates(fiber.dependencies, candidates, seenValues, inspections);
-        collectAppServerScopeCandidates(fiber.updateQueue, candidates, seenValues, inspections);
-        for (const scope of candidates) {
-          if (seenScopes.has(scope)) continue;
-          seenScopes.add(scope);
-          try {
-            const manager = resolver(scope, "local");
-            if (
-              manager
-              && ["sendRequest", "refreshRecentConversations", "codeyReconcileCompletedConversation"]
-                .some((method) => typeof manager[method] === "function")
-            ) return manager;
-          } catch {
-            continue;
-          }
-        }
+        if (seenFibers.has(fiber)) continue;
+        seenFibers.add(fiber);
+        roots.push(fiber.memoizedState, fiber.memoizedProps, fiber.dependencies, fiber.updateQueue);
+      }
+    }
+    // 从各层 provider 同时开始，低层噪声不能抢占高层 scope 的发现预算。
+    const candidates = [];
+    collectAppServerScopeCandidates(roots, candidates);
+    for (const scope of candidates) {
+      try {
+        const manager = resolver(scope, "local");
+        if (manager && ["sendRequest", "refreshRecentConversations", "codeyReconcileCompletedConversation"]
+          .some((method) => typeof manager[method] === "function")) return manager;
+      } catch {
+        continue;
       }
     }
     return null;
@@ -2323,11 +2305,13 @@
   });
 
   const declaredMethod = (object, name) => {
-    for (let depth = 0; object && depth < 8; depth += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(object, name);
-      if (descriptor) return typeof descriptor.value === "function" ? descriptor.value : null;
-      object = Object.getPrototypeOf(object);
-    }
+    try {
+      for (let depth = 0; object && depth < 8; depth += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(object, name);
+        if (descriptor) return typeof descriptor.value === "function" ? descriptor.value : null;
+        object = Object.getPrototypeOf(object);
+      }
+    } catch { /* Unknown native proxies are not capability candidates. */ }
     return null;
   };
 

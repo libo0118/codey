@@ -10,6 +10,50 @@ fn custom() -> SubagentRoleConfig {
 }
 
 #[test]
+fn subagent_count_defaults_roundtrips_and_rejects_invalid_values_before_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let store = ConfigStore::new(path.clone());
+    assert_eq!(CodeyConfig::default().subagent_max_threads, 2);
+    assert_eq!(
+        super::super::store::parse_config_contents("{}", &path)
+            .unwrap()
+            .subagent_max_threads,
+        2
+    );
+    let mut config = CodeyConfig::default().normalize();
+    for limit in [1, 2, 8, 64] {
+        config.subagent_max_threads = limit;
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap().subagent_max_threads, limit);
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    for limit in [0, 65, u32::MAX] {
+        config.subagent_max_threads = limit;
+        assert!(store.save(&config).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    for value in [
+        serde_json::json!(0),
+        serde_json::json!(65),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("4"),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+        serde_json::json!(4_294_967_296_u64),
+    ] {
+        assert!(
+            super::super::store::parse_config_contents(
+                &serde_json::json!({"subagentMaxThreads": value}).to_string(),
+                &path
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn custom_roles_roundtrip_and_missing_access_is_read_only_without_changing_legacy_builtins() {
     let mut config = CodeyConfig::default();
     config

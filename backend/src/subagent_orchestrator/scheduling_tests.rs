@@ -44,6 +44,75 @@ fn tool(root: &Path, session: &str, task: &str, name: &str) -> Result<Option<Str
 }
 
 #[test]
+fn runtime_policy_count_bounds_new_spawns_without_killing_existing_attempts() {
+    let temp = tempdir().unwrap();
+    let state_root = temp.path().join(crate::subagent_gate::STATE_DIRECTORY);
+    let roles = crate::config::default_subagent_roles();
+    for limit in [1, 4, 64] {
+        crate::subagent_gate::commit_runtime_subagent_policy(
+            temp.path(),
+            &roles,
+            &BTreeMap::new(),
+            limit,
+        )
+        .unwrap();
+        let session = format!("session-{limit}");
+        let input = json!({"task_name":"task", "agent_type":"codey_worker", "message":"Work"});
+        assert_eq!(
+            pre_spawn(
+                &state_root,
+                "runtime",
+                &session,
+                Some(&input),
+                limit as usize - 1,
+                1
+            )
+            .unwrap(),
+            None
+        );
+        let next = json!({"task_name":"next", "agent_type":"codey_worker", "message":"Work"});
+        assert!(
+            pre_spawn(
+                &state_root,
+                "runtime",
+                &session,
+                Some(&next),
+                limit as usize,
+                2
+            )
+            .unwrap()
+            .unwrap()
+            .contains(&format!("并发上限 {limit}"))
+        );
+    }
+    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new(), 4)
+        .unwrap();
+    for task in ["first", "second", "third"] {
+        spawn(&state_root, "reduce", task, "codey_worker", "/repo");
+    }
+    crate::subagent_gate::commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new(), 1)
+        .unwrap();
+    let input = json!({"task_name":"next", "agent_type":"codey_worker", "message":"Work"});
+    assert!(
+        pre_spawn(&state_root, "runtime", "reduce", Some(&input), 0, 12)
+            .unwrap()
+            .unwrap()
+            .contains(CONCURRENCY_LIMIT_ERROR_CODE)
+    );
+    for task in ["first", "second", "third"] {
+        assert_eq!(
+            tool(&state_root, "reduce", task, "apply_patch").unwrap(),
+            None
+        );
+        subagent_stopped(&state_root, "runtime", "reduce", task, 22).unwrap();
+    }
+    assert_eq!(
+        pre_spawn(&state_root, "runtime", "reduce", Some(&input), 0, 23).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn every_role_can_read_in_the_same_workspace() {
     let temp = tempdir().unwrap();
     for (index, role) in crate::config::SUBAGENT_ROLE_IDS.into_iter().enumerate() {

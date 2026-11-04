@@ -85,6 +85,7 @@ fn validate(config: &CodeyConfig) -> Result<(), String> {
     if !crate::config::SUBAGENT_REASONING_EFFORTS
         .contains(&config.subagent_reasoning_effort.as_str())
         || crate::config::validate_subagent_roles(&config.subagent_roles).is_err()
+        || crate::config::validate_subagent_max_threads(config.subagent_max_threads).is_err()
     {
         return Err("备份中的子代理配置无效".into());
     }

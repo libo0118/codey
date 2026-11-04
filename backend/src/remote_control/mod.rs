@@ -2,6 +2,7 @@ mod actions;
 mod auth;
 mod create;
 mod desktop;
+mod files;
 mod images;
 mod projection;
 mod protocol;
@@ -70,6 +71,11 @@ struct Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.core.shutdown.send_replace(true);
+        self.core
+            .files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.task.abort();
     }
 }
@@ -241,6 +247,8 @@ impl RemoteControl {
             shutdown: tokio::sync::watch::channel(false).0,
             streams: Arc::new(tokio::sync::Semaphore::new(8)),
             logins: Arc::new(tokio::sync::Semaphore::new(2)),
+            files: Arc::new(Mutex::new(files::Registry::default())),
+            file_transfers: Arc::new(tokio::sync::Semaphore::new(2)),
         });
         let task = tokio::spawn(server::serve(listener, Arc::clone(&core)));
         *slot = Some(Running {
@@ -270,6 +278,12 @@ impl RemoteControl {
     async fn close_listener(&self) {
         if let Some(mut running) = self.running.lock().await.take() {
             running.core.shutdown.send_replace(true);
+            running
+                .core
+                .files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             running.task.abort();
             let _ = (&mut running.task).await;
         }

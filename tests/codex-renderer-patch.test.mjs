@@ -435,137 +435,140 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "function Mjt(){return `critical`}function Ejt(){return `source`}",
       "const appServerPatchSignals=`AppServerRequestClient is missing a message dispatcher mcp_request_enqueued`;",
     ].join("");
-    const patchedAppServerRequestSource = patch(
-      "app://-/assets/app-initial-app-server-request-current-build.js",
-      appServerRequestSource,
-    );
-    assert.match(
-      patchedAppServerRequestSource,
-      /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
-    );
-    const blockedAppServerMessages = [];
-    const routedAppServerTypes = [];
-    const trackedAppServerMessages = [];
-    const appServerGlobal = {
-      __codeyModelWhitelistPatch: {
-        rewriteOutgoingMessage(detail) {
-          if (detail.hostId !== "local") return detail;
-          routedAppServerTypes.push(detail.type);
-          if (detail.request.params.model === "blocked-route/model") {
-            return { ...detail, blocked: true };
-          }
-          return {
-            ...detail,
-            request: {
-              ...detail.request,
-              params: {
-                model: "route-mt6lv4lx-i2bfax/gpt-5.5",
-                modelProvider: "codey_router",
+    for (const [requestUrl, requestSource] of [
+      ["app://-/assets/app-initial-app-server-request-current-build.js", appServerRequestSource],
+      ["app://-/assets/async/24191.589dcc9878.js", appServerRequestSource.replaceAll("`", '"')],
+      ["app://-/webview/assets/84721.a456bc9870.js", appServerRequestSource.replaceAll("`", "'")],
+    ]) {
+      const patchedAppServerRequestSource = patch(requestUrl, requestSource);
+      assert.match(
+        patchedAppServerRequestSource,
+        /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
+      );
+      const blockedAppServerMessages = [];
+      const routedAppServerTypes = [];
+      const trackedAppServerMessages = [];
+      const appServerGlobal = {
+        __codeyModelWhitelistPatch: {
+          rewriteOutgoingMessage(detail) {
+            if (detail.hostId !== "local") return detail;
+            routedAppServerTypes.push(detail.type);
+            if (detail.request.params.model === "blocked-route/model") {
+              return { ...detail, blocked: true };
+            }
+            return {
+              ...detail,
+              request: {
+                ...detail.request,
+                params: {
+                  model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+                  modelProvider: "codey_router",
+                },
               },
-            },
-          };
+            };
+          },
+          isBlockedOutgoingMessage(detail) {
+            return detail.blocked === true;
+          },
+          notifyBlockedOutgoingMessage(detail) {
+            blockedAppServerMessages.push(detail);
+          },
+          trackOutgoingMessage(detail) {
+            trackedAppServerMessages.push(detail);
+          },
+          rewriteIncomingResult(method, result, hostId) {
+            if (hostId !== "local") return result;
+            return method === "model/list"
+              ? { ...result, data: [...result.data, { model: "route/model" }] }
+              : result;
+          },
         },
-        isBlockedOutgoingMessage(detail) {
-          return detail.blocked === true;
-        },
-        notifyBlockedOutgoingMessage(detail) {
-          blockedAppServerMessages.push(detail);
-        },
-        trackOutgoingMessage(detail) {
-          trackedAppServerMessages.push(detail);
-        },
-        rewriteIncomingResult(method, result, hostId) {
-          if (hostId !== "local") return result;
-          return method === "model/list"
-            ? { ...result, data: [...result.data, { model: "route/model" }] }
-            : result;
-        },
-      },
-    };
-    const AppServerRequestClient = Function(
-      "globalThis",
-      "Date",
-      `${patchedAppServerRequestSource};return AppServerRequestClient`,
-    )(appServerGlobal, Date);
-    assert.equal(appServerGlobal.__codeyModelRequestSourceGateInstalled, true);
-    const requestClient = new AppServerRequestClient();
-    await requestClient.enqueueRequest("thread/start", {
-      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
-      model_provider: "openai",
-    }, {});
-    assert.equal(
-      appServerGlobal.__codeyAppServerRequestClients.get("local"),
-      requestClient,
-    );
-    assert.deepEqual(requestClient.sent[0].payload.request.params, {
-      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
-      modelProvider: "codey_router",
-    });
-    await requestClient.enqueueRequest("thread/start", {
-      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
-      model_provider: "openai",
-    }, {}, (request) => {
-      requestClient.dispatchMessage?.("thread-prewarm-start", {
-        request,
-        hostId: requestClient.hostId,
+      };
+      const AppServerRequestClient = Function(
+        "globalThis",
+        "Date",
+        `${patchedAppServerRequestSource};return AppServerRequestClient`,
+      )(appServerGlobal, Date);
+      assert.equal(appServerGlobal.__codeyModelRequestSourceGateInstalled, true);
+      const requestClient = new AppServerRequestClient();
+      await requestClient.enqueueRequest("thread/start", {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        model_provider: "openai",
+      }, {});
+      assert.equal(
+        appServerGlobal.__codeyAppServerRequestClients.get("local"),
+        requestClient,
+      );
+      assert.deepEqual(requestClient.sent[0].payload.request.params, {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        modelProvider: "codey_router",
       });
-    });
-    assert.equal(routedAppServerTypes.at(-1), "mcp-request");
-    assert.deepEqual(requestClient.sent[1].payload.request.params, {
-      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
-      modelProvider: "codey_router",
-    });
-    await assert.rejects(
-      requestClient.enqueueRequest("thread/start", { model: "blocked-route/model" }, {}),
-      /Codey blocked cross-provider model request/,
-    );
-    assert.equal(requestClient.sent.length, 2);
-    assert.equal(blockedAppServerMessages.length, 1);
-    assert.equal(trackedAppServerMessages.length, 2);
-    assert.deepEqual(trackedAppServerMessages[0], {
-      type: "mcp-request",
-      hostId: "local",
-      request: requestClient.sent[0].payload.request,
-    });
-    let releasePortable;
-    let reentering = false;
-    appServerGlobal.__codeyModelWhitelistPatch.guardOutgoingRequest = (_client, method, _params, proceed) => {
-      if (method !== "turn/start" || reentering) return null;
-      return new Promise((resolve) => { releasePortable = resolve; }).then(() => {
-        reentering = true;
-        try { return proceed(); } finally { reentering = false; }
+      await requestClient.enqueueRequest("thread/start", {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        model_provider: "openai",
+      }, {}, (request) => {
+        requestClient.dispatchMessage?.("thread-prewarm-start", {
+          request,
+          hostId: requestClient.hostId,
+        });
       });
-    };
-    const portableSend = requestClient.enqueueRequest("turn/start", { threadId: "portable", model: "route/model" }, {});
-    assert.equal(requestClient.sent.length, 2, "source gate waits before rewrite or transport");
-    releasePortable();
-    await portableSend;
-    assert.equal(requestClient.sent.length, 3, "source gate dispatches exactly once after preparation");
-    const modelListResults = [];
-    requestClient.requestPromises.set("model-list", {
-      method: "model/list",
-      resolve(result) {
-        modelListResults.push(result);
-      },
-    });
-    requestClient.onResult("model-list", { data: [{ model: "gpt-5.6-sol" }] });
-    assert.deepEqual(modelListResults, [{
-      data: [{ model: "gpt-5.6-sol" }, { model: "route/model" }],
-    }]);
-    const remoteClient = new AppServerRequestClient();
-    remoteClient.hostId = "remote-host";
-    await remoteClient.enqueueRequest("thread/start", { model: "remote-model" }, {});
-    assert.deepEqual(remoteClient.sent[0].payload.request.params, { model: "remote-model" });
-    assert.equal(trackedAppServerMessages.at(-1).hostId, "remote-host");
-    let remoteResult;
-    remoteClient.requestPromises.set("remote-list", { method: "model/list", resolve(value) { remoteResult = value; } });
-    remoteClient.onResult("remote-list", { data: [{ model: "remote-model" }] });
-    assert.deepEqual(remoteResult, { data: [{ model: "remote-model" }] });
-    assert.equal(
-      patchErrors.length,
-      2,
-      "the AppServerRequestClient route preflight must patch without compatibility errors",
-    );
+      assert.equal(routedAppServerTypes.at(-1), "mcp-request");
+      assert.deepEqual(requestClient.sent[1].payload.request.params, {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        modelProvider: "codey_router",
+      });
+      await assert.rejects(
+        requestClient.enqueueRequest("thread/start", { model: "blocked-route/model" }, {}),
+        /Codey blocked cross-provider model request/,
+      );
+      assert.equal(requestClient.sent.length, 2);
+      assert.equal(blockedAppServerMessages.length, 1);
+      assert.equal(trackedAppServerMessages.length, 2);
+      assert.deepEqual(trackedAppServerMessages[0], {
+        type: "mcp-request",
+        hostId: "local",
+        request: requestClient.sent[0].payload.request,
+      });
+      let releasePortable;
+      let reentering = false;
+      appServerGlobal.__codeyModelWhitelistPatch.guardOutgoingRequest = (_client, method, _params, proceed) => {
+        if (method !== "turn/start" || reentering) return null;
+        return new Promise((resolve) => { releasePortable = resolve; }).then(() => {
+          reentering = true;
+          try { return proceed(); } finally { reentering = false; }
+        });
+      };
+      const portableSend = requestClient.enqueueRequest("turn/start", { threadId: "portable", model: "route/model" }, {});
+      assert.equal(requestClient.sent.length, 2, "source gate waits before rewrite or transport");
+      releasePortable();
+      await portableSend;
+      assert.equal(requestClient.sent.length, 3, "source gate dispatches exactly once after preparation");
+      const modelListResults = [];
+      requestClient.requestPromises.set("model-list", {
+        method: "model/list",
+        resolve(result) {
+          modelListResults.push(result);
+        },
+      });
+      requestClient.onResult("model-list", { data: [{ model: "gpt-5.6-sol" }] });
+      assert.deepEqual(modelListResults, [{
+        data: [{ model: "gpt-5.6-sol" }, { model: "route/model" }],
+      }]);
+      const remoteClient = new AppServerRequestClient();
+      remoteClient.hostId = "remote-host";
+      await remoteClient.enqueueRequest("thread/start", { model: "remote-model" }, {});
+      assert.deepEqual(remoteClient.sent[0].payload.request.params, { model: "remote-model" });
+      assert.equal(trackedAppServerMessages.at(-1).hostId, "remote-host");
+      let remoteResult;
+      remoteClient.requestPromises.set("remote-list", { method: "model/list", resolve(value) { remoteResult = value; } });
+      remoteClient.onResult("remote-list", { data: [{ model: "remote-model" }] });
+      assert.deepEqual(remoteResult, { data: [{ model: "remote-model" }] });
+      assert.equal(
+        patchErrors.length,
+        2,
+        "the AppServerRequestClient route preflight must patch without compatibility errors",
+      );
+    }
 
     // Codex 26.1007 moved AppServerRequestClient and the Electron bridge
     // forwarder into app-shared-*.js. That chunk must stay in the patch filter
@@ -594,6 +597,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       appServerRequestSource,
     );
     assert.equal(unrelatedChunk, appServerRequestSource);
+    for (const [url, source] of [
+      ["https://-/assets/async/24191.589dcc9878.js", appServerRequestSource],
+      ["app://-/other/async/24191.589dcc9878.js", appServerRequestSource],
+      ["app://-/assets/async/50001.012345abcd.js", "const unrelated=1;"],
+    ]) assert.equal(patch(url, source), source);
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
@@ -895,6 +903,13 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // 只有首个不兼容模块触发两项跳过，其余夹具全部按现行形态改写。
     assert.equal(patchErrors.length, 2);
     assert.equal(patchRecords.length, 2);
+
+    const incomplete = appServerRequestSource.replace("type:`completed`", "type:`changed`");
+    const incompletePatched = patch("app://-/assets/async/24192.589dcc9878.js", incomplete);
+    assert.match(incompletePatched, /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/);
+    assert.doesNotMatch(incompletePatched, /__codeyModelRequestSourceGateInstalled=true/);
+    assert.equal(patchErrors.length, 3);
+    assert.match(String(patchErrors.at(-1)[0]), /app server model result rewrite/);
 
     const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;
     if (productionRendererAsset) {

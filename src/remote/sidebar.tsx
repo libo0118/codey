@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
-import { IconArchive, IconChevronDown, IconChevronRight, IconDeviceLaptop, IconFolder, IconFolderOpen, IconLogout, IconRefresh, IconSearch, IconSettings, IconSquarePlus, IconX } from "@tabler/icons-react";
+import { IconArchive, IconChevronDown, IconChevronRight, IconDeviceLaptop, IconDots, IconFolder, IconFolderOpen, IconLogout, IconRefresh, IconSearch, IconSettings, IconSquarePlus, IconX } from "@tabler/icons-react";
 import { groupThreads, relativeTime, type Project, type Thread } from "./workspace-data";
+import { CopyButton, sessionDeepLink } from "./clipboard";
 
 type Props = {
   threads: Thread[]; projects: Project[]; selectedId?: string; busy: boolean; loading: boolean;
@@ -19,7 +20,8 @@ export function Sidebar(props: Props) {
     const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next;
   });
   function threadRow(thread: Thread) {
-    return <button key={thread.id} className="remote-thread" aria-current={props.selectedId === thread.id ? "page" : undefined} disabled={props.busy} onClick={() => props.onOpen(thread)} title={thread.title}><span>{thread.title}</span><time dateTime={new Date(thread.updatedAt || 0).toISOString()}>{relativeTime(thread.updatedAt)}</time></button>;
+    const link = sessionDeepLink(thread.id);
+    return <div className="remote-thread-row" key={thread.id}><button className="remote-thread" aria-current={props.selectedId === thread.id ? "page" : undefined} disabled={props.busy} onClick={() => props.onOpen(thread)} title={thread.title}><span>{thread.title}</span><time dateTime={new Date(thread.updatedAt || 0).toISOString()}>{relativeTime(thread.updatedAt)}</time></button>{link && <details className="remote-thread-menu" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}><summary aria-label={`${thread.title}的会话操作`}><IconDots size={17} /></summary><div><CopyButton text={link} label="复制会话链接" /></div></details>}</div>;
   }
   return <aside className="remote-thread-list" aria-label="项目和会话">
     <div className="remote-list-heading"><h1>Codex</h1><button className="remote-icon-button" aria-label="搜索会话" aria-expanded={searching} onClick={() => { setSearching(!searching); if (searching) props.onSearch(""); }}><IconSearch size={21} /></button><button className="remote-icon-button" aria-label="新建会话" onClick={() => props.onCreate()} disabled={props.busy}><IconSquarePlus size={21} /></button></div>

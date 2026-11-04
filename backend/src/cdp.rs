@@ -35,8 +35,7 @@ const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
 const DISCOVERY_RETRY_COST_BUDGET: Duration = Duration::from_millis(100);
 const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
 // 门禁要等 Codex 自己建好 request client（实测导航后 6-9 秒），且只是增强：
-// 启动注入完全不碰它，就绪由后台轮询确认；未就绪期间请求路由由 CLI 包装层的
-// stdin 改写兜底。
+// 启动注入完全不碰它，就绪由后台轮询确认；依赖请求接管的操作另行检查门禁。
 const REQUEST_GATE_SETTLE_ROUNDS: u32 = 3;
 const REQUEST_GATE_CDP_MARGIN: Duration = Duration::from_secs(1);
 // 就绪探针是一次同步求值；忙碌的 renderer 也会排队执行并回包，单次预算给足，
@@ -198,6 +197,7 @@ pub struct InjectedTarget {
     websocket_url: Arc<str>,
     pump: BridgePumpHandle,
     injection_statuses: Arc<[InjectionScriptStatus]>,
+    request_gate: RequestGateTask,
 }
 
 #[derive(Debug)]
@@ -262,6 +262,7 @@ impl InjectedTarget {
     }
 
     pub async fn close(self) {
+        self.request_gate.0.abort();
         self.pump.close().await;
     }
 }
@@ -1018,11 +1019,12 @@ impl EstablishedInjection {
     /// 注入完成后才启动请求入口的后台确认：它要等 Codex 自建 request client，
     /// 不属于注入本身的成败。
     fn into_injected(self, injection_statuses: Arc<[InjectionScriptStatus]>) -> InjectedTarget {
-        spawn_request_gate_settle(self.target_id, self.websocket_url.clone());
+        let request_gate = spawn_request_gate_settle(self.target_id, self.websocket_url.clone());
         InjectedTarget {
             websocket_url: self.websocket_url,
             pump: self.pump,
             injection_statuses,
+            request_gate,
         }
     }
 }
@@ -1165,8 +1167,10 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
     : hostBudgetMs;
   const deadline = started + budgetMs;
   const patch = window.__codeyModelWhitelistPatch;
+  const bridge = window.__codexSessionDeleteBridge;
   const patchPresent = () => !!patch && typeof patch.ensureRequestGate === "function"
-    && window.__codeyModelWhitelistPatch === patch;
+    && window.__codeyModelWhitelistPatch === patch && typeof bridge === "function"
+    && window.__codexSessionDeleteBridge === bridge;
   let polls = 0;
   let lastMessage = "";
   const verdict = (ready, reinstall, message, budgetExhausted = false) => JSON.stringify({
@@ -1184,32 +1188,35 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
+      if (__CODEY_GATE_NOTIFY__) patch.notifyRequestGateUnavailable?.();
       return verdict(false, false, lastMessage || "模型请求校验未就绪", true);
     }
     polls += 1;
     const timedOut = Symbol("timeout");
-    const outcome = await Promise.race([
-      Promise.resolve().then(() => patch.ensureRequestGate()).then(
-        (ready) => ({ ready }),
-        (error) => ({ error }),
-      ),
-      new Promise((resolve) => setTimeout(
-        () => resolve(timedOut),
-        Math.min(__CODEY_GATE_CALL_MS__, remaining),
-      )),
-    ]);
+    let timer;
+    let outcome;
+    try {
+      outcome = await Promise.race([
+        Promise.resolve().then(() => patch.ensureRequestGate()).then(
+          (ready) => ({ ready }),
+          (error) => ({ error }),
+        ),
+        new Promise((resolve) => { timer = setTimeout(
+          () => resolve(timedOut), Math.min(__CODEY_GATE_CALL_MS__, remaining),
+        ); }),
+      ]);
+    } finally { clearTimeout(timer); }
     // 任一返回路径都要确认补丁仍是本轮检查的实例，包括成功和探测超时。
-    if (!patchPresent()) {
+    if (!patchPresent() || outcome?.error?.message === "模型请求校验已重新加载") {
       return verdict(false, true, "模型请求补丁缺失或已替换");
     }
     if (outcome === timedOut) {
       // 单次调用超时不覆盖已拿到的真实失败原因——耗尽预算时诊断更需要后者。
       lastMessage = lastMessage || "模型请求校验探测超时";
     } else if (outcome.error !== undefined) {
-      lastMessage = String(
-        (outcome.error && outcome.error.message) || outcome.error || "模型请求校验失败",
-      );
-    } else if (outcome.ready === true) {
+      // 原生错误可能包含用户内容；后台只发布固定分类。
+      lastMessage = "模型请求校验失败";
+    } else if (outcome.ready === true && patch.requestGateReady?.() === true) {
       return verdict(true, false, "");
     } else {
       lastMessage = "模型请求校验未就绪";
@@ -1221,9 +1228,10 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
   }
 })()"#;
 
-fn request_gate_verify_script(wait_budget_ms: u64) -> String {
+fn request_gate_verify_script(wait_budget_ms: u64, notify_unavailable: bool) -> String {
     REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE
         .replace("__CODEY_GATE_BUDGET_MS__", &wait_budget_ms.to_string())
+        .replace("__CODEY_GATE_NOTIFY__", &notify_unavailable.to_string())
         .replace(
             "__CODEY_GATE_CALL_MS__",
             &REQUEST_GATE_POLL_CALL_MS.to_string(),
@@ -1239,6 +1247,7 @@ struct RequestGateBudget {
     deadline: tokio::time::Instant,
     call_timeout: Duration,
     wait_ms: u64,
+    notify_unavailable: bool,
 }
 
 impl RequestGateBudget {
@@ -1248,6 +1257,7 @@ impl RequestGateBudget {
             deadline: tokio::time::Instant::now() + call_timeout,
             call_timeout,
             wait_ms: wait.as_millis() as u64,
+            notify_unavailable: false,
         }
     }
 
@@ -1274,7 +1284,7 @@ async fn verify_request_gate(
     websocket_url: &str,
     budget: RequestGateBudget,
 ) -> std::result::Result<RequestGateVerdict, VerifyFailure> {
-    let script = request_gate_verify_script(budget.wait_ms);
+    let script = request_gate_verify_script(budget.wait_ms, budget.notify_unavailable);
     // runtime 的命令超时不含连接阶段；这里对握手、发送与响应统一限时，确保
     // 先返回明确的 CDP 失败，再由调用方处理重试。
     let response = tokio::time::timeout_at(
@@ -1356,8 +1366,10 @@ async fn settle_request_gate(
     websocket_url: &str,
 ) -> (RequestGateSettle, Option<RequestGateVerdict>) {
     let mut last = None;
-    for _ in 0..REQUEST_GATE_SETTLE_ROUNDS {
-        match verify_request_gate(websocket_url, RequestGateBudget::settle()).await {
+    for round in 0..REQUEST_GATE_SETTLE_ROUNDS {
+        let mut budget = RequestGateBudget::settle();
+        budget.notify_unavailable = round + 1 == REQUEST_GATE_SETTLE_ROUNDS;
+        match verify_request_gate(websocket_url, budget).await {
             Ok(verdict) if verdict.ready => return (RequestGateSettle::Ready, Some(verdict)),
             Ok(verdict) => last = Some(verdict),
             Err(_) => return (RequestGateSettle::Abandoned, None),
@@ -1366,8 +1378,16 @@ async fn settle_request_gate(
     (RequestGateSettle::Exhausted, last)
 }
 
-fn spawn_request_gate_settle(target_id: String, websocket_url: Arc<str>) {
-    tokio::spawn(async move {
+struct RequestGateTask(tokio::task::JoinHandle<()>);
+
+impl Drop for RequestGateTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_request_gate_settle(target_id: String, websocket_url: Arc<str>) -> RequestGateTask {
+    RequestGateTask(tokio::spawn(async move {
         let started = tokio::time::Instant::now();
         let (settle, verdict) = settle_request_gate(&websocket_url).await;
         let event = match settle {
@@ -1383,7 +1403,7 @@ fn spawn_request_gate_settle(target_id: String, websocket_url: Arc<str>) {
                 Some(started.elapsed().as_millis() as u64),
             );
         }
-    });
+    }))
 }
 
 enum AttemptOutcome {
@@ -1749,7 +1769,7 @@ pub(crate) async fn remote_control_request(
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
         r#"typeof window.__codeyRemoteControl === "function"
-          && window.__codeyRemoteControl.version === 2
+          && window.__codeyRemoteControl.version === 3
           && window.__codeySessionToolsInjectLoaded === true
           && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
     )
@@ -1831,6 +1851,7 @@ pub(crate) async fn remote_control_request(
               codey_remote_not_ready: "桌面尚未就绪，暂时无法读取此会话",
               codey_remote_disconnected: "Codex 宿主会话接口未连接，请稍后重试",
               codey_remote_restart_required: "桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接",
+              codey_remote_request_gate_not_ready: "模型线路尚未就绪，远程操作未发送，请稍后重试",
             }};
             const code = typeof error?.code === "string" && Object.hasOwn(messages, error.code) ? error.code : null;
             return JSON.stringify(code ? {{status:"failed",code,message:messages[code]}}
@@ -2681,6 +2702,15 @@ assert.equal(nextPage.window.attempts, 1);
     }
 
     #[tokio::test]
+    async fn dropping_the_injected_gate_aborts_background_settle() {
+        let task = RequestGateTask(tokio::spawn(std::future::pending::<()>()));
+        let abort = task.0.abort_handle();
+        drop(task);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
     async fn request_gate_settles_in_background_until_ready_or_abandoned() {
         use serde_json::json;
         let not_ready = json!({"ready":false,"patchPresent":true,"polls":3,"budgetExhausted":true});
@@ -2960,10 +2990,12 @@ const hostBudgetMs = Number(process.argv[2]);
 const run = async (patch, waitMs = 40, onPending = () => {}) => {
   // 只在触发下一个定时器时推进时钟，避免 CI 调度延迟耗尽测试预算。
   let now = 0;
-  const timers = [];
+  const timers = new Map();
+  let timerSequence = 0;
   const context = vm.createContext({
-    window: {}, console, Date: { now: () => now },
-    setTimeout(callback, delay) { timers.push({ at: now + delay, callback }); },
+    window: { __codexSessionDeleteBridge() {} }, console, Date: { now: () => now },
+    setTimeout(callback, delay) { const id = ++timerSequence; timers.set(id, { at: now + delay, callback }); return id; },
+    clearTimeout(id) { timers.delete(id); },
   });
   context.window.__codeyRequestGateWaitMs = waitMs;
   context.window.__codeyModelWhitelistPatch = patch;
@@ -2980,13 +3012,15 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
     // 先让所有 Promise 回调完成，再运行最近的定时器。
     await new Promise(setImmediate);
     if (settled) break;
-    timers.sort((left, right) => left.at - right.at);
-    const timer = timers.shift();
+    const entry = [...timers.entries()].sort((left, right) => left[1].at - right[1].at)[0];
+    const timer = entry?.[1];
     assert.ok(timer, 'request-gate verification stalled without a timer');
+    timers.delete(entry[0]);
     now = timer.at;
     timer.callback();
   }
   if (failure) throw failure;
+  assert.equal(timers.size, 0);
   return result;
 };
 (async () => {
@@ -3000,7 +3034,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
       assert.equal(verdict.patchPresent, false);
     }
   }
-  const ready = await run({ ensureRequestGate: () => Promise.resolve(true) });
+  const ready = await run({ ensureRequestGate: () => Promise.resolve(true), requestGateReady: () => true });
   assert.equal(ready.ready, true);
   assert.equal(ready.polls, 1);
   assert.equal(ready.waitedMs, 0);
@@ -3010,6 +3044,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
   let calls = 0;
   const lateReady = await run({
     ensureRequestGate: () => Promise.resolve(++calls >= 2),
+    requestGateReady: () => true,
   }, 5_000);
   assert.equal(lateReady.ready, true);
   assert.equal(lateReady.polls, 2);
@@ -3018,7 +3053,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
   const polled = await run(notReady);
   assert.equal(polled.ready, false);
   assert.equal(polled.reinstall, false);
-  assert.equal(polled.message, "当前 Codex 暂不支持模型请求校验");
+  assert.equal(polled.message, "模型请求校验失败");
   assert.equal(polled.waitedMs, 40);
   assert.equal(polled.budgetExhausted, true);
   // 页面配置只能缩短等待，不能延长宿主为本轮分配的预算。
@@ -3056,7 +3091,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
             .args([
                 "-e",
                 harness,
-                &serde_json::to_string(&request_gate_verify_script(1_000)).unwrap(),
+                &serde_json::to_string(&request_gate_verify_script(1_000, false)).unwrap(),
                 "1000",
             ])
             .output()
