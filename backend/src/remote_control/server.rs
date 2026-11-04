@@ -482,12 +482,7 @@ async fn route(core: Arc<Core>, mut request: Request<Incoming>, peer: SocketAddr
         "/remote/threads" => {
             let search = args["search"].as_str().unwrap_or_default().to_string();
             let archived = args["archived"].as_bool().unwrap_or(false);
-            tokio::task::spawn_blocking(move || {
-                super::store::threads(crate::codex_config::codex_home(), &search, archived)
-            })
-            .await
-            .map_err(|_| "读取会话任务失败".to_string())
-            .and_then(std::convert::identity)
+            remote_threads(&core, search, archived).await
         }
         "/remote/projects" => {
             tokio::task::spawn_blocking(
@@ -537,6 +532,76 @@ async fn route(core: Arc<Core>, mut request: Request<Incoming>, peer: SocketAddr
         Ok(value) => json_response(StatusCode::OK, value),
         Err(error) => failure(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+async fn remote_threads(core: &Core, search: String, archived: bool) -> Result<Value, String> {
+    let threads = tokio::task::spawn_blocking(move || {
+        super::store::threads(crate::codex_config::codex_home(), &search, archived)
+    })
+    .await
+    .map_err(|_| "读取会话任务失败".to_string())??;
+    Ok(threads_with_activity(threads, |ids| read_thread_activity(core, ids)).await)
+}
+
+async fn read_thread_activity(core: &Core, thread_ids: Vec<String>) -> Value {
+    let Some(state) = core.state.upgrade() else {
+        return Value::Null;
+    };
+    let Some(runtime) = state.runtime.lock().await.clone() else {
+        return Value::Null;
+    };
+    let websocket = runtime.renderer_websocket_url().await;
+    match crate::cdp::remote_control_request(
+        &websocket,
+        &json!({"action":"activity","threadIds":thread_ids}),
+    )
+    .await
+    {
+        Ok(value) => {
+            if let Some(reason @ ("timeout" | "disconnected" | "request_failed")) =
+                value["reason"].as_str()
+            {
+                eprintln!("[Codey] remote_thread_activity_unavailable: {reason}");
+            }
+            value
+        }
+        Err(_) => {
+            eprintln!("[Codey] remote_thread_activity_unavailable: desktop_request_failed");
+            Value::Null
+        }
+    }
+}
+
+async fn threads_with_activity<F: std::future::Future<Output = Value>>(
+    mut threads: Value,
+    read: impl FnOnce(Vec<String>) -> F,
+) -> Value {
+    let rows = threads
+        .as_array_mut()
+        .expect("thread inventory is an array");
+    let ids = rows
+        .iter()
+        .take(200)
+        .map(|row| {
+            row["id"]
+                .as_str()
+                .expect("inventory thread has an id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let activity = if ids.is_empty() {
+        Value::Null
+    } else {
+        read(ids).await
+    };
+    // Merge only into filtered inventory rows; runtime results cannot revive hidden threads.
+    for row in rows {
+        let id = row["id"].as_str().expect("inventory thread has an id");
+        row["running"] = activity["running"][id]
+            .as_bool()
+            .map_or(Value::Null, Value::Bool);
+    }
+    threads
 }
 
 fn event_stream(

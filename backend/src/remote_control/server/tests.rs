@@ -2,6 +2,50 @@ use super::super::auth::{Auth, Credentials};
 use super::*;
 
 #[tokio::test]
+async fn thread_activity_queries_only_filtered_inventory_and_never_adds_runtime_rows() {
+    let inventory = json!([
+        {"id":"root-a","title":"A","cwd":"/project","updatedAt":10},
+        {"id":"root-b","title":"B","cwd":"/project","updatedAt":9},
+        {"id":"unknown","title":"C","cwd":"/project","updatedAt":8}
+    ]);
+    let mut expected = inventory.clone();
+    expected[0]["running"] = json!(true);
+    expected[1]["running"] = json!(false);
+    expected[2]["running"] = Value::Null;
+    let rows = threads_with_activity(inventory, |ids| async move {
+        assert_eq!(ids, ["root-a", "root-b", "unknown"]);
+        json!({"running":{"root-a":true,"root-b":false,"hidden-subagent":true,"archived":true}})
+    })
+    .await;
+    assert_eq!(rows, expected);
+}
+
+#[tokio::test]
+async fn thread_activity_unavailability_is_unknown_and_empty_inventory_does_not_query() {
+    let rows = threads_with_activity(json!([{"id":"root-a"}]), |_| async { Value::Null }).await;
+    assert_eq!(rows, json!([{"id":"root-a","running":null}]));
+    let rows = threads_with_activity(json!([]), |_| async {
+        panic!("an empty inventory must not probe the desktop")
+    })
+    .await;
+    assert_eq!(rows, json!([]));
+    let inventory = json!(
+        (0..200)
+            .map(|id| json!({"id":id.to_string()}))
+            .collect::<Vec<_>>()
+    );
+    let rows = threads_with_activity(inventory, |ids| async move {
+        assert_eq!(ids.len(), 200);
+        assert_eq!(ids.first().unwrap(), "0");
+        assert_eq!(ids.last().unwrap(), "199");
+        json!({"running":{"0":"true","199":false}})
+    })
+    .await;
+    assert_eq!(rows[0]["running"], Value::Null);
+    assert_eq!(rows[199]["running"], false);
+}
+
+#[tokio::test]
 async fn existing_desktop_owners_are_followed_without_resuming_and_only_unowned_threads_open() {
     let owner = follow_or_open(async { Ok("existing owner") }, async {
         panic!("an existing owner must not be resumed or checked against the model gate")

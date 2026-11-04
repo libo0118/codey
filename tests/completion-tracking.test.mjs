@@ -3420,10 +3420,12 @@ function loadHostedManagerInjection(handlers, options = {}) {
   const account = { kind: "signal-family" };
   const calls = [];
   const pendingDisposals = [];
+  const pendingActive = new Set();
   const rpcHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, (...args) => {
     calls.push([name, ...args]);
     const pending = Promise.resolve().then(() => handler(...args));
-    pending[Symbol.dispose] = () => pendingDisposals.push(name);
+    pendingActive.add(pending);
+    pending[Symbol.dispose] = () => { pendingActive.delete(pending); pendingDisposals.push(name); };
     return pending;
   }]));
   let current = { status: "ready", client: { hostId: "local", rpc: fakeRpcStub(rpcHandlers) } };
@@ -3454,6 +3456,7 @@ function loadHostedManagerInjection(handlers, options = {}) {
     ...runtime,
     calls,
     pendingDisposals,
+    pendingActive,
     connectionReads: () => connectionReads,
     imports: () => imports,
     setConnection: (value) => { current = value; },
@@ -3777,4 +3780,159 @@ test("hosted deletion hides the deleted turns at once and reloads the conversati
   assert.equal(runtime.getTurnRow(1).dataset.codeyHardDeleted, undefined);
   assert.deepEqual(runtime.alerts, []);
   assert.equal(runtime.getReloadCount(), 0);
+});
+
+function loadRemoteActivity(runtime) {
+  runtime.window.__codeyModelWhitelistPatch = {
+    ensureRequestGate() { assert.fail("activity must not use the model gate"); },
+    requestGateReady() { assert.fail("activity must not use the model gate"); },
+  };
+  vm.runInNewContext(remoteControlSource, { window: runtime.window, document: runtime.document, URL });
+  return (threadIds = ["thread-1"]) => runtime.window.__codeyRemoteControl(
+    { action: "activity", threadIds }, Date.now() + 10_000,
+  );
+}
+
+test("passive activity uses an existing hosted connection before any adapter is cached and follows native terminal states", async () => {
+  let status = "active";
+  let turnStatus = "inProgress";
+  const runtime = loadHostedManagerInjection({
+    sendRequest(method, params, options) {
+      assert.equal(method, "thread/read");
+      assert.deepEqual({ ...params }, { threadId: "thread-1", includeTurns: false });
+      assert.equal(options.priority, "background");
+      assert.equal(options.coalesce, false);
+      assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 1_000);
+      return { thread: { status: { type: status }, turns: [{ status: turnStatus }] } };
+    },
+    getThreadExecutionState() { assert.fail("cached inProgress can stick after completion"); },
+    resumeConversation() { assert.fail("activity must not resume"); },
+  });
+  assert.equal(runtime.window.__codeyCodexSessionController, null);
+  const activity = loadRemoteActivity(runtime);
+  assert.equal((await activity()).running["thread-1"], true);
+  for (turnStatus of ["completed", "failed", "interrupted"]) {
+    status = "idle";
+    assert.equal((await activity()).running["thread-1"], false, turnStatus);
+  }
+  status = "systemError";
+  assert.equal((await activity()).running["thread-1"], false);
+  assert.equal(runtime.imports(), 0);
+  assert.equal(runtime.pendingActive.size, 0);
+  assert.equal(runtime.calls.every(([name]) => name === "sendRequest"), true);
+});
+
+test("passive activity leaves unloaded or unrecognized native status unknown instead of using stale turns", async () => {
+  for (const status of [{ type: "notLoaded" }, { type: "unknown" }, null, undefined, "completed"]) {
+    const runtime = loadHostedManagerInjection({ sendRequest: () => ({ thread: { status, turns: [{ status: "inProgress" }] } }) });
+    assert.equal((await loadRemoteActivity(runtime)()).running["thread-1"], null);
+    assert.equal(runtime.pendingActive.size, 0);
+  }
+});
+
+test("passive activity does not discover native managers, import assets or trust legacy cached active state", async () => {
+  const legacy = createLocalDeletionManager({
+    getConversation() { assert.fail("legacy cached activity is not authoritative"); },
+    sendRequest() { assert.fail("legacy queued requests have no cancellable handle"); },
+  });
+  for (const runtime of [loadInjection({ initialSessionId: "" }), loadInjection({
+    initialSessionId: "", appServerManagers: new Map([["local", legacy]]),
+    codexSessionController: { kind: "manager", manager: legacy },
+  })]) {
+    runtime.window.__codeyImportCodexAsset = () => assert.fail("passive activity cannot initialize a manager");
+    const result = await loadRemoteActivity(runtime)();
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), { running: { "thread-1": null }, reason: "unavailable" });
+  }
+});
+
+test("passive activity caps batches at 200 and four native reads without any other native operations", async () => {
+  let inFlight = 0;
+  let maximum = 0;
+  const runtime = loadHostedManagerInjection({ async sendRequest() {
+    maximum = Math.max(maximum, ++inFlight);
+    await Promise.resolve();
+    inFlight -= 1;
+    return { thread: { status: "active" } };
+  } });
+  const activity = loadRemoteActivity(runtime);
+  const ids = Array.from({ length: 200 }, (_, index) => `thread-${index}`);
+  const result = await activity(ids);
+  assert.equal(Object.keys(result.running).length, 200);
+  assert.equal(Object.values(result.running).every(value => value === true), true);
+  assert.equal(runtime.calls.length, 200);
+  assert.equal(maximum, 4);
+  await assert.rejects(activity([...ids, "too-many"]), /活动请求无效/);
+  assert.equal(runtime.calls.length, 200);
+});
+
+test("passive activity times out, disposes every pending RPC and stops dispatch before the next poll", async () => {
+  const runtime = loadHostedManagerInjection({ sendRequest: () => new Promise(() => {}) });
+  const activity = loadRemoteActivity(runtime);
+  const ids = Array.from({ length: 8 }, (_, index) => `thread-${index}`);
+  for (let round = 1; round <= 2; round += 1) {
+    const pending = activity(ids);
+    await flushMicrotasks();
+    assert.equal(runtime.pendingActive.size, 4);
+    runtime.flushTimers();
+    const result = await pending;
+    assert.equal(result.reason, "timeout");
+    assert.equal(Object.values(result.running).every(value => value === null), true);
+    assert.equal(runtime.pendingActive.size, 0);
+    assert.equal(runtime.calls.length, round * 4, "unstarted rows must not be dispatched after timeout");
+  }
+});
+
+test("passive activity errors remain unknown and cannot expose raw RPC messages", async () => {
+  const runtime = loadHostedManagerInjection({ sendRequest() { throw Error("PRIVATE_TOKEN private chat text"); } });
+  const result = await loadRemoteActivity(runtime)();
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { running: { "thread-1": null }, reason: "request_failed" });
+  assert.equal(runtime.pendingActive.size, 0);
+  assert.equal(runtime.pendingDisposals.length, 1);
+});
+
+test("passive activity discards a whole replaced-connection batch and reads the new connection next time", async () => {
+  const releases = [];
+  const runtime = loadHostedManagerInjection({ sendRequest: () => new Promise(resolve => releases.push(resolve)) });
+  const activity = loadRemoteActivity(runtime);
+  const pending = activity(["a", "b"]);
+  await flushMicrotasks();
+  releases[0]({ thread: { status: "active" } });
+  await flushMicrotasks();
+  runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: fakeRpcStub({
+    sendRequest: async () => ({ thread: { status: "idle" } }),
+  }) } });
+  releases[1]({ thread: { status: "active" } });
+  assert.deepEqual(JSON.parse(JSON.stringify(await pending)), { running: { a: null, b: null }, reason: "disconnected" });
+  assert.equal(runtime.pendingActive.size, 0);
+  assert.equal((await activity(["a"])).running.a, false);
+  runtime.setConnection({ status: "disconnected", client: null });
+  assert.equal((await activity(["a"])).running.a, null);
+});
+
+test("passive activity stops at its batch deadline even when native responses resolve successfully", async () => {
+  let runtime;
+  runtime = loadHostedManagerInjection({ sendRequest() {
+    runtime.advanceTime(3_001);
+    return { thread: { status: "active" } };
+  } });
+  const result = await loadRemoteActivity(runtime)(["a", "b", "c", "d", "not-dispatched"]);
+  assert.equal(runtime.calls.length, 4);
+  assert.equal(result.reason, "timeout");
+  assert.equal(Object.values(result.running).every(value => value === null), true);
+});
+
+test("remote adapter upgrades published v3 once, while legacy session tools remain untouched and unknown", async () => {
+  let disposed = 0;
+  let loaderCalls = 0;
+  const old = Object.assign(() => assert.fail("published adapter cannot handle activity"), { version: 3, dispose() { disposed += 1; } });
+  const loader = Object.assign(() => { loaderCalls += 1; assert.fail("old session discovery is not passive"); }, { remoteVersion: 1 });
+  const runtime = { window: { __codeyRemoteControl: old, __codeyLoadCodexSessionController: loader } };
+  const activity = loadRemoteActivity(runtime);
+  assert.equal(runtime.window.__codeyRemoteControl.version, 4);
+  assert.equal(disposed, 1);
+  assert.equal((await activity()).running["thread-1"], null);
+  assert.equal(loaderCalls, 0);
+  assert.equal(runtime.window.__codeyLoadCodexSessionController, loader);
+  loadRemoteActivity(runtime);
+  assert.equal(disposed, 1);
 });

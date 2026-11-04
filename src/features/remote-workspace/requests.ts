@@ -5,8 +5,8 @@ import type { ConversationEvent, CreationResult, Submission } from "./types";
 
 // 手机端复用带 HttpOnly Cookie 的传输；这些端点不属于桌面 invoke 命令。
 export const remoteWorkspaceRequests = {
-  threads: (search: string, archived: boolean) => remoteRequest<Thread[]>("/remote/threads", { search, archived }),
-  projects: () => remoteRequest<Project[]>("/remote/projects", {}),
+  threads: (search: string, archived: boolean, signal?: AbortSignal) => remoteRequest<Thread[]>("/remote/threads", { search, archived }, signal),
+  projects: (signal?: AbortSignal) => remoteRequest<Project[]>("/remote/projects", {}, signal),
   models: () => remoteRequest<ModelCatalog>("/remote/models", {}),
   defaults: (projectId: string) => remoteRequest<ThreadSettings>("/remote/defaults", { projectId }),
   session: async () => { const result = await remoteRequest<{ authenticated: boolean }>("/remote/session"); if (!result.authenticated) throw new RemoteError("登录已过期或被撤销", 401); return result; },

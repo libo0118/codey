@@ -2361,13 +2361,61 @@
   );
 
   // RPC 结果用完即释放，与 Codex 自己调用宿主接口的方式一致。
-  const callHostedAppServer = async (call) => {
+  const callHostedAppServer = async (call, timeoutMs) => {
     const pending = call();
+    let timer;
     try {
-      return await pending;
+      return await (timeoutMs == null ? pending : Promise.race([
+        pending,
+        new Promise((_, reject) => {
+          timer = window.setTimeout(() => reject(Object.assign(new Error("会话活动读取超时"), {
+            code: "codey_remote_activity_timeout",
+          })), timeoutMs);
+        }),
+      ]));
     } finally {
+      window.clearTimeout(timer);
       try { pending?.[Symbol.dispose]?.(); } catch {}
     }
+  };
+
+  const readHostedThreadActivity = async (rpc, threadIds, expiresAt) => {
+    const running = Object.fromEntries(threadIds.map((id) => [id, null]));
+    const connection = rpc();
+    const deadline = Math.min(expiresAt, Date.now() + 3_000);
+    let cursor = 0;
+    let stopped = false;
+    let reason;
+    const current = () => {
+      try { return !disposed && rpc() === connection; } catch { return false; }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, threadIds.length) }, async () => {
+      while (!stopped && cursor < threadIds.length) {
+        if (!current()) { stopped = true; reason = "disconnected"; break; }
+        const timeoutMs = Math.min(1_000, deadline - Date.now());
+        if (timeoutMs <= 0) { stopped = true; reason = "timeout"; break; }
+        const id = threadIds[cursor++];
+        try {
+          // Metadata-only native reads neither resume nor subscribe; cached execution state can stick active.
+          const response = await callHostedAppServer(() => connection.sendRequest("thread/read", {
+            threadId: id, includeTurns: false,
+          }, { priority: "background", source: "thread_catalog", coalesce: false, timeoutMs }), timeoutMs);
+          if (!current()) { stopped = true; reason = "disconnected"; break; }
+          if (Date.now() >= deadline) { stopped = true; reason = "timeout"; break; }
+          const status = response?.thread?.status;
+          const type = typeof status === "string" ? status : status?.type;
+          running[id] = type === "active" ? true : type === "idle" || type === "systemError" ? false : null;
+        } catch (error) {
+          stopped = true;
+          reason = error?.code === "codey_remote_activity_timeout" ? "timeout" : "request_failed";
+        }
+      }
+    }));
+    if (!current()) {
+      for (const id of threadIds) running[id] = null;
+      reason = "disconnected";
+    }
+    return { running, ...(reason ? { reason } : {}) };
   };
 
   // 与资源补丁里的 codeyReconcileCompletedConversation 同一判定：原生 app-server
@@ -2459,6 +2507,7 @@
     };
     const manager = {
       codeyHostedAppServerManager: true,
+      codeyReadThreadActivity: (threadIds, expiresAt) => readHostedThreadActivity(rpc, threadIds, expiresAt),
       sendRequest: (method, params) => callHostedAppServer(() => (
         params === undefined ? rpc().sendRequest(method) : rpc().sendRequest(method, params)
       )),
@@ -2630,6 +2679,8 @@
     return {
       kind: "manager",
       manager,
+      readThreadActivity: ownHostedAppServerManagers.has(manager)
+        ? (threadIds, expiresAt) => manager.codeyReadThreadActivity(threadIds, expiresAt) : null,
       // RPC 存根的任意属性都像函数，宿主删除只认本脚本创建的适配器。
       prepareMessageDeletion: canDeleteMessages ? messageDeletionMethods.prepare.bind(manager)
         : hostedDeletion ? (conversationId) => manager.codeyPrepareMessageDeletion(conversationId) : null,
@@ -2796,6 +2847,15 @@
   const loadCodexSessionController = async ({ requireCompletionReconcile = false, feature = "session" } = {}) => {
     if (requireCompletionReconcile) feature = "reconcile";
     if (disposed) throw unavailableCapability(feature);
+    if (feature === "activity") {
+      // Only inspect existing bindings: normal discovery may initialize native managers or deferred RPCs.
+      const cached = window.__codeyCodexSessionController?.manager;
+      const manager = ownHostedAppServerManagers.has(cached) ? cached
+        : appServerManagerFromReact(cachedAppServerManagerFromScope);
+      // shortcut: legacy queued reads lack a cancellation handle; report unknown until native cancellation is available.
+      if (!ownHostedAppServerManagers.has(manager)) throw unavailableCapability(feature);
+      return managerSessionController(manager);
+    }
     const cached = window.__codeyCodexSessionController;
     // 新管理器可能在此前探测失败后才登记，必须先于缓存和失败退避检查。
     const current = registeredSessionController(feature)
@@ -2852,6 +2912,7 @@
     return state.pending;
   };
   loadCodexSessionController.remoteVersion = 1;
+  loadCodexSessionController.activityVersion = 1;
   window.__codeyLoadCodexSessionController = loadCodexSessionController;
   window.__codeyLoadCodexRequestClient = async () => (
     (await loadCodexSessionController({ feature: "modelRouting" })).manager.requestClient

@@ -1,4 +1,4 @@
-export type Thread = { id: string; title: string; cwd: string; updatedAt: number };
+export type Thread = { id: string; title: string; cwd: string; updatedAt: number; running?: boolean | null };
 export type Project = { id: string; name: string; cwd: string; rootPaths?: string[] };
 export type Question = { id: string; question: string; options?: { label: string; description?: string | null }[] | null };
 export type RequestedPermissions = { network?: { enabled: boolean }; fileSystem?: { read?: string[]; write?: string[] } };

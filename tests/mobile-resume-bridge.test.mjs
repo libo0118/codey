@@ -81,6 +81,8 @@ test("CDP readiness requires the current remote and session-controller generatio
   window.__codeyRemoteControl.version = 2;
   assert.equal(ready(), false, "an adapter without request readiness is not ready");
   window.__codeyRemoteControl.version = 3;
+  assert.equal(ready(), false, "the published adapter has no passive activity action");
+  window.__codeyRemoteControl.version = 4;
   assert.equal(ready(), true);
   delete window.__codeyLoadCodexSessionController.remoteVersion;
   assert.equal(ready(), false, "a legacy session loader is not ready");

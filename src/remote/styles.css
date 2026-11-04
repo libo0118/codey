@@ -31,7 +31,8 @@ body { background: #fff; }
 .remote-project-heading svg { flex: none; }
 .remote-project-threads { margin-left: 25px; }
 .remote-codex-workspace .remote-thread { display: flex; align-items: center; justify-content: space-between; text-align: left; gap: 10px; width: 100%; min-height: 38px; padding: 8px 10px; background: transparent; border-color: transparent; font-size: 13px; }
-.remote-thread > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-thread > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-thread-running { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #16a34a; vertical-align: 1px; }
 .remote-thread time { flex: none; font-size: 11px; color: var(--remote-muted); }
 .remote-codex-workspace .remote-thread[aria-current], .remote-codex-workspace .remote-thread:hover { background: var(--remote-hover); }
 .remote-codex-workspace .remote-show-more { border: 0; background: transparent; justify-content: flex-start; color: var(--remote-muted); font-size: 12px; margin-bottom: 8px; }

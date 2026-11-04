@@ -31,6 +31,8 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const scope = useOperationScope(active);
   const session = useRef<object | null>(null);
   const listVersion = useRef(0);
+  const listRequest = useRef<AbortController | null>(null);
+  const liveRunning = useRef<{ id: string; running: boolean | null } | null>(null);
   const modelVersion = useRef(0);
   const drafts = useRef(new Map<string, WorkspaceDraft>());
   const selectedId = selected?.id;
@@ -38,40 +40,103 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const draftProject = projects.find(item => item.id === project);
   const defaultsReady = creationDefaults?.project === project;
   const composerSettings = { ...defaultThreadSettings(catalog, defaultsReady ? creationDefaults.settings : {}), ...editor.settings };
-  const { view, connected, isConnected, connectionError, reconnect } = useRemoteConversationController(active, selectedId, onUnauthorized);
+  const unauthorized = useStableEvent(() => {
+    session.current = null; listVersion.current++; listRequest.current?.abort(); listRequest.current = null;
+    clearRunning(); setLoading(false); onUnauthorized();
+  });
+  const { view, connected, isConnected, connectionError, reconnect } = useRemoteConversationController(active, selectedId, unauthorized);
   const composerView: View | null = creating ? { id: "", turns: [], requests: [], historyComplete: true, ...composerSettings } : view;
   const activeTurn = view ? [...view.turns].reverse().find(turn => turn.status === "inProgress") : undefined;
 
+  const clearRunning = useStableEvent((since?: typeof liveRunning.current) => {
+    const live = liveRunning.current;
+    const fresh = since !== undefined && live && live !== since && isConnected() ? live : null;
+    liveRunning.current = fresh || (selectedId ? { id: selectedId, running: null } : null);
+    setThreads(previous => previous.some(thread => thread.running === true) ? previous.map(thread => thread.running === true && thread.id !== fresh?.id ? { ...thread, running: null } : thread) : previous);
+  });
   useEffect(() => {
     session.current = active ? {} : null;
-    return () => { session.current = null; listVersion.current++; modelVersion.current++; };
-  }, [active]);
+    if (!active) clearRunning();
+    return () => { session.current = null; listVersion.current++; modelVersion.current++; listRequest.current?.abort(); listRequest.current = null; };
+  }, [active, clearRunning]);
   useEffect(() => { if (draftScope) drafts.current.set(draftScope, editor); }, [draftScope, editor]);
 
   const fail = useStableEvent((cause: unknown) => {
-    if (requests.unauthorized(cause)) onUnauthorized();
+    if (requests.unauthorized(cause)) unauthorized();
     setError(errorText(cause));
   });
-  const refreshList = useStableEvent(async () => {
+  const refreshList = useStableEvent(async (background = false) => {
     const token = session.current;
-    if (!token) return;
+    if (!token || document.visibilityState !== "visible" || !navigator.onLine || background && listRequest.current) return;
+    listRequest.current?.abort();
+    const controller = listRequest.current = new AbortController();
+    const liveAtStart = liveRunning.current;
     const version = ++listVersion.current;
-    const current = () => session.current === token && version === listVersion.current;
-    setLoading(true);
+    const current = () => session.current === token && version === listVersion.current && !controller.signal.aborted;
+    // 列表不沿用写操作的 90 秒时限，慢读取不能长期保留旧绿点。
+    const timeout = window.setTimeout(() => {
+      if (current()) { clearRunning(liveAtStart); setLoading(false); fail(new Error("会话列表刷新超时，请重试")); }
+      controller.abort(); if (listRequest.current === controller) listRequest.current = null;
+    }, 5000);
+    controller.signal.addEventListener("abort", () => window.clearTimeout(timeout), { once: true });
+    if (!background) setLoading(true);
     try {
-      const [nextThreads, nextProjects] = await Promise.all([requests.threads(search, archived), requests.projects()]);
+      const [nextThreads, nextProjects] = await Promise.all([requests.threads(search, archived, controller.signal), background ? null : requests.projects(controller.signal)]);
       if (!current()) return;
-      setThreads(nextThreads); setProjects(nextProjects);
-      // 刷新目录不能把正在编辑的新会话草稿改绑到另一个项目。
-      if (!creating) setProject(previous => nextProjects.some(item => item.id === previous) ? previous : nextProjects[0]?.id || "");
-    } catch (cause) { if (current()) fail(cause); }
-    finally { if (current()) setLoading(false); }
+      // 请求开始后的流更新优先，新的目录结果仍可清除更早的运行状态。
+      const live = liveRunning.current;
+      setThreads(live && (live !== liveAtStart || live.running === null && !isConnected()) ? nextThreads.map(thread => thread.id === live.id ? { ...thread, running: live.running } : thread) : nextThreads);
+      if (nextProjects) {
+        setProjects(nextProjects);
+        // 刷新目录不能把正在编辑的新会话草稿改绑到另一个项目。
+        if (!creating) setProject(previous => nextProjects.some(item => item.id === previous) ? previous : nextProjects[0]?.id || "");
+      }
+    } catch (cause) { if (current()) { clearRunning(liveAtStart); fail(cause); } }
+    finally { if (current() && !background) setLoading(false); controller.abort(); if (listRequest.current === controller) listRequest.current = null; }
   });
   useEffect(() => {
     if (!active) return;
     const timer = window.setTimeout(() => void refreshList(), search ? 180 : 0);
-    return () => { window.clearTimeout(timer); listVersion.current++; };
+    return () => { window.clearTimeout(timer); listVersion.current++; listRequest.current?.abort(); listRequest.current = null; };
   }, [active, search, archived, listRevision, refreshList]);
+
+  useEffect(() => {
+    if (!active) return;
+    let timer: number | undefined;
+    const update = () => {
+      window.clearTimeout(timer);
+      if (!session.current) return;
+      if (document.visibilityState !== "visible" || !navigator.onLine) {
+        listVersion.current++; listRequest.current?.abort(); listRequest.current = null;
+        clearRunning(); setLoading(false);
+        return;
+      }
+      void refreshList(true);
+      timer = window.setTimeout(update, 5000);
+    };
+    if (document.visibilityState === "visible" && navigator.onLine) timer = window.setTimeout(update, 5000);
+    else update();
+    window.addEventListener("focus", update); window.addEventListener("online", update); window.addEventListener("offline", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", update); window.removeEventListener("online", update); window.removeEventListener("offline", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [active, refreshList, clearRunning]);
+
+  useEffect(() => {
+    if (!active || !selectedId || !session.current) { liveRunning.current = null; return; }
+    if (connectionError) {
+      listVersion.current++; listRequest.current?.abort(); listRequest.current = null;
+      clearRunning(); setLoading(false);
+    }
+    const running = connected && view?.id === selectedId && document.visibilityState === "visible" && navigator.onLine
+      ? view.status === "active" ? true : view.status === "idle" || view.status === "systemError" ? false : null
+      : null;
+    liveRunning.current = { id: selectedId, running };
+    setThreads(previous => previous.some(thread => thread.id === selectedId && thread.running !== running) ? previous.map(thread => thread.id === selectedId ? { ...thread, running } : thread) : previous);
+  }, [active, selectedId, connected, connectionError, view, clearRunning]);
 
   const loadModels = useStableEvent(async () => {
     const token = session.current;
@@ -83,7 +148,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
       if (current()) { setCatalog(next); setCatalogError(""); }
     } catch (cause) {
       if (!current()) return;
-      if (requests.unauthorized(cause)) onUnauthorized();
+      if (requests.unauthorized(cause)) unauthorized();
       setCatalogError("模型列表暂时无法加载，仍沿用桌面设置。");
     }
   });
@@ -97,7 +162,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
       if (!disposed) setCreationDefaults({ project, settings });
     }).catch(cause => {
       if (disposed) return;
-      if (requests.unauthorized(cause)) onUnauthorized();
+      if (requests.unauthorized(cause)) unauthorized();
       setDefaultsError("桌面默认设置暂时无法加载，请重试。");
     });
     return () => { disposed = true; };
@@ -121,7 +186,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   async function run(operation: (current: () => boolean) => Promise<void>) {
     const pending = scope.begin();
     if (!pending) return false;
-    listVersion.current++;
+    listVersion.current++; listRequest.current?.abort(); listRequest.current = null; setLoading(false);
     setBusy(true); setError("");
     try { await operation(pending.current); }
     catch (cause) { if (pending.current()) fail(cause); }

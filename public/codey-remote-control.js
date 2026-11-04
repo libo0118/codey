@@ -1,6 +1,6 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 3;
+  const version = 4;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
@@ -8,15 +8,18 @@
   const appServerManagerRegistryResolverFromModule = (...args) => window.__codeyAppServerManagerRegistryResolverFromModule?.(...args);
   const appServerManagerFromReact = (...args) => window.__codeyAppServerManagerFromReact?.(...args);
   const remoteError = (code, message) => Object.assign(new Error(message), { code });
-  const getCodexSessionController = async () => {
+  const getCodexSessionController = async (feature = "remote") => {
     if (typeof window.__codeyLoadCodexSessionController !== "function") {
       throw remoteError("codey_remote_controller_not_ready", "桌面会话接口尚未就绪");
     }
     if (window.__codeyLoadCodexSessionController.remoteVersion !== 1) {
       throw remoteError("codey_remote_restart_required", "桌面会话工具版本已更新，请在本机通过 Codey 重启 Codex 后重新连接");
     }
+    if (feature === "activity" && window.__codeyLoadCodexSessionController.activityVersion !== 1) {
+      throw remoteError("codey_remote_unsupported", "桌面会话活动接口尚未就绪");
+    }
     try {
-      return await window.__codeyLoadCodexSessionController({ feature: "remote" });
+      return await window.__codeyLoadCodexSessionController({ feature });
     } catch (error) {
       if (error?.code === "codey_capability_unavailable") {
         throw remoteError("codey_remote_unsupported", "当前 Codex 暂不支持远程读取会话，请更新 Codey 后重试");
@@ -162,6 +165,22 @@
       requestPatch = patch;
     };
     assertCurrent();
+    if (args.action === "activity") {
+      if (!Array.isArray(args.threadIds) || args.threadIds.length > 200
+        || args.threadIds.some(id => typeof id !== "string" || !id)) throw new Error("会话活动请求无效");
+      const threadIds = [...new Set(args.threadIds)];
+      const unknown = { running: Object.fromEntries(threadIds.map(id => [id, null])) };
+      try {
+        const controller = await getCodexSessionController("activity");
+        assertCurrent();
+        return await controller.readThreadActivity(threadIds, expiresAt);
+      } catch (error) {
+        const reason = error?.code === "codey_remote_disconnected" ? "disconnected"
+          : error?.code === "codey_remote_unsupported" || error?.code === "codey_remote_controller_not_ready"
+            || error?.code === "codey_remote_restart_required" ? "unavailable" : "request_failed";
+        return { ...unknown, reason };
+      }
+    }
     if (args.action === "resume") {
       const controller = await getCodexSessionController();
       const manager = controller.manager;

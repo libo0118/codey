@@ -1769,7 +1769,7 @@ pub(crate) async fn remote_control_request(
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
         r#"typeof window.__codeyRemoteControl === "function"
-          && window.__codeyRemoteControl.version === 3
+          && window.__codeyRemoteControl.version === 4
           && window.__codeySessionToolsInjectLoaded === true
           && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
     )
@@ -1833,11 +1833,12 @@ pub(crate) async fn remote_control_request(
         .await
         .map_err(|_| "远程桌面适配加载失败")?;
     }
+    let activity = args["action"] == "activity";
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "系统时间无效")?
         .as_millis()
-        + 60_000;
+        + if activity { 3_000 } else { 60_000 };
     // CDP returns object references by default. Send JSON text like the other
     // structured renderer probes so both resume and create return their value.
     let script = format!(
@@ -1863,7 +1864,7 @@ pub(crate) async fn remote_control_request(
         websocket_url,
         &script,
         true,
-        Duration::from_secs(65),
+        Duration::from_secs(if activity { 5 } else { 65 }),
     )
     .await
     .map_err(|_| "桌面响应中断或超时，操作可能已提交；请先查看会话，不要重复发送".to_string())?;

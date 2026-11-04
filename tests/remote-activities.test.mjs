@@ -107,6 +107,6 @@ test("真实 Workspace hook 接收并更新协作投影，只保留父会话列�
   assert.equal(h.render().view.turns[0].messages[0].collaboration.agents[0].status, "running");
   sockets[0].handlers.message(event([startedActivity, completedActivity])); await h.flush();
   assert.equal(h.render().view.turns[0].messages[1].collaboration.agents[0].message, completedActivity.collaboration.agents[0].message);
-  assert.deepEqual(h.render().threads, [thread]); assert.equal(calls.length, 0); assert.equal(sockets.length, 1);
+  assert.deepEqual(h.render().threads, [{ ...thread, running: null }]); assert.equal(calls.length, 0); assert.equal(sockets.length, 1);
   h.unmount();
 });

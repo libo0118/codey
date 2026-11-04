@@ -69,18 +69,26 @@ export function createControllerHarness(url, name, stubs = {}) {
 }
 
 export function installControllerWindow(t) {
-  const previous = globalThis.window;
   const events = new EventTarget();
+  const document = Object.assign(new EventTarget(), { visibilityState: "visible" });
+  const navigator = { onLine: true };
   const timers = new Map();
+  const delays = new Map();
   let nextId = 0;
-  globalThis.window = Object.assign(events, {
-    setTimeout(callback) { const id = ++nextId; timers.set(id, callback); return id; },
-    clearTimeout(id) { timers.delete(id); },
+  const window = Object.assign(events, {
+    setTimeout(callback, delay = 0) { const id = ++nextId; timers.set(id, callback); delays.set(id, delay); return id; },
+    clearTimeout(id) { timers.delete(id); delays.delete(id); },
   });
-  t.after(() => { if (previous === undefined) delete globalThis.window; else globalThis.window = previous; });
+  for (const [name, value] of Object.entries({ window, document, navigator })) {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    t.after(() => previous ? Object.defineProperty(globalThis, name, previous) : delete globalThis[name]);
+  }
   return {
-    timers,
-    tick() { const pending = [...timers.values()]; timers.clear(); pending.forEach((callback) => callback()); },
+    timers, delays,
+    tick(maxDelay = Infinity) { const pending = [...timers].filter(([id]) => delays.get(id) <= maxDelay); pending.forEach(([id]) => { timers.delete(id); delays.delete(id); }); pending.forEach(([, callback]) => callback()); },
     dispatch(name) { events.dispatchEvent(new Event(name)); },
+    visibility(value) { document.visibilityState = value; document.dispatchEvent(new Event("visibilitychange")); },
+    online(value) { navigator.onLine = value; events.dispatchEvent(new Event(value ? "online" : "offline")); },
   };
 }

@@ -5,10 +5,10 @@ import { collectElements, createModuleGraph, createStub, elementProps, elementTy
 
 const project = { id: "project", name: "Project", cwd: "/project" };
 const thread = { id: "thread", title: "Thread", cwd: project.cwd, updatedAt: 1 };
-const view = { id: thread.id, title: "Last known view", historyComplete: false,
+const view = { id: thread.id, title: "Last known view", status: "active", historyComplete: false,
   turns: [{ id: "turn", status: "inProgress", messages: [] }],
   requests: [{ id: 7, method: "item/commandExecution/requestApproval", supported: true, params: {} }] };
-const invalidFrames = [["malformed JSON", "{"], ["invalid state schema", { type: "state", state: { ...view, turns: null } }]];
+const invalidFrames = [["malformed JSON", "{"], ["invalid state schema", { type: "state", state: { ...view, turns: null } }], ["mismatched thread", { type: "state", state: { ...view, id: "wrong-thread" } }]];
 
 class RemoteError extends Error {
   constructor(message, status) { super(message); this.status = status; }
@@ -85,13 +85,14 @@ for (const [label, invalid] of invalidFrames) {
   test(`valid state followed by ${label} becomes read-only immediately and ignores late frames`, async t => {
     const h = fixture(t); await h.ready(); const beforeInvalid = h.render();
     const socket = h.sockets[0], lateMessage = socket.onmessage, lateClose = socket.onclose;
-    assert.equal(beforeInvalid.connected, true); socket.frame(invalid);
+    assert.equal(beforeInvalid.connected, true); assert.equal(beforeInvalid.threads[0].running, true); socket.frame(invalid);
     await assertBlocked(h, beforeInvalid);
     lateMessage({ data: JSON.stringify({ type: "disconnected", message: "late generic disconnect" }) });
     lateMessage({ data: JSON.stringify({ type: "state", state: { ...view, title: "must not replace last view" } }) });
     lateMessage({ data: "{" }); lateClose();
     h.last("/remote/session").reject(new Error("network unavailable")); await h.flush(); h.browser.tick();
     const c = h.render(); assert.equal(c.connected, false); assert.deepEqual(c.view, view); assert.equal(c.draft, "保留草稿");
+    assert.notEqual(c.threads[0].running, true);
     assert.match(c.connectionError, /数据无效/); assert.equal(socket.closed, 1); assert.equal(h.sockets.length, 1);
     assert.equal(h.calls.filter(call => call.path === "/remote/session").length, 1); await assertBlocked(h, c);
   });
@@ -101,9 +102,10 @@ test("manual reconnect requires a matching new state and ignores old frames and 
   const h = fixture(t); await h.ready(); const old = h.sockets[0], oldMessage = old.onmessage, oldClose = old.onclose;
   old.frame("{"); const oldSession = h.last("/remote/session");
   assert.ok(oldSession, "失效帧必须进入断线会话校验");
-  h.render().reconnect(); h.render(); const next = h.sockets[1];
+  h.render().reconnect(); h.render(); const rejected = h.sockets[1];
   assert.equal(h.render().connected, false);
-  next.frame({ type: "state", state: { ...view, id: "wrong-thread" } }); assert.equal(h.render().connected, false);
+  rejected.frame({ type: "state", state: { ...view, id: "wrong-thread" } }); assert.equal(h.render().connected, false); assert.equal(rejected.closed, 1);
+  h.render().reconnect(); h.render(); const next = h.sockets[2];
   next.frame({ type: "state", state: { ...view, title: "New connection" } }); assert.equal(h.render().connected, true);
   oldMessage({ data: "{" }); oldClose(); oldSession.reject(new RemoteError("old revoked session", 401));
   await h.flush(); h.browser.tick();

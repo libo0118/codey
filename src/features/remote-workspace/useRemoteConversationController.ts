@@ -50,7 +50,7 @@ export function useRemoteConversationController(active: boolean, threadId: strin
             } else if (event.state.id === threadId) {
               connectedThread.current = threadId;
               setView(event.state); setConnected(true); setConnectionError(""); delay = 2000;
-            }
+            } else closed("会话数据无效，请重新连接", true);
           },
           invalid: () => closed("会话数据无效，请重新连接", true),
           close: () => closed(),
