@@ -106,6 +106,8 @@ async fn restore_config(
         return Err("配置已被其他操作更新，请重新预览备份后再恢复".into());
     }
     let config = backup.prepare(&previous)?;
+    crate::codex_config::validate_custom_subagent_role_conflicts(&config.subagent_roles)
+        .map_err(|_| "备份中的自定义子代理与本机原生角色冲突或原生配置无法读取")?;
     super::validate_official_account_config_change(&previous, &config)
         .map_err(|_| "备份配置不符合本机官方账号边界")?;
     super::ensure_local_route_config_change_allowed(&previous, &config)
@@ -151,6 +153,59 @@ mod tests {
             ..CodeyConfig::default()
         };
         backup::parse(&backup::export(config).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn custom_subagents_export_inspect_restore_replace_the_matrix() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state(temp.path().join("config.json"));
+        let role = serde_json::from_value(json!({
+            "name":"检查", "description":"用途", "developerInstructions":"返回证据", "access":"readOnly"
+        })).unwrap();
+        state
+            .config
+            .write()
+            .await
+            .subagent_roles
+            .insert("custom_agent_backup_test".into(), role);
+        let exported = invoke(&state, &json!({"action":"export", "confirmed":true}))
+            .await
+            .unwrap();
+        let content = exported["content"].as_str().unwrap();
+        let inspection = invoke(&state, &json!({"action":"inspect", "content":content}))
+            .await
+            .unwrap();
+        assert_eq!(inspection["settingsRevision"], 0);
+        let old = state
+            .config
+            .write()
+            .await
+            .subagent_roles
+            .remove("custom_agent_backup_test")
+            .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .subagent_roles
+            .insert("custom_agent_obsolete".into(), old);
+        let restored = invoke(
+            &state,
+            &json!({
+                "action":"restore", "confirmed":true, "content":content, "settingsRevision":0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored["restored"], true);
+        let config = state.config.read().await.clone();
+        assert!(
+            config
+                .subagent_roles
+                .contains_key("custom_agent_backup_test")
+        );
+        assert!(!config.subagent_roles.contains_key("custom_agent_obsolete"));
+        assert_eq!(state.store.load().unwrap(), config);
     }
 
     #[tokio::test]

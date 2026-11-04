@@ -68,7 +68,7 @@ export type PromptOptimizationConfig = {
   instruction: string;
 };
 
-export type SubagentRoleId =
+export type BuiltinSubagentRoleId =
   | "codey_quick_scan"
   | "codey_deep_research"
   | "codey_visual_analysis"
@@ -76,10 +76,16 @@ export type SubagentRoleId =
   | "codey_visual_worker"
   | "default";
 
+export type SubagentRoleId = BuiltinSubagentRoleId | (string & {});
+
 export type SubagentRoleConfig = {
   enabled: boolean;
   model: string;
   reasoningEffort: string;
+  name?: string;
+  description?: string;
+  developerInstructions?: string;
+  access?: "readOnly" | "readWrite";
 };
 
 export type RouteRequestLogConfig = {
@@ -141,7 +147,9 @@ export type Config = {
   scopeGuard: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;
-  subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;
+  subagentRoles: Record<string, SubagentRoleConfig>;
+  /** 仅用于提交删除意图，不写入持久化配置。 */
+  deletedSubagentRoles?: string[];
   miscModel: string;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
@@ -314,6 +322,7 @@ export type Confirmation = {
     | "enable-experimental-updates"
     | "discard-settings-changes"
     | "delete-notification-channel"
+    | "delete-subagent"
     | "delete-route"
     | "delete-official-account"
     | "disable-official-account-siwc"

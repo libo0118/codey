@@ -507,6 +507,22 @@ pub struct SubagentRoleConfig {
     pub model: String,
     #[serde(default = "default_subagent_reasoning_effort")]
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub developer_instructions: String,
+    // Missing access preserves legacy builtins, but custom roles fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<SubagentAccess>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 impl SubagentRoleConfig {
@@ -515,7 +531,21 @@ impl SubagentRoleConfig {
             enabled: true,
             model: model.into(),
             reasoning_effort: reasoning_effort.into(),
+            name: String::new(),
+            description: String::new(),
+            developer_instructions: String::new(),
+            access: Some(SubagentAccess::ReadWrite),
         }
+    }
+
+    pub(crate) fn access_for_role(&self, role: &str) -> SubagentAccess {
+        self.access.unwrap_or_else(|| {
+            if SUBAGENT_ROLE_IDS.contains(&role) {
+                SubagentAccess::ReadWrite
+            } else {
+                SubagentAccess::ReadOnly
+            }
+        })
     }
 }
 

@@ -19,6 +19,7 @@ import { routeModelAlias } from "../modelRoutes";
 import { fallbackRouteShortName, validateThirdPartyRouteShortName } from "../routeShortNames";
 import { MAX_ROUTE_NAME_CHARACTERS, validateOfficialRouteSettings } from "../officialRouteSettings";
 import { previewOfficialModels, previewUpstreamModels } from "../previewModels";
+import { validateSubagents } from "../features/subagents/state";
 import {
   previewCrashpadPendingStats,
   previewTraceLogStats,
@@ -1151,7 +1152,13 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "save_codey_config") {
-        const incoming = args.config as Config;
+        const { deletedSubagentRoles, ...incoming } = args.config as Config;
+        const subagentRoles = { ...previewConfig.subagentRoles, ...incoming.subagentRoles };
+        for (const id of deletedSubagentRoles ?? []) delete subagentRoles[id];
+        const subagentError = validateSubagents({ ...incoming, subagentRoles });
+        if (subagentError) return { status: "failed", message: subagentError };
+        const restartRequired = incoming.codexLaunchProxy !== previewConfig.codexLaunchProxy
+          || Object.keys(subagentRoles).some(id => !previewConfig.subagentRoles[id]);
         for (const profile of incoming.profiles) {
           const error = profile.authMode === "officialAccount"
             ? ""
@@ -1163,6 +1170,7 @@ if (import.meta.env.DEV) {
         }
         previewConfig = {
           ...incoming,
+          subagentRoles,
           profiles: incoming.profiles.map((profile) => ({
             ...profile,
             apiKey: profile.clearApiKey ? "" : profile.apiKey,
@@ -1190,7 +1198,7 @@ if (import.meta.env.DEV) {
             userConfigured: false,
             detectionFailed: false,
           },
-          restartRequired: false,
+          restartRequired,
         };
       }
       if (command === "sync_current_provider") {

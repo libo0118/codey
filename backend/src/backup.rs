@@ -84,11 +84,7 @@ fn validate(config: &CodeyConfig) -> Result<(), String> {
         .map_err(|_| "备份中的线路配置无效")?;
     if !crate::config::SUBAGENT_REASONING_EFFORTS
         .contains(&config.subagent_reasoning_effort.as_str())
-        || config.subagent_roles.iter().any(|(role, selection)| {
-            !crate::config::SUBAGENT_ROLE_IDS.contains(&role.as_str())
-                || !crate::config::SUBAGENT_REASONING_EFFORTS
-                    .contains(&selection.reasoning_effort.as_str())
-        })
+        || crate::config::validate_subagent_roles(&config.subagent_roles).is_err()
     {
         return Err("备份中的子代理配置无效".into());
     }

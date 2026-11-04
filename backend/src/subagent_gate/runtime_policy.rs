@@ -17,10 +17,33 @@ use super::{
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct RuntimeSubagentPolicy {
-    pub(super) schema_version: u32,
-    pub(super) roles: BTreeMap<String, crate::config::SubagentRoleConfig>,
-    pub(super) runtime_agent_hashes: BTreeMap<String, String>,
+pub(crate) struct RuntimeSubagentPolicy {
+    pub(crate) schema_version: u32,
+    pub(crate) roles: BTreeMap<String, crate::config::SubagentRoleConfig>,
+    pub(crate) runtime_agent_hashes: BTreeMap<String, String>,
+}
+
+pub(crate) fn load_runtime_subagent_policy(
+    state_root: &Path,
+) -> Result<Option<RuntimeSubagentPolicy>> {
+    anyhow::ensure!(
+        read_optional_runtime_policy_file(&state_root.join(RUNTIME_SUBAGENT_POLICY_PENDING_FILE))?
+            .is_none(),
+        "Codey 子代理角色策略正在切换，暂时拒绝派发"
+    );
+    let Some(bytes) =
+        read_optional_runtime_policy_file(&state_root.join(RUNTIME_SUBAGENT_POLICY_FILE))?
+    else {
+        return Ok(None);
+    };
+    let policy: RuntimeSubagentPolicy =
+        serde_json::from_slice(&bytes).context("无法读取 Codey 子代理运行时策略")?;
+    anyhow::ensure!(
+        policy.schema_version == RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION,
+        "子代理运行时策略版本不受支持"
+    );
+    crate::config::validate_subagent_roles(&policy.roles).map_err(anyhow::Error::msg)?;
+    Ok(Some(policy))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,7 +137,8 @@ pub(super) fn read_optional_runtime_policy_file(path: &Path) -> Result<Option<Ve
         "Codey 子代理运行时策略状态不是可信普通文件：{}",
         path.display()
     );
-    crate::fs_util::read_bounded(path, 256 * 1024)
+    // 38 roles at the field byte limits can exceed 256 KiB after JSON escaping.
+    crate::fs_util::read_bounded(path, 2 * 1024 * 1024)
         .map(Some)
         .with_context(|| format!("读取 Codey 子代理运行时策略状态失败：{}", path.display()))
 }

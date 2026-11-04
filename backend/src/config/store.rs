@@ -73,6 +73,7 @@ impl ConfigStore {
     }
 
     pub(crate) fn persist(&self, config: CodeyConfig) -> Result<CodeyConfig> {
+        super::validate_subagent_roles(&config.subagent_roles).map_err(anyhow::Error::msg)?;
         let config = config.normalize();
         let bytes = serde_json::to_vec_pretty(&config)?;
         self.rotate_backups_best_effort(&bytes);
@@ -180,5 +181,12 @@ pub(super) fn parse_config_contents(contents: &str, path: &Path) -> Result<Codey
     // explicit marker probe (a second full JSON parse) was redundant.
     let config = serde_json::from_str::<CodeyConfig>(contents)
         .with_context(|| format!("解析 Codey 配置失败：{}", path.display()))?;
+    let custom_roles = config
+        .subagent_roles
+        .iter()
+        .filter(|(role, _)| !super::SUBAGENT_ROLE_IDS.contains(&role.as_str()))
+        .map(|(role, selection)| (role.clone(), selection.clone()))
+        .collect();
+    super::validate_subagent_roles(&custom_roles).map_err(anyhow::Error::msg)?;
     Ok(config.normalize())
 }

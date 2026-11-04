@@ -25,7 +25,8 @@ mod tests;
 use runtime_policy::{RuntimeSubagentPolicy, read_optional_runtime_policy_file};
 pub(crate) use runtime_policy::{
     begin_runtime_subagent_policy_update, clear_runtime_subagent_policy,
-    commit_runtime_subagent_policy, runtime_subagent_policy_matches, runtime_subagent_policy_paths,
+    commit_runtime_subagent_policy, load_runtime_subagent_policy, runtime_subagent_policy_matches,
+    runtime_subagent_policy_paths,
 };
 use state::*;
 pub(crate) use sweep::spawn_stale_session_state_sweep;

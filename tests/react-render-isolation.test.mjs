@@ -25,6 +25,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
         "OperationsPanel.tsx",
         "ModelSection.tsx",
         "FeaturePolicyCard.tsx",
+        "NetworkProxyPage.tsx",
       ].map((file) => readFile(new URL(`src/${file}`, root), "utf8")),
     ).then((sources) => sources.join("\n")),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
@@ -84,7 +85,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /OpenAI Chat Completions/);
   assert.match(sections, /Anthropic Messages/);
   assert.doesNotMatch(sections, /route-auth-mode-label/);
-  assert.equal(sections.match(/<Select\s/g)?.length, 3);
+  assert.equal(sections.match(/<Select\s/g)?.length, 4);
   assert.equal(sections.match(/<ModelCombobox\s/g)?.length, 2);
   assert.doesNotMatch(sections, /<select/);
   assert.match(sections, /visibleProfiles\.map\(\(profile\) =>/);
@@ -129,6 +130,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
     "OperationsPanel",
     "ModelSection",
     "FeaturePolicyCard",
+    "NetworkProxyPage",
   ]) {
     assert.match(sections, new RegExp(`export const ${component} = memo\\(`));
   }

@@ -211,10 +211,10 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
         let lease = lease.as_ref().expect("active role lease");
         // Saved settings can have pending edits. Preserve the settings currently
         // attested by this lease rather than applying the next launch's settings.
-        let applied_roles = SUBAGENT_ROLE_IDS
+        let applied_roles = registered_roles_for_lease(lease)
             .into_iter()
             .map(|role| {
-                let selection = lease.subagent_roles.get(role).cloned().unwrap_or_else(|| {
+                let selection = lease.subagent_roles.get(&role).cloned().unwrap_or_else(|| {
                     let mut disabled = SubagentRoleConfig::new(
                         &lease.subagent_model,
                         &lease.subagent_reasoning_effort,
@@ -222,7 +222,7 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
                     disabled.enabled = false;
                     disabled
                 });
-                (role.to_string(), selection)
+                (role, selection)
             })
             .collect();
         let applied = CodeyConfig {

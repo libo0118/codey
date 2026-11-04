@@ -96,8 +96,8 @@ use crate::codex_provider;
 use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
     CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, MAX_ROUTE_NAME_CHARS,
-    PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig, validate_provider_profiles,
+    PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT, SubagentRoleConfig,
+    validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -1756,6 +1756,7 @@ struct CodeyConfigSaveInput {
     subagent_roles_present: bool,
     subagent_model_present: bool,
     subagent_reasoning_effort_present: bool,
+    deleted_subagent_roles: Vec<String>,
     misc_model_present: bool,
 }
 
@@ -1773,6 +1774,7 @@ impl CodeyConfigSaveInput {
             subagent_roles_present: true,
             subagent_model_present: true,
             subagent_reasoning_effort_present: true,
+            deleted_subagent_roles: Vec::new(),
             misc_model_present: true,
         }
     }
@@ -1797,6 +1799,12 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let subagent_model_present = fields.contains_key("subagentModel");
     let subagent_reasoning_effort_present = fields.contains_key("subagentReasoningEffort");
     let misc_model_present = fields.contains_key("miscModel");
+    let deleted_subagent_roles = fields
+        .get("deletedSubagentRoles")
+        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+        .transpose()
+        .map_err(|_| "参数 deletedSubagentRoles 无效：必须是字符串数组".to_string())?
+        .unwrap_or_default();
     let config = serde_json::from_value(config_value)
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
@@ -1810,6 +1818,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
+        deleted_subagent_roles,
         misc_model_present,
     })
 }
@@ -1849,12 +1858,21 @@ async fn save_codey_config_locked(
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
+        deleted_subagent_roles,
         misc_model_present,
     } = input;
     let previous = state.config.read().await.clone();
     if config_input.settings_revision != previous.settings_revision {
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
     }
+    // Validate raw role updates and explicit deletions before normalization or any side effects.
+    let merged_subagent_roles = crate::config::merge_subagent_role_updates(
+        &previous.subagent_roles,
+        &config_input.subagent_roles,
+        &deleted_subagent_roles,
+    )?;
+    crate::codex_config::validate_custom_subagent_role_conflicts(&merged_subagent_roles)
+        .map_err(|error| format!("子代理配置无效：{error:#}"))?;
     let mut config = previous.clone();
     config.remember_model_aliases();
     config.profiles = merge_profile_secrets(config_input.profiles, &previous)?;
@@ -2005,22 +2023,20 @@ async fn save_codey_config_locked(
             .contains_key(SUBAGENT_ROLE_DEFAULT);
     if subagent_roles_present && !config_input.subagent_roles.is_empty() {
         for (role, selection) in config_input.subagent_roles {
-            if SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
-                let selection_changed = config.subagent_roles.get(&role).is_none_or(|previous| {
-                    previous.enabled != selection.enabled
-                        || !model_id::equal(&previous.model, &selection.model)
-                        || !previous
-                            .reasoning_effort
-                            .trim()
-                            .eq_ignore_ascii_case(selection.reasoning_effort.trim())
-                });
-                if selection_changed {
-                    explicitly_configured_subagent_models.push(selection.model.clone());
-                }
-                config.subagent_roles.insert(role, selection);
+            let selection_changed = previous.subagent_roles.get(&role).is_none_or(|previous| {
+                previous.enabled != selection.enabled
+                    || !model_id::equal(&previous.model, &selection.model)
+                    || !previous
+                        .reasoning_effort
+                        .trim()
+                        .eq_ignore_ascii_case(selection.reasoning_effort.trim())
+            });
+            if selection_changed {
+                explicitly_configured_subagent_models.push(selection.model.clone());
             }
         }
     }
+    config.subagent_roles = merged_subagent_roles;
     if !default_role_supplied && (subagent_model_present || subagent_reasoning_effort_present) {
         let fallback_model = config.subagent_model.clone();
         let fallback_effort = config.subagent_reasoning_effort.clone();
@@ -2820,6 +2836,9 @@ async fn hot_reload_runtime_subagent_config_locked(
 
 #[cfg(test)]
 mod subagent_hot_reload_commit_tests;
+
+#[cfg(test)]
+mod custom_subagent_tests;
 
 #[cfg(test)]
 mod slow_apply_tests;

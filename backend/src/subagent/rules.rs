@@ -107,6 +107,27 @@ pub(crate) struct RuleDecision {
 }
 
 impl RuleSet {
+    // Runtime roles come only from the validated Codey policy, not dynamic rule JSON.
+    pub(crate) fn register_runtime_role(&mut self, role: &str) {
+        if self.roles.contains_key(role) {
+            return;
+        }
+        self.roles.insert(
+            role.to_string(),
+            RolePolicy {
+                access: "write".into(),
+                visual: true,
+            },
+        );
+        if let Some(rule) = self
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "allow-role-capabilities")
+        {
+            rule.roles.push(role.to_string());
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.schema_version == RULE_SCHEMA_VERSION,

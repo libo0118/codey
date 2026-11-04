@@ -30,6 +30,56 @@ fn backup_roundtrip_preserves_credentials_and_preferences() {
 }
 
 #[test]
+fn old_backups_remain_compatible_and_custom_roles_restore_as_a_complete_matrix() {
+    let mut config = configured();
+    let custom: crate::config::SubagentRoleConfig = serde_json::from_value(json!({
+        "name":"检查", "description":"用途", "developerInstructions":"返回证据", "access":"readOnly",
+        "model":"provider/model", "reasoningEffort":"ultra"
+    })).unwrap();
+    config
+        .subagent_roles
+        .insert("custom_agent_1".into(), custom);
+    let backup = parse(&export(config.clone()).unwrap()).unwrap();
+    assert_eq!(backup.summary(3)["settingsRevision"], 3);
+    let mut previous = configured();
+    previous.subagent_roles.insert(
+        "custom_agent_2".into(),
+        config.subagent_roles["custom_agent_1"].clone(),
+    );
+    let restored = backup.prepare(&previous).unwrap();
+    assert_eq!(
+        restored.subagent_roles["custom_agent_1"],
+        config.subagent_roles["custom_agent_1"]
+    );
+    assert!(!restored.subagent_roles.contains_key("custom_agent_2"));
+    let mut legacy: Value = serde_json::from_str(&export(configured()).unwrap()).unwrap();
+    for role in legacy["config"]["subagentRoles"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        for field in ["name", "description", "developerInstructions", "access"] {
+            role.as_object_mut().unwrap().remove(field);
+        }
+    }
+    let legacy = parse(&legacy.to_string())
+        .unwrap()
+        .prepare(&previous)
+        .unwrap();
+    assert!(
+        legacy
+            .subagent_roles
+            .values()
+            .all(|role| role.access == Some(crate::config::SubagentAccess::ReadWrite))
+    );
+    assert!(!legacy.subagent_roles.contains_key("custom_agent_2"));
+    let mut invalid: Value = serde_json::from_str(&export(config).unwrap()).unwrap();
+    invalid["config"]["subagentRoles"]["custom_agent_1"]["developerInstructions"] =
+        json!("x".repeat(4001));
+    assert!(parse(&invalid.to_string()).is_err());
+}
+
+#[test]
 fn invalid_and_incompatible_backups_fail_without_echoing_input() {
     for content in ["", "test-backup-secret", "{}", "[]"] {
         assert!(parse(content).is_err());

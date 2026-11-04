@@ -16,6 +16,24 @@ pub(super) fn refresh_runtime_subagent_roles_at(
     marker: &Path,
     remote_compaction_models: Option<&HashSet<String>>,
 ) -> Result<()> {
+    refresh_runtime_subagent_roles_with_commit(
+        config,
+        marker,
+        remote_compaction_models,
+        crate::subagent_gate::commit_runtime_subagent_policy,
+    )
+}
+
+pub(super) fn refresh_runtime_subagent_roles_with_commit(
+    config: &CodeyConfig,
+    marker: &Path,
+    remote_compaction_models: Option<&HashSet<String>>,
+    commit_policy: impl FnOnce(
+        &Path,
+        &BTreeMap<String, SubagentRoleConfig>,
+        &BTreeMap<String, String>,
+    ) -> Result<()>,
+) -> Result<()> {
     anyhow::ensure!(
         config.subagent_optimization,
         "当前 Codey 配置未启用子代理协作优化"
@@ -30,6 +48,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(
     );
 
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
+    ensure_managed_runtime_path(&constraints_dir, &constraints_dir)?;
     create_private_dir_all(&constraints_dir)?;
     let runtime_roles = runtime_subagent_roles(
         Some(&config.subagent_roles),
@@ -53,7 +72,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(
     .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;
     let expected_hashes = runtime_agent_plan_hashes(&plans);
     let runtime_home = runtime_home_for_lease(&state);
-    let mut snapshots = snapshot_runtime_agent_files(&constraints_dir)?;
+    let mut snapshots = snapshot_runtime_agent_files(&constraints_dir, &registration_roles)?;
     let (runtime_policy_path, runtime_policy_pending_path) =
         crate::subagent_gate::runtime_subagent_policy_paths(&runtime_home);
     snapshots.push(RuntimeAgentFileSnapshot {
@@ -91,11 +110,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(
         state.runtime_agent_hashes.clone_from(&expected_hashes);
         state.remote_compaction_models = remote_compaction_models.cloned().unwrap_or_default();
         write_lease(marker, &state)?;
-        crate::subagent_gate::commit_runtime_subagent_policy(
-            &runtime_home,
-            &runtime_roles,
-            &expected_hashes,
-        )
+        commit_policy(&runtime_home, &runtime_roles, &expected_hashes)
     })();
 
     if let Err(error) = update {
@@ -111,11 +126,15 @@ pub(super) fn refresh_runtime_subagent_roles_at(
     Ok(())
 }
 
-fn snapshot_runtime_agent_files(constraints_dir: &Path) -> Result<Vec<RuntimeAgentFileSnapshot>> {
-    SUBAGENT_ROLE_IDS
-        .into_iter()
+fn snapshot_runtime_agent_files(
+    constraints_dir: &Path,
+    roles: &BTreeMap<String, SubagentRoleConfig>,
+) -> Result<Vec<RuntimeAgentFileSnapshot>> {
+    roles
+        .keys()
         .map(|role| {
             let path = runtime_agent_path(constraints_dir, role);
+            ensure_managed_runtime_path(constraints_dir, &path)?;
             let contents = read_optional(&path)?;
             Ok(RuntimeAgentFileSnapshot { path, contents })
         })

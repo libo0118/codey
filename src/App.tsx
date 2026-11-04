@@ -19,6 +19,8 @@ import { useDraftConfig } from "./useDraftConfig";
 import { ModelPickerDialog } from "./AppDialogs";
 import { SystemSettingsDialog } from "./SystemSettingsDialog";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
+import { NetworkProxyPage } from "./NetworkProxyPage";
+import { validateSubagents } from "./features/subagents/state";
 import { ModelSection } from "./ModelSection";
 import { UsageAnalysisHeader, UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
@@ -434,6 +436,8 @@ export function App({
   }
 
   async function persist(next: Config) {
+    const subagentError = validateSubagents(next);
+    if (subagentError) throw new Error(subagentError);
     const submittedDraft = config;
     const result = await invoke<{
       config: Config;
@@ -479,6 +483,10 @@ export function App({
     successText: string,
   ) {
     if (isBusy) return false;
+    if (dirty) {
+      setNotice({ tone: "error", text: "请先保存或放弃当前设置更改，再调整通知渠道。" });
+      return false;
+    }
     setBusy("save-notification-channel");
     try {
       const result = await persist({
@@ -1054,7 +1062,8 @@ export function App({
       action: "restart",
       title: "重启 Codex？",
       description:
-        "当前 Codex 客户端将被关闭并由 Codey 自动重新拉起，正在执行的本地任务会被中断。",
+        "当前 Codex 客户端将被关闭并由 Codey 自动重新拉起，正在执行的本地任务会被中断。"
+        + (dirty ? "重启前还会保存当前所有未保存的设置更改。" : ""),
       confirmLabel: "重启 Codex",
       run: () => void restartCodex(),
     });
@@ -1719,8 +1728,10 @@ export function App({
               subagentModelOptions={subagentModelOptions}
               onConfigChange={handleConfigChange}
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
+              onRequestConfirmation={setConfirmation}
             />
           ),
+          networkProxy: <NetworkProxyPage config={config} isBusy={isBusy} onConfigChange={handleConfigChange} />,
           remote: (active) => <RemoteControlPanel active={active} isBusy={isBusy} container={popupContainer} />,
           sessions: (active) => <SessionsPage active={active} isBusy={isBusy} onRestart={handleRestartCodex} container={popupContainer} />,
           backup: (active) => <BackupPage active={active} isBusy={isBusy} dirty={dirty} setBusy={setBusy} container={popupContainer}

@@ -501,7 +501,9 @@
 
 .subagent-role-switch-wrap {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 6px;
 }
 
 .subagent-control-group {
@@ -552,6 +554,65 @@
   .subagent-control-label {
     display: block;
     width: 56px;
+  }
+}
+
+.subagent-role-item--custom {
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.35fr) 130px 82px;
+  row-gap: 16px;
+}
+
+.subagent-role-item--custom .subagent-role-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-custom-fields {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--codey-border-subtle);
+}
+
+.subagent-custom-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.subagent-custom-field > label {
+  color: var(--codey-muted);
+  font-weight: 550;
+}
+
+.subagent-custom-field--wide {
+  grid-column: 1 / -1;
+}
+
+.subagent-custom-empty {
+  margin: 0;
+  padding: 18px;
+  color: var(--codey-muted);
+  font-size: 12px;
+}
+
+.subagent-field-error {
+  color: var(--codey-red, #d70015);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+@container settings-content (max-width: 640px) {
+  .subagent-role-item--custom {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .subagent-custom-fields {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

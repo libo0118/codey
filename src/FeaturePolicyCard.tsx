@@ -5,17 +5,17 @@ import {
   IconFocus2,
   IconHelpCircle,
   IconInfoCircle,
-  IconNetwork,
   IconPhotoSearch,
+  IconPlus,
   IconTerminal2,
+  IconTrash,
   IconUsersGroup,
   IconWorldSearch,
-  IconX,
 } from "@tabler/icons-react";
 
 import type {
   Config,
-  SubagentRoleId,
+  Confirmation,
 } from "./App.types";
 import {
   Button,
@@ -23,19 +23,20 @@ import {
   Input,
   Select,
   Switch,
+  TextArea,
   Tooltip,
 } from "./components/ui";
 import { ModelCombobox } from "./components/ModelCombobox";
-import { routeProviderId } from "./modelRoutes";
 import {
   resolveSubagentModelOption,
   type SubagentModelOption,
 } from "./subagentModels";
 import { SettingsPageHeader } from "./SettingsPageHeader";
-import { validateCodexLaunchProxy } from "./urlValidation";
 import type { DiagnosticStorageTarget } from "./diagnosticStorage";
 import { NotificationChannelsCard } from "./notifications/NotificationChannelsCard";
 import type { NotificationChannel } from "./notifications/types";
+import { BUILTIN_SUBAGENT_ROLES, CUSTOM_SUBAGENT_FIELDS, enabledSubagentCount, isCustomSubagent, subagentSelection } from "./features/subagents/state";
+import { useSubagentsController } from "./features/subagents/useSubagentsController";
 
 const GPU_LAUNCH_MODES = [
   { value: "off", label: "关闭" },
@@ -46,6 +47,8 @@ const GPU_LAUNCH_MODES = [
   label: string;
 }>;
 const REASONING_EFFORT_LABELS: Record<string, string> = {
+  none: "无",
+  minimal: "最低",
   low: "低",
   medium: "中",
   high: "高",
@@ -59,49 +62,8 @@ const DEFAULT_SUBAGENT_TASK = {
   icon: IconUsersGroup,
   description: "未指定专用角色时使用的模型与思考深度。",
 } as const;
-const SUBAGENT_TASK_TYPES = [
-  {
-    id: "codey_quick_scan",
-    name: "快速定位",
-    kind: "analysis",
-    icon: IconFocus2,
-    description: "用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
-  },
-  {
-    id: "codey_deep_research",
-    name: "深度检索",
-    kind: "analysis",
-    icon: IconWorldSearch,
-    description: "用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
-  },
-  {
-    id: "codey_visual_analysis",
-    name: "界面核验",
-    kind: "analysis",
-    icon: IconPhotoSearch,
-    description: "用于截图、页面、GUI、PDF 的视觉证据观察，以及前端改动的独立核验。",
-  },
-  {
-    id: "codey_worker",
-    name: "逻辑开发",
-    kind: "implementation",
-    icon: IconTerminal2,
-    description: "用于后端、数据、算法、命令行和脚本等不改变可见界面的逻辑实现。",
-  },
-  {
-    id: "codey_visual_worker",
-    name: "前端开发",
-    kind: "implementation",
-    icon: IconDeviceDesktopCode,
-    description: "用于界面、布局、样式与交互实现，客户端可截图时附渲染证据。",
-  },
-] as const satisfies ReadonlyArray<{
-  id: SubagentRoleId;
-  name: string;
-  kind: "analysis" | "implementation";
-  icon: typeof IconFocus2;
-  description: string;
-}>;
+const ROLE_ICONS = [IconFocus2, IconWorldSearch, IconPhotoSearch, IconTerminal2, IconDeviceDesktopCode];
+const SUBAGENT_TASK_TYPES = BUILTIN_SUBAGENT_ROLES.map((task, index) => ({ ...task, icon: ROLE_ICONS[index] }));
 
 export type SubagentPolicyCardProps = {
   config: Config;
@@ -109,6 +71,7 @@ export type SubagentPolicyCardProps = {
   subagentModelOptions: SubagentModelOption[];
   onConfigChange: (config: Config) => void;
   onSubagentOptimizationChange: (checked: boolean) => void;
+  onRequestConfirmation: (confirmation: Confirmation) => void;
 };
 
 export function SubagentPolicyCardComponent({
@@ -117,17 +80,13 @@ export function SubagentPolicyCardComponent({
   subagentModelOptions,
   onConfigChange,
   onSubagentOptimizationChange,
+  onRequestConfirmation,
 }: SubagentPolicyCardProps) {
+  const controller = useSubagentsController({ config, isBusy, subagentModelOptions, onConfigChange });
   const subagentPolicyControlsDisabled = isBusy;
-  const preferredProfile =
-    config.profiles.find((profile) => profile.id === config.activeProfileId) ??
-    config.profiles[0];
-  const preferredProviderId = preferredProfile
-    ? routeProviderId(preferredProfile)
-    : undefined;
-  const enabledRoleCount = SUBAGENT_TASK_TYPES.filter(
-    ({ id }) => config.subagentRoles[id]?.enabled !== false,
-  ).length;
+  const preferredProviderId = controller.preferredProviderId;
+  const enabledRoleCount = enabledSubagentCount(config);
+  const customRoles = Object.keys(config.subagentRoles).filter(isCustomSubagent);
   const analysisTasks = SUBAGENT_TASK_TYPES.filter(
     (task) => task.kind === "analysis",
   );
@@ -142,15 +101,12 @@ export function SubagentPolicyCardComponent({
   ).length;
 
   const renderRoleCard = (
-    task: (typeof SUBAGENT_TASK_TYPES)[number] | typeof DEFAULT_SUBAGENT_TASK,
+    task: { id: string; name: string; icon: typeof IconUsersGroup; description: string },
   ) => {
     const isDefaultRole = task.id === "default";
+    const custom = isCustomSubagent(task.id);
     const TaskIcon = task.icon;
-    const selection = config.subagentRoles[task.id] ?? {
-      enabled: true,
-      model: config.subagentModel,
-      reasoningEffort: config.subagentReasoningEffort,
-    };
+    const selection = subagentSelection(config, task.id);
     const selectedModel = resolveSubagentModelOption(
       subagentModelOptions,
       selection.model,
@@ -161,22 +117,7 @@ export function SubagentPolicyCardComponent({
       label: REASONING_EFFORT_LABELS[effort] ?? effort,
       value: effort,
     }));
-    const updateRole = (next: Partial<typeof selection>) => {
-      const nextSelection = { ...selection, ...next };
-      onConfigChange({
-        ...config,
-        ...(isDefaultRole
-          ? {
-              subagentModel: nextSelection.model,
-              subagentReasoningEffort: nextSelection.reasoningEffort,
-            }
-          : {}),
-        subagentRoles: {
-          ...config.subagentRoles,
-          [task.id]: nextSelection,
-        },
-      });
-    };
+    const updateRole = (next: Partial<typeof selection>) => controller.updateRole(task.id, next);
     const roleDisabled = !isDefaultRole && !selection.enabled;
     const isSingleEnabledRole = selection.enabled && enabledRoleCount <= 1;
 
@@ -184,13 +125,13 @@ export function SubagentPolicyCardComponent({
       <div
         key={task.id}
         id={task.id}
-        className={`subagent-role-item ${
+        className={`subagent-role-item ${custom ? "subagent-role-item--custom" : ""} ${
           roleDisabled ? "subagent-role-disabled" : ""
         }`}
       >
         <div className="subagent-role-identity">
           <div
-            className={`subagent-role-icon-box subagent-role-icon-box--${task.id}`}
+            className={`subagent-role-icon-box subagent-role-icon-box--${custom ? "default" : task.id}`}
           >
             <TaskIcon size={18} stroke={1.9} aria-hidden="true" />
           </div>
@@ -231,22 +172,7 @@ export function SubagentPolicyCardComponent({
               }
               options={subagentModelOptions}
               preferredProviderId={preferredProviderId}
-              onChange={(value) => {
-                const option = subagentModelOptions.find(
-                  (candidate) => candidate.value === value,
-                );
-                if (!option) return;
-                const reasoningEffort =
-                  option.supportedReasoningEfforts.includes(
-                    selection.reasoningEffort,
-                  )
-                    ? selection.reasoningEffort
-                    : option.defaultReasoningEffort;
-                updateRole({
-                  model: option.value,
-                  reasoningEffort,
-                });
-              }}
+              onChange={(value) => controller.changeModel(task.id, value)}
             />
           </div>
         </div>
@@ -280,6 +206,24 @@ export function SubagentPolicyCardComponent({
           </div>
         </div>
         <div className="subagent-role-switch-wrap">
+          {custom && (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              disabled={isBusy || isSingleEnabledRole}
+              title={isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : `删除${task.name}`}
+              aria-label={`删除${task.name}`}
+              onClick={() => onRequestConfirmation({
+                action: "delete-subagent",
+                title: `删除子代理「${task.name}」？`,
+                description: "将从当前配置移除这个自定义角色。点击侧栏“保存更改”后生效；保存前可放弃全部更改以恢复。",
+                confirmLabel: "删除子代理",
+                run: () => controller.removeRole(task.id),
+              })}
+            >
+              <IconTrash size={15} aria-hidden="true" />
+            </Button>
+          )}
           {!isDefaultRole && (
             <span
               title={
@@ -297,6 +241,49 @@ export function SubagentPolicyCardComponent({
             </span>
           )}
         </div>
+        {custom && (
+          <div className="subagent-custom-fields">
+            {CUSTOM_SUBAGENT_FIELDS.map(({ key, label, limit }) => {
+              const value = selection[key] ?? "";
+              const bytes = new TextEncoder().encode(value).length;
+              const fieldId = `${task.id}-${key}`;
+              const invalid = !value.trim() || bytes > limit;
+              const fieldProps = {
+                id: fieldId,
+                value,
+                disabled: isBusy,
+                "aria-label": `${task.name}${label}`,
+                "aria-invalid": invalid,
+                "aria-describedby": `${fieldId}-hint`,
+                onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => updateRole({ [key]: event.target.value }),
+              };
+              return (
+                <div key={key} className={`subagent-custom-field ${key === "developerInstructions" ? "subagent-custom-field--wide" : ""}`}>
+                  <label htmlFor={fieldId}>{label}</label>
+                  {key === "developerInstructions" ? <TextArea {...fieldProps} rows={3} /> : <Input {...fieldProps} />}
+                  <small id={`${fieldId}-hint`} className={invalid ? "subagent-field-error" : "field-hint"}>
+                    {bytes} / {limit} 字节{invalid ? " · 必填且不能超限" : ""}
+                  </small>
+                </div>
+              );
+            })}
+            <div className="subagent-custom-field subagent-custom-field--wide">
+              <label id={`${task.id}-access-label`}>读写能力</label>
+              <Select
+                aria-labelledby={`${task.id}-access-label`}
+                aria-label={`${task.name}读写能力`}
+                value={selection.access ?? "readOnly"}
+                disabled={isBusy || roleDisabled}
+                filter={false}
+                optionList={[{ value: "readOnly", label: "只读" }, { value: "readWrite", label: "可读写" }]}
+                onChange={(value) => {
+                  if (value === "readOnly" || value === "readWrite") updateRole({ access: value });
+                }}
+              />
+              <small className="field-hint">受父任务权限与工具门禁约束，不提供独立安全沙箱；角色指令不能提升权限。</small>
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -308,7 +295,7 @@ export function SubagentPolicyCardComponent({
           id="subagent-title"
           title="子代理优化"
           icon={<IconUsersGroup size={15} />}
-          description="基于 Codex 原生子代理的多角色调度与模型配置。"
+          description="保留默认与五类内置角色，按任务添加自己的子代理。"
           actions={
             <Switch
               checked={config.subagentOptimization}
@@ -378,6 +365,30 @@ export function SubagentPolicyCardComponent({
                 </div>
               </div>
 
+              <div className="subagent-group-card subagent-custom-group codey-card">
+                <div className="subagent-group-header">
+                  <div className="subagent-group-title-wrap">
+                    <span className="subagent-group-title">自定义子代理</span>
+                    <span className="subagent-stat-badge subagent-stat-badge--readonly">
+                      已启用 {customRoles.filter(id => config.subagentRoles[id].enabled).length} / {customRoles.length}
+                    </span>
+                  </div>
+                  <Button size="sm" disabled={isBusy || customRoles.length >= 32} onClick={controller.addRole}>
+                    <IconPlus size={15} aria-hidden="true" />添加子代理
+                  </Button>
+                </div>
+                <div className="subagent-group-items">
+                  {customRoles.length ? customRoles.map(id => renderRoleCard({
+                    id,
+                    name: config.subagentRoles[id].name || "未命名子代理",
+                    description: config.subagentRoles[id].description || "请填写角色用途，帮助主代理选择合适的角色。",
+                    icon: IconUsersGroup,
+                  })) : (
+                    <p className="subagent-custom-empty">最多添加 32 个专项角色，默认只读；修改后点击侧栏“保存更改”。</p>
+                  )}
+                </div>
+              </div>
+              {controller.error && <p role="alert" className="subagent-field-error">{controller.error}</p>}
               <div className="subagent-policy-callout">
                 <IconInfoCircle
                   size={16}
@@ -387,7 +398,8 @@ export function SubagentPolicyCardComponent({
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : "各角色工具权限一致，按任务分工选择模型。角色启停、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；实际操作受父任务权限约束。"}
+                    : "角色启停、读写能力、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；停用或删除不会中止已运行任务。"}
+                  {" "}自定义角色由 Codey 管理，仅供通过 Codey 启动的 Codex 加载；新增角色需保存并重启 Codex。配置随 Codey 备份保存，实际操作不越过父任务权限。
                 </div>
               </div>
             </>
@@ -398,7 +410,7 @@ export function SubagentPolicyCardComponent({
               </div>
               <div className="module-disabled-text">
                 <strong>子代理优化已关闭</strong>
-                <p>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁。</p>
+                <p>开启后选择性委派给五类内置角色或自定义角色，并分别配置模型与思考深度。</p>
               </div>
             </div>
           )}
@@ -427,29 +439,6 @@ type FeaturePolicyCardProps = {
   onRequestRemoveChannel?: (channel: NotificationChannel) => void;
 };
 
-const LAUNCH_PROXY_TOOLTIP_CONTENT = (
-  <div className="space-y-1.5 text-xs text-left leading-relaxed">
-    <div className="font-semibold">Codex 启动代理格式与说明</div>
-    <div>
-      支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
-    </div>
-    <div>
-      限制说明：认证可用 http://用户名:密码@主机:端口 形式；SOCKS 代理必须指定端口；https:// 表示用 TLS 连接代理本身。
-    </div>
-    <div className="pt-0.5">
-      <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
-      <div className="mt-0.5 space-y-0.5 font-mono text-[11px] opacity-90">
-        <div>http://127.0.0.1:7890</div>
-        <div>http://user:pass@127.0.0.1:7890</div>
-        <div>socks5://127.0.0.1:1080</div>
-      </div>
-    </div>
-    <div className="border-t border-current/15 pt-1 text-[11px] opacity-80">
-      客户端与 app-server 经此代理访问网络，重启 Codex 后生效；本地路由与额度查询不受影响。
-    </div>
-  </div>
-);
-
 function FeaturePolicyCardComponent({
   config,
   isMacClient,
@@ -463,8 +452,6 @@ function FeaturePolicyCardComponent({
   onChannelChange,
   onRequestRemoveChannel,
 }: FeaturePolicyCardProps) {
-  const launchProxy = config.codexLaunchProxy ?? "";
-  const launchProxyError = validateCodexLaunchProxy(launchProxy);
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
@@ -476,88 +463,6 @@ function FeaturePolicyCardComponent({
 
   return (
     <>
-      <section className="secondary-section launch-proxy-section" aria-labelledby="launch-proxy-title">
-        <div className="feature-policy-heading">
-          <div className="flex items-center gap-2">
-            <span className="section-title-icon" aria-hidden="true">
-              <IconNetwork size={14} />
-            </span>
-            <h3 id="launch-proxy-title" className="settings-section-heading">Codex 启动代理</h3>
-            <Tooltip content={LAUNCH_PROXY_TOOLTIP_CONTENT} position="top">
-              <span
-                className="inline-flex shrink-0 cursor-help items-center text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)]"
-                aria-label="Codex 启动代理格式与说明"
-              >
-                <IconHelpCircle size={14} aria-hidden="true" />
-              </span>
-            </Tooltip>
-          </div>
-          <p>客户端与 app-server 经此代理访问网络，重启 Codex 后生效；本地路由与额度查询不受影响。</p>
-        </div>
-        <div className={`feature-card launch-proxy-card ${launchProxy.trim() ? "active" : ""}`}>
-          <div className="feature-card-body launch-proxy-row">
-            <div className="launch-proxy-label">
-              <label htmlFor="codex-launch-proxy-input">代理地址</label>
-              <span
-                className={`launch-proxy-state ${
-                  launchProxyError ? "is-error" : launchProxy.trim() ? "is-active" : ""
-                }`}
-              >
-                {launchProxyError ? "格式错误" : launchProxy.trim() ? "已设置代理" : "直连"}
-              </span>
-            </div>
-            <div className="launch-proxy-field">
-            <Input
-              id="codex-launch-proxy-input"
-              aria-label="Codex 启动代理"
-              aria-invalid={Boolean(launchProxyError)}
-              aria-describedby={
-                launchProxyError
-                  ? "codex-launch-proxy-error"
-                  : undefined
-              }
-              value={launchProxy}
-              disabled={isBusy}
-              placeholder="留空不走代理，例如 http://127.0.0.1:7890"
-              rightSection={
-                launchProxy ? (
-                  <button
-                    type="button"
-                    className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[var(--codey-muted,#8e8e93)] hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 hover:text-[var(--codey-text,#1d1d1f)] transition-colors"
-                    onClick={() =>
-                      onConfigChange({
-                        ...config,
-                        codexLaunchProxy: "",
-                      })
-                    }
-                    aria-label="清空代理设置"
-                    title="清空代理设置"
-                  >
-                    <IconX size={12} aria-hidden="true" />
-                  </button>
-                ) : undefined
-              }
-              onChange={(event) =>
-                onConfigChange({
-                  ...config,
-                  codexLaunchProxy: event.target.value,
-                })
-              }
-            />
-            {launchProxyError ? (
-              <small
-                id="codex-launch-proxy-error"
-                className="text-[var(--codey-red,#d70015)]"
-                role="alert"
-              >
-                {launchProxyError}
-              </small>
-            ) : null}
-            </div>
-          </div>
-        </div>
-      </section>
-
       <section className="secondary-section" aria-labelledby="runtime-title">
         <div className="feature-policy-heading">
           <div className="flex items-center gap-2">

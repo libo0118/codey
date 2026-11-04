@@ -29,6 +29,7 @@ use crate::fs_util::timestamp_millis;
 use crate::local_router::{self, RuntimeRouterEndpoint};
 
 mod context_budget;
+mod custom_subagents;
 mod fastctx;
 mod fs_io;
 mod repair;
@@ -36,6 +37,11 @@ mod runtime_role_transaction;
 
 pub(crate) use repair::{ConfigRepairFailure, repair_codex_config};
 
+pub(crate) use custom_subagents::validate_custom_subagent_role_conflicts;
+use custom_subagents::{
+    custom_agent_header, ensure_managed_runtime_agent_file, ensure_managed_runtime_path,
+    validate_custom_roles_against_document, validate_native_agent_files,
+};
 use fastctx::{
     apply_fastctx_guidance_to_table, arguments_have_codey_fastctx_marker,
     disable_fast_context_tools, enable_fast_context_tools, fast_context_tools_status_from_document,
@@ -451,6 +457,11 @@ fn apply_isolated_runtime_router_config(
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
     let persistent = parse_document(existing).context("解析 Codex config.toml 失败")?;
+    if subagent_optimization && let Some(roles) = subagent_roles {
+        crate::config::validate_subagent_roles(roles).map_err(anyhow::Error::msg)?;
+        validate_custom_roles_against_document(roles, &persistent)?;
+        validate_native_agent_files(home, roles)?;
+    }
     if local_router.is_some() && user_owned_router_provider_occupies_id(&persistent) {
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
@@ -507,6 +518,7 @@ fn apply_isolated_runtime_router_config(
         .then_some(CODEY_FASTCTX_NAMESPACE);
 
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
+    ensure_managed_runtime_path(&constraints_dir, &constraints_dir)?;
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
         rebuild_constraint_file(
@@ -523,6 +535,12 @@ fn apply_isolated_runtime_router_config(
         SUBAGENT_ROLE_IDS
             .into_iter()
             .map(str::to_string)
+            .chain(subagent_roles.into_iter().flat_map(|roles| {
+                roles
+                    .keys()
+                    .filter(|role| !SUBAGENT_ROLE_IDS.contains(&role.as_str()))
+                    .cloned()
+            }))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -801,15 +819,15 @@ fn runtime_subagent_roles(
         .and_then(|roles| roles.get(SUBAGENT_ROLE_DEFAULT))
         .cloned()
         .unwrap_or_else(|| SubagentRoleConfig::new(legacy_model, legacy_reasoning_effort));
-    SUBAGENT_ROLE_IDS
+    let mut roles = configured.cloned().unwrap_or_default();
+    for role in SUBAGENT_ROLE_IDS {
+        roles
+            .entry(role.to_string())
+            .or_insert_with(|| fallback.clone());
+    }
+    roles
         .into_iter()
-        .filter_map(|role| {
-            let selection = configured
-                .and_then(|roles| roles.get(role))
-                .cloned()
-                .unwrap_or_else(|| fallback.clone());
-            selection.enabled.then(|| (role.to_string(), selection))
-        })
+        .filter(|(_, selection)| selection.enabled)
         .collect()
 }
 
@@ -823,7 +841,7 @@ fn runtime_registration_roles(
     anyhow::ensure!(
         registered_roles
             .iter()
-            .all(|role| SUBAGENT_ROLE_IDS.contains(&role.as_str())),
+            .all(|role| crate::config::valid_subagent_role_id(role)),
         "Codey 子代理注册集合包含未知角色"
     );
     if enabled_roles
@@ -840,7 +858,14 @@ fn runtime_registration_roles(
     Ok(registered_roles
         .iter()
         .map(|role| {
-            let selection = enabled_roles.get(role).unwrap_or(&fallback).clone();
+            let mut selection = enabled_roles.get(role).unwrap_or(&fallback).clone();
+            if !SUBAGENT_ROLE_IDS.contains(&role.as_str()) && !enabled_roles.contains_key(role) {
+                selection.name = role.clone();
+                selection.description = "已停用的自定义子代理".into();
+                selection.developer_instructions =
+                    "角色已停用，不执行新任务；向主代理回报。".into();
+                selection.access = Some(crate::config::SubagentAccess::ReadOnly);
+            }
             (role.clone(), selection)
         })
         .collect())
@@ -869,43 +894,18 @@ fn prepare_runtime_agent_files(
     )?;
     let mut registrations = Vec::with_capacity(plans.len());
     for plan in plans {
+        ensure_managed_runtime_agent_file(
+            constraints_dir,
+            &plan.registration.config_file,
+            &plan.registration.role,
+        )?;
         if let Some(parent) = plan.registration.config_file.parent() {
             create_private_dir_all(parent)?;
         }
         atomic_write(&plan.registration.config_file, &plan.contents)?;
         registrations.push(plan.registration);
     }
-    remove_unplanned_runtime_agent_files(constraints_dir, &registrations)?;
     Ok(registrations)
-}
-
-fn remove_unplanned_runtime_agent_files(
-    constraints_dir: &Path,
-    registrations: &[RuntimeAgentRegistration],
-) -> Result<()> {
-    let active_roles = registrations
-        .iter()
-        .map(|registration| registration.role.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    for role in SUBAGENT_ROLE_IDS {
-        if active_roles.contains(role) {
-            continue;
-        }
-        let path = runtime_agent_path(constraints_dir, role);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "清理已停用的 Codey 子代理运行时文件失败：{}",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 fn plan_runtime_agent_files(
@@ -915,26 +915,36 @@ fn plan_runtime_agent_files(
     remote_compaction_models: Option<&HashSet<String>>,
 ) -> Result<Vec<RuntimeAgentPlan>> {
     let mut plans = Vec::with_capacity(roles.len());
-    for role in SUBAGENT_ROLE_IDS {
-        let Some(selection) = roles.get(role) else {
-            continue;
-        };
-        let source = subagent_source_config(role)
-            .with_context(|| format!("缺少 Codey 子代理约束模板：{role}"))?;
-        let source_path = if role == SUBAGENT_ROLE_DEFAULT {
-            constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)
-        } else {
-            constraints_dir
-                .join(CODEY_SUBAGENT_SOURCES_DIR)
-                .join(format!("{role}.toml"))
-        };
-        if let Some(parent) = source_path.parent() {
-            create_private_dir_all(parent)?;
-        }
-        rebuild_constraint_file(&source_path, source)?;
+    crate::config::validate_subagent_roles(roles).map_err(anyhow::Error::msg)?;
+    for (role, selection) in roles {
         let runtime_path = runtime_agent_path(constraints_dir, role);
+        ensure_managed_runtime_agent_file(constraints_dir, &runtime_path, role)?;
+        let source = if let Some(source) = subagent_source_config(role) {
+            let source_path = if role == SUBAGENT_ROLE_DEFAULT {
+                constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)
+            } else {
+                constraints_dir
+                    .join(CODEY_SUBAGENT_SOURCES_DIR)
+                    .join(format!("{role}.toml"))
+            };
+            ensure_managed_runtime_path(constraints_dir, &source_path)?;
+            if let Some(parent) = source_path.parent() {
+                create_private_dir_all(parent)?;
+            }
+            rebuild_constraint_file(&source_path, source)?;
+            source.to_string()
+        } else {
+            let mut source = DocumentMut::new();
+            source["description"] = value(format!(
+                "{}：{}",
+                selection.name.trim(),
+                selection.description.trim()
+            ));
+            source["developer_instructions"] = value(selection.developer_instructions.trim());
+            document_string(&source)?
+        };
         let (contents, description) = render_runtime_agent(
-            source,
+            &source,
             role,
             selection,
             fastctx_instructions,
@@ -1006,7 +1016,13 @@ fn render_runtime_agent(
         document["model_provider"] = value(local_router::ROUTER_PROVIDER_ID);
     }
     document["model_reasoning_effort"] = value(&reasoning_effort);
-    let rendered = document_string(&document)?;
+    if selection.access_for_role(role) == crate::config::SubagentAccess::ReadOnly {
+        document["sandbox_mode"] = value("read-only");
+    }
+    let mut rendered = document_string(&document)?;
+    if !SUBAGENT_ROLE_IDS.contains(&role) {
+        rendered.insert_str(0, &custom_agent_header(role));
+    }
     Ok((rendered.into_bytes(), description))
 }
 
@@ -1248,6 +1264,22 @@ fn reconcile_runtime_subagent_roles_with_compaction(
         "当前 Codex 运行时未注册 Codey 子代理任务类型，需要重启 Codex"
     );
 
+    // New roles wait for registration, without delaying edits/deletions of existing roles.
+    let registered = registered_roles_for_lease(&state);
+    let pending_registration = config.subagent_roles.iter().any(|(role, selection)| {
+        !registered.contains(role)
+            && (selection.enabled || !SUBAGENT_ROLE_IDS.contains(&role.as_str()))
+    });
+    if pending_registration && state.registered_subagent_roles.is_empty() {
+        return Err(SubagentRoleRegistrationChanged.into());
+    }
+    let mut registered_config = config.clone();
+    for (role, selection) in &mut registered_config.subagent_roles {
+        if !registered.contains(role) {
+            selection.enabled = false;
+        }
+    }
+    let config = &registered_config;
     let runtime_roles = runtime_subagent_roles(
         Some(&config.subagent_roles),
         &config.subagent_model,
@@ -1299,10 +1331,16 @@ fn reconcile_runtime_subagent_roles_with_compaction(
         reasons.push(RuntimeSubagentRepairReason::RuntimeAttestationPolicy);
     }
     if reasons.is_empty() {
+        if pending_registration {
+            return Err(SubagentRoleRegistrationChanged.into());
+        }
         return Ok(RuntimeSubagentReconcileReport::default());
     }
 
     refresh_runtime_subagent_roles_at(config, marker, remote_compaction_models)?;
+    if pending_registration {
+        return Err(SubagentRoleRegistrationChanged.into());
+    }
     Ok(RuntimeSubagentReconcileReport {
         repaired: true,
         reasons,
@@ -3529,3 +3567,6 @@ fn prune_stale_backup_dirs(backup_root: &Path, marker: &Path) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod custom_subagent_tests;

@@ -122,6 +122,7 @@ test("App does not broadcast rejected save or route results", async () => {
   const result = { config: baseConfig(), modelState: { defaultModel: "old" } };
   const dependencies = {
     config: baseConfig(),
+    validateSubagents: () => null,
     invoke: async () => result,
     applyCommandResult: () => false,
     adoptSavedConfig: () => { throw new Error("the shared boundary owns config adoption"); },

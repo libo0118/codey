@@ -18,6 +18,8 @@ use crate::subagent::telemetry::{
 };
 
 mod contract;
+#[cfg(test)]
+mod custom_subagent_tests;
 mod identity;
 #[cfg(test)]
 mod migration_tests;
@@ -850,16 +852,38 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         active_agents,
         now_ms,
     } = context;
-    let loaded_rules = rules::load_logged(state_root);
+    let mut loaded_rules = rules::load_logged(state_root);
+    let runtime_policy = crate::subagent_gate::load_runtime_subagent_policy(state_root)?;
+    if let Some(policy) = &runtime_policy {
+        for (role, selection) in &policy.roles {
+            if selection.enabled {
+                loaded_rules.rules.register_runtime_role(role);
+            }
+        }
+    }
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store
         .load(runtime_id, session_id, now_ms)?
         .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
-    let prepared = match prepare_task_capsule(tool_input, hook_workspace_root, &loaded_rules.rules)
-    {
-        Ok(prepared) => prepared,
-        Err(reason) => return Ok(Some(reason)),
-    };
+    let mut prepared =
+        match prepare_task_capsule(tool_input, hook_workspace_root, &loaded_rules.rules) {
+            Ok(prepared) => prepared,
+            Err(reason) => return Ok(Some(reason)),
+        };
+    if let Some(policy) = &runtime_policy {
+        let Some(selection) = policy
+            .roles
+            .get(&prepared.role)
+            .filter(|selection| selection.enabled)
+        else {
+            return Ok(Some("Codey 子代理角色未启用或未注册".to_string()));
+        };
+        if selection.access_for_role(&prepared.role) == crate::config::SubagentAccess::ReadOnly {
+            prepared.capabilities.retain(|capability| {
+                capability != "command.execute" && capability != "workspace.write"
+            });
+        }
+    }
     if ledger.issued_task_ids.contains(&prepared.capsule.id) {
         return Ok(Some(duplicate_task_id_denial(
             &ledger,
@@ -2193,7 +2217,7 @@ pub(crate) fn authorize_child_tool(
         tool_name,
         tool_input,
     } = context;
-    let loaded_rules = rules::load_logged(state_root);
+    let mut loaded_rules = rules::load_logged(state_root);
     let tool_class = rules::classify_tool(tool_name);
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store.load(runtime_id, session_id, now_ms)?;
@@ -2289,6 +2313,9 @@ pub(crate) fn authorize_child_tool(
             .and_then(|ledger| ledger.reservations.get(task_id))
     });
     let role = bound_reservation.map(|reservation| reservation.role.as_str());
+    if let Some(role) = role.filter(|role| crate::config::valid_subagent_role_id(role)) {
+        loaded_rules.rules.register_runtime_role(role);
+    }
     let decision = loaded_rules.rules.evaluate(&RuleContext {
         actor: RuleActor::Child,
         role,
@@ -2326,8 +2353,10 @@ pub(crate) fn authorize_child_tool(
                     reservation.attempt_id
                 ))
             }
-            Some(reservation) if !reservation_declares_visual(reservation) => Some(format!(
-                "Codey 视觉门禁：attempt `{}` 未声明 `visual.inspect` capability，禁止工具 `{tool_name}`。请改派视觉角色或由主代理接管。",
+            Some(reservation) if !reservation_declares_visual(reservation)
+                || (!reservation_declares_write(reservation)
+                    && !matches!(rules::normalize_tool_name(tool_name).as_str(), "view_image" | "screenshot")) => Some(format!(
+                "Codey 视觉门禁：attempt `{}` 缺少所需的视觉/交互权限，禁止工具 `{tool_name}`。只读子代理仅可查看图片或截图，其余交互由主代理接管。",
                 reservation.attempt_id
             )),
             Some(_) => None,

@@ -1857,7 +1857,11 @@ pub(super) fn normalize_subagent_config(
     roles: &mut BTreeMap<String, SubagentRoleConfig>,
 ) {
     normalize_subagent_selection(model, reasoning_effort);
-    roles.retain(|role, _| SUBAGENT_ROLE_IDS.contains(&role.as_str()));
+    roles.retain(|role, selection| {
+        SUBAGENT_ROLE_IDS.contains(&role.as_str())
+            || super::validate_subagent_roles(&BTreeMap::from([(role.clone(), selection.clone())]))
+                .is_ok()
+    });
     if roles.is_empty() {
         *roles = uniform_subagent_roles(model, reasoning_effort);
     } else {
@@ -1870,8 +1874,9 @@ pub(super) fn normalize_subagent_config(
                 .entry(role.to_string())
                 .or_insert_with(|| fallback.clone());
         }
-        for selection in roles.values_mut() {
+        for (role, selection) in roles.iter_mut() {
             normalize_subagent_selection(&mut selection.model, &mut selection.reasoning_effort);
+            selection.access = Some(selection.access_for_role(role));
         }
     }
     if let Some(default_role) = roles.get(SUBAGENT_ROLE_DEFAULT) {
