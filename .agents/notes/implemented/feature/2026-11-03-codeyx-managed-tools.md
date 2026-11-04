@@ -2,6 +2,8 @@
 
 Status: implemented
 
+预览分支的 custom 保留范围以[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)为准；原速度与生命周期定制不再保留，本篇的工具安装、索引范围与配置保护仍适用。
+
 ## Problem
 
 CodeGraph 项目索引与 Ponytail 安装会产生网络、用户配置和项目写入副作用，需要显式管理而非成为启动依赖。FastCtx 已有配置及重复加载保护，新增入口不能再维护第二个开关，也不能接管用户自管 MCP 或插件来源。

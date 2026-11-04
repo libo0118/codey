@@ -25,8 +25,6 @@ mod identity;
 mod migration_tests;
 #[cfg(test)]
 mod scheduling_tests;
-#[cfg(test)]
-mod turn_settlement_tests;
 
 use contract::*;
 use identity::*;
@@ -72,8 +70,6 @@ struct SessionLedger {
     updated_at_ms: u64,
     #[serde(default)]
     issued_task_ids: BTreeSet<String>,
-    #[serde(default)]
-    settled_agent_id_hashes: BTreeSet<String>,
     #[serde(default = "default_fencing_token")]
     next_fencing_token: u64,
     reservations: BTreeMap<String, Reservation>,
@@ -645,7 +641,6 @@ impl SessionLedger {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             issued_task_ids: BTreeSet::new(),
-            settled_agent_id_hashes: BTreeSet::new(),
             next_fencing_token: 1,
             reservations: BTreeMap::new(),
         }
@@ -698,13 +693,6 @@ fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
     anyhow::ensure!(
         is_canonical_hash(&ledger.runtime_id_hash),
         "Codey 子代理账本当前 runtime 哈希格式无效"
-    );
-    anyhow::ensure!(
-        ledger
-            .settled_agent_id_hashes
-            .iter()
-            .all(|hash| is_canonical_hash(hash)),
-        "Codey 子代理账本包含格式无效的终态 agent 哈希"
     );
     anyhow::ensure!(
         ledger.retired_runtime_id_hashes.len() <= MAX_RETIRED_RUNTIME_IDS,
@@ -1006,12 +994,6 @@ pub(crate) fn post_spawn(
     if let Some(agent_id) = returned_agent_id.as_deref() {
         let mut conflicts = identity_task_candidates(&ledger, agent_id);
         conflicts.remove(task_id);
-        if ledger
-            .settled_agent_id_hashes
-            .contains(&hash_component(agent_id))
-        {
-            conflicts.insert(task_id.to_string());
-        }
         if !conflicts.is_empty() {
             conflicts.insert(task_id.to_string());
             let reason = format!(
@@ -1313,9 +1295,6 @@ fn update_reservation_lifecycle(
         return Ok(true);
     };
     let agent_hash = hash_component(agent_id);
-    if ledger.settled_agent_id_hashes.contains(&agent_hash) {
-        return Ok(false);
-    }
     let mut candidates = identity_task_candidates(&ledger, agent_id);
     if candidates.is_empty()
         && let Some(task_id) = task_id_from_subagent_transcript(
@@ -1511,8 +1490,7 @@ pub(crate) fn observe_status_response(
         let refines_lifecycle_stop = reservation.state == ReservationState::Terminal
             && reservation.outcome == ExecutionOutcome::Unknown;
         if transitions_to_terminal || refines_lifecycle_stop {
-            // Keep the terminal identity so delayed lifecycle events cannot recreate an orphan marker.
-            if let Some(agent_id_hash) = reservation.agent_id_hash.clone() {
+            if let Some(agent_id_hash) = reservation.agent_id_hash.take() {
                 agent_id_hashes.push(agent_id_hash);
             }
             reservation.state = ReservationState::Terminal;
@@ -1633,9 +1611,6 @@ fn reconcile_pending_init_observations(
     let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
         return Ok(None);
     };
-    if ledger.reservations.is_empty() {
-        return Ok(None);
-    }
 
     let mut task_states = BTreeMap::<String, AgentState>::new();
     let mut conflicting_states = BTreeSet::new();
@@ -1788,28 +1763,6 @@ pub(crate) fn active_reservation_count(
     )
 }
 
-pub(crate) fn pending_unbound_spawn_reservations(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<BTreeMap<String, u64>> {
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(ledger
-        .reservations
-        .into_iter()
-        .filter_map(|(task_id, reservation)| {
-            (reservation.state == ReservationState::Pending
-                && reservation.agent_id_hash.is_none()
-                && reservation.fenced_at_ms.is_none())
-            .then_some((task_id, reservation.created_at_ms))
-        })
-        .collect())
-}
-
 /// A single-target status reply may only update that target, even if a provider
 /// accidentally returns another child's identity or a multi-agent envelope.
 pub(crate) fn single_agent_status_matches_target(
@@ -1884,14 +1837,12 @@ pub(crate) fn active_reservation_projection(
         .reservations
         .values()
         .filter(|reservation| reservation.state.is_active())
-        .count();
-    let identities = ledger
-        .reservations
-        .values()
+        .collect::<Vec<_>>();
+    let identities = active
+        .iter()
         .filter_map(|reservation| reservation.agent_id_hash.clone())
-        .chain(ledger.settled_agent_id_hashes)
         .collect();
-    Ok(Some((active, identities)))
+    Ok(Some((active.len(), identities)))
 }
 
 /// Atomically fences every still-active reservation before the gate discards
@@ -2515,34 +2466,14 @@ pub(crate) fn settle_turn(
     now_ms: u64,
 ) -> Result<()> {
     let store = LedgerStore::open(state_root, session_id)?;
-    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
         return Ok(());
     };
     anyhow::ensure!(
         !ledger_has_outstanding(&ledger),
         "Codey 子代理仍有未结算的活动 attempt"
     );
-    if ledger.reservations.is_empty() && ledger.issued_task_ids.is_empty() {
-        return Ok(());
-    }
-    ledger
-        .settled_agent_id_hashes
-        .extend(
-            ledger
-                .reservations
-                .iter()
-                .filter_map(|(task_id, reservation)| {
-                    reservation
-                        .agent_id_hash
-                        .as_ref()
-                        .filter(|hash| !is_provisional_task_binding(hash, task_id))
-                        .cloned()
-                }),
-        );
-    // Task names and capacity reset per turn; concrete child identities remain fenced until SessionEnd.
-    ledger.reservations.clear();
-    ledger.issued_task_ids.clear();
-    store.save(&mut ledger, now_ms)
+    store.remove()
 }
 
 pub(crate) fn end_session(
@@ -2879,17 +2810,12 @@ mod tests {
         .unwrap();
         subagent_stopped(temp.path(), "runtime-a", "session-a", "agent-a", 12).unwrap();
         settle_turn(temp.path(), "runtime-a", "session-a", 13).unwrap();
-        let ledger = LedgerStore::open(temp.path(), "session-a")
-            .unwrap()
-            .load("runtime-a", "session-a", 14)
-            .unwrap()
-            .unwrap();
-        assert!(ledger.reservations.is_empty());
-        assert!(ledger.issued_task_ids.is_empty());
         assert!(
-            ledger
-                .settled_agent_id_hashes
-                .contains(&hash_component("agent-a"))
+            LedgerStore::open(temp.path(), "session-a")
+                .unwrap()
+                .load("runtime-a", "session-a", 14)
+                .unwrap()
+                .is_none()
         );
     }
 

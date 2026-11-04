@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "84";
+  const patchVersion = "82";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -697,9 +697,7 @@
   });
 
   const nativeFastServiceTiers = (value) => {
-    // Undo only the tiers explicitly marked as injected by an older Codey.
-    const nativeTiers = value?.[Symbol.for("codey.nativeUltrafastTierSource")]?.nativeTiers ?? value;
-    const tiers = Array.isArray(nativeTiers) ? nativeTiers : [];
+    const tiers = Array.isArray(value) ? value : [];
     const fastTierIndex = tiers.findIndex((tier) => tier?.id === fastServiceTierId);
     if (fastTierIndex < 0) return [...tiers, fastServiceTier()];
     const currentFastTier = tiers[fastTierIndex];
@@ -716,8 +714,7 @@
   };
 
   const nativeFastSpeedTiers = (value) => {
-    const nativeTiers = value?.[Symbol.for("codey.nativeUltrafastTierSource")]?.nativeTiers ?? value;
-    const tiers = Array.isArray(nativeTiers) ? nativeTiers : [];
+    const tiers = Array.isArray(value) ? value : [];
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 

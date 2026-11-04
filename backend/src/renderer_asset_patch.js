@@ -617,22 +617,25 @@
       source.includes("supportsIndependentSpeedModes") &&
       source.includes("ultrafast_mode")
     ) {
-      // API keys retain Fast; Ultrafast still requires native account access.
+      // Fast/Ultrafast permission comes only from ChatGPT account requirements.
+      // Codey routes declare speed tiers in the model catalog, so the shared
+      // check used by the picker, slash commands, settings and request resolver
+      // allows every tier; the model's serviceTiers still decide what exists.
       patched = replaceUniqueRendererGate(
         patched,
-        /if\s*\(\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\)\s*return\s*!1\s*;\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*return\s+\4\s*===\s*`flex`\s*\|\|\s*\1\[\s*\2\s*\?\?\s*`fast`\s*\]/g,
-        (_match, access, mode, classify, tier) =>
-          `let ${mode}=${classify}(${tier});return ${mode}===\`fast\`||${tier}===\`flex\`||(${access}?.[${mode}??\`fast\`]??!1)`,
+        /if\s*\(\s*([$A-Z_a-z][$\w]*)\s*==\s*null\s*\)\s*return\s*!1\s*;\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*[$A-Z_a-z][$\w]*\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*return\s+\3\s*===\s*`flex`\s*\|\|\s*\1\[\s*\2\s*\?\?\s*`fast`\s*\]/g,
+        "return!0",
         "service tier access",
       );
     }
     if (/=\{serviceTierAccess:[$A-Z_a-z][$\w]*,isLoading:/.test(source)) {
-      // Keep Fast visible without granting Ultrafast while requirements load.
+      // API key logins and pending requirements yield a null access object,
+      // which hides the speed control and settings entirely. Keep a fixed
+      // grant so visibility follows the model's own service tiers.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\b([$A-Z_a-z][$\w]*)=)([$A-Z_a-z][$\w]*&&![$A-Z_a-z][$\w]*&&[$A-Z_a-z][$\w]*!=null\?[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\):null)(?=[^;]{0,200};let [$A-Z_a-z][$\w]*=\2,[$A-Z_a-z][$\w]*;return[^;]{0,200}?\{serviceTierAccess:)/g,
-        (_match, assignment, _name, nativeAccess) =>
-          `${assignment}((access)=>({...access,fast:!0,ultrafast:access?.ultrafast===!0}))(${nativeAccess})`,
+        /(\b([$A-Z_a-z][$\w]*)=)[$A-Z_a-z][$\w]*&&![$A-Z_a-z][$\w]*&&[$A-Z_a-z][$\w]*!=null\?[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\):null(?=[^;]{0,200};let [$A-Z_a-z][$\w]*=\2,[$A-Z_a-z][$\w]*;return[^;]{0,200}?\{serviceTierAccess:)/g,
+        (_match, assignment) => `${assignment}{fast:!0,ultrafast:!0}`,
         "service tier access state",
       );
     }

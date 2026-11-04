@@ -218,3 +218,26 @@ fn migration_preserves_fencing_and_does_not_quarantine_supported_ledgers() {
         ExecutionOutcome::Lost
     );
 }
+
+#[test]
+fn removed_custom_settlement_field_is_ignored_until_the_next_write() {
+    let temp = tempdir().unwrap();
+    let path = legacy_ledger(temp.path(), LEDGER_SCHEMA_VERSION, true);
+    active_reservation_count(temp.path(), "runtime", "session", 20).unwrap();
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["settled_agent_id_hashes"] = json!([hash_component("agent-a")]);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+
+    assert_eq!(
+        active_reservation_count(temp.path(), "runtime", "session", 21).unwrap(),
+        Some(1)
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    subagent_stopped(temp.path(), "runtime", "session", "agent-a", 22).unwrap();
+    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(saved.get("settled_agent_id_hashes").is_none());
+    assert_eq!(saved["reservations"]["task_a"]["state"], "terminal");
+    settle_turn(temp.path(), "runtime", "session", 23).unwrap();
+    assert!(!path.exists());
+}

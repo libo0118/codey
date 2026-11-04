@@ -791,6 +791,9 @@ fn render_catalog_for_provider(
         ensure_catalog_compatibility(model);
         expose_supported_model(model);
         add_fast_speed_controls(model);
+        if supports_ultrafast_speed(model) {
+            add_ultrafast_speed_controls(model);
+        }
     }
 
     if !official_provider {
@@ -1260,17 +1263,6 @@ fn account_model_with_runtime_template(base: &Value, account: &Value) -> Value {
         if let Some(object) = merged.as_object_mut() {
             object.remove("upgrade");
             object.remove("availability_nux");
-            for key in ["service_tiers", "additional_speed_tiers"] {
-                if account.get(key).is_none_or(Value::is_null)
-                    && let Some(tiers) = object.get_mut(key).and_then(Value::as_array_mut)
-                {
-                    tiers.retain(|tier| {
-                        tier.as_str()
-                            .or_else(|| tier.get("id").and_then(Value::as_str))
-                            != Some("ultrafast")
-                    });
-                }
-            }
         }
     }
     merged
@@ -1889,13 +1881,14 @@ fn synthetic_model(
             object.remove("multi_agent_reasoning_effort");
         }
     }
-    if !preserve_source_runtime_metadata {
-        model["service_tiers"] = json!([]);
-        model["additional_speed_tiers"] = json!([]);
-    }
+    model["service_tiers"] = json!([]);
+    model["additional_speed_tiers"] = json!([]);
     ensure_catalog_compatibility(&mut model);
     clamp_reasoning_efforts(&mut model);
     add_fast_speed_controls(&mut model);
+    if supports_ultrafast_speed(&model) {
+        add_ultrafast_speed_controls(&mut model);
+    }
     model
 }
 

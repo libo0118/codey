@@ -399,149 +399,6 @@ test("non-Codey providers still require migration before route changes", async (
   runtime.patch.dispose();
 });
 
-function nativeAccessPicker(models) {
-  const body = new FakeElementCore("body", { connected: true });
-  const trigger = body.appendChild(new FakeElementCore("button", {
-    attributes: { "aria-haspopup": "menu" },
-  }));
-  const caches = [[], [], []];
-  const state = { selectedTier: null };
-  const picker = {
-    model: models[0].model,
-    models,
-    onSelectServiceTier(tier) { state.selectedTier = tier; },
-  };
-  const composer = {
-    memoizedProps: { conversationId: "thread", hideLabel: false },
-    updateQueue: { memoCache: { data: caches.slice(0, 2) } },
-    alternate: { updateQueue: { memoCache: { data: [caches[2]] } } },
-  };
-  trigger.__reactFiber$accessTest = { memoizedProps: picker, return: composer };
-  const renderNative = () => {
-    // Account access is covered separately; this fixture checks model capability isolation.
-    const model = picker.models.find((model) => model.model === picker.model);
-    const availableOptions = [null, ...(model?.serviceTiers || []).map((tier) => tier.id)];
-    const serviceTierForRequest = availableOptions.includes(state.selectedTier) ? state.selectedTier : null;
-    return { availableOptions, serviceTierForRequest };
-  };
-  return { body, trigger, caches, composer, picker, state, renderNative };
-}
-
-test("native picker ignores forced Ultrafast metadata without mutating Jotai caches", async () => {
-  const tiers = [{ id: "priority", name: "Fast" }];
-  const speeds = ["fast"];
-  const model = { model: "gpt-6.1-sol", serviceTiers: tiers, additionalSpeedTiers: speeds };
-  const fixture = nativeAccessPicker([model]);
-  const nativeTiers = [...tiers];
-  const nativeModel = { ...model, serviceTiers: nativeTiers };
-  fixture.composer.updateQueue.memoCache.data.push([{ models: [nativeModel] }]);
-  fixture.composer.updateQueue.memoCache.data.splice(1, 1);
-  fixture.composer.return = { memoizedProps: {},
-    updateQueue: { memoCache: { data: [fixture.caches[1]] } } };
-  const runtime = await loadPatch({ status: "ok", native_selection_only: true,
-    models: [model.model], default_model: model.model,
-    model_metadata: [{ model: model.model,
-      service_tiers: [{ id: "ultrafast", name: "Ultrafast" }],
-      additional_speed_tiers: ["ultrafast"] }],
-  }, [statsigClient()], { documentBody: fixture.body, nativeSelectionOnly: true });
-  fixture.renderNative();
-  runtime.dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
-  assert.deepEqual(fixture.renderNative().availableOptions, [null, "priority"]);
-  assert.equal(nativeModel.serviceTiers, nativeTiers);
-  fixture.picker.onSelectServiceTier("ultrafast");
-  assert.equal(fixture.renderNative().serviceTierForRequest, null);
-  runtime.patch.dispose();
-  assert.equal(model.serviceTiers, tiers);
-  assert.equal(model.additionalSpeedTiers, speeds);
-  assert.equal(nativeModel.serviceTiers, nativeTiers);
-});
-
-test("native Ultrafast capability is preserved but cannot be granted by Codey metadata", async () => {
-  const models = ["declared-model", "native-model", "unknown-model"];
-  const queryClient = activeModelQueryClient(models);
-  const declared = queryClient.model(models[0]);
-  declared.id = "native-id";
-  declared.serviceTiers = [{ id: "priority", name: "Native Fast", description: "Native description" }];
-  declared.additionalSpeedTiers = ["fast"];
-  declared.defaultServiceTier = "priority";
-  const native = queryClient.model(models[1]);
-  const nativeUltrafast = { id: "ultrafast", name: "Native Ultrafast", description: "Native capability" };
-  native.serviceTiers = [nativeUltrafast];
-  native.additionalSpeedTiers = ["ultrafast"];
-  const ultrafast = { id: "ultrafast", name: "Ultrafast", description: "Backend capability" };
-  const metadata = models.slice(0, 2).map((model) => ({ model, supported_reasoning_efforts: ["medium"],
-    service_tiers: [ultrafast, ultrafast, { id: "unrelated" }],
-    additional_speed_tiers: ["ultrafast", "ultrafast", "unrelated"],
-  }));
-  const catalog = { status: "ok", native_selection_only: true, models, default_model: models[2], model_metadata: metadata };
-  const { patch } = await loadPatch(catalog, [statsigClient()], { queryClient, nativeSelectionOnly: true });
-  const preserved = queryClient.model(models[0]);
-  assert.deepEqual(preserved.serviceTiers, declared.serviceTiers);
-  assert.deepEqual(preserved.additionalSpeedTiers, ["fast"]);
-  assert.equal(preserved.id, "native-id");
-  assert.equal(preserved.isDefault, true, "keep the native default rather than the catalog default");
-  assert.equal(preserved.defaultServiceTier, "priority");
-  assert.deepEqual(declared.additionalSpeedTiers, ["fast"], "leave shared native data unchanged");
-  assert.equal(queryClient.model(models[1]).serviceTiers.find(tier => tier.id === "ultrafast"), nativeUltrafast);
-  assert.equal(queryClient.model(models[1]).serviceTiers.filter(tier => tier.id === "ultrafast").length, 1);
-  assert.equal(queryClient.model(models[2]).serviceTiers.some(tier => tier.id === "ultrafast"), false);
-  assert.equal(queryClient.model(models[2]).additionalSpeedTiers.includes("ultrafast"), false);
-  await patch.setCatalog(structuredClone(catalog));
-  assert.equal(queryClient.model(models[0]), preserved, "repeat delivery must reuse an unchanged descriptor");
-  assert.equal(patch.delivery().pendingQueryEntries, 0);
-  await patch.setCatalog({ ...catalog, model_metadata: metadata.map(({ model, supported_reasoning_efforts }) => ({ model, supported_reasoning_efforts })) });
-  assert.deepEqual(queryClient.model(models[0]).serviceTiers, declared.serviceTiers);
-  assert.deepEqual(queryClient.model(models[0]).additionalSpeedTiers, ["fast"]);
-  assert.equal(queryClient.model(models[1]).serviceTiers.find(tier => tier.id === "ultrafast"), nativeUltrafast,
-    "native declarations must survive catalog refreshes");
-  assert.ok(queryClient.model(models[1]).additionalSpeedTiers.includes("ultrafast"));
-  patch.dispose();
-});
-
-test("a native refresh removes only Ultrafast marked as injected by an older Codey", async () => {
-  const model = "gpt-6.1-sol";
-  const queryClient = activeModelQueryClient([model]);
-  const source = Symbol.for("codey.nativeUltrafastTierSource");
-  const tiers = [{ id: "priority", name: "Fast" }];
-  const speeds = ["fast"];
-  queryClient.model(model).serviceTiers = [...tiers, { id: "ultrafast" }];
-  queryClient.model(model).additionalSpeedTiers = [...speeds, "ultrafast"];
-  Object.defineProperty(queryClient.model(model).serviceTiers, source, { value: { nativeTiers: tiers } });
-  Object.defineProperty(queryClient.model(model).additionalSpeedTiers, source, { value: { nativeTiers: speeds } });
-  const { patch } = await loadPatch({ status: "ok", native_selection_only: true,
-    models: [model], default_model: model,
-  }, [statsigClient()], { queryClient, nativeSelectionOnly: true });
-  assert.deepEqual(queryClient.model(model).serviceTiers, tiers);
-  assert.deepEqual(queryClient.model(model).additionalSpeedTiers, speeds);
-  patch.dispose();
-});
-
-test("switching native models drops unavailable Ultrafast and preserves an eligible request tier", async () => {
-  const model = "native-ultrafast-model";
-  const otherModel = "fast-only-model";
-  const queryClient = activeModelQueryClient([model, otherModel]);
-  queryClient.model(model).serviceTiers = [{ id: "priority", name: "Fast" }, { id: "ultrafast", name: "Ultrafast" }];
-  queryClient.model(model).additionalSpeedTiers = ["fast", "ultrafast"];
-  const fixture = nativeAccessPicker(queryClient.result().data);
-  queryClient.subscribe(result => { fixture.picker.models = result.data; });
-  const { patch, dispatchDocumentEvent } = await loadPatch({
-    status: "ok", native_selection_only: true, models: [model, otherModel], default_model: model,
-  }, [statsigClient()], { queryClient, documentBody: fixture.body, nativeSelectionOnly: true });
-  fixture.renderNative();
-  dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
-  assert.deepEqual(fixture.renderNative().availableOptions, [null, "priority", "ultrafast"]);
-  fixture.picker.onSelectServiceTier("ultrafast");
-  assert.equal(fixture.renderNative().serviceTierForRequest, "ultrafast");
-  const request = compactionRequest("turn/start", { threadId: "native-thread", model, serviceTier: "ultrafast" });
-  assert.equal(patch.rewriteOutgoingMessage(request).request.params.serviceTier, "ultrafast");
-  fixture.picker.model = otherModel;
-  dispatchDocumentEvent("pointerdown", { target: fixture.trigger });
-  assert.deepEqual(fixture.renderNative().availableOptions, [null, "priority"]);
-  assert.equal(fixture.renderNative().serviceTierForRequest, null,
-    "switching to a model without Ultrafast must stop sending the old selected tier");
-  patch.dispose();
-});
-
 async function loadPatch(
   catalogResponse,
   clients,
@@ -1232,7 +1089,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "84");
+  assert.equal(patch.version, "82");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -5862,7 +5719,7 @@ test("composer trigger handles mounting, removal and hot reload without full sca
   assert.equal(textNode.nodeValue, "[主] gpt-6-astra");
   assert.equal(runtime.wildcardScanCount(), scans);
   const previousObservers = [...runtime.mutationObserverInstalls()];
-  runtime.patch.version = "83";
+  runtime.patch.version = "previous";
   const nextPatch = await runtime.reload();
   assert.ok(previousObservers.every(entry => entry.observer.disconnected));
   assert.equal(textNode.nodeValue, "[主] gpt-6-astra");

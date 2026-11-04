@@ -82,7 +82,6 @@
   const messageSelectButtons = new WeakMap();
   const messageLogicalAnchorByRow = new WeakMap();
   const messageLogicalRowsByAnchor = new WeakMap();
-  const messageSelectionSessionByRow = new WeakMap();
   const messageLogicalGroupIdsByKey = new Map();
   const selectedLogicalMessageIdsByKey = new Map();
   const conversationTurnSelector = [
@@ -3404,10 +3403,9 @@
     const sessionId = selectedLogicalMessageIdsByKey.size ? getSessionId() : "";
     const persistedCount = sessionId ? logicalMessageSelectionGroups(sessionId).length : 0;
     const count = persistedCount || selectedRows().length;
-    if (toolbar.hidden !== (count === 0)) toolbar.hidden = count === 0;
+    toolbar.hidden = count === 0;
     const label = toolbar.querySelector("[data-codey-count]");
-    const text = `已选 ${count} 轮`;
-    if (label && label.textContent !== text) label.textContent = text;
+    if (label) label.textContent = `已选 ${count} 轮`;
   };
 
   const updateSelectionButton = (row) => {
@@ -3416,10 +3414,8 @@
     const button = messageSelectButtons.get(anchor)
       || anchor.querySelector("[data-codey-message-select]");
     if (!button) return;
-    const pressed = selected ? "true" : "false";
-    const text = selected ? "✓" : "○";
-    if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
-    if (button.textContent !== text) button.textContent = text;
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+    button.textContent = selected ? "✓" : "○";
   };
 
   const setLogicalRowSelected = (row, selected) => {
@@ -3440,18 +3436,19 @@
     const rows = [...document.querySelectorAll("[data-codey-message-id]")]
       .filter(isRenderedSessionElement);
     rows.forEach((row, index) => {
-      const selected = row.classList?.contains(selectedClass);
-      const previous = selected && rows[index - 1]?.classList?.contains(selectedClass);
-      const next = selected && rows[index + 1]?.classList?.contains(selectedClass);
-      if (previous && row.dataset.codeySelectedPrevious !== "true") row.dataset.codeySelectedPrevious = "true";
-      else if (!previous && row.dataset.codeySelectedPrevious) delete row.dataset.codeySelectedPrevious;
-      if (next && row.dataset.codeySelectedNext !== "true") row.dataset.codeySelectedNext = "true";
-      else if (!next && row.dataset.codeySelectedNext) delete row.dataset.codeySelectedNext;
+      delete row.dataset.codeySelectedPrevious;
+      delete row.dataset.codeySelectedNext;
+      if (!row.classList?.contains(selectedClass)) return;
+      if (rows[index - 1]?.classList?.contains(selectedClass)) {
+        row.dataset.codeySelectedPrevious = "true";
+      }
+      if (rows[index + 1]?.classList?.contains(selectedClass)) {
+        row.dataset.codeySelectedNext = "true";
+      }
     });
   };
 
   const selectRow = (row, event) => {
-    installMessageSelection(document, true);
     const anchor = logicalAnchorForMessageRow(row);
     const rows = logicalSelectionRows();
     if (event?.shiftKey && lastSelectedRow && rows.includes(lastSelectedRow)) {
@@ -3470,7 +3467,6 @@
 
   const deleteSelected = async () => {
     if (messageDeleteInFlight) return;
-    installMessageSelection(document, true);
     const rows = selectedRows();
     const sessionId = String(getSessionId() || "").replace(/^local:/, "").trim();
     const selectedGroupsByAnchor = new Map();
@@ -3589,7 +3585,6 @@
     toolbar.innerHTML = '<span data-codey-count>已选 0 轮</span><button type="button" data-codey-delete data-danger>删除</button><button type="button" data-codey-clear>取消</button>';
     toolbar.querySelector("[data-codey-delete]")?.addEventListener("click", () => void deleteSelected());
     toolbar.querySelector("[data-codey-clear]")?.addEventListener("click", () => {
-      installMessageSelection(document, true);
       clearLogicalMessageSelections(getSessionId());
       selectedRows().forEach((row) => {
         setLogicalRowSelected(row, false);
@@ -3870,7 +3865,7 @@
     && isRenderedSessionElement(root)
   );
 
-  const installMessageSelection = (root = document, forceRefresh = false) => {
+  const installMessageSelection = (root = document) => {
     mountToolbar();
     if (lastSelectedRow?.isConnected === false) lastSelectedRow = null;
     let rows = directMessageSelectionRoot(root)
@@ -3905,8 +3900,7 @@
         return;
       }
       if (
-        !forceRefresh
-        && record
+        record
         && cachedButtonMounted
         && root.dataset.codeySelectionSignature === record.signature
         && !logicalTopologyChanged
@@ -3930,15 +3924,6 @@
         installed = true;
         return null;
       }
-      const previousSessionId = messageSelectionSessionByRow.get(row);
-      if (previousSessionId && previousSessionId !== sessionId) {
-        row.classList.remove(selectedClass);
-        messageLogicalAnchorByRow.delete(row);
-        messageLogicalRowsByAnchor.delete(row);
-        delete row.dataset.codeyMessageIds;
-        if (lastSelectedRow === row) lastSelectedRow = null;
-      }
-      messageSelectionSessionByRow.set(row, sessionId);
       const previousMessageId = row.dataset.codeyMessageId || "";
       if (previousMessageId !== record.messageId) {
         const previousNormalizedMessageId = normalizeMessageId(previousMessageId);
@@ -3965,7 +3950,7 @@
         row.dataset.codeyMessageId = record.messageId;
         installed = true;
       }
-      if (row.dataset.codeyMessageRow !== "true") row.dataset.codeyMessageRow = "true";
+      row.dataset.codeyMessageRow = "true";
       const buttonResult = installMessageSelectButton(row);
       record.button = buttonResult.button;
       installed = installed || buttonResult.installed;
@@ -3992,21 +3977,17 @@
         const logicalTurn = index === 0 ? "anchor" : "continuation";
         if (row.dataset.codeyLogicalTurn !== logicalTurn) installed = true;
         messageLogicalAnchorByRow.set(row, anchor);
-        if (row.dataset.codeyLogicalTurn !== logicalTurn) row.dataset.codeyLogicalTurn = logicalTurn;
-        if (row.dataset.codeySelectionSignature !== record.signature) row.dataset.codeySelectionSignature = record.signature;
-        if (groupSelected !== row.classList.contains(selectedClass)) {
-          if (groupSelected) row.classList.add(selectedClass);
-          else row.classList.remove(selectedClass);
-        }
-        if (button.hidden !== (index !== 0)) button.hidden = index !== 0;
-        const tabIndex = index === 0 ? 0 : -1;
-        if (button.tabIndex !== tabIndex) button.tabIndex = tabIndex;
-        if (index === 0 && button.hasAttribute("aria-hidden")) button.removeAttribute("aria-hidden");
-        else if (index !== 0 && button.getAttribute("aria-hidden") !== "true") button.setAttribute("aria-hidden", "true");
+        row.dataset.codeyLogicalTurn = logicalTurn;
+        row.dataset.codeySelectionSignature = record.signature;
+        if (groupSelected) row.classList.add(selectedClass);
+        else row.classList.remove(selectedClass);
+        button.hidden = index !== 0;
+        button.tabIndex = index === 0 ? 0 : -1;
+        if (index === 0) button.removeAttribute("aria-hidden");
+        else button.setAttribute("aria-hidden", "true");
         if (lastSelectedRow === row && index !== 0) lastSelectedRow = anchor;
-        const messageIds = index === 0 ? JSON.stringify(groupedMessageIds) : "";
-        if (messageIds && row.dataset.codeyMessageIds !== messageIds) row.dataset.codeyMessageIds = messageIds;
-        else if (!messageIds && row.dataset.codeyMessageIds) delete row.dataset.codeyMessageIds;
+        if (index === 0) row.dataset.codeyMessageIds = JSON.stringify(groupedMessageIds);
+        else delete row.dataset.codeyMessageIds;
       });
       updateSelectionButton(anchor);
     });
@@ -4162,23 +4143,6 @@
   };
   const updateSessionMutationPending = () => {
     recordSessionMutationStats();
-  };
-
-  const codeyControlIds = new Set([
-    "codey-settings-button", toolbarId, toastId, sidebarActionTooltipId, styleId,
-  ]);
-  const codeyControlAttributes = [
-    sessionExportAttribute, tasksImportAttribute, projectImportAttribute, sessionDeleteAttribute,
-    threadUpdatedAtAttribute, "data-codey-message-select", "data-codey-prompt-optimize",
-  ];
-  const isCodeyControl = (element) => element instanceof HTMLElement && (
-    codeyControlIds.has(element.id)
-    || element.dataset.codeyMessageSelect === "true"
-    || codeyControlAttributes.some((attribute) => element.hasAttribute(attribute))
-  );
-  const nodesAreCodeyControls = (nodes) => {
-    for (const node of nodes || []) if (!isCodeyControl(node)) return false;
-    return true;
   };
 
   const isCodeyOwned = (element) => (
@@ -4932,15 +4896,6 @@
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
         : mutation.target?.parentElement;
-      if (!target || isCodeyControl(target)) continue;
-      if (mutation.type === "attributes" && mutation.attributeName === "class"
-        && !target.hasAttribute?.(sidebarThreadRowSelector.slice(1, -1))
-        && !nativeThreadStatusClassPattern.test(String(mutation.oldValue || ""))
-        && !nativeThreadStatusClassPattern.test(String(target.className || ""))) continue;
-      if (mutation.type === "childList"
-        && (mutation.addedNodes?.length || mutation.removedNodes?.length)
-        && nodesAreCodeyControls(mutation.addedNodes)
-        && nodesAreCodeyControls(mutation.removedNodes)) continue;
       if (mutation.type === "attributes") {
         if (target && !isCodeyOwned(target)) {
           const { threadRow } = contextForTarget(target);

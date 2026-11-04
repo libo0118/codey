@@ -2,6 +2,8 @@
 
 Status: implemented
 
+本篇保留 custom 的合并决定及原始理由；预览分支对速度与会话选择补丁的保留范围由[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)部分取代，其余思考档位、遥测与 Linux 边界仍适用。
+
 ## Problem
 
 合并上游 `5364c29f` 时，fork 的整轮 mutation drain 与上游有界分帧队列重叠。仅把选择入口改成邻近轮刷新，会漏掉复用 DOM 中远处的旧会话选择锚点：切换会话后 Shift 点击可能把未选择的轮次加入删除请求，删除前再全量刷新也无法撤销这些选择。

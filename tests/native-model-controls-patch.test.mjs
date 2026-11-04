@@ -4,7 +4,7 @@ import test from "node:test";
 import { readSource } from "./helpers/read-source.mjs";
 import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
 
-test("Fast works for API keys while Ultrafast retains native account and model eligibility", async () => {
+test("Fast access follows model tiers for every login and third-party routes keep Ultra", async () => {
   const records = [];
   const savedLog = globalThis.__codeyPatchLog;
   globalThis.__codeyPatchLog = (record) => records.push(JSON.parse(record).operation);
@@ -82,24 +82,12 @@ test("Fast works for API keys while Ultrafast retains native account and model e
       tierAccessSource,
       "app://-/assets/app-shared-tier-access-fixture.js",
     );
-    const tiers = Function(`${patchedTierAccess};return {Uat,Wat,Xat}`)();
+    const tiers = Function(`${patchedTierAccess};return {Wat,Xat}`)();
     for (const access of [null, deniedAccess]) {
       assert.equal(tiers.Wat("priority", access), true);
-      assert.equal(tiers.Wat("ultrafast", access), false);
+      assert.equal(tiers.Wat("ultrafast", access), true);
       assert.equal(tiers.Xat(null, "priority", access), "priority");
-      assert.equal(tiers.Xat(null, "ultrafast", access), null);
     }
-    assert.deepEqual(tiers.Uat({ requirements: { featureRequirements: {
-      fast_mode: true, ultrafast_mode: false,
-    } } }), { fast: true, ultrafast: false }, "native denial must remain a denial");
-    const grantedAccess = { fast: true, ultrafast: true };
-    assert.equal(tiers.Wat("ultrafast", grantedAccess), true);
-    assert.equal(tiers.Xat(null, "ultrafast", grantedAccess), "ultrafast");
-    const availableTiers = (model, access) => model.serviceTiers
-      .filter(tier => tiers.Wat(tier.id, access)).map(tier => tier.id);
-    assert.deepEqual(availableTiers({ serviceTiers: [{ id: "priority" }] }, grantedAccess), ["priority"]);
-    assert.deepEqual(availableTiers({ serviceTiers: [{ id: "priority" }, { id: "ultrafast" }] }, deniedAccess), ["priority"]);
-    assert.deepEqual(availableTiers({ serviceTiers: [{ id: "priority" }, { id: "ultrafast" }] }, grantedAccess), ["priority", "ultrafast"]);
     assert.equal(tiers.Xat(null, "default", null), null, "standard speed still sends no tier");
 
     // Codex 26.1013 app-initial access hook: only finished ChatGPT requirements
@@ -110,23 +98,19 @@ test("Fast works for API keys while Ultrafast retains native account and model e
       "let{data:c,isPending:l}=query,u=!!i?.isLoading||a&&l,d;",
       "t[3]!==c||t[4]!==u||t[5]!==a?(d=a&&!u&&c!=null?Tr(c):null,t[3]=c,t[4]=u,t[5]=a,t[6]=d):d=t[6];",
       "let f=d,p;return t[7]!==u||t[8]!==f?(p={serviceTierAccess:f,isLoading:u},t[7]=u,t[8]=f,t[9]=p):p=t[9],p}",
-      "function Tr(e){return{fast:e.fast_mode!==!1,ultrafast:e.ultrafast_mode===!0}}",
+      "function Tr(e){return{fast:e.fast_mode!==!1,ultrafast:!1}}",
     ].join("");
     const accessHook = Function(`${patchAsset(accessHookSource)};return Mxo`)();
     for (const [auth, query] of [
       [{ authMethod: "apikey" }, { data: null, isPending: false }],
       [{ authMethod: "chatgpt" }, { data: null, isPending: true }],
-      [{ authMethod: "chatgpt" }, { data: { ultrafast_mode: true }, isPending: true }],
       [{ authMethod: "chatgpt" }, { data: { fast_mode: false }, isPending: false }],
     ]) {
       assert.deepEqual(
         accessHook({ hostId: "local" }, auth, query, []).serviceTierAccess,
-        { fast: true, ultrafast: false },
+        { fast: true, ultrafast: true },
       );
     }
-    assert.deepEqual(accessHook({ hostId: "local" }, { authMethod: "chatgpt" }, {
-      data: { fast_mode: true, ultrafast_mode: true }, isPending: false,
-    }, []).serviceTierAccess, { fast: true, ultrafast: true });
     assert.deepEqual(records, [], "current Fast shapes must patch without compatibility errors");
 
     // Codex 26.1021 host services pass the same Ultra gate into the model

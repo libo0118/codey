@@ -2962,7 +2962,7 @@ test("session mutation overflow yields, keeps recent controls and permits explic
   assert.ok(rows.some((row) => !row.dataset.codeyMessageId), "one deferred task must yield before the whole burst");
   runtime.flushTimers();
   assert.equal(rows.at(-1).dataset.codeyMessageId, "turn-burst-89", "keep recent optional controls when the root budget is full");
-  // Overflow may skip optional UI discovery, never an explicit selection/deletion refresh.
+  // A direct installer scan can still discover turns skipped by the optional queue.
   runtime.window.__codeyInstallMessageSelection(parent);
   assert.deepEqual(rows.map((row) => row.dataset.codeyMessageId),
     rows.map((_, index) => `turn-burst-${index}`));
@@ -3002,24 +3002,6 @@ test("streaming mutations within mounted turns skip conversation discovery and s
   rows.forEach((row) => assert.ok(messageSelectButton(row)));
 });
 
-test("unchanged selection refresh does not rewrite button text", () => {
-  const runtime = loadInjection({ turnIds: [] });
-  const wrapper = new TreeElement();
-  wrapper.isConnected = true;
-  const row = wrapper.appendChild(new TreeElement({ "data-turn-key": "unchanged-turn" }));
-  runtime.window.__codeyInstallMessageSelection(wrapper);
-  const button = messageSelectButton(row);
-  let text = button.textContent;
-  let writes = 0;
-  Object.defineProperty(button, "textContent", {
-    get: () => text,
-    set(value) { text = value; writes += 1; },
-  });
-  runtime.window.__codeyInstallMessageSelection(wrapper);
-  assert.equal(writes, 0, "the same glyph must not create another child-list mutation");
-  assert.equal(button.textContent, "○");
-});
-
 test("a wrapper refresh retains selection adjacency to the turn outside that wrapper", () => {
   const runtime = loadInjection({ turnIds: [] });
   const first = new TreeElement({ "data-turn-key": "outside-wrapper" });
@@ -3039,78 +3021,6 @@ test("a wrapper refresh retains selection adjacency to the turn outside that wra
   assert.equal(second.dataset.codeySelectedPrevious, "true");
 });
 
-test("selection before the deferred drain reads a reused row in its current session", async () => {
-  const runtime = loadInjection({
-    turnIds: [], codexSessionController: createRecoveryController([]),
-    bridgeHandler: async (path) => path === "/session/delete-messages"
-      ? { status: "ok", deleted: 1 } : { status: "ok" },
-  });
-  const row = new TreeElement({ "data-turn-key": "old-session-turn" });
-  row.isConnected = true;
-  runtime.appendExistingRow(row);
-  runtime.window.__codeyInstallMessageSelection(row);
-  messageSelectButton(row).dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  assert.equal(row.classList.contains("codey-message-selected"), true);
-  runtime.setSessionId("session-after-navigation");
-  row.setAttribute("data-turn-key", "current-session-turn");
-  runtime.emitMutations([{ type: "attributes", attributeName: "data-turn-key", target: row }]);
-  messageSelectButton(row).dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  assert.equal(row.dataset.codeyMessageId, "current-session-turn");
-  await runtime.window.__codeyDeleteSelectedMessages();
-  const deletion = runtime.bridgeCalls.find(({ path }) => path === "/session/delete-messages");
-  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.payload)), {
-    sessionId: "session-after-navigation", messageIds: ["current-session-turn"],
-  });
-});
-
-test("shift selection cannot reuse a distant anchor from another session", async () => {
-  const runtime = loadInjection({
-    turnIds: [], codexSessionController: createRecoveryController([]),
-    bridgeHandler: async (path) => path === "/session/delete-messages"
-      ? { status: "ok", deleted: 1 } : { status: "ok" },
-  });
-  const rows = Array.from({ length: 3 }, (_, index) => {
-    const row = new TreeElement({ "data-turn-key": `same-${index}` });
-    row.isConnected = true;
-    runtime.appendExistingRow(row);
-    return row;
-  });
-  runtime.window.__codeyInstallMessageSelection();
-  const click = (row, shiftKey = false) => messageSelectButton(row).dispatchEvent({
-    type: "click", shiftKey, preventDefault() {}, stopPropagation() {},
-  });
-  click(rows[0]);
-  runtime.setSessionId("new-session");
-  click(rows[2], true);
-  await runtime.window.__codeyDeleteSelectedMessages();
-  const deletion = runtime.bridgeCalls.find(({ path }) => path === "/session/delete-messages");
-  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.payload)), {
-    sessionId: "new-session", messageIds: ["same-2"],
-  });
-});
-
-test("a reused row cannot carry its selected class into another session with the same turn id", () => {
-  const runtime = loadInjection({ turnIds: [] });
-  const row = new TreeElement({ "data-turn-key": "same-turn-id" });
-  row.isConnected = true;
-  runtime.appendExistingRow(row);
-  runtime.window.__codeyInstallMessageSelection(row);
-  const click = () => messageSelectButton(row).dispatchEvent({
-    type: "click", preventDefault() {}, stopPropagation() {},
-  });
-  click();
-  runtime.setSessionId("new-session");
-  click();
-  assert.equal(row.classList.contains("codey-message-selected"), true,
-    "the new session starts unselected, so its first click must select the row");
-  click();
-  assert.equal(row.classList.contains("codey-message-selected"), false);
-  runtime.setSessionId("session-1");
-  runtime.window.__codeyInstallMessageSelection();
-  assert.equal(row.classList.contains("codey-message-selected"), true,
-    "selection in the old session remains scoped to that session");
-});
-
 test("session mutation collection observes a detached row's current identity after it remounts", () => {
   const runtime = loadInjection({ turnIds: [] });
   const parent = new TreeElement();
@@ -3126,32 +3036,6 @@ test("session mutation collection observes a detached row's current identity aft
   runtime.flushTimers();
   assert.equal(row.dataset.codeyMessageId, "reused-turn");
   assert.equal(row.dataset.codeyLogicalTurn, "anchor");
-});
-
-test("session mutations ignore selection controls and class writebacks before they saturate discovery", () => {
-  const runtime = loadInjection({ turnIds: [] });
-  const parent = new TreeElement();
-  parent.isConnected = true;
-  const records = [];
-  let discoveries = 0;
-  for (let index = 0; index < 90; index += 1) {
-    const row = parent.appendChild(new TreeElement({ "data-turn-key": `owned-${index}` }));
-    const button = row.appendChild(new TreeElement({ "data-codey-message-select": "true" }));
-    for (const element of [row, button]) {
-      const original = element.closest.bind(element);
-      element.closest = (...args) => { discoveries += 1; return original(...args); };
-    }
-    records.push(
-      { type: "attributes", target: row, attributeName: "class", oldValue: "" },
-      { type: "attributes", target: button, attributeName: "aria-hidden", oldValue: "true" },
-      { type: "childList", target: row, addedNodes: [button], removedNodes: [] },
-    );
-  }
-  runtime.emitMutations(records);
-  runtime.flushTimers();
-  assert.equal(discoveries, 0, "our own rendering must not refill the discovery queue");
-  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].processedNodes, 0);
-  assert.equal(runtime.window.__codeyObserverStats["codey-inject.sessionToolMutations"].pending, 0);
 });
 
 test("installs selection on mixed Codex turn row shapes", () => {
