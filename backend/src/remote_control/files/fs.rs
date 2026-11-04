@@ -257,6 +257,13 @@ pub(super) fn snapshot(
     }
     // tempfile is unlinked on Unix; Windows uses share_mode(0) and DELETE_ON_CLOSE.
     let mut destination = tempfile::tempfile().map_err(|_| "无法创建私有下载快照")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        destination
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| "无法限制下载快照权限")?;
+    }
     let mut digest = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; CHUNK];
