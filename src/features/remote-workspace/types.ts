@@ -10,4 +10,7 @@ export type WorkspaceDraft = {
 
 export type Submission = { id: string; args: Record<string, unknown> };
 export type CreationResult = { id: string; firstTurn: string };
-export type ConversationEvent = { type: "state"; state: View } | { type: "disconnected"; message: string };
+export type ViewPatch = { op: "add" | "replace"; path: string; value: unknown } | { op: "remove"; path: string };
+export type ConversationEvent = { type: "state"; state: View; streamVersion?: 2; revision?: number }
+  | { type: "delta"; baseRevision: number; revision: number; patches: ViewPatch[] }
+  | { type: "disconnected"; message: string };

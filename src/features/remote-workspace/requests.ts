@@ -20,7 +20,7 @@ export const remoteWorkspaceRequests = {
   forgetSubmission,
   unauthorized: (error: unknown) => error instanceof RemoteError && error.status === 401,
   connect(threadId: string, handlers: { message: (event: ConversationEvent) => void; invalid: () => void; close: () => void }) {
-    const socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/remote/events/${encodeURIComponent(threadId)}`);
+    const socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/remote/events/${encodeURIComponent(threadId)}?stream=2`);
     socket.onmessage = event => {
       let message: ConversationEvent | null;
       try { message = conversationEvent(JSON.parse(event.data)); }
@@ -28,6 +28,7 @@ export const remoteWorkspaceRequests = {
       if (message) handlers.message(message);
     };
     socket.onclose = handlers.close;
-    return { close: () => { socket.onmessage = null; socket.onclose = null; socket.close(); } };
+    return { history: () => socket.send(JSON.stringify({ type: "history" })),
+      close: () => { socket.onmessage = null; socket.onclose = null; socket.close(); } };
   },
 };

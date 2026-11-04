@@ -2,6 +2,13 @@ use super::*;
 use serde_json::json;
 use std::io::{Read, Write};
 
+fn provenance(revision: u64) -> super::super::desktop::NativeProvenance {
+    super::super::desktop::NativeProvenance {
+        owner: "synthetic-owner".into(),
+        revision: Some(revision),
+    }
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -9,6 +16,16 @@ struct Fixture {
     registry: Arc<Mutex<Registry>>,
     binding: BindingGuard,
     state: Value,
+    revision: u64,
+}
+
+impl Fixture {
+    fn update(&mut self) {
+        self.revision += 1;
+        self.binding
+            .update(&self.state, &provenance(self.revision))
+            .unwrap();
+    }
 }
 
 fn fixture(text: &str) -> Fixture {
@@ -22,7 +39,8 @@ fn fixture(text: &str) -> Fixture {
         None,
         vec![temp.path().join("synthetic-codex-home")],
     )));
-    let binding = BindingGuard::new(registry.clone(), "token", &thread, &state).unwrap();
+    let binding =
+        BindingGuard::new(registry.clone(), "token", &thread, &state, &provenance(1)).unwrap();
     Fixture {
         _temp: temp,
         root,
@@ -30,6 +48,7 @@ fn fixture(text: &str) -> Fixture {
         registry,
         binding,
         state,
+        revision: 1,
     }
 }
 
@@ -51,6 +70,623 @@ fn descriptor(fixture: &Fixture, reference: &str) -> Descriptor {
     describe(select(fixture, reference), || Ok(())).unwrap()
 }
 
+fn compact_view(state: &Value) -> Value {
+    use super::super::projection::{MessageWindow, Projection, PublicState, StreamVersion};
+    match Projection::default().public_state(
+        state,
+        StreamVersion::V2,
+        &mut MessageWindow::default(),
+    ) {
+        PublicState::V2(state) => state,
+        PublicState::Legacy(_) => panic!("expected v2 projection"),
+    }
+}
+
+fn inline_fixture(item: Value) -> Fixture {
+    let mut fixture = fixture("");
+    fixture.state["cwd"] = Value::Null;
+    fixture.state["turns"][0]["items"] = json!([item]);
+    fixture.update();
+    fixture
+}
+
+#[test]
+fn public_inline_images_keep_legacy_urls_and_resolve_v2_ids_without_copying_or_snapshotting() {
+    for (mime, bytes) in [
+        ("image/png", b"\x89PNG\r\n\x1a\nsynthetic png".as_slice()),
+        ("image/jpeg", b"\xff\xd8\xffsynthetic jpeg".as_slice()),
+        ("image/gif", b"GIF89asynthetic gif".as_slice()),
+        ("image/webp", b"RIFF1234WEBPsynthetic webp".as_slice()),
+    ] {
+        let encoded = STANDARD.encode(bytes);
+        let url = format!("data:{mime};base64,{encoded}");
+        for item in [
+            json!({"id":"user","type":"userMessage","content":[{"type":"file","path":"outputs/not-opened.bin"},{"type":"image","url":url}]}),
+            json!({"id":"tool","type":"mcpToolCall","result":{"content":[{"type":"image","mimeType":mime,"data":encoded}]}}),
+            json!({"id":123,"type":"dynamicToolCall","contentItems":[{"type":"image","mimeType":mime,"data":encoded}]}),
+        ] {
+            let fixture = inline_fixture(item);
+            let legacy = super::super::protocol::view(&fixture.state);
+            let attachments = legacy["turns"][0]["messages"][0]["attachments"]
+                .as_array()
+                .unwrap();
+            let slot = attachments.len() - 1;
+            assert_eq!(attachments[slot]["url"], url);
+            let compact = compact_view(&fixture.state);
+            let attachment = &compact["turns"][0]["messages"][0]["attachments"][slot];
+            assert!(attachment.get("url").is_none());
+            let id = attachment["id"].as_str().unwrap();
+            assert_eq!(
+                id,
+                inline_image_reference_id(
+                    &legacy["turns"][0]["id"],
+                    &legacy["turns"][0]["messages"][0]["id"],
+                    slot,
+                    &url
+                )
+            );
+            let selected = select(&fixture, id);
+            assert!(selected_path(&selected).is_err());
+            let references::Reference::InlineImage { url: source, .. } = &selected.value else {
+                panic!("not an inline image")
+            };
+            let source = Arc::clone(source);
+            let file = describe(selected, || Ok(())).unwrap();
+            let references::Reference::InlineImage { url: described, .. } = &file.selection.value
+            else {
+                panic!("not an inline image")
+            };
+            assert!(Arc::ptr_eq(&source, described));
+            assert!(matches!(&file.source, DescriptorSource::InlineImage));
+            assert_eq!(file.size, bytes.len() as u64);
+            assert_eq!(file.mime, mime);
+            assert_eq!(
+                fixture.registry.lock().unwrap().budget.available_permits(),
+                CACHE_KIB
+            );
+            let resolved = fixture.registry.lock().unwrap().insert(file).unwrap();
+            assert_eq!(resolved["file"]["url"], resolved["file"]["downloadUrl"]);
+            assert!(!resolved.to_string().contains("data:"));
+            assert!(!resolved.to_string().contains("workspace"));
+            let file = fixture
+                .registry
+                .lock()
+                .unwrap()
+                .cached(
+                    "token",
+                    &fixture.thread,
+                    resolved["file"]["id"].as_str().unwrap(),
+                )
+                .unwrap();
+            let snapshot = prepare_snapshot(&fixture.registry, &file, || Ok(())).unwrap();
+            assert_eq!(snapshot.read(0).unwrap(), bytes);
+            assert_eq!(snapshot.digest, crate::fs_util::sha256_hex(bytes));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    snapshot.file.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inline_image_identity_uses_public_turn_message_fallbacks_and_absolute_attachment_slots() {
+    let url = "data:image/gif;base64,R0lGODlh";
+    for turn_id in [
+        Value::Null,
+        json!(15),
+        json!({"private":"not a public id"}),
+        json!("turn"),
+    ] {
+        for item in [
+            json!({"type":"userMessage","content":[{"type":"file","path":"outputs/a.bin"},{"type":"image","url":url}]}),
+            json!({"id":{"private":"not a public id"},"type":"steeringUserMessage","input":[{"type":"image","url":url}]}),
+        ] {
+            let mut fixture = inline_fixture(item);
+            fixture.state["turns"][0]["turnId"] = turn_id.clone();
+            fixture.update();
+            let compact = compact_view(&fixture.state);
+            let attachments = compact["turns"][0]["messages"][0]["attachments"]
+                .as_array()
+                .unwrap();
+            let id = attachments.last().unwrap()["id"].as_str().unwrap();
+            assert_eq!(snapshot(&fixture, id).read(0).unwrap(), b"GIF89a");
+        }
+    }
+    let mut fixture = fixture("");
+    fixture.state["cwd"] = Value::Null;
+    fixture.state["turns"][0]["items"] = json!([]);
+    fixture.state["turns"][0]["params"]["input"] = json!([{"type":"image","url":url}]);
+    fixture.update();
+    let compact = compact_view(&fixture.state);
+    let id = compact["turns"][0]["messages"][0]["attachments"][0]["id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(snapshot(&fixture, id).read(0).unwrap(), b"GIF89a");
+    assert_ne!(
+        inline_image_reference_id(&json!(1), &json!("m"), 0, url),
+        inline_image_reference_id(&json!(2), &json!("m"), 0, url)
+    );
+    assert_ne!(
+        inline_image_reference_id(&json!("t"), &json!("m"), 0, url),
+        inline_image_reference_id(&json!("t"), &json!("other"), 0, url)
+    );
+}
+
+#[test]
+fn inline_metadata_preserves_standard_base64_magic_and_the_existing_encoded_size_limit() {
+    for suffix in 0..72 {
+        let bytes = [b"GIF89a".as_slice(), &vec![0xff; suffix]].concat();
+        let encoded = STANDARD.encode(&bytes);
+        for encoded in [
+            encoded.clone(),
+            encoded.trim_end_matches('=').into(),
+            format!("{encoded}\n"),
+            encoded.replace('/', "_"),
+            format!("{}!", &encoded[..encoded.len() - 1]),
+        ] {
+            let url = format!("data:image/gif;base64,{encoded}");
+            let accepted = STANDARD
+                .decode(&encoded)
+                .is_ok_and(|bytes| fs::image_mime(&bytes) == Some("image/gif"));
+            assert_eq!(
+                public_image_url(&json!(url)).is_some(),
+                accepted,
+                "{encoded}"
+            );
+            if accepted {
+                assert_eq!(
+                    inline_image_metadata(&url).unwrap().size,
+                    bytes.len() as u64
+                );
+            }
+        }
+    }
+    for url in [
+        "data:image/gif;base64,R0lGODlhZh==", // nonzero unused padding bits
+        "data:image/gif;base64,R0l=ODlh",
+        "data:image/gif;base64,R0lGODlh====",
+        "data:image/gif;base64,",
+        "data:image/png;base64,R0lGODlh",
+        "data:image/svg+xml;base64,PHN2Zz4=",
+        "data:text/html;base64,PGh0bWw+",
+        "data:image/gif;BASE64,R0lGODlh",
+    ] {
+        assert!(inline_image_metadata(url).is_err(), "{url}");
+        assert!(public_image_url(&json!(url)).is_none(), "{url}");
+        let fixture = inline_fixture(
+            json!({"id":"user","type":"userMessage","content":[{"type":"image","url":url}]}),
+        );
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .selection(
+                    "token",
+                    &fixture.thread,
+                    &inline_image_reference_id(&json!("turn"), &json!("user"), 0, url)
+                )
+                .is_err()
+        );
+    }
+    assert!(fs::snapshot_inline_image("R0lGODlh", 6, "image/png", || Ok(())).is_err());
+    assert!(fs::snapshot_inline_image("R0lGODlh", 7, "image/gif", || Ok(())).is_err());
+    assert!(fs::snapshot_inline_image("R0lGODlh!", 6, "image/gif", || Ok(())).is_err());
+    // Keep the Native encoded-length cap, including its existing final quartet rounding.
+    let mut bytes = vec![0; MAX_INLINE_IMAGE_ENCODED / 4 * 3];
+    bytes[..6].copy_from_slice(b"GIF89a");
+    let url = format!("data:image/gif;base64,{}", STANDARD.encode(&bytes));
+    assert_eq!(
+        inline_image_metadata(&url).unwrap().size,
+        bytes.len() as u64
+    );
+    let fixture = inline_fixture(
+        json!({"id":"user","type":"userMessage","content":[{"type":"image","url":url}]}),
+    );
+    let compact = compact_view(&fixture.state);
+    let id = compact["turns"][0]["messages"][0]["attachments"][0]["id"]
+        .as_str()
+        .unwrap();
+    assert!(url.len() > 4096);
+    assert_eq!(descriptor(&fixture, id).size, bytes.len() as u64);
+    bytes.push(0);
+    let oversized = format!("data:image/gif;base64,{}", STANDARD.encode(bytes));
+    assert!(
+        inline_image_metadata(&oversized)
+            .err()
+            .unwrap()
+            .contains("上限")
+    );
+    assert!(public_image_url(&json!(oversized)).is_none());
+}
+
+#[test]
+fn only_projected_image_attachments_authorize_inline_bytes_never_metadata_markdown_or_urls() {
+    let url = "data:image/gif;base64,R0lGODlh";
+    for item in [
+        json!({"id":"hidden","type":"futurePrivateItem","content":[{"type":"image","url":url}]}),
+        json!({"id":"hidden","type":"mcpToolCall","arguments":{"content":[{"type":"image","mimeType":"image/gif","data":"R0lGODlh"}]}}),
+        json!({"id":"hidden","type":"mcpToolCall","result":{"_meta":{"content":[{"type":"image","mimeType":"image/gif","data":"R0lGODlh"}]}}}),
+        json!({"id":"hidden","type":"mcpToolCall","result":{"structuredContent":{"type":"image","mimeType":"image/gif","data":"R0lGODlh"}}}),
+        json!({"id":"hidden","type":"reasoning","content":[{"type":"image","url":url}]}),
+        json!({"id":"hidden","type":"collabAgentToolCall","tool":"wait","receiverThreads":[{"threadId":"hidden-child","thread":{"content":[{"type":"image","url":url}]}}]}),
+        json!({"id":"hidden","type":"agentMessage","text":format!("![not a native attachment]({url})")}),
+        json!({"id":"hidden","type":"userMessage","content":[{"type":"file","url":url}]}),
+        json!({"id":"hidden","type":"userMessage","content":[{"type":"localImage","url":url}]}),
+        json!({"id":"hidden","type":"userMessage","content":[{"type":"image","url":"https://example.invalid/no-proxy.gif"}]}),
+    ] {
+        let fixture = inline_fixture(item);
+        let id = inline_image_reference_id(&json!("turn"), &json!("hidden"), 0, url);
+        let registry = fixture.registry.lock().unwrap();
+        assert!(registry.selection("token", &fixture.thread, &id).is_err());
+        assert!(
+            registry
+                .selection(
+                    "token",
+                    &fixture.thread,
+                    "https://example.invalid/no-proxy.gif"
+                )
+                .is_err()
+        );
+        if let Ok(selected) = registry.selection("token", &fixture.thread, url) {
+            assert!(describe(selected, || Ok(())).is_err());
+        }
+    }
+}
+
+#[test]
+fn inline_image_bindings_replacement_cancellation_disconnect_and_revocation_remain_scoped() {
+    let mut bytes = vec![b'x'; CHUNK * 3];
+    bytes[..6].copy_from_slice(b"GIF89a");
+    let url = format!("data:image/gif;base64,{}", STANDARD.encode(&bytes));
+    for close_old_first in [true, false] {
+        let fixture = inline_fixture(
+            json!({"id":"user","type":"userMessage","content":[{"type":"image","url":url}]}),
+        );
+        let reference = inline_image_reference_id(&json!("turn"), &json!("user"), 0, &url);
+        let newer = BindingGuard::new(
+            fixture.registry.clone(),
+            "token",
+            &fixture.thread,
+            &fixture.state,
+            &provenance(fixture.revision),
+        )
+        .unwrap();
+        let file = descriptor(&fixture, &reference);
+        let selection = file.selection();
+        let response = fixture.registry.lock().unwrap().insert(file).unwrap();
+        let id = response["file"]["id"].as_str().unwrap();
+        let file = fixture
+            .registry
+            .lock()
+            .unwrap()
+            .cached("token", &fixture.thread, id)
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .selection("other-token", &fixture.thread, &reference)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .selection("token", &uuid::Uuid::new_v4().to_string(), &reference)
+                .is_err()
+        );
+        let budget = fixture
+            .registry
+            .lock()
+            .unwrap()
+            .budget((CACHE_KIB * 1024) as u64)
+            .unwrap();
+        assert!(
+            prepare_snapshot(&fixture.registry, &file, || Ok(()))
+                .err()
+                .unwrap()
+                .contains("预算")
+        );
+        drop(budget);
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .cached("other-token", &fixture.thread, id)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .cached("token", &uuid::Uuid::new_v4().to_string(), id)
+                .is_err()
+        );
+        let mut checks = 0;
+        assert!(
+            prepare_snapshot(&fixture.registry, &file, || {
+                checks += 1;
+                if checks == 4 {
+                    Err("cancel".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fixture.registry.lock().unwrap().budget.available_permits(),
+            CACHE_KIB
+        );
+        let download = prepare_snapshot(&fixture.registry, &file, || Ok(())).unwrap();
+        assert_eq!(download.digest, crate::fs_util::sha256_hex(&bytes));
+        assert_eq!(download.read(0).unwrap(), bytes[..CHUNK]);
+        let (first, last) = if close_old_first {
+            (fixture.binding, newer)
+        } else {
+            (newer, fixture.binding)
+        };
+        drop(first);
+        assert!(fixture.registry.lock().unwrap().current(&selection));
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .cached("token", &fixture.thread, id)
+                .is_ok()
+        );
+        drop(last);
+        assert!(!fixture.registry.lock().unwrap().current(&selection));
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .cached("token", &fixture.thread, id)
+                .is_err()
+        );
+        drop(download);
+        assert_eq!(
+            fixture.registry.lock().unwrap().budget.available_permits(),
+            CACHE_KIB
+        );
+    }
+    let mut fixture = inline_fixture(
+        json!({"id":"user","type":"userMessage","content":[{"type":"image","url":url}]}),
+    );
+    let reference = inline_image_reference_id(&json!("turn"), &json!("user"), 0, &url);
+    let file = descriptor(&fixture, &reference);
+    let selection = file.selection();
+    let old = prepare_snapshot(&fixture.registry, &file, || Ok(())).unwrap();
+    fixture.state["turns"][0]["items"][0]["content"][0]["url"] =
+        json!("data:image/gif;base64,R0lGODdh");
+    fixture.update();
+    assert!(!fixture.registry.lock().unwrap().current(&selection));
+    assert!(
+        prepare_snapshot(&fixture.registry, &file, || fixture
+            .registry
+            .lock()
+            .unwrap()
+            .current(&selection)
+            .then_some(())
+            .ok_or("replaced".into()))
+        .is_err()
+    );
+    assert_eq!(old.read(0).unwrap(), bytes[..CHUNK]);
+    let compact = compact_view(&fixture.state);
+    let current_id = compact["turns"][0]["messages"][0]["attachments"][0]["id"]
+        .as_str()
+        .unwrap();
+    let current = select(&fixture, current_id);
+    let newer = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &fixture.state,
+        &provenance(fixture.revision),
+    )
+    .unwrap();
+    fixture.registry.lock().unwrap().prune(|_| false);
+    assert!(!fixture.registry.lock().unwrap().current(&current));
+    fixture.update();
+    newer
+        .update(&fixture.state, &provenance(fixture.revision))
+        .unwrap();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .selection("token", &fixture.thread, current_id)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn synthetic_inline_images_use_the_authenticated_resolve_and_get_routes() {
+    use super::super::{
+        actions::Ledger,
+        auth::{Auth, Credentials},
+        server::{self, Core},
+    };
+    use reqwest::StatusCode;
+    let bytes = b"GIF89asynthetic route image\0bytes";
+    let data = STANDARD.encode(bytes);
+    let url = format!("data:image/gif;base64,{data}");
+    let mut fixture = fixture("");
+    fixture.state["cwd"] = Value::Null;
+    fixture.state["turns"][0]["items"] = json!([
+        {"id":"user","type":"userMessage","content":[{"type":"image","url":url}]},
+        {"id":"tool","type":"mcpToolCall","result":{"content":[{"type":"image","mimeType":"image/gif","data":data}]}}
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut auth = Auth::load(fixture._temp.path().join("synthetic-remote.json")).unwrap();
+    auth.configure(
+        "",
+        "admin",
+        Some(Credentials::new("admin", "synthetic-password-1234").unwrap()),
+        address.port(),
+        String::new(),
+    )
+    .unwrap();
+    let revision = auth.revision().to_string();
+    let login = auth.issue(&revision, false).unwrap();
+    let other = auth.issue(&revision, false).unwrap();
+    let cookie = format!("codey_remote={}", login.token);
+    let core = Arc::new(Core {
+        auth: Arc::new(Mutex::new(auth)),
+        state: std::sync::Weak::new(),
+        public_url: std::sync::RwLock::new(None),
+        address,
+        actions: tokio::sync::Mutex::new(Ledger::default()),
+        shutdown: tokio::sync::watch::channel(false).0,
+        streams: Arc::new(Semaphore::new(8)),
+        logins: Arc::new(Semaphore::new(2)),
+        files: fixture.registry.clone(),
+        file_transfers: Arc::new(Semaphore::new(2)),
+    });
+    let binding = BindingGuard::new(
+        fixture.registry.clone(),
+        &login.token,
+        &fixture.thread,
+        &fixture.state,
+        &provenance(fixture.revision),
+    )
+    .unwrap();
+    let task = tokio::spawn(server::serve(listener, core.clone()));
+    let base = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let compact = compact_view(&fixture.state);
+    let mut last_url = String::new();
+    for message in compact["turns"][0]["messages"].as_array().unwrap() {
+        let reference = message["attachments"][0]["id"].as_str().unwrap();
+        let resolve = || {
+            client
+                .post(format!("{base}/remote/files/resolve"))
+                .header("origin", &base)
+                .header("cookie", &cookie)
+                .json(&json!({"threadId":fixture.thread,"reference":reference}))
+        };
+        assert_eq!(
+            resolve().send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let reply = resolve()
+            .header("x-csrf-token", login.session["csrfToken"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let resolved: Value = reply.json().await.unwrap();
+        assert_eq!(resolved["file"]["size"], bytes.len());
+        assert_eq!(resolved["file"]["mime"], "image/gif");
+        assert!(!resolved.to_string().contains("data:"));
+        assert!(!resolved.to_string().contains("workspace"));
+        assert_eq!(
+            fixture.registry.lock().unwrap().budget.available_permits(),
+            CACHE_KIB
+        );
+        assert_eq!(core.file_transfers.available_permits(), 2);
+        last_url = format!(
+            "{base}{}",
+            resolved["file"]["downloadUrl"].as_str().unwrap()
+        );
+        assert_eq!(
+            client.get(&last_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(&last_url)
+                .header("cookie", format!("codey_remote={}", other.token))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(last_url.replace(&fixture.thread, &uuid::Uuid::new_v4().to_string()))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(&last_url)
+                .header("cookie", &cookie)
+                .header("origin", "https://evil.invalid")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let reply = client
+            .get(&last_url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        assert_eq!(reply.headers()["content-type"], "image/gif");
+        assert_eq!(reply.headers()["content-length"], bytes.len().to_string());
+        assert_eq!(
+            reply.headers()["etag"],
+            format!("\"sha256-{}\"", crate::fs_util::sha256_hex(bytes))
+        );
+        assert_eq!(reply.headers()["cache-control"], "no-store");
+        assert_eq!(reply.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(reply.bytes().await.unwrap().as_ref(), bytes);
+    }
+    assert!(core.state.upgrade().is_none());
+    drop(binding);
+    assert_eq!(
+        client
+            .get(&last_url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    core.auth.lock().unwrap().revoke("*").unwrap();
+    assert_eq!(
+        client
+            .get(&last_url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    core.shutdown.send_replace(true);
+    drop(client);
+    task.await.unwrap();
+}
+
 #[test]
 fn public_activity_file_links_use_the_same_projection_without_widening_authority() {
     let message = "[结果](outputs/activity.txt) [越界](../outside.txt)";
@@ -68,7 +704,7 @@ fn public_activity_file_links_use_the_same_projection_without_widening_authority
         )
         .unwrap();
         fixture.state["turns"][0]["items"] = json!([item]);
-        fixture.binding.update(&fixture.state).unwrap();
+        fixture.update();
         assert!(
             super::super::protocol::view(&fixture.state)
                 .to_string()
@@ -90,7 +726,7 @@ fn public_activity_file_links_use_the_same_projection_without_widening_authority
     }
     let mut fixture = fixture("");
     fixture.state["turns"][0]["items"] = json!([{"id":"unknown","type":"collabAgentToolCall","tool":"futureAction","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"completed","message":message}}}]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     assert!(
         fixture
             .registry
@@ -180,7 +816,7 @@ fn native_user_attachment_has_only_opaque_identity_and_exact_outside_workspace_a
         {"id":"user","type":"userMessage","content":[{"type":"file","path":outside}]},
         {"id":"model","type":"agentMessage","text":format!("[not authorized](<{}>)",outside.display()),"content":[{"type":"file","path":outside}]}
     ]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     let view = super::super::protocol::view(&fixture.state);
     let attachment = &view["turns"][0]["messages"][0]["attachments"][0];
     assert_eq!(attachment["name"], "private-user-file.bin");
@@ -244,7 +880,7 @@ fn native_absolute_attachments_protect_config_but_allow_exact_home_and_downloads
                 json!([{"id":"user","type":"userMessage","content":parts},model])
             };
             fixture.state["turns"][0]["params"]["input"] = json!(parts);
-            fixture.binding.update(&fixture.state).unwrap();
+            fixture.update();
             let view = super::super::protocol::view(&fixture.state);
             let attachments = view["turns"][0]["messages"][0]["attachments"]
                 .as_array()
@@ -252,7 +888,10 @@ fn native_absolute_attachments_protect_config_but_allow_exact_home_and_downloads
             assert_eq!(attachments.len(), paths.len());
             for (index, attachment) in attachments.iter().enumerate() {
                 let selected = select(&fixture, attachment["id"].as_str().unwrap());
-                assert!(selected.value.native);
+                assert!(matches!(
+                    &selected.value,
+                    references::Reference::File { native: true, .. }
+                ));
                 if index < 2 {
                     let file = describe(selected, || Ok(())).unwrap();
                     assert_eq!(
@@ -279,7 +918,7 @@ fn native_absolute_attachments_protect_config_but_allow_exact_home_and_downloads
 #[test]
 fn native_absolute_attachments_deny_protected_alias_targets_and_all_file_or_parent_links() {
     let mut fixture = fixture("");
-    let parent = fixture.root.parent().unwrap();
+    let parent = fixture.root.parent().unwrap().to_path_buf();
     let protected = parent.join("custom-config");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("auth.json"), b"SYNTHETIC_CONFIG").unwrap();
@@ -317,7 +956,7 @@ fn native_absolute_attachments_deny_protected_alias_targets_and_all_file_or_pare
         .collect();
     fixture.state["turns"][0]["items"] =
         json!([{"id":"user","type":"userMessage","content":parts}]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     let view = super::super::protocol::view(&fixture.state);
     let attachments = view["turns"][0]["messages"][0]["attachments"]
         .as_array()
@@ -360,7 +999,7 @@ fn passive_resolution_allocates_no_snapshot_and_native_percent_paths_remain_exac
         {"id":"user","type":"userMessage","content":[{"type":"file","path":literal}]},
         {"id":"answer","type":"agentMessage","text":format!("[absolute](<{}>)",literal.display())}
     ]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     let view = super::super::protocol::view(&fixture.state);
     let id = view["turns"][0]["messages"][0]["attachments"][0]["id"]
         .as_str()
@@ -421,7 +1060,10 @@ fn file_resolution_requires_a_bound_public_candidate_and_independent_safe_root()
             .contains("先打开")
     );
     let mut selected = select(&fixture, "../outside");
-    selected.value.value = "outputs/file.txt".into();
+    let references::Reference::File { value, .. } = &mut selected.value else {
+        panic!("expected file reference")
+    };
+    *value = "outputs/file.txt".into();
     selected.cwd = Some(if cfg!(windows) { "C:/" } else { "/" }.into());
     assert!(selected_path(&selected).is_err());
 }
@@ -453,7 +1095,7 @@ fn replaced_links_and_disconnected_bindings_drop_only_owned_cache_files() {
     let response = fixture.registry.lock().unwrap().insert(file).unwrap();
     let id = response["file"]["id"].as_str().unwrap().to_string();
     fixture.state["turns"][0]["items"][0]["text"] = json!("[replacement](outputs/b.txt)");
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     assert!(
         fixture
             .registry
@@ -479,8 +1121,357 @@ fn replaced_links_and_disconnected_bindings_drop_only_owned_cache_files() {
 }
 
 #[test]
+fn newer_native_revocations_survive_stale_snapshots_and_the_newer_window_closing() {
+    for inline in [false, true] {
+        let mut fixture = fixture("[file](outputs/a.txt)");
+        let mut bytes = vec![b'x'; CHUNK * 3];
+        bytes[..6].copy_from_slice(b"GIF89a");
+        std::fs::write(fixture.root.join("outputs/a.txt"), &bytes).unwrap();
+        if inline {
+            let url = format!("data:image/gif;base64,{}", STANDARD.encode(&bytes));
+            fixture.state["turns"][0]["items"] =
+                json!([{"id":"image","type":"userMessage","content":[{"type":"image","url":url}]}]);
+            fixture.update();
+        }
+        let reference = if inline {
+            compact_view(&fixture.state)["turns"][0]["messages"][0]["attachments"][0]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        } else {
+            "outputs/a.txt".to_string()
+        };
+        let stale_state = fixture.state.clone();
+        let stale_revision = fixture.revision;
+        let stale = BindingGuard::new(
+            fixture.registry.clone(),
+            "token",
+            &fixture.thread,
+            &stale_state,
+            &provenance(stale_revision),
+        )
+        .unwrap();
+        let file = descriptor(&fixture, &reference);
+        let selection = file.selection();
+        let prepared = prepare_snapshot(&fixture.registry, &file, || Ok(())).unwrap();
+        let registry = fixture.registry.clone();
+        let mut transfer = (0..prepared.size).step_by(CHUNK).map(|offset| {
+            if !registry.lock().unwrap().current(&selection) {
+                return Err("revoked".to_string());
+            }
+            prepared.read(offset)
+        });
+        assert_eq!(transfer.next().unwrap().unwrap(), bytes[..CHUNK]);
+        let response = fixture.registry.lock().unwrap().insert(file).unwrap();
+        let id = response["file"]["id"].as_str().unwrap();
+        let file = fixture
+            .registry
+            .lock()
+            .unwrap()
+            .cached("token", &fixture.thread, id)
+            .unwrap();
+        fixture.state["turns"][0]["items"] = json!([]);
+        fixture.update();
+        stale
+            .update(&stale_state, &provenance(stale_revision))
+            .unwrap();
+        drop(fixture.binding);
+        let registry = fixture.registry.lock().unwrap();
+        assert!(!registry.current(&selection));
+        assert!(registry.cached("token", &fixture.thread, id).is_err());
+        assert!(
+            registry
+                .selection("token", &fixture.thread, &reference)
+                .is_err()
+        );
+        drop(registry);
+        assert_eq!(transfer.next().unwrap().unwrap_err(), "revoked");
+        assert!(
+            prepare_snapshot(&fixture.registry, &file, || {
+                fixture
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .current(&selection)
+                    .then_some(())
+                    .ok_or("revoked".into())
+            })
+            .is_err()
+        );
+        assert!(!fixture.registry.lock().unwrap().current(&selection));
+        drop(transfer);
+        stale
+            .update(&stale_state, &provenance(stale_revision + 2))
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .unwrap()
+                .selection("token", &fixture.thread, &reference)
+                .is_ok()
+        );
+        drop(stale);
+        assert!(fixture.registry.lock().unwrap().bindings.is_empty());
+    }
+}
+
+#[test]
+fn native_counter_reset_blocks_all_old_leases_until_the_group_reconnects() {
+    let fixture = fixture("[file](outputs/a.txt)");
+    std::fs::write(fixture.root.join("outputs/a.txt"), b"synthetic").unwrap();
+    fixture
+        .binding
+        .update(&fixture.state, &provenance(10))
+        .unwrap();
+    let other = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &fixture.state,
+        &provenance(10),
+    )
+    .unwrap();
+    let file = descriptor(&fixture, "outputs/a.txt");
+    let selection = file.selection();
+    let response = fixture.registry.lock().unwrap().insert(file).unwrap();
+    let id = response["file"]["id"].as_str().unwrap();
+    fixture
+        .binding
+        .update(&fixture.state, &provenance(1))
+        .unwrap();
+    drop(fixture.binding);
+    {
+        let registry = fixture.registry.lock().unwrap();
+        assert!(!registry.current(&selection));
+        assert!(
+            registry
+                .selection("token", &fixture.thread, "outputs/a.txt")
+                .unwrap_err()
+                .contains("重置")
+        );
+        assert!(registry.cached("token", &fixture.thread, id).is_err());
+    }
+    other.update(&fixture.state, &provenance(11)).unwrap();
+    let still_blocked = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &fixture.state,
+        &provenance(12),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .selection("token", &fixture.thread, "outputs/a.txt")
+            .is_err()
+    );
+    drop(still_blocked);
+    drop(other);
+    let reconnected = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &fixture.state,
+        &provenance(1),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .selection("token", &fixture.thread, "outputs/a.txt")
+            .is_ok()
+    );
+    let other_owner = NativeProvenance {
+        owner: "different-native-owner".into(),
+        revision: Some(100),
+    };
+    assert!(
+        BindingGuard::new(
+            fixture.registry.clone(),
+            "token",
+            &fixture.thread,
+            &fixture.state,
+            &other_owner
+        )
+        .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .selection("token", &fixture.thread, "outputs/a.txt")
+            .unwrap_err()
+            .contains("窗口已变化")
+    );
+    drop(reconnected);
+    assert!(
+        BindingGuard::new(
+            fixture.registry.clone(),
+            "token",
+            &fixture.thread,
+            &fixture.state,
+            &other_owner
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn unknown_native_file_revision_revokes_without_failing_the_chat_binding() {
+    let fixture = fixture("[file](outputs/a.txt)");
+    let selection = select(&fixture, "outputs/a.txt");
+    let unknown = NativeProvenance {
+        owner: "synthetic-owner".into(),
+        revision: None,
+    };
+    fixture.binding.update(&fixture.state, &unknown).unwrap();
+    let another = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &fixture.state,
+        &unknown,
+    )
+    .unwrap();
+    let registry = fixture.registry.lock().unwrap();
+    assert!(!registry.current(&selection));
+    assert!(
+        registry
+            .selection("token", &fixture.thread, "outputs/a.txt")
+            .unwrap_err()
+            .contains("版本未知")
+    );
+    drop(registry);
+    fixture
+        .binding
+        .update(&fixture.state, &provenance(2))
+        .unwrap();
+    assert!(!fixture.registry.lock().unwrap().current(&selection));
+    drop(another);
+}
+
+#[test]
+fn native_authority_tracks_only_latest_or_live_scopes_and_does_not_resurrect_unknown_ones() {
+    let mut fixture = fixture("[file](outputs/a.txt)");
+    let old = fixture.state.clone();
+    let selection = select(&fixture, "outputs/a.txt");
+    let stale = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &old,
+        &provenance(1),
+    )
+    .unwrap();
+    for index in 0..8 {
+        fixture.state["turns"][0]["items"] = json!([{"id":format!("new-{index}"),"type":"agentMessage","text":format!("[new](outputs/{index}.txt)")}]);
+        fixture.update();
+        let registry = fixture.registry.lock().unwrap();
+        assert!(registry.bindings.values().next().unwrap().scopes.len() <= 2);
+        assert!(!registry.current(&selection));
+    }
+    drop(stale);
+    assert_eq!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .bindings
+            .values()
+            .next()
+            .unwrap()
+            .scopes
+            .len(),
+        1
+    );
+    fixture.state["turns"][0]["items"] = json!([]);
+    fixture.update();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .bindings
+            .values()
+            .next()
+            .unwrap()
+            .scopes
+            .is_empty()
+    );
+    let late = BindingGuard::new(
+        fixture.registry.clone(),
+        "token",
+        &fixture.thread,
+        &old,
+        &provenance(1),
+    )
+    .unwrap();
+    assert!(!fixture.registry.lock().unwrap().current(&selection));
+    late.update(&old, &provenance(fixture.revision)).unwrap();
+    assert!(!fixture.registry.lock().unwrap().current(&selection));
+    late.update(&old, &provenance(fixture.revision + 1))
+        .unwrap();
+    assert!(fixture.registry.lock().unwrap().current(&selection));
+}
+
+#[test]
+fn native_history_gaps_preserve_unloaded_items_but_complete_history_can_revoke_them() {
+    for canonical in [false, true] {
+        let fixture = fixture("[file](outputs/a.txt)");
+        let selected = select(&fixture, "outputs/a.txt");
+        let mut partial = fixture.state.clone();
+        partial["turns"][0]["items"] =
+            json!([{"id":"recent","type":"agentMessage","text":"no file"}]);
+        partial["turns"][0]["itemsPagination"] = json!({"hasLoadedOldest":false});
+        if canonical {
+            partial["turns"][0]["items"] = json!({"isComplete":false,"entitiesByKey":{"recent":{"id":"recent","type":"agentMessage","text":"no file"}},"islands":[{"entries":[{"value":"recent"}]}]});
+        }
+        let newer = BindingGuard::new(
+            fixture.registry.clone(),
+            "token",
+            &fixture.thread,
+            &partial,
+            &provenance(2),
+        )
+        .unwrap();
+        assert!(fixture.registry.lock().unwrap().current(&selected));
+        partial["turns"][0]["itemsPagination"]["hasLoadedOldest"] = json!(true);
+        if canonical {
+            partial["turns"][0]["items"]["isComplete"] = json!(true);
+        }
+        newer.update(&partial, &provenance(3)).unwrap();
+        assert!(!fixture.registry.lock().unwrap().current(&selected));
+        newer.update(&fixture.state, &provenance(4)).unwrap();
+        assert!(fixture.registry.lock().unwrap().current(&selected));
+        partial["turns"] = json!([]);
+        partial["turnsPagination"] = json!({"hasLoadedOldest":false});
+        if canonical {
+            partial["turnHistory"] = json!({"kind":"canonical","history":{"isComplete":false,"entitiesByKey":{},"islands":[]}});
+        }
+        newer.update(&partial, &provenance(5)).unwrap();
+        assert!(fixture.registry.lock().unwrap().current(&selected));
+        partial["turnsPagination"]["hasLoadedOldest"] = json!(true);
+        if canonical {
+            partial["turnHistory"]["history"]["isComplete"] = json!(true);
+        }
+        newer.update(&partial, &provenance(6)).unwrap();
+        assert!(!fixture.registry.lock().unwrap().current(&selected));
+    }
+}
+
+#[test]
 fn same_session_windows_keep_old_downloads_and_independent_history_until_their_own_disconnect() {
-    let mut fixture = fixture("[old](outputs/old.txt) [shared](outputs/shared.bin)");
+    let mut fixture = fixture("[shared](outputs/shared.bin)");
+    fixture.state["turnsPagination"] = json!({"hasLoadedOldest":false});
+    fixture.state["turns"].as_array_mut().unwrap().push(json!({"turnId":"old","items":[{"id":"old-answer","type":"agentMessage","text":"[old](outputs/old.txt)"}]}));
+    fixture.update();
     let bytes = vec![b's'; CHUNK * 3];
     std::fs::write(fixture.root.join("outputs/old.txt"), b"old").unwrap();
     std::fs::write(fixture.root.join("outputs/new.txt"), b"new").unwrap();
@@ -492,17 +1483,18 @@ fn same_session_windows_keep_old_downloads_and_independent_history_until_their_o
     let response = fixture.registry.lock().unwrap().insert(file).unwrap();
     let id = response["file"]["id"].as_str().unwrap();
     let mut newer_state = fixture.state.clone();
-    newer_state["turns"][0]["items"][0]["text"] =
-        json!("[shared](outputs/shared.bin) [new](outputs/new.txt)");
+    newer_state["turns"][1] = json!({"turnId":"new","items":[{"id":"new-answer","type":"agentMessage","text":"[new](outputs/new.txt)"}]});
     let mut newer = Some(
         BindingGuard::new(
             fixture.registry.clone(),
             "token",
             &fixture.thread,
             &newer_state,
+            &provenance(fixture.revision + 1),
         )
         .unwrap(),
     );
+    fixture.revision += 1;
     assert!(fixture.registry.lock().unwrap().current(&selection));
     assert_eq!(
         snapshot(&fixture, "outputs/old.txt").read(0).unwrap(),
@@ -513,8 +1505,8 @@ fn same_session_windows_keep_old_downloads_and_independent_history_until_their_o
         b"new"
     );
     fixture.state["turns"][0]["items"][0]["text"] =
-        json!("[old](outputs/old.txt) [shared](outputs/shared.bin) [late](outputs/late.txt)");
-    fixture.binding.update(&fixture.state).unwrap();
+        json!("[shared](outputs/shared.bin) [late](outputs/late.txt)");
+    fixture.update();
     assert_eq!(
         snapshot(&fixture, "outputs/late.txt").read(0).unwrap(),
         b"late"
@@ -605,6 +1597,7 @@ fn shared_download_stream_survives_either_window_closing_until_the_last_binding(
             "token",
             &fixture.thread,
             &fixture.state,
+            &provenance(fixture.revision),
         )
         .unwrap();
         let file = descriptor(&fixture, "outputs/a.txt");
@@ -661,7 +1654,7 @@ fn shared_download_stream_survives_either_window_closing_until_the_last_binding(
 
 #[test]
 fn multiple_connection_leases_remain_token_and_thread_scoped_and_revoked_guards_cannot_rebind() {
-    let fixture = fixture("[file](outputs/a.txt)");
+    let mut fixture = fixture("[file](outputs/a.txt)");
     std::fs::write(fixture.root.join("outputs/a.txt"), b"safe").unwrap();
     let selection = select(&fixture, "outputs/a.txt");
     let file = descriptor(&fixture, "outputs/a.txt");
@@ -672,6 +1665,7 @@ fn multiple_connection_leases_remain_token_and_thread_scoped_and_revoked_guards_
         "token",
         &fixture.thread,
         &fixture.state,
+        &provenance(fixture.revision),
     )
     .unwrap();
     let _other_token = BindingGuard::new(
@@ -679,6 +1673,7 @@ fn multiple_connection_leases_remain_token_and_thread_scoped_and_revoked_guards_
         "other",
         &fixture.thread,
         &fixture.state,
+        &provenance(fixture.revision),
     )
     .unwrap();
     let mut other_state = fixture.state.clone();
@@ -689,6 +1684,7 @@ fn multiple_connection_leases_remain_token_and_thread_scoped_and_revoked_guards_
         "token",
         &other_thread,
         &other_state,
+        &provenance(fixture.revision),
     )
     .unwrap();
     {
@@ -715,8 +1711,10 @@ fn multiple_connection_leases_remain_token_and_thread_scoped_and_revoked_guards_
                 .is_ok()
         );
     }
-    fixture.binding.update(&fixture.state).unwrap();
-    newer.update(&fixture.state).unwrap();
+    fixture.update();
+    newer
+        .update(&fixture.state, &provenance(fixture.revision))
+        .unwrap();
     assert!(
         fixture
             .registry
@@ -751,6 +1749,7 @@ fn multiple_connections_reject_conflicting_roots_or_authority_and_real_updates_e
         "token",
         &fixture.thread,
         &conflict,
+        &provenance(fixture.revision),
     )
     .unwrap();
     assert!(!fixture.registry.lock().unwrap().current(&selection));
@@ -763,6 +1762,7 @@ fn multiple_connections_reject_conflicting_roots_or_authority_and_real_updates_e
             .is_err()
     );
     drop(newer);
+    fixture.update();
     assert!(
         fixture
             .registry
@@ -779,13 +1779,17 @@ fn multiple_connections_reject_conflicting_roots_or_authority_and_real_updates_e
             .selection("token", &fixture.thread, "outputs/a.txt")
             .is_ok()
     );
-    fixture.binding.update(&conflict).unwrap();
+    fixture.revision += 1;
+    fixture
+        .binding
+        .update(&conflict, &provenance(fixture.revision))
+        .unwrap();
     assert!(!fixture.registry.lock().unwrap().current(&selection));
     let path = fixture.root.parent().unwrap().join("user-selected.bin");
     std::fs::write(&path, b"user").unwrap();
     fixture.state["turns"][0]["items"] =
         json!([{"id":"same-item","type":"userMessage","content":[{"type":"file","path":path}]}]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     let view = super::super::protocol::view(&fixture.state);
     let reference = view["turns"][0]["messages"][0]["attachments"][0]["id"]
         .as_str()
@@ -798,6 +1802,7 @@ fn multiple_connections_reject_conflicting_roots_or_authority_and_real_updates_e
         "token",
         &fixture.thread,
         &conflict,
+        &provenance(fixture.revision),
     )
     .unwrap();
     assert!(!fixture.registry.lock().unwrap().current(&native));
@@ -810,9 +1815,11 @@ fn multiple_connections_reject_conflicting_roots_or_authority_and_real_updates_e
             .is_err()
     );
     drop(newer);
+    assert!(!fixture.registry.lock().unwrap().current(&native));
+    fixture.update();
     assert!(fixture.registry.lock().unwrap().current(&native));
     fixture.state["turns"][0]["items"] = json!([]);
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     assert!(!fixture.registry.lock().unwrap().current(&native));
     assert!(
         fixture
@@ -919,7 +1926,7 @@ fn absolute_workspace_links_image_metadata_ttl_and_native_identity_are_stable() 
     std::fs::write(&path, b"\x89PNG\r\n\x1a\nimage").unwrap();
     fixture.state["turns"][0]["items"][0]["text"] =
         json!(format!("![image](<{}>)", path.display()));
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     let mut file = descriptor(&fixture, path.to_str().unwrap());
     assert_eq!(file.mime, "image/png");
     assert_eq!(
@@ -950,7 +1957,7 @@ fn absolute_workspace_links_image_metadata_ttl_and_native_identity_are_stable() 
         "{}[hidden](outputs/hidden.txt)",
         "x".repeat(super::super::protocol::MAX_PUBLIC_TEXT)
     ));
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     assert!(
         fixture
             .registry
@@ -983,11 +1990,11 @@ fn protected_real_targets_are_denied_even_below_a_parent_workspace_and_unresolve
     assert!(describe(select(&fixture, "outputs/safe.txt"), || Ok(())).is_ok());
     fixture.state["cwd"] = json!(protected);
     fixture.state["turns"][0]["items"][0]["text"] = json!("[secret](auth.json)");
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     assert!(describe(select(&fixture, "auth.json"), || Ok(())).is_err());
     fixture.state["cwd"] = json!(fixture.root);
     fixture.state["turns"][0]["items"][0]["text"] = json!("[safe](outputs/safe.txt)");
-    fixture.binding.update(&fixture.state).unwrap();
+    fixture.update();
     #[cfg(unix)]
     std::fs::remove_file(&alias).unwrap();
     #[cfg(windows)]

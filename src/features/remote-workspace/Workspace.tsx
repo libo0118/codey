@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { IconArrowDown, IconArrowLeft, IconDeviceLaptop, IconRefresh, IconSquarePlus } from "@tabler/icons-react";
 import type { Approval } from "../../remote/workspace-data";
 import { Sidebar } from "../../remote/sidebar";
@@ -13,12 +13,31 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
   const c = useRemoteWorkspaceController({ active, onUnauthorized });
   const { threads, projects, selected, selectedId, selectedProject, search, archived, project, creating,
     draftScope, draftProject, defaultsReady, composerView, view, connected, connectionError, activeTurn,
-    models, busy, loading, error, draft, images, uncertain, catalogError } = c;
+    models, busy, loading, error, draft, images, uncertain, catalogError, fileGeneration, loadingEarlier } = c;
   const [atBottom, setAtBottom] = useState(true);
   const scroll = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
-  useEffect(() => { pinned.current = true; setAtBottom(true); }, [draftScope]);
-  useEffect(() => { if (pinned.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [view]);
+  const anchor = useRef<{ id: string; offset: number } | null>(null);
+  const files = useMemo(() => ({ threadId: view?.id || "", enabled: active && connected && view?.id === selectedId, generation: fileGeneration }), [active, connected, selectedId, view?.id, fileGeneration]);
+  function rememberAnchor() {
+    const container = scroll.current;
+    if (!container) return;
+    const top = container.getBoundingClientRect().top;
+    const first = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]")).find(element => element.getBoundingClientRect().bottom > top);
+    anchor.current = first ? { id: first.dataset.messageId!, offset: first.getBoundingClientRect().top - top } : null;
+  }
+  useLayoutEffect(() => { pinned.current = true; anchor.current = null; setAtBottom(true); }, [draftScope]);
+  useLayoutEffect(() => {
+    const container = scroll.current;
+    if (!container) return;
+    if (pinned.current) container.scrollTop = container.scrollHeight;
+    else if (anchor.current) {
+      const previous = anchor.current;
+      const element = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]")).find(element => element.dataset.messageId === previous.id);
+      if (element) container.scrollTop += element.getBoundingClientRect().top - container.getBoundingClientRect().top - previous.offset;
+    }
+    rememberAnchor();
+  }, [view, draftScope]);
 
   return <div className={`remote-codex-workspace${selected || creating ? " has-selection" : ""}`}>
     <Sidebar threads={threads} projects={projects} selectedId={selectedId} busy={busy} loading={loading} search={search} archived={archived} error={!selected && !creating ? error : ""} onSearch={c.changeSearch} onArchived={c.changeArchived} onOpen={c.open} onCreate={c.startCreating} onRefresh={c.refresh} onPanel={onPanel} onLogout={onLogout} />
@@ -33,12 +52,12 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
         {!creating && <button className="remote-icon-button" disabled={busy} aria-label="重新连接" onClick={c.reconnect}><IconRefresh size={18} /></button>}
       </header>
       {connectionError && <p className="remote-connection" role="status">{connectionError}</p>}
-      <MessageFilesContext.Provider value={{ threadId: view?.id || "", enabled: active && connected && view?.id === selectedId }}><div className="remote-transcript">
-        <div className="remote-messages" ref={scroll} onScroll={event => { const element = event.currentTarget; pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); }}>
-          {view && !view.historyComplete && <button disabled={busy || !connected} onClick={() => void c.loadHistory()}>加载完整历史</button>}
+      <MessageFilesContext.Provider value={files}><div className="remote-transcript">
+        <div className="remote-messages" ref={scroll} onScroll={event => { const element = event.currentTarget; pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); rememberAnchor(); }}>
+          {view && (view.hasEarlierMessages || !view.historyComplete) && <button disabled={busy || loadingEarlier || !connected} onClick={() => { rememberAnchor(); pinned.current = false; void c.loadHistory(); }}>{loadingEarlier ? "正在加载更早内容…" : view.hasEarlierMessages ? "加载更早内容" : "加载完整历史"}</button>}
           {!creating && !view && <p className="remote-chat-loading">{connectionError ? "暂时无法读取会话，请点击重新连接。" : "正在获取桌面会话…"}</p>}
           {(creating || view?.turns.length === 0) && <div className="remote-chat-empty"><h2>从一个想法开始</h2><p>{creating && !draftProject ? "请先在电脑 Codex 中保存本地项目。" : `描述任务，让 Codex 在 ${draftProject && creating ? draftProject.name : selectedProject?.name || "当前工作区"} 中开始工作。`}</p></div>}
-          {view?.turns.map((turn, index) => <ConversationTurn key={`${view.id}:${turn.id || index}`} turn={turn} />)}
+          {view?.turns.map((turn, index) => turn.messages.length > 0 && <ConversationTurn key={`${view.id}:${turn.id || index}`} turn={turn} />)}
           {view?.requests.map(request => <ApprovalCard key={String(request.id)} request={request} disabled={busy || !connected} onRespond={args => c.respond(request.id, args)} />)}
           {activeTurn && <p className="remote-working" role="status"><span className="remote-chat-status-dot is-connected" />Codex 正在工作…</p>}
         </div>

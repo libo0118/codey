@@ -14,6 +14,12 @@ pub(super) const OWNER_UNAVAILABLE: &str = "尚未取得桌面会话，请点击
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 
+#[derive(Clone)]
+pub(super) struct NativeProvenance {
+    pub owner: String,
+    pub revision: Option<u64>,
+}
+
 pub(super) struct Desktop {
     stream: Box<dyn Transport>,
     buffer: Vec<u8>,
@@ -216,8 +222,32 @@ impl Desktop {
         self.apply_event(event)
     }
 
-    pub fn state_frame(&mut self) -> String {
-        self.projection.frame(&self.state)
+    pub fn public_state(
+        &mut self,
+        version: super::projection::StreamVersion,
+        window: &mut super::projection::MessageWindow,
+    ) -> super::projection::PublicState {
+        self.projection.public_state(&self.state, version, window)
+    }
+
+    pub fn provenance(&self) -> Result<NativeProvenance, String> {
+        Ok(NativeProvenance {
+            owner: self.owner.clone().ok_or("尚未取得桌面会话所属客户端")?,
+            revision: self
+                .revision
+                .as_ref()
+                .and_then(Value::as_u64)
+                .filter(|revision| *revision <= 9_007_199_254_740_991),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn follow_transport(
+        stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        thread: &str,
+    ) -> Result<Self, String> {
+        validate_thread(thread)?;
+        Self::subscribe(Self::initialize(Box::new(stream)).await?, thread).await
     }
 
     fn apply_event(&mut self, event: Value) -> Result<bool, String> {
@@ -654,6 +684,27 @@ mod tests {
         assert!(desktop.apply_event(event).unwrap());
         let patch = json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"patches","revision":3,"baseRevision":2,"patches":[]}}});
         assert!(desktop.apply_event(patch).unwrap_err().contains("失步"));
+    }
+
+    #[tokio::test]
+    async fn native_provenance_accepts_only_safe_numeric_revisions() {
+        let (mut desktop, _server) = action_fixture(json!({"id":"t"}));
+        assert_eq!(desktop.provenance().unwrap().revision, None);
+        for revision in [
+            json!("2"),
+            json!(-1),
+            json!(1.5),
+            json!(9_007_199_254_740_992u64),
+        ] {
+            let event = json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":revision,"conversationState":{"id":"t"}}}});
+            assert!(desktop.apply_event(event).unwrap());
+            assert_eq!(desktop.provenance().unwrap().revision, None);
+        }
+        let event = json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":42,"conversationState":{"id":"t"}}}});
+        assert!(desktop.apply_event(event).unwrap());
+        let provenance = desktop.provenance().unwrap();
+        assert_eq!(provenance.owner, "owner");
+        assert_eq!(provenance.revision, Some(42));
     }
 
     #[test]

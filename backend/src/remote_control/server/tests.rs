@@ -599,6 +599,343 @@ async fn state_coalescing_does_not_delay_urgent_changes() {
     assert_eq!(pending, Some(tokio::time::Instant::now()));
 }
 
+async fn native_read(stream: &mut tokio::io::DuplexStream) -> Value {
+    use tokio::io::AsyncReadExt;
+    let size = stream.read_u32_le().await.unwrap() as usize;
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn native_write(stream: &mut tokio::io::DuplexStream, value: Value) {
+    use tokio::io::AsyncWriteExt;
+    let bytes = value.to_string().into_bytes();
+    stream.write_u32_le(bytes.len() as u32).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+}
+
+async fn synthetic_stream(
+    server: &Server,
+    cookie: &str,
+    state: Value,
+    version: super::super::projection::StreamVersion,
+) -> (
+    WebSocketStream<tokio::io::DuplexStream>,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<()>,
+) {
+    let thread = state["id"].as_str().unwrap().to_string();
+    // A single state cannot fit in the WebSocket's 1 KiB transport. Tests
+    // deliberately leave it unread while sending real framed Native updates.
+    let (socket, client) = tokio::io::duplex(1024);
+    let (native, mut desktop) = tokio::io::duplex(2 * 1024 * 1024);
+    let socket = WebSocketStream::from_raw_socket(
+        socket,
+        Role::Server,
+        Some(
+            WebSocketConfig::default()
+                .max_message_size(Some(1024))
+                .max_frame_size(Some(1024)),
+        ),
+    )
+    .await;
+    let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let core = server.core.clone();
+    let token = cookie.split_once('=').unwrap().1.to_string();
+    let task = tokio::spawn(async move {
+        stream::session(
+            socket,
+            &core,
+            &token,
+            version,
+            Desktop::follow_transport(native, &thread),
+        )
+        .await;
+    });
+    let initialize = native_read(&mut desktop).await;
+    assert_eq!(initialize["method"], "initialize");
+    native_write(&mut desktop, json!({"type":"response","requestId":initialize["requestId"],"resultType":"success","result":{"clientId":"synthetic-mobile"}})).await;
+    let following = native_read(&mut desktop).await;
+    assert_eq!(following["method"], "thread-stream-following-changed");
+    assert_eq!(following["params"]["conversationId"], state["id"]);
+    native_write(&mut desktop, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":state["id"],"change":{"type":"snapshot","revision":1,"conversationState":state}}})).await;
+    (client, desktop, task)
+}
+
+async fn socket_value(socket: &mut WebSocketStream<tokio::io::DuplexStream>) -> Value {
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = message {
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+}
+
+fn stream_state(server: &Server) -> Value {
+    let root = server
+        ._directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(root.join("outputs")).unwrap();
+    std::fs::write(
+        root.join("outputs/result.bin"),
+        b"synthetic public artifact",
+    )
+    .unwrap();
+    json!({"id":uuid::Uuid::new_v4().to_string(),"cwd":root,"turns":[{"turnId":"turn","status":"inProgress","items":(0..80).map(|id|json!({"id":format!("item-{id}"),"type":"agentMessage","text":if id == 0 { "[old file](outputs/result.bin)".into() } else { "x".repeat(4096) }})).collect::<Vec<_>>()}]})
+}
+
+async fn wait_for_reference(server: &Server, token: &str, thread: &str, present: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let current = server
+                .core
+                .files
+                .lock()
+                .unwrap()
+                .selection(token, thread, "outputs/result.bin")
+                .is_ok();
+            if current == present {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_slow_socket_keeps_reading_native_revokes_hidden_refs_and_delivers_the_final_delta() {
+    use super::super::projection::{MessageWindow, Projection, PublicState, StreamVersion};
+    let server = fixture().await;
+    let (cookie, _) = login_session(&server, false).await;
+    let token = cookie.split_once('=').unwrap().1;
+    let mut state = stream_state(&server);
+    let thread = state["id"].as_str().unwrap().to_string();
+    let (mut socket, mut native, task) =
+        synthetic_stream(&server, &cookie, state.clone(), StreamVersion::V2).await;
+    wait_for_reference(&server, token, &thread, true).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for byte in 0..3 {
+        socket
+            .send(Message::Ping(Bytes::from(vec![byte])))
+            .await
+            .unwrap();
+    }
+    let first_update = json!([
+        {"op":"replace","path":"/turns/0/items/0/text","value":"old download removed"},
+        {"op":"replace","path":"/turns/0/items/79/text","value":"not delivered intermediate"},
+        {"op":"add","path":"/title","value":"not delivered intermediate"}
+    ]);
+    native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":1,"revision":2,"patches":first_update}}})).await;
+    // This must complete before the phone starts consuming its first frame.
+    wait_for_reference(&server, token, &thread, false).await;
+    super::super::protocol::apply_patches(&mut state, &first_update).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let final_update = json!([
+        {"op":"replace","path":"/turns/0/items/79/text","value":"final public record"},
+        {"op":"replace","path":"/turns/0/status","value":"completed"},
+        {"op":"replace","path":"/title","value":"final title"}
+    ]);
+    native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":2,"revision":3,"patches":final_update}}})).await;
+    super::super::protocol::apply_patches(&mut state, &final_update).unwrap();
+    // A real Native discovery response is an ordering barrier after the final
+    // update, not an assumption based on elapsed time or a mirrored stream loop.
+    native_write(
+        &mut native,
+        json!({"type":"client-discovery-request","requestId":"final-read-barrier"}),
+    )
+    .await;
+    let discovery = tokio::time::timeout(Duration::from_secs(1), native_read(&mut native))
+        .await
+        .unwrap();
+    assert_eq!(discovery["type"], "client-discovery-response");
+    assert_eq!(discovery["requestId"], "final-read-barrier");
+    let first = socket_value(&mut socket).await;
+    assert_eq!(first["type"], "state");
+    assert_eq!(first["revision"], 1);
+    assert_eq!(first["state"]["turns"][0]["status"], "inProgress");
+    assert_eq!(
+        first["state"]["turns"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    assert!(!first.to_string().contains("outputs/result.bin"));
+    let delta = socket_value(&mut socket).await;
+    assert_eq!(delta["type"], "delta");
+    assert_eq!(delta["baseRevision"], 1);
+    assert_eq!(delta["revision"], 2);
+    assert!(!delta.to_string().contains("not delivered intermediate"));
+    let mut client = first["state"].clone();
+    super::super::protocol::apply_patches(&mut client, &delta["patches"]).unwrap();
+    let PublicState::V2(expected) = Projection::default().public_state(
+        &state,
+        StreamVersion::V2,
+        &mut MessageWindow::default(),
+    ) else {
+        panic!("v2");
+    };
+    assert_eq!(client, expected);
+    assert_eq!(
+        client["turns"][0]["messages"][19]["text"],
+        "final public record"
+    );
+    native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":3,"revision":4,"patches":[]}}})).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err()
+    );
+    socket
+        .send(Message::Text(r#"{"type":"history"}"#.into()))
+        .await
+        .unwrap();
+    let history = socket_value(&mut socket).await;
+    assert_eq!(history["baseRevision"], 2);
+    assert_eq!(history["revision"], 3);
+    super::super::protocol::apply_patches(&mut client, &history["patches"]).unwrap();
+    assert_eq!(client["turns"][0]["messages"].as_array().unwrap().len(), 70);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), native_read(&mut native))
+            .await
+            .is_err(),
+        "local history must not call Native actions"
+    );
+    socket
+        .send(Message::Text(
+            r#"{"type":"history","action":"send"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(socket_value(&mut socket).await["type"], "disconnected");
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_reference(&server, token, &thread, false).await;
+}
+
+#[tokio::test]
+async fn uncertain_file_provenance_revokes_downloads_without_disconnect_of_valid_chat() {
+    use super::super::projection::StreamVersion;
+    for revision in [json!(1), json!("unknown-native-revision")] {
+        let server = fixture().await;
+        let (cookie, session) = login_session(&server, false).await;
+        let token = cookie.split_once('=').unwrap().1;
+        let mut state = stream_state(&server);
+        state["turns"][0]["items"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        let thread = state["id"].as_str().unwrap().to_string();
+        let (mut socket, mut native, task) =
+            synthetic_stream(&server, &cookie, state.clone(), StreamVersion::V2).await;
+        assert_eq!(socket_value(&mut socket).await["type"], "state");
+        state["title"] = json!("known revision");
+        native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"snapshot","revision":10,"conversationState":state}}})).await;
+        assert_ne!(socket_value(&mut socket).await["type"], "disconnected");
+        let file = resolve_download(&server, &cookie, &session, &thread).await;
+        let url = file["file"]["downloadUrl"].as_str().unwrap();
+        state["title"] = json!("chat survives uncertain file authority");
+        native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"snapshot","revision":revision,"conversationState":state}}})).await;
+        let frame = socket_value(&mut socket).await;
+        assert_ne!(frame["type"], "disconnected");
+        assert!(frame.to_string().contains("chat survives"));
+        wait_for_reference(&server, token, &thread, false).await;
+        assert_eq!(
+            client()
+                .get(format!("{}{url}", server.base))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":revision,"revision":11,"patches":[{"op":"replace","path":"/title","value":"chat still live"}]}}})).await;
+        let frame = socket_value(&mut socket).await;
+        assert_ne!(frame["type"], "disconnected");
+        assert!(frame.to_string().contains("chat still live"));
+        socket.send(Message::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn revocation_and_native_errors_cancel_a_blocked_write_and_drop_its_binding() {
+    use super::super::projection::StreamVersion;
+    for reason in ["revoke", "owner-disconnected", "stale-native-revision"] {
+        let server = fixture().await;
+        let (cookie, _) = login_session(&server, false).await;
+        let token = cookie.split_once('=').unwrap().1;
+        let state = stream_state(&server);
+        let thread = state["id"].as_str().unwrap().to_string();
+        let (mut socket, mut native, task) =
+            synthetic_stream(&server, &cookie, state, StreamVersion::V2).await;
+        wait_for_reference(&server, token, &thread, true).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        match reason {
+            "revoke" => { server.core.auth.lock().unwrap().revoke("*").unwrap(); },
+            "owner-disconnected" => native_write(&mut native, json!({"type":"broadcast","method":"client-status-changed","params":{"clientId":"synthetic-owner","status":"disconnected"}})).await,
+            _ => native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":9,"revision":10,"patches":[]}}})).await,
+        }
+        // The network budget is at least 10 s, but authorization/Native failure
+        // must cancel it without flushing the remaining stale public frame.
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_reference(&server, token, &thread, false).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap();
+        assert!(
+            !matches!(result, Some(Ok(Message::Text(_)))),
+            "stale frame completed after {reason}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_socket_keeps_full_shape_and_deduplicates_without_accepting_history_commands() {
+    use super::super::{projection::StreamVersion, protocol};
+    let server = fixture().await;
+    let (cookie, _) = login_session(&server, false).await;
+    let state = stream_state(&server);
+    let thread = state["id"].clone();
+    let expected = json!({"type":"state","state":protocol::view(&state)});
+    let (mut socket, mut native, task) =
+        synthetic_stream(&server, &cookie, state, StreamVersion::Legacy).await;
+    assert_eq!(socket_value(&mut socket).await, expected);
+    native_write(&mut native, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"synthetic-owner","params":{"hostId":"local","conversationId":thread,"change":{"type":"patches","baseRevision":1,"revision":2,"patches":[]}}})).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err()
+    );
+    socket
+        .send(Message::Text(r#"{"type":"history"}"#.into()))
+        .await
+        .unwrap();
+    assert_eq!(socket_value(&mut socket).await["type"], "disconnected");
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn bind_download_fixture(
     server: &Server,
     cookie: &str,
@@ -621,9 +958,17 @@ fn bind_download_fixture(
     let thread = uuid::Uuid::new_v4().to_string();
     let state = json!({"id":thread,"cwd":root,"turns":[{"turnId":"turn","items":[{"id":"answer","type":"agentMessage","text":"[生成文件](outputs/result.bin)"}]}]});
     let token = cookie.split_once('=').unwrap().1;
-    let binding =
-        super::super::files::BindingGuard::new(server.core.files.clone(), token, &thread, &state)
-            .unwrap();
+    let binding = super::super::files::BindingGuard::new(
+        server.core.files.clone(),
+        token,
+        &thread,
+        &state,
+        &super::super::desktop::NativeProvenance {
+            owner: "synthetic-owner".into(),
+            revision: Some(1),
+        },
+    )
+    .unwrap();
     (thread, binding, path, state)
 }
 
@@ -639,6 +984,65 @@ async fn resolve_download(server: &Server, cookie: &str, session: &Value, thread
         .unwrap();
     assert_eq!(reply.status(), StatusCode::OK);
     reply.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn stale_native_window_cannot_resolve_or_get_an_observed_removed_file() {
+    use super::super::{desktop::NativeProvenance, files::BindingGuard};
+    let server = fixture().await;
+    let (cookie, session) = login_session(&server, false).await;
+    let (thread, newer, _, mut state) = bind_download_fixture(&server, &cookie, b"synthetic");
+    let token = cookie.split_once('=').unwrap().1;
+    let provenance = NativeProvenance {
+        owner: "synthetic-owner".into(),
+        revision: Some(1),
+    };
+    let stale_state = state.clone();
+    let stale = BindingGuard::new(
+        server.core.files.clone(),
+        token,
+        &thread,
+        &state,
+        &provenance,
+    )
+    .unwrap();
+    let file = resolve_download(&server, &cookie, &session, &thread).await;
+    let url = file["file"]["downloadUrl"].as_str().unwrap();
+    state["turns"][0]["items"] = json!([]);
+    newer
+        .update(
+            &state,
+            &NativeProvenance {
+                revision: Some(2),
+                ..provenance.clone()
+            },
+        )
+        .unwrap();
+    stale.update(&stale_state, &provenance).unwrap();
+    drop(newer);
+    assert_eq!(
+        client()
+            .get(format!("{}{url}", server.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client()
+            .post(format!("{}/remote/files/resolve", server.base))
+            .header("origin", &server.base)
+            .header("cookie", &cookie)
+            .header("x-csrf-token", session["csrfToken"].as_str().unwrap())
+            .json(&json!({"threadId":thread,"reference":"outputs/result.bin"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
@@ -817,7 +1221,15 @@ async fn real_download_bytes_headers_sha_cross_thread_changes_and_revocation_are
         StatusCode::CONFLICT
     );
     state["turns"][0]["items"][0]["text"] = json!("[replacement](outputs/other.bin)");
-    binding.update(&state).unwrap();
+    binding
+        .update(
+            &state,
+            &super::super::desktop::NativeProvenance {
+                owner: "synthetic-owner".into(),
+                revision: Some(2),
+            },
+        )
+        .unwrap();
     assert_eq!(
         client()
             .get(format!("{}{url}", server.base))

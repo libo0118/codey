@@ -11,8 +11,10 @@ import { activityMessages, completedActivity, startedActivity } from "./fixtures
 
 const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real }).exports;
+const { ConversationTurn: ExpandedTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { ...real, react: { ...React, useState: () => [true, () => {}] } } }).exports;
 const turn = messages => ({ id: "turn", status: "completed", messages });
 const render = messages => renderToStaticMarkup(React.createElement(ConversationTurn, { turn: turn(messages) }));
+const renderExpanded = messages => renderToStaticMarkup(React.createElement(ExpandedTurn, { turn: turn(messages) }));
 
 test("真实活动组件呈现工具合同的 name，不以 text 或虚构 displayTitle 替换", () => {
   const html = render(activityMessages);
@@ -27,7 +29,8 @@ test("native started/completed/interrupted/interacted 在顶层无状态时仍�
   for (const [action, status, label, state] of cases) {
     const html = render([{ ...startedActivity, collaboration: { action, agents: [{ id: "review", name: "审查消息展示", ...(status && { status }) }] } }]);
     assert.ok(html.includes(label), action); assert.ok(html.includes(state), action);
-    assert.match(html, /审查消息展示/); assert.match(html, /暂无公开结果/);
+    assert.match(html, /审查消息展示/); assert.doesNotMatch(html, /暂无公开结果/);
+    assert.match(renderExpanded([{ ...startedActivity, collaboration: { action, agents: [{ id: "review", name: "审查消息展示", ...(status && { status }) }] } }]), /暂无公开结果/);
     assert.doesNotMatch(html, /未支持的活动|公开结果请在电脑端/);
     if (action === "started") assert.doesNotMatch(html, /已完成/);
   }
@@ -37,7 +40,7 @@ test("协作调用的所有公开 action 可呈现，多子代理状态互不混
   const actions = { spawnAgent: "开始工作", sendInput: "发送输入", resumeAgent: "恢复工作", wait: "等待结果", closeAgent: "关闭子代理", sendMessage: "发送消息", followupTask: "追加任务", interruptAgent: "中止工作", listAgents: "查看子代理" };
   for (const [action, label] of Object.entries(actions)) assert.ok(render([{ ...completedActivity, collaboration: { ...completedActivity.collaboration, action } }]).includes(label), action);
   const statuses = { pendingInit: "初始化中", running: "运行中", interrupted: "已中止", completed: "已完成", errored: "失败", shutdown: "已关闭", notFound: "未找到", futureState: "状态未知" };
-  const html = render([{ ...completedActivity, collaboration: { action: "wait", agents: Object.entries(statuses).map(([status], index) => ({ id: String(index), name: `agent-${index}`, status, message: index === 3 ? "**公开结果**\n\n```ts\nconst checked = true;\n```" : undefined })) } }]);
+  const html = renderExpanded([{ ...completedActivity, collaboration: { action: "wait", agents: Object.entries(statuses).map(([status], index) => ({ id: String(index), name: `agent-${index}`, status, message: index === 3 ? "**公开结果**\n\n```ts\nconst checked = true;\n```" : undefined })) } }]);
   for (const [index, label] of Object.values(statuses).entries()) assert.ok(html.includes(`<span>agent-${index}</span><small>${label}</small>`), label);
   assert.match(html, /<strong>公开结果<\/strong>/); assert.match(html, /code-copy/);
   assert.match(html, /class="remote-agent-result"[^>]*tabindex="0"[^>]*role="region"/);
@@ -51,13 +54,13 @@ test("未知协作 action/缺失投影及未知 kind 只显示安全 placeholder
       assert.match(html, /请在电脑端查看/); assert.doesNotMatch(html, /PRIVATE_CANARY/);
     }
   }
-  const empty = render([{ ...completedActivity, collaboration: { action: "wait", agents: [] } }]);
+  const empty = renderExpanded([{ ...completedActivity, collaboration: { action: "wait", agents: [] } }]);
   assert.match(empty, /暂无公开子代理状态或结果/);
 });
 
 test("长子代理名字和公开结果完整保留在有键盘滚动入口的结果区域，不读取隐藏标题或 prompt", () => {
   const name = "long-public-agent-name-".repeat(8), message = "公开结果\n\n".repeat(100);
-  const html = render([{ ...completedActivity, collaboration: { action: "wait", agents: [{ id: "child", name, status: "completed", message, title: "PRIVATE_CANARY", prompt: "PRIVATE_CANARY" }, { id: "unnamed" }] } }]);
+  const html = renderExpanded([{ ...completedActivity, collaboration: { action: "wait", agents: [{ id: "child", name, status: "completed", message, title: "PRIVATE_CANARY", prompt: "PRIVATE_CANARY" }, { id: "unnamed" }] } }]);
   assert.ok(html.includes(name)); assert.equal((html.match(/<p>公开结果<\/p>/g) || []).length, 100);
   assert.match(html, /未命名子代理/); assert.match(html, /未提供状态/); assert.match(html, /tabindex="0" role="region"/);
   assert.doesNotMatch(html, /PRIVATE_CANARY/);
@@ -70,7 +73,7 @@ test("真实消息树保持工具/回答/协作原序与稳定 key，流式更�
   assert.deepEqual(children.map(node => elementProps(node).key), activityMessages.map(message => message.id));
   const before = children.find(node => elementProps(node).message?.id === "collab-wait");
   const details = before.type(before.props);
-  assert.equal(details.type, "details"); assert.equal(details.props.open, undefined); assert.equal(details.props.onToggle, undefined);
+  assert.equal(details.type, "details"); assert.equal(details.props.open, undefined); assert.equal(typeof details.props.onToggle, "function");
   const streamed = activityMessages.map(message => message.id === "collab-wait" ? { ...message, status: "inProgress", collaboration: { ...message.collaboration, agents: [...message.collaboration.agents, { id: "extra", name: "新增子代理", status: "running" }] } } : message);
   graph.restart();
   const after = collectElements(graph.exports.ConversationTurn({ turn: turn([{ id: "new", role: "assistant", kind: "agentMessage", text: "新增" }, ...streamed]) }), node => elementProps(node).message?.id === "collab-wait")[0];

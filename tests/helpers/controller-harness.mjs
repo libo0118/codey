@@ -51,7 +51,7 @@ export function createControllerHarness(url, name, stubs = {}) {
     for (let attempt = 0; attempt < 30; attempt++) {
       cursor = 0;
       changed = false;
-      value = graph.exports[name](...args);
+      value = typeof name === "function" ? name(graph.exports, ...args) : graph.exports[name](...args);
       effects.splice(0).forEach((effect) => effect());
       if (!changed) return value;
     }
@@ -63,7 +63,7 @@ export function createControllerHarness(url, name, stubs = {}) {
       for (let index = 0; index < 30; index++) { await Promise.resolve(); if (changed && !unmounted) render(); }
       return value;
     },
-    unmount() { unmounted = true; hooks.forEach((hook) => hook?.cleanup?.()); },
+    unmount() { if (unmounted) return; unmounted = true; hooks.forEach((hook) => hook?.cleanup?.()); },
     get writesAfterUnmount() { return writesAfterUnmount; },
   };
 }

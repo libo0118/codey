@@ -1,3 +1,4 @@
+import { memo, useState } from "react";
 import { imageUrl, messageUrl, type FileChange, type Message, type Turn } from "./workspace-data";
 import { FileLink } from "./files";
 import { CodeBlock, RichText } from "./markdown";
@@ -12,7 +13,7 @@ const agentStatuses: Record<string, string> = { pendingInit: "初始化中", run
 const agentStatusLabel = (status: string | undefined) => status === undefined ? "未提供状态" : Object.prototype.hasOwnProperty.call(agentStatuses, status) ? agentStatuses[status] : "状态未知";
 const textKinds = new Set(["userMessage", "steeringUserMessage", "agentMessage", "assistantMessage", "planImplementation", "error"]);
 
-export function FileChanges({ changes }: { changes: FileChange[] }) {
+export const FileChanges = memo(function FileChanges({ changes }: { changes: FileChange[] }) {
   return <div className="remote-changes">{changes.map((change, index) => {
     const lines = change.diff.split("\n");
     return <section className="remote-diff" key={`${change.path}:${index}`} aria-label={`文件变更 ${change.path}`}>
@@ -20,7 +21,7 @@ export function FileChanges({ changes }: { changes: FileChange[] }) {
       <pre tabIndex={0} aria-label="统一差异，可横向滚动"><code>{lines.map((line, i) => <span key={i} className={line.startsWith("@@") ? "diff-hunk" : line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-delete" : "diff-context"}>{line}{i < lines.length - 1 ? "\n" : ""}</span>)}</code></pre>
     </section>;
   })}</div>;
-}
+});
 
 function Attachments({ message }: { message: Message }) {
   return message.attachments?.map((attachment, index) => {
@@ -35,14 +36,15 @@ function Attachments({ message }: { message: Message }) {
   });
 }
 
-function Activity({ message }: { message: Message }) {
+const Activity = memo(function Activity({ message }: { message: Message }) {
+  const [expanded, setExpanded] = useState(false);
   const collaborative = message.kind === "collabAgentToolCall" || message.kind === "subAgentActivity";
   const actions = message.kind === "subAgentActivity" ? lifecycleActions : collaborationActions;
   const collaboration = collaborative && message.collaboration && Object.prototype.hasOwnProperty.call(actions, message.collaboration.action) ? message.collaboration : undefined;
   const known = Object.prototype.hasOwnProperty.call(activityLabels, message.kind) && (!collaborative || Boolean(collaboration));
-  return <details className={`remote-activity remote-activity-${known ? message.kind : "unknown"}`} data-message-id={message.id || undefined}>
+  return <details className={`remote-activity remote-activity-${known ? message.kind : "unknown"}`} data-message-id={message.id || undefined} onToggle={event => setExpanded(event.currentTarget.open)}>
     <summary><span className="remote-activity-heading"><span>{known ? activityLabels[message.kind] : "未支持的活动"}{collaboration ? ` · ${actions[collaboration.action]}` : known && message.tool && ` · ${message.tool.name}`}</span>{message.status && <small>{statusLabel(message.status)}</small>}</span>{collaboration && <span className="remote-agent-summary">{collaboration.agents.map(agent => <span className="remote-agent-state" key={agent.id}><span>{agent.name || "未命名子代理"}</span><small>{agentStatusLabel(agent.status)}</small></span>)}</span>}</summary>
-    {!known ? <p className="remote-content-notice">此活动类型暂不支持，请在电脑端查看。</p>
+    {(!known || expanded) && <>{!known ? <p className="remote-content-notice">此活动类型暂不支持，请在电脑端查看。</p>
       : collaboration ? <div className="remote-collaboration">{collaboration.agents.length ? collaboration.agents.map(agent => <section key={agent.id}><h4>{agent.name || "未命名子代理"}</h4>{agent.message?.trim() ? <div className="remote-agent-result" tabIndex={0} role="region" aria-label={`${agent.name || "未命名子代理"}的公开结果，可滚动`}><RichText text={agent.message} /></div> : <p className="remote-content-notice">暂无公开结果。</p>}</section>) : <p className="remote-content-notice">暂无公开子代理状态或结果。</p>}</div>
       : message.kind === "commandExecution" ? message.command ? <><p className="remote-command-cwd">{message.command.cwd}</p><CodeBlock text={message.command.command} language="命令" />{message.command.output && <pre className="remote-command-output" tabIndex={0} aria-label="命令输出，可横向滚动">{message.command.output}</pre>}{message.command.exitCode !== undefined && <p className={message.command.exitCode ? "remote-client-error" : "remote-content-notice"}>退出码 {message.command.exitCode}</p>}</> : <CodeBlock text={message.text} language="命令与输出" />
       : message.kind === "fileChange" ? message.changes?.length ? <FileChanges changes={message.changes} /> : <pre tabIndex={0}>{message.text || "文件变更详情请在电脑端查看。"}</pre>
@@ -50,19 +52,24 @@ function Activity({ message }: { message: Message }) {
       : message.kind === "reasoning" ? <RichText text={message.text} />
       : message.tool ? <div className="remote-tool">{message.tool.input && <section><h4>输入</h4><pre tabIndex={0}>{message.tool.input}</pre></section>}{message.tool.output && <section><h4>结果</h4><RichText text={message.tool.output} /></section>}{message.tool.error && <p className="remote-client-error" role="status">{message.tool.error}</p>}{!message.tool.input && !message.tool.output && !message.tool.error && <p className="remote-content-notice">暂无公开结果。</p>}</div>
       : <p className="remote-content-notice">公开结果请在电脑端查看。</p>}
-    {known && <Attachments message={message} />}{message.truncated && <p className="remote-content-notice">内容已截断，完整内容请在电脑端查看。</p>}
+    {known && <Attachments message={message} />}{message.truncated && <p className="remote-content-notice">内容已截断，完整内容请在电脑端查看。</p>}</>}
   </details>;
-}
+});
 
-export function ConversationTurn({ turn }: { turn: Turn }) {
+const ConversationMessage = memo(function ConversationMessage({ message }: { message: Message }) {
+  if (!textKinds.has(message.kind) || !["user", "assistant", "error"].includes(message.role)) return <p className="remote-content-notice" data-message-id={message.id || undefined}>未支持的消息，请在电脑端查看。</p>;
+  return <article className={`remote-message ${message.role}`} data-message-id={message.id || undefined} aria-label={message.role === "user" ? "你" : "Codex"}>
+    {message.role === "user" ? <div className="remote-user-text">{message.text}</div> : <RichText text={message.text} />}
+    <Attachments message={message} />{message.truncated && <p className="remote-content-notice">内容已截断，完整内容请在电脑端查看。</p>}
+  </article>;
+});
+
+export const ConversationTurn = memo(function ConversationTurn({ turn }: { turn: Turn }) {
+  if (!turn.messages.length) return null;
   const elapsed = turn.startedAt && turn.completedAt ? Math.max(0, Math.round((turn.completedAt - turn.startedAt) / 1000)) : 0;
   return <section className="remote-turn">{turn.messages.map((message, index) => {
     const key = message.id || `${message.role}:${message.kind}:${index}`;
     if (message.role === "activity") return <Activity key={key} message={message} />;
-    if (!textKinds.has(message.kind) || !["user", "assistant", "error"].includes(message.role)) return <p key={key} className="remote-content-notice">未支持的消息，请在电脑端查看。</p>;
-    return <article className={`remote-message ${message.role}`} key={key} data-message-id={message.id || undefined} aria-label={message.role === "user" ? "你" : "Codex"}>
-      {message.role === "user" ? <div className="remote-user-text">{message.text}</div> : <RichText text={message.text} />}
-      <Attachments message={message} />{message.truncated && <p className="remote-content-notice">内容已截断，完整内容请在电脑端查看。</p>}
-    </article>;
+    return <ConversationMessage key={key} message={message} />;
   })}{elapsed > 0 && <p className="remote-turn-status">用时 {elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ` : ""}{elapsed % 60} 秒</p>}{turn.status === "failed" && <p className="remote-client-error" role="alert">任务失败：{typeof turn.error === "string" ? turn.error : "请查看电脑端详情"}</p>}{turn.status === "interrupted" && <p className="remote-turn-status">已停止</p>}</section>;
-}
+});

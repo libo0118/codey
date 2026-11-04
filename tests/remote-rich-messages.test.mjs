@@ -10,6 +10,7 @@ import { createModuleGraph } from "./helpers/jsx-tree.mjs";
 const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const graph = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real });
 const { RichText, ConversationTurn } = graph.exports;
+const { ConversationTurn: ExpandedTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { ...real, react: { ...React, useState: () => [true, () => {}] } } }).exports;
 const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, props));
 
 test("真实 Markdown 组件呈现标题、嵌套列表、表格、行内代码和围栏", () => {
@@ -29,7 +30,7 @@ test("交错活动保留真实消息顺序和独立 identity，不把后续活�
     { id: "d", role: "assistant", kind: "agentMessage", text: "最终回答" },
   ];
   const html = render(ConversationTurn, { turn: { id: "turn", status: "completed", messages } });
-  const order = messages.map(message => html.indexOf(message.text));
+  const order = messages.map(message => html.indexOf(`data-message-id="${message.id}"`));
   assert.ok(order.every((position, index) => position >= 0 && (!index || position > order[index - 1])), `实际位置 ${order}`);
 });
 
@@ -54,7 +55,7 @@ test("公开命令、工具、计划、统一 Diff、图片与截断提示按类
     { id: "diff", role: "activity", kind: "fileChange", text: "", changes: [{ path: "src/a.ts", kind: "update", diff: "@@ -1 +1 @@\n-old\n+new" }] },
     { id: "image", role: "user", kind: "userMessage", text: "图片", attachments: [{ name: "Mock.png", url: "data:image/png;base64,YQ==" }], truncated: true },
   ];
-  const html = render(ConversationTurn, { turn: { id: "turn", status: "completed", messages } });
+  const html = render(ExpandedTurn, { turn: { id: "turn", status: "completed", messages } });
   for (const text of ["node test.js", "2 passed", "退出码 0", "MCP 工具", "lookup", "public query", "<strong>公开结果</strong>", "Mock tool failed", "data-status=\"in_progress\"", "Unified", "diff-add", "diff-delete", 'alt="Mock.png"', "内容已截断"]) assert.ok(html.includes(text), text);
 });
 

@@ -44,7 +44,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     session.current = null; listVersion.current++; listRequest.current?.abort(); listRequest.current = null;
     clearRunning(); setLoading(false); onUnauthorized();
   });
-  const { view, connected, isConnected, connectionError, reconnect } = useRemoteConversationController(active, selectedId, unauthorized);
+  const { view, connected, isConnected, connectionError, reconnect, fileGeneration, loadingEarlier, loadEarlier } = useRemoteConversationController(active, selectedId, unauthorized);
   const composerView: View | null = creating ? { id: "", turns: [], requests: [], historyComplete: true, ...composerSettings } : view;
   const activeTurn = view ? [...view.turns].reverse().find(turn => turn.status === "inProgress") : undefined;
 
@@ -247,7 +247,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   return {
     threads, projects, selected, selectedId, selectedProject: selected ? projectForThread(selected, projects) : undefined,
     search, archived, project, creating, draftScope, draftProject, defaultsReady, composerView,
-    view, connected, connectionError, activeTurn, models: modelOptions(catalog), busy, loading, error,
+    view, connected, connectionError, activeTurn, models: modelOptions(catalog), busy, loading, error, fileGeneration, loadingEarlier,
     draft: editor.text, images: editor.images, uncertain: editor.uncertain,
     catalogError: [catalogError, creating ? defaultsError : ""].filter(Boolean).join(" "),
     open, startCreating, send, changeSettings, confirmSubmission,
@@ -258,7 +258,11 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     refresh: () => { void refreshList(); void loadModels(); },
     back: () => { if (session.current && !scope.pending) { setSelected(null); setCreating(false); void refreshList(); } },
     reconnect: () => { if (session.current && !scope.pending) reconnect(); },
-    loadHistory: () => perform("history", {}, true),
+    loadHistory: () => {
+      if (!session.current || scope.pending || !isConnected()) return Promise.resolve(false);
+      if (view?.hasEarlierMessages) return Promise.resolve(loadEarlier());
+      return view && !view.historyComplete ? perform("history", {}, view.hasEarlierMessages === undefined) : Promise.resolve(false);
+    },
     respond: (approvalId: string | number, args: Record<string, unknown>) => perform("respond", { ...args, approvalId }),
     stop: () => activeTurn ? perform("interrupt", { turnId: activeTurn.id }) : Promise.resolve(false),
     reloadModels: () => { if (session.current) { void loadModels(); setDefaultsRevision(value => value + 1); } },

@@ -44,6 +44,31 @@ test("跨会话和卸载取消旧解析，迟到成功与失败不回写新目�
   assert.equal(h.writesAfterUnmount, 0);
 });
 
+test("同会话新连接作废旧元数据与解析，不因普通增量重查，断线取消等待且不请求", async () => {
+  const h = fixture();
+  h.render(first, "report.pdf", undefined, true, 1); const old = h.calls[0];
+  h.render(first, "report.pdf", undefined, false, 1); assert.equal(old.args[2].aborted, true);
+  await h.flush(); assert.equal(h.calls.length, 1);
+  assert.equal(h.render(first, "report.pdf", undefined, true, 2).file, undefined);
+  await h.flush(); assert.equal(h.calls.length, 2); const fresh = h.calls[1];
+  old.resolve({ file: file(first) }); assert.equal((await h.flush()).file, undefined);
+  const nextFile = { ...file(first), downloadUrl: file(first).downloadUrl.replace(/a{64}$/, "b".repeat(64)) };
+  fresh.resolve({ file: nextFile }); assert.equal((await h.flush()).file.downloadUrl, nextFile.downloadUrl);
+  h.render(first, "report.pdf", undefined, true, 2); await h.flush(); assert.equal(h.calls.length, 2);
+  h.render(first, "report.pdf", undefined, false, 2); h.render(first, "report.pdf", undefined, true, 3);
+  assert.equal(h.render().file, undefined); assert.equal(h.calls.length, 3); h.unmount();
+});
+
+test("重连不再信任旧结构化 download descriptor，但保持原首帧直接附件与手动重试边界", async () => {
+  const h = fixture();
+  assert.equal(h.render(first, "opaque", file(first), true, 1).file.downloadUrl, file(first).downloadUrl);
+  const next = h.render(first, "opaque", file(first), true, 2);
+  assert.equal(next.file, undefined); assert.equal(h.calls.length, 1);
+  h.calls[0].reject(new Error("Mock revoked descriptor")); assert.match((await h.flush()).error, /revoked/);
+  h.render(first, "opaque", file(first), true, 2); assert.equal(h.calls.length, 1);
+  h.render().retry(); h.render(); assert.equal(h.calls.length, 2); h.unmount();
+});
+
 test("会话切换首帧不残留旧 href，失效、云端与坏元数据明确显示原因", async () => {
   const h = fixture();
   h.render(first, "a.pdf", undefined, true); h.calls[0].resolve({ file: file(first) }); await h.flush();

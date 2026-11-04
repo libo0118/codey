@@ -8,6 +8,7 @@ use std::{
     time::SystemTime,
 };
 
+use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
 use sha2::{Digest, Sha256};
 
 pub(super) const MAX_FILE: u64 = 200 * 1024 * 1024;
@@ -255,15 +256,7 @@ pub(super) fn snapshot(
     if before.size > MAX_FILE {
         return Err("文件超过 200 MiB 下载上限".into());
     }
-    // tempfile is unlinked on Unix; Windows uses share_mode(0) and DELETE_ON_CLOSE.
-    let mut destination = tempfile::tempfile().map_err(|_| "无法创建私有下载快照")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        destination
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| "无法限制下载快照权限")?;
-    }
+    let mut destination = private_snapshot()?;
     let mut digest = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; CHUNK];
@@ -288,6 +281,65 @@ pub(super) fn snapshot(
     check()?;
     if before != stamp(source)? || before.size != total {
         return Err("源文件正在变化，请稍后重新解析下载".into());
+    }
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "读取私有下载快照失败")?;
+    Ok((destination, format!("{:x}", digest.finalize())))
+}
+
+fn private_snapshot() -> Result<File, String> {
+    // tempfile is unlinked on Unix; Windows uses share_mode(0) and DELETE_ON_CLOSE.
+    let file = tempfile::tempfile().map_err(|_| "无法创建私有下载快照")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| "无法限制下载快照权限")?;
+    }
+    Ok(file)
+}
+
+pub(super) fn snapshot_inline_image(
+    encoded: &str,
+    expected: u64,
+    mime: &str,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(File, String), String> {
+    if encoded.len() > super::MAX_INLINE_IMAGE_ENCODED {
+        return Err("内嵌图片超过下载上限".into());
+    }
+    check()?;
+    let mut source = DecoderReader::new(encoded.as_bytes(), &STANDARD);
+    let mut destination = private_snapshot()?;
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut header = [0u8; 12];
+    let mut header_count = 0;
+    let mut buffer = [0u8; CHUNK];
+    loop {
+        check()?;
+        let count = source
+            .read(&mut buffer)
+            .map_err(|_| "内嵌图片 Base64 编码无效")?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > expected {
+            return Err("内嵌图片大小与解析结果不匹配".into());
+        }
+        let copy = count.min(header.len() - header_count);
+        header[header_count..header_count + copy].copy_from_slice(&buffer[..copy]);
+        header_count += copy;
+        digest.update(&buffer[..count]);
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|_| "写入私有下载快照失败")?;
+    }
+    check()?;
+    if total != expected || image_mime(&header[..header_count]) != Some(mime) {
+        return Err("内嵌图片大小或类型与解析结果不匹配".into());
     }
     destination
         .seek(SeekFrom::Start(0))

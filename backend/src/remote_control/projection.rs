@@ -1,5 +1,8 @@
 //! Cache encoded turns without retaining a second copy of desktop history.
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde::Serialize;
 use serde_json::{
@@ -9,14 +12,19 @@ use serde_json::{
 
 use super::protocol;
 
+mod stream;
+pub(super) use stream::{Encoder, MessageWindow, PublicState, StreamVersion};
+
 #[derive(Default)]
 pub(super) struct Projection {
     turns: HashMap<String, Box<RawValue>>,
+    compact_turns: HashMap<String, Arc<Value>>,
 }
 
 impl Projection {
     pub fn reset(&mut self) {
         self.turns.clear();
+        self.compact_turns.clear();
     }
 
     // Invalidate before applying each batch. Structural changes fall back to a
@@ -56,6 +64,7 @@ impl Projection {
                 }
                 if let Some(id) = id {
                     self.turns.remove(id);
+                    self.compact_turns.remove(id);
                 } else {
                     self.reset();
                 }
@@ -105,6 +114,90 @@ impl Projection {
         })
         .expect("JSON state")
     }
+
+    pub fn public_state(
+        &mut self,
+        state: &Value,
+        version: StreamVersion,
+        window: &mut MessageWindow,
+    ) -> PublicState {
+        if version == StreamVersion::Legacy {
+            return PublicState::Legacy(self.frame(state));
+        }
+        let turns = protocol::turns(state);
+        let ids: HashSet<_> = turns
+            .iter()
+            .filter_map(|turn| turn["turnId"].as_str())
+            .collect();
+        let cacheable = ids.len() == turns.len();
+        self.compact_turns
+            .retain(|id, _| cacheable && ids.contains(id.as_str()));
+        let turns: Vec<_> = turns
+            .iter()
+            .map(|&turn| {
+                if cacheable {
+                    self.compact_turns
+                        .entry(turn["turnId"].as_str().unwrap().to_string())
+                        .or_insert_with(|| Arc::new(compact_turn(turn)))
+                        .clone()
+                } else {
+                    Arc::new(compact_turn(turn))
+                }
+            })
+            .collect();
+        PublicState::V2(window.view(protocol::view_metadata(state), &turns))
+    }
+}
+
+fn compact_turn(turn: &Value) -> Value {
+    let mut result = protocol::turn_view(turn);
+    let turn_id = result["id"].clone();
+    for message in result["messages"]
+        .as_array_mut()
+        .expect("projected messages")
+    {
+        // Structured fields already contain this same public output; unknown
+        // schemas keep their safe placeholder text instead of being blanked.
+        let redundant = matches!(
+            message["kind"].as_str(),
+            Some("commandExecution" | "mcpToolCall" | "dynamicToolCall")
+        ) || (message["kind"] == "fileChange"
+            && message["changes"]
+                .as_array()
+                .expect("projected changes")
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{}\n{}",
+                        change["path"].as_str().expect("projected path"),
+                        change["diff"].as_str().expect("projected diff")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .starts_with(message["text"].as_str().expect("projected text")));
+        if redundant {
+            message["text"] = Value::String(String::new());
+        }
+        let message_id = message["id"].clone();
+        for (slot, attachment) in message["attachments"]
+            .as_array_mut()
+            .expect("projected attachments")
+            .iter_mut()
+            .enumerate()
+        {
+            if let Some(url) = attachment["url"]
+                .as_str()
+                .filter(|url| url.starts_with("data:image/"))
+            {
+                let id = super::files::inline_image_reference_id(&turn_id, &message_id, slot, url);
+                let attachment = attachment.as_object_mut().expect("projected attachment");
+                attachment.remove("url");
+                attachment.insert("id".into(), Value::String(id));
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

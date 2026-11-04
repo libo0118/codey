@@ -31,6 +31,7 @@ use super::desktop::Desktop;
 use crate::commands::AppState;
 
 mod downloads;
+mod stream;
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = Response<Body>;
@@ -610,6 +611,10 @@ fn event_stream(
     thread: String,
     request: &mut Request<Incoming>,
 ) -> Reply {
+    let version = match super::projection::StreamVersion::from_query(request.uri().query()) {
+        Ok(version) => version,
+        Err(error) => return failure(StatusCode::BAD_REQUEST, error),
+    };
     let headers = request.headers();
     let key = headers
         .get("sec-websocket-key")
@@ -642,11 +647,10 @@ fn event_stream(
     let upgrade = hyper::upgrade::on(request);
     tokio::spawn(async move {
         let _permit = permit;
-        let mut shutdown = core.shutdown.subscribe();
         let Ok(Ok(upgraded)) = tokio::time::timeout(Duration::from_secs(10), upgrade).await else {
             return;
         };
-        let mut socket = WebSocketStream::from_raw_socket(
+        let socket = WebSocketStream::from_raw_socket(
             TokioIo::new(upgraded),
             Role::Server,
             Some(
@@ -656,52 +660,14 @@ fn event_stream(
             ),
         )
         .await;
-        let result = async {
-            if *shutdown.borrow() || !authorized(&core,&token) { return Err("登录会话已撤销".to_string()); }
-            let mut desktop = follow_desktop(&core, &token, &thread).await?;
-            let binding = super::files::BindingGuard::new(Arc::clone(&core.files),&token,&thread,&desktop.state)?;
-            let mut pending = Some(tokio::time::Instant::now());
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
-            let mut ticks = 0u8;
-            loop {
-                if *shutdown.borrow() || !authorized(&core,&token) { return Err("登录会话已撤销".to_string()); }
-                if pending.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
-                    let frame = desktop.state_frame();
-                    tokio::time::timeout(Duration::from_secs(10),socket.send(Message::Text(frame.into()))).await
-                        .map_err(|_|"手机连接超时")?.map_err(|_|"手机连接已断开")?;
-                    pending = None;
-                }
-                tokio::select! {
-                    _ = shutdown.changed() => return Ok::<_,String>(()),
-                    _ = tokio::time::sleep_until(pending.unwrap_or_else(tokio::time::Instant::now)), if pending.is_some() => {},
-                    _ = heartbeat.tick() => {
-                        ticks = (ticks + 1) % 15;
-                        if ticks == 0 {
-                            tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Ping(Bytes::new()))).await
-                                .map_err(|_|"手机连接超时")?.map_err(|_|"手机连接已断开")?;
-                        }
-                    },
-                    result = desktop.update() => { if result? { binding.update(&desktop.state)?; schedule_state(&mut pending, desktop.urgent); } },
-                    message = socket.next() => match message {
-                        Some(Ok(Message::Ping(bytes))) => { socket.send(Message::Pong(bytes)).await.map_err(|_|"手机连接已断开")?; },
-                        Some(Ok(Message::Pong(_))) => {},
-                        _ => return Ok(()),
-                    }
-                }
-            }
-        }.await;
-        if let Err(error) = result {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                socket.send(Message::Text(
-                    json!({"type":"disconnected","message":error})
-                        .to_string()
-                        .into(),
-                )),
-            )
-            .await;
-        }
-        let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
+        stream::session(
+            socket,
+            &core,
+            &token,
+            version,
+            follow_desktop(&core, &token, &thread),
+        )
+        .await;
     });
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)

@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use serde_json::Value;
@@ -8,15 +9,69 @@ use serde_json::Value;
 use super::super::protocol;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Reference {
-    pub value: String,
-    pub native: bool,
-    pub markdown: bool,
+pub(super) enum Reference {
+    File {
+        value: String,
+        native: bool,
+        markdown: bool,
+    },
+    InlineImage {
+        url: Arc<String>,
+        name: String,
+    },
 }
 
-pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, String> {
-    let mut result = HashMap::new();
+pub(super) type Scope = (String, String);
+
+#[derive(Clone)]
+pub(super) struct References {
+    pub values: HashMap<String, Reference>,
+    pub scopes: HashMap<Scope, HashMap<String, Reference>>,
+    items: HashSet<Scope>,
+    turns: HashSet<String>,
+    complete_turns: HashSet<String>,
+    complete: bool,
+}
+
+impl References {
+    pub fn covers(&self, scope: &Scope) -> bool {
+        self.items.contains(scope)
+            || self.complete_turns.contains(&scope.0)
+            || self.complete && !self.turns.contains(&scope.0)
+    }
+}
+
+pub(super) fn collect(state: &Value) -> Result<References, String> {
+    let mut collected = References {
+        values: HashMap::new(),
+        scopes: HashMap::new(),
+        items: HashSet::new(),
+        turns: HashSet::new(),
+        complete_turns: HashSet::new(),
+        complete: if state["turnHistory"]["kind"] == "canonical" {
+            state["turnHistory"]["history"]["isComplete"] == true
+        } else {
+            // Native normalization defaults absent pagination to complete history.
+            state["turnsPagination"].is_null()
+                || state["turnsPagination"]["hasLoadedOldest"] == true
+        },
+    };
     for turn in protocol::turns(state) {
+        let turn_id = &turn["turnId"];
+        let scope_turn = turn_id.to_string();
+        collected.turns.insert(scope_turn.clone());
+        let items = &turn["items"];
+        if turn["itemsPagination"]["hasLoadedOldest"] != false
+            && (items.is_array() || items["isComplete"] == true || items["items"].is_array())
+        {
+            collected.complete_turns.insert(scope_turn.clone());
+        }
+        let public_turn_id =
+            if turn_id.is_string() || turn_id.as_i64().is_some() || turn_id.as_u64().is_some() {
+                turn_id
+            } else {
+                &Value::Null
+            };
         let items = protocol::ordered_items(&turn["items"]);
         let has_user = items.iter().any(|item| {
             matches!(
@@ -25,7 +80,9 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
             )
         });
         for (index, item) in items.into_iter().enumerate() {
+            let mut result = HashMap::new();
             let kind = item["type"].as_str().unwrap_or_default();
+            let mut public = protocol::item_view(item, &turn["turnId"], index);
             if matches!(
                 kind,
                 "agentMessage" | "assistantMessage" | "userMessage" | "steeringUserMessage"
@@ -57,7 +114,6 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
                     | "subAgentActivity"
                     | "reasoning"
             ) {
-                let public = protocol::item_view(item, &turn["turnId"], index);
                 for text in public["tool"]["output"]
                     .as_str()
                     .into_iter()
@@ -77,11 +133,26 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
                     add_markdown(&mut result, text);
                 }
             }
-            if result.len() > 4096 {
+            add_inline_images(&mut result, public_turn_id, &mut public);
+            collected.values.extend(result.clone());
+            if collected.values.len() > 4096 {
                 return Err("会话文件引用过多，请在电脑端下载".into());
             }
+            let identity = item
+                .get("id")
+                .filter(|id| id.is_string() || id.is_number())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(["index", index]));
+            let scope = (scope_turn.clone(), identity.to_string());
+            collected.items.insert(scope.clone());
+            if !result.is_empty() {
+                collected.scopes.insert(scope, result);
+            }
         }
+        let input_scope = (scope_turn, "params".into());
+        collected.items.insert(input_scope.clone());
         if !has_user {
+            let mut result = HashMap::new();
             let text = protocol::text_content(&turn["params"]["input"]);
             add_markdown(&mut result, &text);
             add_parts(
@@ -92,12 +163,25 @@ pub(super) fn collect(state: &Value) -> Result<HashMap<String, Reference>, Strin
                 &turn["params"]["input"],
                 true,
             );
+            add_inline_images(
+                &mut result,
+                public_turn_id,
+                &mut protocol::item_view(
+                    &serde_json::json!({"type":"userMessage","content":turn["params"]["input"]}),
+                    &turn["turnId"],
+                    usize::MAX,
+                ),
+            );
+            collected.values.extend(result.clone());
+            if !result.is_empty() {
+                collected.scopes.insert(input_scope, result);
+            }
         }
-        if result.len() > 4096 {
+        if collected.values.len() > 4096 {
             return Err("会话文件引用过多，请在电脑端下载".into());
         }
     }
-    Ok(result)
+    Ok(collected)
 }
 
 fn add_markdown(result: &mut HashMap<String, Reference>, text: &str) {
@@ -108,12 +192,42 @@ fn add_markdown(result: &mut HashMap<String, Reference>, text: &str) {
     for value in markdown_references(&text[..end]) {
         result.insert(
             value.clone(),
-            Reference {
+            Reference::File {
                 value,
                 native: false,
                 markdown: true,
             },
         );
+    }
+}
+
+fn add_inline_images(result: &mut HashMap<String, Reference>, turn: &Value, public: &mut Value) {
+    let message_id = public["id"].clone();
+    for (slot, attachment) in public["attachments"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(url) = attachment["url"].as_str() else {
+            continue;
+        };
+        if super::inline_image_metadata(url).is_err() {
+            continue;
+        }
+        let id = super::inline_image_reference_id(turn, &message_id, slot, url);
+        let Some(name) = attachment["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if let Value::String(url) = attachment["url"].take() {
+            result.insert(
+                id,
+                Reference::InlineImage {
+                    url: Arc::new(url),
+                    name,
+                },
+            );
+        }
     }
 }
 
@@ -141,7 +255,7 @@ fn add_parts(
         let id = super::reference_id(turn, item, index, part_index, value);
         result.insert(
             id,
-            Reference {
+            Reference::File {
                 value: value.to_string(),
                 native,
                 markdown: false,

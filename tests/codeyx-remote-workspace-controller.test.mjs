@@ -251,6 +251,19 @@ test("原生执行状态优先于缓存轮次，未知状态不能从历史 inPr
   h.unmount();
 });
 
+test("v2 增量继续由 View.status 更新绿点及控制元数据，不从历史轮次推断状态", async t => {
+  const h = fixture(t); await h.ready(); await h.open(); h.render().changeDraft("保留 Mock 草稿"); h.render().reconnect(); h.render();
+  const socket = h.sockets.at(-1);
+  socket.handlers.message({ type: "state", streamVersion: 2, revision: 1, state: { ...view, hasEarlierMessages: true } }); await h.flush();
+  socket.handlers.message({ type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: "/status", value: "active" }, { op: "add", path: "/turns/-", value: { id: "live", status: "inProgress", messages: [] } }] }); await h.flush();
+  assert.equal(h.render().threads[0].running, true); assert.equal(h.render().activeTurn.id, "live");
+  socket.handlers.message({ type: "delta", baseRevision: 2, revision: 3, patches: [{ op: "replace", path: "/status", value: "notLoaded" }] }); await h.flush();
+  assert.equal(h.render().threads[0].running, null); assert.equal(h.render().draft, "保留 Mock 草稿");
+  socket.handlers.message({ type: "delta", baseRevision: 3, revision: 4, patches: [{ op: "replace", path: "/status", value: "idle" }, { op: "replace", path: "/turns/0/status", value: "completed" }] }); await h.flush();
+  assert.equal(h.render().threads[0].running, false); assert.equal(h.render().activeTurn, undefined); assert.equal(h.sockets.length, 2);
+  h.unmount();
+});
+
 test("新批量结果可清除更早的 WS 运行状态，不让已连接但未更新的旧 view 粘住绿点", async t => {
   const h = fixture(t); await h.ready([{ ...thread, running: true }]); await h.open();
   for (const result of [{ ...thread, running: false }, { ...thread, running: null }, thread]) {

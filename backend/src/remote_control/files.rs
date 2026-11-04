@@ -17,17 +17,135 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::desktop::NativeProvenance;
+
 pub(super) const CHUNK: usize = fs::CHUNK;
 const CACHE_KIB: usize = 400 * 1024;
 const MAX_CACHE_ENTRIES: usize = 64;
 const LIFETIME: Duration = Duration::from_secs(10 * 60);
+const MAX_INLINE_IMAGE_ENCODED: usize = (4 * 1024 * 1024usize).div_ceil(3) * 4;
 
 #[derive(Clone)]
 struct Binding {
     lease: u64,
     token: String,
     cwd: Option<String>,
+    provenance: NativeProvenance,
+    references: Result<references::References, String>,
+}
+
+struct ScopeAuthority {
+    revision: u64,
     references: Result<HashMap<String, references::Reference>, String>,
+}
+
+struct Bindings {
+    leases: Vec<Binding>,
+    provenance: NativeProvenance,
+    cwd: Result<Option<String>, String>,
+    scopes: HashMap<references::Scope, ScopeAuthority>,
+    allowed: HashMap<String, Vec<references::Reference>>,
+    blocked: Option<String>,
+}
+
+impl Bindings {
+    fn observe(&mut self, binding: &Binding) -> Result<(), String> {
+        if self.provenance.owner != binding.provenance.owner {
+            let error =
+                "会话所属的 Codex 窗口已变化，请关闭此会话的连接后重新打开以重新授权".to_string();
+            self.blocked = Some(error.clone());
+            return Err(error);
+        }
+        if self.blocked.is_some() {
+            return Ok(());
+        }
+        let Some(revision) = binding.provenance.revision else {
+            self.blocked = Some("桌面文件版本未知，请关闭此会话的连接后重新打开以重新授权".into());
+            return Ok(());
+        };
+        if self
+            .provenance
+            .revision
+            .is_some_and(|current| revision < current)
+        {
+            return Ok(());
+        }
+        let fresh = self
+            .provenance
+            .revision
+            .is_some_and(|current| revision > current)
+            || self.leases.is_empty();
+        if self
+            .provenance
+            .revision
+            .is_some_and(|current| revision > current)
+        {
+            self.provenance.revision = Some(revision);
+            self.cwd = Ok(binding.cwd.clone());
+        } else if self.cwd.as_ref() != Ok(&binding.cwd) {
+            self.cwd = Err("同版本桌面会话的工作区不一致".into());
+        }
+        let refs = match &binding.references {
+            Ok(refs) => refs,
+            Err(error) => {
+                self.blocked = Some(error.clone());
+                return Ok(());
+            }
+        };
+        // Covered Native items can revoke references; unloaded history cannot.
+        for (scope, authority) in &mut self.scopes {
+            if !refs.covers(scope) {
+                continue;
+            }
+            let values = refs.scopes.get(scope).cloned().unwrap_or_default();
+            if revision == authority.revision && authority.references.as_ref() != Ok(&values) {
+                authority.references = Err("同版本桌面会话的文件引用不一致".into());
+            } else if revision > authority.revision {
+                authority.revision = revision;
+                authority.references = Ok(values);
+            }
+        }
+        // A same-revision snapshot can confirm known authority, not introduce
+        // unknown scopes after their last live lease has gone away.
+        if fresh {
+            for (scope, values) in &refs.scopes {
+                self.scopes
+                    .entry(scope.clone())
+                    .or_insert_with(|| ScopeAuthority {
+                        revision,
+                        references: Ok(values.clone()),
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_scopes(&mut self) {
+        self.scopes.retain(|scope, authority| {
+            Some(authority.revision) == self.provenance.revision
+                && authority
+                    .references
+                    .as_ref()
+                    .is_ok_and(|refs| !refs.is_empty())
+                || self.leases.iter().any(|binding| {
+                    binding
+                        .references
+                        .as_ref()
+                        .is_ok_and(|refs| refs.scopes.contains_key(scope))
+                })
+        });
+        self.allowed.clear();
+        for authority in self.scopes.values() {
+            if let Ok(refs) = &authority.references {
+                for (reference, value) in refs {
+                    let values = self.allowed.entry(reference.clone()).or_default();
+                    if !values.contains(value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,10 +248,14 @@ pub(super) struct Descriptor {
     pub size: u64,
     pub name: String,
     pub mime: &'static str,
-    path: PathBuf,
-    stamp: fs::Stamp,
+    source: DescriptorSource,
     selection: Selection,
     created: Instant,
+}
+
+enum DescriptorSource {
+    File { path: PathBuf, stamp: fs::Stamp },
+    InlineImage,
 }
 
 impl Descriptor {
@@ -151,9 +273,12 @@ impl Descriptor {
     }
 
     pub fn validate_source(&self) -> Result<(), String> {
-        let path = selected_path(&self.selection)?;
-        if !references::same_path(&path, &self.path)
-            || fs::stamp(&fs::open(&path)?.file)? != self.stamp
+        let DescriptorSource::File { path, stamp } = &self.source else {
+            return Ok(());
+        };
+        let selected = selected_path(&self.selection)?;
+        if !references::same_path(&selected, path)
+            || &fs::stamp(&fs::open(&selected)?.file)? != stamp
         {
             return Err("文件内容或位置已变化，请重新解析下载".into());
         }
@@ -183,7 +308,7 @@ impl Snapshot {
 }
 
 pub(super) struct Registry {
-    bindings: HashMap<(String, String), Vec<Binding>>,
+    bindings: HashMap<(String, String), Bindings>,
     descriptors: HashMap<String, Arc<Descriptor>>,
     budget: Arc<Semaphore>,
     next_lease: u64,
@@ -230,10 +355,13 @@ impl Registry {
             .bindings
             .get(&(owner.clone(), thread.to_string()))
             .ok_or("请先打开并保持连接此会话，再下载文件")?;
+        if let Some(error) = &bindings.blocked {
+            return Err(error.clone());
+        }
         let mut selected = None;
-        for binding in bindings {
+        for binding in &bindings.leases {
             let values = binding.references.as_ref().map_err(Clone::clone)?;
-            if let Some(value) = values.get(reference) {
+            if let Some(value) = values.values.get(reference) {
                 selected = Some((binding, reference.to_string(), value.clone()));
                 break;
             }
@@ -242,11 +370,10 @@ impl Registry {
             // Markdown renderers may percent-encode a public destination. Compare
             // lexical candidates only; this never probes a client-supplied path.
             let requested = references::local_path(reference)?;
-            for binding in bindings {
+            for binding in &bindings.leases {
                 let values = binding.references.as_ref().map_err(Clone::clone)?;
-                if let Some((key, value)) = values.iter().find(|(key, value)| {
-                    !value.native
-                        && key.as_str() == value.value
+                if let Some((key, value)) = values.values.iter().find(|(key, value)| {
+                    matches!(value, references::Reference::File { value, native: false, .. } if key.as_str() == value.as_str())
                         && references::local_path(key)
                             .is_ok_and(|path| references::same_path(&path, &requested))
                 }) {
@@ -274,20 +401,27 @@ impl Registry {
         self.bindings
             .get(&(selection.owner.clone(), selection.thread.clone()))
             .is_some_and(|bindings| {
-                // Different history windows may omit a reference, but may not
-                // disagree about its authority or the thread's workspace.
-                bindings.iter().all(|binding| {
-                    binding.cwd == selection.cwd
-                        && binding.references.as_ref().is_ok_and(|refs| {
-                            refs.get(&selection.reference)
-                                .is_none_or(|value| value == &selection.value)
+                // History gaps may omit a reference, but cannot undo observed
+                // Native revocation or disagree about authority/workspace.
+                bindings.blocked.is_none()
+                    && bindings.cwd.as_ref() == Ok(&selection.cwd)
+                    && bindings
+                        .allowed
+                        .get(&selection.reference)
+                        .is_some_and(|values| values.contains(&selection.value))
+                    && bindings.leases.iter().all(|binding| {
+                        binding.cwd == selection.cwd
+                            && binding.references.as_ref().is_ok_and(|refs| {
+                                refs.values
+                                    .get(&selection.reference)
+                                    .is_none_or(|value| value == &selection.value)
+                            })
+                    })
+                    && bindings.leases.iter().any(|binding| {
+                        binding.references.as_ref().is_ok_and(|refs| {
+                            refs.values.get(&selection.reference) == Some(&selection.value)
                         })
-                }) && bindings.iter().any(|binding| {
-                    binding
-                        .references
-                        .as_ref()
-                        .is_ok_and(|refs| refs.get(&selection.reference) == Some(&selection.value))
-                })
+                    })
             })
     }
 
@@ -343,8 +477,9 @@ impl Registry {
 
     pub fn prune(&mut self, mut authorized: impl FnMut(&str) -> bool) {
         self.bindings.retain(|_, bindings| {
-            bindings.retain(|binding| authorized(&binding.token));
-            !bindings.is_empty()
+            bindings.leases.retain(|binding| authorized(&binding.token));
+            bindings.prune_scopes();
+            !bindings.leases.is_empty()
         });
         let remove: Vec<_> = self
             .descriptors
@@ -377,6 +512,7 @@ impl BindingGuard {
         token: &str,
         thread: &str,
         state: &Value,
+        provenance: &NativeProvenance,
     ) -> Result<Self, String> {
         if state["id"].as_str() != Some(thread) {
             return Err("文件投影会话不匹配".into());
@@ -385,16 +521,29 @@ impl BindingGuard {
         let mut current = registry.lock().unwrap_or_else(|e| e.into_inner());
         current.next_lease += 1;
         let lease = current.next_lease;
-        current
+        let binding = Binding {
+            lease,
+            token: token.to_string(),
+            cwd: state["cwd"].as_str().map(str::to_string),
+            provenance: provenance.clone(),
+            references: references::collect(state),
+        };
+        let bindings = current
             .bindings
             .entry(key.clone())
-            .or_default()
-            .push(Binding {
-                lease,
-                token: token.to_string(),
-                cwd: state["cwd"].as_str().map(str::to_string),
-                references: references::collect(state),
+            .or_insert_with(|| Bindings {
+                leases: Vec::new(),
+                provenance: provenance.clone(),
+                cwd: Ok(binding.cwd.clone()),
+                scopes: HashMap::new(),
+                allowed: HashMap::new(),
+                blocked: None,
             });
+        if let Err(error) = bindings.observe(&binding) {
+            current.prune(|_| true);
+            return Err(error);
+        }
+        bindings.leases.push(binding);
         current.prune(|_| true);
         drop(current);
         Ok(Self {
@@ -404,18 +553,40 @@ impl BindingGuard {
         })
     }
 
-    pub fn update(&self, state: &Value) -> Result<(), String> {
+    pub fn update(&self, state: &Value, provenance: &NativeProvenance) -> Result<(), String> {
         if state["id"].as_str() != Some(self.key.1.as_str()) {
             return Err("文件投影会话不匹配".into());
         }
         let mut current = self.registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(binding) = current.bindings.get_mut(&self.key).and_then(|bindings| {
-            bindings
-                .iter_mut()
-                .find(|binding| binding.lease == self.lease)
-        }) {
-            binding.cwd = state["cwd"].as_str().map(str::to_string);
-            binding.references = references::collect(state);
+        if let Some(bindings) = current.bindings.get_mut(&self.key)
+            && let Some(index) = bindings
+                .leases
+                .iter()
+                .position(|binding| binding.lease == self.lease)
+        {
+            if provenance.owner == bindings.leases[index].provenance.owner
+                && let (Some(revision), Some(previous)) = (
+                    provenance.revision,
+                    bindings.leases[index].provenance.revision,
+                )
+                && revision < previous
+            {
+                bindings.blocked =
+                    Some("桌面文件版本已重置，请关闭此会话的连接后重新打开以重新授权".into());
+            }
+            let binding = Binding {
+                lease: self.lease,
+                token: bindings.leases[index].token.clone(),
+                cwd: state["cwd"].as_str().map(str::to_string),
+                provenance: provenance.clone(),
+                references: references::collect(state),
+            };
+            let observed = bindings.observe(&binding);
+            if observed.is_ok() {
+                bindings.leases[index] = binding;
+            }
+            current.prune(|_| true);
+            return observed;
         }
         current.prune(|_| true);
         Ok(())
@@ -426,19 +597,29 @@ impl Drop for BindingGuard {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(bindings) = registry.bindings.get_mut(&self.key) {
-            bindings.retain(|binding| binding.lease != self.lease);
+            bindings
+                .leases
+                .retain(|binding| binding.lease != self.lease);
         }
         registry.prune(|_| true);
     }
 }
 
 fn selected_path(selection: &Selection) -> Result<PathBuf, String> {
-    let reference = if selection.value.markdown {
-        references::local_path(&selection.value.value)?
-    } else {
-        references::native_path(&selection.value.value)?
+    let references::Reference::File {
+        value,
+        native,
+        markdown,
+    } = &selection.value
+    else {
+        return Err("内嵌图片没有本地文件路径".into());
     };
-    if selection.value.native && reference.is_absolute() {
+    let reference = if *markdown {
+        references::local_path(value)?
+    } else {
+        references::native_path(value)?
+    };
+    if *native && reference.is_absolute() {
         selection.protection.check_path(&reference)?;
         let source = fs::open(&reference)?;
         let canonical = source.canonical(&reference)?;
@@ -491,6 +672,18 @@ pub(super) fn describe(
     mut check: impl FnMut() -> Result<(), String>,
 ) -> Result<Descriptor, String> {
     check()?;
+    if let references::Reference::InlineImage { url, name } = &selection.value {
+        let metadata = inline_image_metadata(url)?;
+        check()?;
+        return Ok(Descriptor {
+            size: metadata.size,
+            name: name.clone(),
+            mime: metadata.mime,
+            source: DescriptorSource::InlineImage,
+            selection,
+            created: Instant::now(),
+        });
+    }
     let path = selected_path(&selection)?;
     let mut source = fs::open(&path)?;
     let before = fs::stamp(&source.file)?;
@@ -522,8 +715,10 @@ pub(super) fn describe(
         size: before.size(),
         name,
         mime,
-        path,
-        stamp: before,
+        source: DescriptorSource::File {
+            path,
+            stamp: before,
+        },
         selection,
         created: Instant::now(),
     })
@@ -536,12 +731,27 @@ pub(super) fn prepare_snapshot(
 ) -> Result<Snapshot, String> {
     check()?;
     descriptor.validate_source()?;
-    let mut source = fs::open(&descriptor.path)?;
     let budget = registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .budget(descriptor.size)?;
-    let (file, digest) = fs::snapshot(&mut source.file, &descriptor.stamp, &mut check)?;
+    let (file, digest) = match &descriptor.source {
+        DescriptorSource::File { path, stamp } => {
+            fs::snapshot(&mut fs::open(path)?.file, stamp, &mut check)?
+        }
+        DescriptorSource::InlineImage => {
+            let references::Reference::InlineImage { url, .. } = &descriptor.selection.value else {
+                return Err("内嵌图片引用无效".into());
+            };
+            let metadata = inline_image_metadata(url)?;
+            fs::snapshot_inline_image(
+                metadata.encoded,
+                descriptor.size,
+                descriptor.mime,
+                &mut check,
+            )?
+        }
+    };
     check()?;
     descriptor.validate_source()?;
     Ok(Snapshot {
@@ -581,6 +791,71 @@ pub(super) fn reference_id(
     crate::fs_util::sha256_hex_str(&json!([turn.as_str(), identity, part, path]).to_string())
 }
 
+pub(super) fn inline_image_reference_id(
+    turn_id: &Value,
+    message_id: &Value,
+    image_slot: usize,
+    url: &str,
+) -> String {
+    crate::fs_util::sha256_hex_str(
+        &json!([
+            "inline-image",
+            turn_id,
+            message_id,
+            image_slot,
+            crate::fs_util::sha256_hex_str(url)
+        ])
+        .to_string(),
+    )
+}
+
+struct InlineImageMetadata<'a> {
+    encoded: &'a str,
+    size: u64,
+    mime: &'static str,
+}
+
+fn inline_image_metadata(url: &str) -> Result<InlineImageMetadata<'_>, String> {
+    let (mime, encoded) = url
+        .strip_prefix("data:")
+        .and_then(|url| url.split_once(";base64,"))
+        .ok_or("内嵌图片格式无效")?;
+    let mime = match mime {
+        "image/png" => "image/png",
+        "image/jpeg" => "image/jpeg",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        _ => return Err("不支持此内嵌图片类型".into()),
+    };
+    if encoded.len() > MAX_INLINE_IMAGE_ENCODED {
+        return Err("内嵌图片超过下载上限".into());
+    }
+    if encoded.is_empty()
+        || !encoded.len().is_multiple_of(4)
+        || !encoded.as_bytes()[..encoded.len() - 4]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    {
+        return Err("内嵌图片 Base64 编码无效".into());
+    }
+    // STANDARD checks final padding/trailing bits; only the format header is decoded here.
+    let tail = STANDARD
+        .decode_slice(&encoded.as_bytes()[encoded.len() - 4..], &mut [0; 3])
+        .map_err(|_| "内嵌图片 Base64 编码无效")?;
+    let mut header = [0; 12];
+    let count = STANDARD
+        .decode_slice(&encoded.as_bytes()[..encoded.len().min(16)], &mut header)
+        .map_err(|_| "内嵌图片 Base64 编码无效")?;
+    if fs::image_mime(&header[..count]) != Some(mime) {
+        return Err("内嵌图片类型与内容不匹配".into());
+    }
+    Ok(InlineImageMetadata {
+        encoded,
+        size: ((encoded.len() / 4 - 1) * 3 + tail) as u64,
+        mime,
+    })
+}
+
 pub(super) fn public_image_url(value: &Value) -> Option<&str> {
     let url = value.as_str()?;
     if url.starts_with("https:") {
@@ -590,12 +865,7 @@ pub(super) fn public_image_url(value: &Value) -> Option<&str> {
             && parsed.password().is_none())
         .then_some(url);
     }
-    let (mime, encoded) = url.strip_prefix("data:")?.split_once(";base64,")?;
-    if encoded.len() > (4 * 1024 * 1024usize).div_ceil(3) * 4 {
-        return None;
-    }
-    let bytes = STANDARD.decode(encoded).ok()?;
-    (fs::image_mime(&bytes) == Some(mime)).then_some(url)
+    inline_image_metadata(url).ok().map(|_| url)
 }
 
 pub(super) fn download_route(path: &str) -> Option<(&str, &str)> {

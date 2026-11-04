@@ -8,7 +8,7 @@ const thread = { id: "thread", title: "Thread", cwd: project.cwd, updatedAt: 1 }
 const view = { id: thread.id, title: "Last known view", status: "active", historyComplete: false,
   turns: [{ id: "turn", status: "inProgress", messages: [] }],
   requests: [{ id: 7, method: "item/commandExecution/requestApproval", supported: true, params: {} }] };
-const invalidFrames = [["malformed JSON", "{"], ["invalid state schema", { type: "state", state: { ...view, turns: null } }], ["mismatched thread", { type: "state", state: { ...view, id: "wrong-thread" } }]];
+const invalidFrames = [["malformed JSON", "{"], ["invalid state schema", { type: "state", state: { ...view, turns: null } }], ["mismatched thread", { type: "state", state: { ...view, id: "wrong-thread" } }], ["v2 first revision is not 1", { type: "state", streamVersion: 2, revision: 2, state: view }]];
 
 class RemoteError extends Error {
   constructor(message, status) { super(message); this.status = status; }
@@ -23,7 +23,8 @@ function fixture(t) {
   let sequence = 0, unauthorized = 0;
   globalThis.location = { protocol: "https:", host: "mobile.invalid" };
   globalThis.WebSocket = class {
-    constructor(url) { this.url = url; this.closed = 0; sockets.push(this); }
+    constructor(url) { this.url = url; this.closed = 0; this.sent = []; sockets.push(this); }
+    send(data) { this.sent.push(data); }
     frame(value) { this.onmessage?.({ data: typeof value === "string" ? value : JSON.stringify(value) }); }
     close() { this.closed++; this.onclose?.(); }
     end() { this.onclose?.(); }
@@ -56,6 +57,48 @@ function fixture(t) {
   });
   return { ...h, render, ready, browser, options, sockets, calls, journal, last, get unauthorized() { return unauthorized; } };
 }
+
+test("新 URL 协商 v2，旧服务完整帧兼容；ack/error 不伪造连接，历史优先只读 WS 且不自动扩展 Native", async t => {
+  const h = fixture(t); await h.ready(false); const socket = h.sockets[0];
+  assert.equal(socket.url, "wss://mobile.invalid/remote/events/thread?stream=2");
+  socket.frame({ type: "ack", requestId: "Mock-ack" }); socket.frame({ type: "error", message: "Mock ignored" });
+  assert.equal(h.render().connected, false);
+  const initial = { ...view, hasEarlierMessages: true, model: "Mock-model", effort: "high", permissionMode: "read-only", serviceTier: null,
+    turns: [{ id: "turn", status: "inProgress", messages: [{ id: "last", role: "assistant", kind: "agentMessage", text: "Mock recent" }] }] };
+  socket.frame({ type: "state", streamVersion: 2, revision: 1, state: initial });
+  let c = h.render(); assert.equal(c.connected, true); await c.loadHistory(); await c.loadHistory();
+  assert.deepEqual(socket.sent, ['{"type":"history"}']); assert.equal(mutations(h).length, 0); assert.equal(h.sockets.length, 1);
+  socket.frame({ type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "add", path: "/turns/0/messages/0", value: { id: "first", role: "user", kind: "userMessage", text: "Mock earlier" } }, { op: "replace", path: "/hasEarlierMessages", value: false }] });
+  c = h.render(); assert.equal(c.loadingEarlier, false); assert.equal(c.draft, "保留草稿"); assert.equal(c.composerView.permissionMode, "read-only");
+  assert.deepEqual(c.view.turns[0].messages.map(message => message.id), ["first", "last"]);
+  assert.equal(mutations(h).length, 0, "窗口已展开也不自动读取全部 Native 历史");
+  const work = c.loadHistory(); assert.equal(h.last("/remote/action").args.action, "history");
+  h.last("/remote/action").resolve({}); await work; h.render(); assert.equal(h.sockets.length, 1, "v2 Native 历史读取也不为分页重连");
+  h.render().reconnect(); h.render(); assert.equal(h.sockets.length, 2);
+  assert.equal(h.render().connected, false); h.sockets[1].frame({ type: "state", state: view }); assert.equal(h.render().connected, true);
+  assert.equal(h.render().draft, "保留草稿"); assert.equal(socket.sent.length, 1);
+});
+
+for (const [label, bad] of [
+  ["旧 revision", { type: "delta", baseRevision: 2, revision: 3, patches: [] }],
+  ["坏 patch", { type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: "/turns/99", value: {} }] }],
+  ["坏 schema", { type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: "/turns", value: null }] }],
+  ["错 thread", { type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: "/id", value: "other" }] }],
+  ["v2 混入 legacy", { type: "state", state: view }],
+  ["重复 v2 首帧", { type: "state", streamVersion: 2, revision: 1, state: view }],
+]) test(`真实 v2 传输 ${label} 同步只读，保留草稿且不自动重连，手动重连隔离晚到帧`, async t => {
+  const h = fixture(t); await h.ready(false); const socket = h.sockets[0];
+  socket.frame({ type: "state", streamVersion: 2, revision: 1, state: view });
+  const c = h.render(), oldMessage = socket.onmessage, fileGeneration = c.fileGeneration;
+  socket.frame(bad); await assertBlocked(h, c);
+  h.browser.tick(30000); assert.equal(h.sockets.length, 1); assert.equal(h.render().connected, false);
+  assert.deepEqual(h.render().view, view); assert.equal(h.render().draft, "保留草稿"); assert.match(h.render().connectionError, /数据无效/);
+  h.render().reconnect(); h.render(); const fresh = h.sockets[1];
+  fresh.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...view, title: "Mock fresh" } });
+  oldMessage({ data: JSON.stringify({ type: "delta", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: "/title", value: "Mock stale" }] }) });
+  assert.equal(h.render().view.title, "Mock fresh"); assert.equal(h.render().connected, true); assert.equal(h.render().draft, "保留草稿");
+  assert.notEqual(h.render().fileGeneration, fileGeneration); assert.equal(mutations(h).length, 0); assert.equal(socket.sent.length, 0);
+});
 
 const mutations = h => h.calls.filter(call => call.path === "/remote/action" || call.path === "/remote/create");
 
