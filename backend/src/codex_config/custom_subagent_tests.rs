@@ -301,10 +301,11 @@ fn linked_runtime_directory_is_rejected_without_touching_external_files() {
     let marker = temp.path().join("state/lease.json");
     let constraints = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     let outside = temp.path().join("outside");
-    fs::create_dir_all(&constraints).unwrap();
+    let linked_directory = constraints.join(CODEY_RUNTIME_AGENTS_DIR);
+    fs::create_dir_all(linked_directory.parent().unwrap()).unwrap();
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("custom_agent_1.toml"), "external").unwrap();
-    std::os::unix::fs::symlink(&outside, constraints.join(CODEY_RUNTIME_AGENTS_DIR)).unwrap();
+    std::os::unix::fs::symlink(&outside, linked_directory).unwrap();
     assert!(start(&home, &marker, &config()).is_err());
     assert_eq!(
         fs::read_to_string(outside.join("custom_agent_1.toml")).unwrap(),
