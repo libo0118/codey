@@ -108,10 +108,28 @@ pub(crate) struct CodexPaths {
     pub(crate) codex_home: PathBuf,
 }
 
+fn supports_fetch_interception(paths: Option<&CodexPaths>) -> bool {
+    // Owl's app:// interception stalls startup without emitting requestPaused.
+    !cfg!(target_os = "linux")
+        || !paths.is_some_and(|paths| {
+            paths.app_dir.join("owl-shell-runtime.json").is_file()
+                && paths
+                    .app_dir
+                    .join("resources/owl-electron-app.json")
+                    .is_file()
+        })
+}
+
 /// Codex 启动前调用：替换旧服务，从端点一出现就开始挂载页面。
 pub(crate) fn start_service(debug_port: u16, disable_pet: bool, paths: Option<CodexPaths>) {
     let mut context = ServiceContext::new(disable_pet, default_cache_dir());
-    if let Some(paths) = &paths {
+    context.fetch_interception = supports_fetch_interception(paths.as_ref());
+    if !context.fetch_interception {
+        log_service_event(
+            "renderer_asset_patch.owl_runtime_compatibility",
+            json!({ "runtime": "owl", "staticAssetRewrite": false, "runtimeInjection": true }),
+        );
+    } else if let Some(paths) = &paths {
         context.start_asset_scan(paths);
     }
     let context = Arc::new(context);
@@ -179,6 +197,7 @@ struct PageEntry {
 type PendingAssetScan = tokio::task::JoinHandle<Result<crate::renderer_asset_scan::ScanOutcome>>;
 
 struct ServiceContext {
+    fetch_interception: bool,
     install_script: Arc<str>,
     /// 当前拦截规则。离线扫描完成后换成精确地址，并下发给已挂上的页面。
     patterns: Mutex<Value>,
@@ -199,6 +218,7 @@ impl ServiceContext {
     fn new(disable_pet: bool, cache_dir: PathBuf) -> Self {
         let install_script: Arc<str> = Arc::from(renderer_asset_patch_document_script(disable_pet));
         Self {
+            fetch_interception: true,
             cache: PatchCache::new(cache_dir, &install_script),
             install_script,
             patterns: Mutex::new(fetch_patterns(disable_pet, None)),
@@ -819,6 +839,10 @@ async fn on_attached(connection: BrowserConnection, context: Arc<ServiceContext>
                 },
             },
         );
+    }
+    if !context.fetch_interception {
+        resume();
+        return;
     }
     // Fetch 拦截由浏览器侧处理，页面暂停时也会应答；落位后才放行页面。
     if let Err(error) = connection
@@ -1459,6 +1483,55 @@ mod tests {
             ]);
         }
         json!({ "method": "Fetch.requestPaused", "sessionId": session, "params": params })
+    }
+
+    #[tokio::test]
+    async fn runtime_only_pages_resume_without_enabling_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = TestService::start_with(temp.path(), |context| {
+            context.fetch_interception = false;
+        })
+        .await;
+        service.answer_startup(json!([])).await;
+        service
+            .send(json!({ "method": "Target.attachedToTarget", "params": {
+                "sessionId": "owl-page", "waitingForDebugger": true,
+                "targetInfo": { "targetId": "main", "type": "page", "url": "" }
+            }}))
+            .await;
+        let resume = service.expect("Runtime.runIfWaitingForDebugger").await;
+        assert_eq!(resume["sessionId"], "owl-page");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), service.socket.next())
+                .await
+                .is_err(),
+            "runtime-only integration must not send Fetch.enable"
+        );
+        assert!(service.context.page_stats("main").is_some());
+        service.finish().await;
+    }
+
+    #[test]
+    fn owl_markers_select_runtime_only_injection_on_linux() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = CodexPaths {
+            app_dir: temp.path().to_path_buf(),
+            codex_home: temp.path().join("codex"),
+        };
+        assert!(supports_fetch_interception(None));
+        assert!(supports_fetch_interception(Some(&paths)));
+        std::fs::write(temp.path().join("owl-shell-runtime.json"), "{}").unwrap();
+        assert!(supports_fetch_interception(Some(&paths)));
+        std::fs::create_dir(temp.path().join("resources")).unwrap();
+        std::fs::write(
+            temp.path().join("resources/owl-electron-app.json"),
+            r#"{"runtimeName":"owl"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            supports_fetch_interception(Some(&paths)),
+            !cfg!(target_os = "linux")
+        );
     }
 
     #[tokio::test]
