@@ -1769,8 +1769,9 @@ pub(crate) async fn remote_control_request(
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
         r#"typeof window.__codeyRemoteControl === "function"
-          && window.__codeyRemoteControl.version === 4
+          && window.__codeyRemoteControl.version === 5
           && window.__codeySessionToolsInjectLoaded === true
+          && typeof window.__codeyLoadAppServerManagerSourceResolver === "function"
           && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
     )
     .await
@@ -1780,7 +1781,8 @@ pub(crate) async fn remote_control_request(
         let session_tools_load = format!(
             r#"(() => {{
               if (window.__codeySessionToolsInjectLoaded === true
-                && window.__codeyLoadCodexSessionController?.remoteVersion !== 1) {{
+                && (window.__codeyLoadCodexSessionController?.remoteVersion !== 1
+                  || typeof window.__codeyLoadAppServerManagerSourceResolver !== "function")) {{
                 return "codey_remote_restart_required";
               }}
               {script};
@@ -1809,6 +1811,7 @@ pub(crate) async fn remote_control_request(
             let probe = codey_runtime_core::bridge::evaluate_script(
                 websocket_url,
                 r#"window.__codeySessionToolsInjectLoaded === true
+                  && typeof window.__codeyLoadAppServerManagerSourceResolver === "function"
                   && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
             )
             .await;

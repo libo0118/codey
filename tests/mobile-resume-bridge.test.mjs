@@ -75,6 +75,7 @@ test("CDP readiness requires the current remote and session-controller generatio
     __codeyRemoteControl: Object.assign(() => {}, { version: 1 }),
     __codeyLoadCodexSessionController: Object.assign(() => {}, { remoteVersion: 1 }),
     __codeySessionToolsInjectLoaded: true,
+    __codeyLoadAppServerManagerSourceResolver: () => null,
   };
   const ready = () => vm.runInNewContext(probe[1], { window });
   assert.equal(ready(), false, "an old remote adapter is not ready");
@@ -83,7 +84,12 @@ test("CDP readiness requires the current remote and session-controller generatio
   window.__codeyRemoteControl.version = 3;
   assert.equal(ready(), false, "the published adapter has no passive activity action");
   window.__codeyRemoteControl.version = 4;
+  assert.equal(ready(), false, "the published adapter has no source-based creation lookup");
+  window.__codeyRemoteControl.version = 5;
   assert.equal(ready(), true);
+  delete window.__codeyLoadAppServerManagerSourceResolver;
+  assert.equal(ready(), false, "creation source lookup must be installed");
+  window.__codeyLoadAppServerManagerSourceResolver = () => null;
   delete window.__codeyLoadCodexSessionController.remoteVersion;
   assert.equal(ready(), false, "a legacy session loader is not ready");
   window.__codeyLoadCodexSessionController.remoteVersion = 1;
@@ -93,17 +99,18 @@ test("CDP readiness requires the current remote and session-controller generatio
 
 test("CDP refuses an installed legacy generation before loading or disposing desktop session tools", () => {
   const load = formatScript("session_tools_load", { script: "window.loads += 1;" });
-  for (const [loaded, generation] of [[true, undefined], [true, 1], [false, undefined], [undefined, undefined]]) {
+  for (const [loaded, generation, sourceReady = true] of [[true, undefined], [true, 1], [true, 1, false], [false, undefined], [undefined, undefined]]) {
     const state = { selectedSession: "thread-1", selectedMessages: ["turn-1"] };
     const window = {
       __codeySessionToolsInjectLoaded: loaded,
       __codeyLoadCodexSessionController: Object.assign(() => {}, { remoteVersion: generation }),
+      __codeyLoadAppServerManagerSourceResolver: sourceReady ? () => null : undefined,
       __codeySessionToolsInstall: { dispose() { assert.fail("must not dispose desktop controls"); } },
       loads: 0,
       state,
     };
     const stage = vm.runInNewContext(load, { window });
-    const restartRequired = loaded === true && generation !== 1;
+    const restartRequired = loaded === true && (generation !== 1 || !sourceReady);
     assert.equal(stage, restartRequired ? "codey_remote_restart_required" : "");
     assert.equal(window.loads, restartRequired ? 0 : 1);
     assert.equal(window.__codeySessionToolsInjectLoaded, loaded);

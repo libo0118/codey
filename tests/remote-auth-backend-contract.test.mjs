@@ -80,6 +80,44 @@ test("native creation retains creation-input tools while defaults expose no cred
   assert.equal(submitted.inputs, creationInputs);
 });
 
+test("remote creation reuses the shared source resolver when manager exports are absent", async () => {
+  const inputs = { tools: ["native-tool"], instructions: "native project instructions" };
+  let submitted, sourceReads = 0;
+  const manager = {
+    sendRequest: async () => ({ config: { model: "native-model" } }),
+    startConversation: async (_params, options) => {
+      submitted = await options.readThreadCreationInputs();
+      return { status: "created", conversationId: "created" };
+    },
+  };
+  const app = runtime(manager);
+  app.window.__codeyAppServerManagerResolverFromModule = () => null;
+  app.window.__codeyAppServerManagerRegistryResolverFromModule = () => null;
+  app.context.document.scripts.push({ src: "app://codex/assets/app-initial-source.js" });
+  const module = {
+    factory: function (scope, hostId) {
+      return { scope: scope, hostId: hostId, requestClient: scope.get("client"), dynamicTools: new Map(), readCreationInputs: async () => inputs };
+    },
+  };
+  app.window.__codeyImportCodexAsset = async () => module;
+  app.window.__codeyLoadAppServerManagerSourceResolver = async (url, found) => {
+    assert.equal(url, "app://codex/assets/app-initial-source.js");
+    assert.equal(found, module);
+    sourceReads++;
+    return () => manager;
+  };
+  const defaults = await app.window.__codeyRemoteControl({ action: "defaults", cwd: "/project" }, Date.now() + 10000);
+  assert.equal(defaults.model, "native-model");
+  const result = await app.window.__codeyRemoteControl({ action: "create", params: {} }, Date.now() + 10000);
+  assert.equal(result.id, "created");
+  assert.equal(submitted, inputs);
+  assert.ok(sourceReads > 0);
+  app.window.__codeyModelWhitelistPatch.requestGateReady = () => false;
+  submitted = null;
+  await assert.rejects(app.window.__codeyRemoteControl({ action: "create", params: {} }, Date.now() + 10000), /模型线路尚未就绪/);
+  assert.equal(submitted, null);
+});
+
 function modelWriteRuntime() {
   const writes = [];
   const inputs = { readCreationInputs: async () => "native inputs" };

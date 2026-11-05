@@ -2602,6 +2602,7 @@
     if (resolver) managerSourceResolvers.set(module, resolver);
     return resolver;
   };
+  window.__codeyLoadAppServerManagerSourceResolver = loadManagerSourceResolver;
 
   const messageDeletionMethods = {
     async prepare(conversationId) {

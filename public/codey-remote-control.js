@@ -1,6 +1,6 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 4;
+  const version = 5;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
@@ -98,9 +98,11 @@
         const factory = remoteCreationInputsFactoryFromModule(module);
         const resolver = appServerManagerResolverFromModule(module);
         const registryResolver = appServerManagerRegistryResolverFromModule(module);
+        const sourceResolver = await window.__codeyLoadAppServerManagerSourceResolver?.(url, module);
         if (factory) factories.add(factory);
         if (resolver) resolvers.add(resolver);
         if (registryResolver) registryResolvers.add(registryResolver);
+        if (sourceResolver) registryResolvers.add(sourceResolver);
         for (const value of Object.values(module || {})) {
           if (typeof value !== "function") continue;
           const source = Function.prototype.toString.call(value);
