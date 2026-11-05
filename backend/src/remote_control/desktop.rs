@@ -8,6 +8,8 @@ use uuid::Uuid;
 use super::protocol;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+// Native snapshots include full history and inline images, unlike the bounded public stream.
+const MAX_RECEIVE_FRAME: usize = 64 * 1024 * 1024;
 pub(super) const UNCERTAIN: &str = "桌面响应中断或超时，操作可能已提交；请先查看会话，不要重复发送";
 pub(super) const OWNER_UNAVAILABLE: &str = "尚未取得桌面会话，请点击重新连接以在电脑中打开会话";
 
@@ -155,8 +157,8 @@ impl Desktop {
         loop {
             if self.buffer.len() >= 4 {
                 let length = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
-                if length == 0 || length > MAX_FRAME {
-                    return Err("Codex 桌面 IPC 帧长度不兼容".into());
+                if length == 0 || length > MAX_RECEIVE_FRAME {
+                    return Err("Codex 桌面 IPC 帧长度无效或超过 64 MiB".into());
                 }
                 if self.buffer.len() >= length + 4 {
                     let value: Value = serde_json::from_slice(&self.buffer[4..length + 4])
@@ -878,6 +880,42 @@ mod tests {
             },
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn large_native_snapshot_preserves_framing_and_outgoing_limit() {
+        let (mut desktop, mut server) = action_fixture(Value::Null);
+        // The reported Linux snapshot is 22,197,762 bytes, above the old 16 MiB limit.
+        let text_len = 22_197_762;
+        let fixture = tokio::spawn(async move {
+            write_frame(&mut server, json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":1,"conversationState":{"id":"t","title":"x".repeat(text_len),"turns":[]}}}})).await;
+            write_frame(&mut server, json!({"type":"response","requestId":"next"})).await;
+        });
+        let snapshot = desktop.next().await.unwrap();
+        assert!(desktop.apply_event(snapshot).unwrap());
+        assert_eq!(desktop.state["title"].as_str().unwrap().len(), text_len);
+        assert_eq!(desktop.next().await.unwrap()["requestId"], "next");
+        fixture.await.unwrap();
+        assert_eq!(
+            desktop
+                .send(&json!({"text":"x".repeat(MAX_FRAME)}))
+                .await
+                .unwrap_err(),
+            "桌面消息过大"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_frame_limit_rejects_invalid_headers_before_reading_payload() {
+        for size in [0, (MAX_RECEIVE_FRAME + 1) as u32, u32::MAX] {
+            let (mut desktop, mut server) = action_fixture(Value::Null);
+            server.write_u32_le(size).await.unwrap();
+            let error = tokio::time::timeout(Duration::from_millis(100), desktop.next())
+                .await
+                .expect("invalid frame must not wait for its body")
+                .unwrap_err();
+            assert!(error.contains("帧长度"));
+        }
     }
 
     #[tokio::test]
