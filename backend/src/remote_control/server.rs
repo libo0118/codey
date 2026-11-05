@@ -36,7 +36,7 @@ mod stream;
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = Response<Body>;
 const MAX_BODY: usize = 1024 * 1024;
-// Four MiB of images expanded as base64, plus escaped message text and metadata.
+// Four MiB of attachments expanded as base64, plus escaped message text and metadata.
 const MAX_MESSAGE_BODY: usize = 7 * 1024 * 1024;
 const STATE_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 
@@ -716,7 +716,7 @@ async fn action_once(
                 validate_model_settings(&catalog, &json!({}), &args)?;
             }
             authorize_action(&core, &token)?;
-            super::create::create(&state, &args).await
+            super::create::create(&state, &args, || authorize_action(&core, &token)).await
         }
     };
     let result = core
@@ -777,22 +777,31 @@ async fn perform_action(core: &Core, token: &str, args: &Value) -> Result<Value,
     }
     authorize_action(core, token)?;
     desktop
-        .action(action, args, async {
-            let state = core.state.upgrade().ok_or("Codey 正在退出")?;
-            let runtime = state
-                .runtime
-                .lock()
-                .await
-                .clone()
-                .ok_or("Codex 桌面尚未启动")?;
-            let websocket = runtime.renderer_websocket_url().await;
-            require_model_request_gate(&websocket).await?;
-            authorize_action(core, token)
-        })
+        .action(
+            action,
+            args,
+            async {
+                let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+                let runtime = state
+                    .runtime
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or("Codex 桌面尚未启动")?;
+                let websocket = runtime.renderer_websocket_url().await;
+                require_model_request_gate(&websocket).await?;
+                authorize_action(core, token)
+            },
+            async {
+                authorize_action(core, token)?;
+                let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+                super::create::prepare_files(&state, args, || authorize_action(core, token)).await
+            },
+        )
         .await
 }
 
-async fn require_model_request_gate(websocket_url: &str) -> Result<(), String> {
+pub(super) async fn require_model_request_gate(websocket_url: &str) -> Result<(), String> {
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         codey_runtime_core::bridge::evaluate_script(

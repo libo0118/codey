@@ -94,7 +94,7 @@ fn large_history_is_bounded_then_one_item_update_is_a_small_public_delta() {
     let current = snapshot(&mut projection, &state, &mut window);
     let first = receive(&mut encoder, current.clone(), &mut client, &mut revision);
     assert!(first.len() < MESSAGE_BUDGET + 2048);
-    assert!(ids(&client).len() < INITIAL_MESSAGES);
+    assert!(ids(&client).len() < INITIAL_BODIES);
     assert_eq!(client["hasEarlierMessages"], true);
     assert!(encoder.prepare(current).unwrap().is_none());
     apply(
@@ -231,6 +231,143 @@ fn recent_window_counts_messages_not_turns_and_history_expansion_has_a_stable_an
 }
 
 #[test]
+fn initial_window_counts_visible_bodies_not_interleaved_activity_or_empty_messages() {
+    let mut state = json!({"id":"thread","turns":(0..45).map(|index| {
+        let body = match index % 6 {
+            0 => json!({"id":format!("body-{index}"),"type":"userMessage","content":[{"type":"text","text":"question"}]}),
+            1 => json!({"id":format!("body-{index}"),"type":"steeringUserMessage","input":[{"type":"text","text":"follow-up"}]}),
+            2 => json!({"id":format!("body-{index}"),"type":"agentMessage","text":"answer"}),
+            3 => json!({"id":format!("body-{index}"),"type":"assistantMessage","text":"answer"}),
+            4 => json!({"id":format!("body-{index}"),"type":"planImplementation","planContent":"plan"}),
+            _ => json!({"id":format!("body-{index}"),"type":"error","message":"error"}),
+        };
+        let body = if index == 37 { json!({"id":"body-37","type":"userMessage","content":[{"type":"file","path":"/public/image.png"}]}) } else { body };
+        json!({"turnId":format!("turn-{index}"),"status":"completed","items":[
+            body,
+            {"id":format!("empty-{index}"),"type":"agentMessage","text":"  "},
+            {"id":format!("reason-{index}"),"type":"reasoning","summary":["r".repeat(6000)]},
+            {"id":format!("command-{index}"),"type":"commandExecution","command":"test","aggregatedOutput":"c".repeat(6000)},
+            {"id":format!("tool-{index}"),"type":"mcpToolCall","tool":"lookup","result":{"content":[{"type":"text","text":"t".repeat(6000)}]}}
+        ]})
+    }).collect::<Vec<_>>()});
+    let mut projection = Projection::default();
+    let mut window = MessageWindow::default();
+    let mut encoder = Encoder::new(StreamVersion::V2);
+    let (mut client, mut revision) = (Value::Null, 0);
+    let frame = receive(
+        &mut encoder,
+        snapshot(&mut projection, &state, &mut window),
+        &mut client,
+        &mut revision,
+    );
+    assert!(
+        frame.len() > MESSAGE_BUDGET,
+        "activities must not exhaust the body budget"
+    );
+    assert_eq!(ids(&client).len(), 100);
+    assert_eq!(ids(&client).first(), Some(&"body-25"));
+    assert_eq!(ids(&client).last(), Some(&"tool-44"));
+    assert_eq!(client["hasEarlierMessages"], true);
+    let image_only = client["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|turn| turn["messages"].as_array().unwrap())
+        .find(|message| message["id"] == "body-37")
+        .unwrap();
+    assert_eq!(image_only["text"], "");
+    assert_eq!(image_only["attachments"].as_array().unwrap().len(), 1);
+
+    apply(
+        &mut projection,
+        &mut state,
+        json!([
+            {"op":"add","path":"/turns/44/items/-","value":{"id":"live-activity","type":"commandExecution","command":"live"}},
+            {"op":"add","path":"/turns/44/items/-","value":{"id":"live-body","type":"agentMessage","text":"live answer"}}
+        ]),
+    );
+    receive(
+        &mut encoder,
+        snapshot(&mut projection, &state, &mut window),
+        &mut client,
+        &mut revision,
+    );
+    assert_eq!(ids(&client).first(), Some(&"body-25"));
+    assert_eq!(
+        &ids(&client)[ids(&client).len() - 2..],
+        &["live-activity", "live-body"]
+    );
+    for (first, more) in [("body-15", true), ("body-5", true), ("body-0", false)] {
+        window.expand();
+        receive(
+            &mut encoder,
+            snapshot(&mut projection, &state, &mut window),
+            &mut client,
+            &mut revision,
+        );
+        assert_eq!(ids(&client).first(), Some(&first));
+        assert_eq!(ids(&client).last(), Some(&"live-body"));
+        assert_eq!(client["hasEarlierMessages"], more);
+    }
+    assert_eq!(ids(&client).len(), 227);
+}
+
+#[test]
+fn activity_only_initial_window_is_still_bounded_and_history_remains_available() {
+    let small = json!({"turns":[{"turnId":"turn","status":"inProgress","items":(0..35).map(|id| json!({"id":format!("small-{id}"),"type":"reasoning","summary":["public"]})).collect::<Vec<_>>()}]});
+    let mut projection = Projection::default();
+    let small_view = snapshot(&mut projection, &small, &mut MessageWindow::default());
+    assert_eq!(ids(view(&small_view)).len(), 35);
+    assert_eq!(view(&small_view)["hasEarlierMessages"], false);
+    assert_eq!(view(&small_view)["turns"][0]["status"], "inProgress");
+
+    let mut state = json!({"turns":[{"turnId":"turn","items":(0..10).map(|id| json!({
+        "id":format!("activity-{id}"),"type":"fileChange",
+        "changes":(0..8).map(|part| json!({"path":format!("{part}.txt"),"diff":"x".repeat(128 * 1024)})).collect::<Vec<_>>()
+    })).collect::<Vec<_>>()}]});
+    projection.reset();
+    let mut window = MessageWindow::default();
+    let first = snapshot(&mut projection, &state, &mut window);
+    let initial_ids = ids(view(&first));
+    assert!(initial_ids.len() > 1 && initial_ids.len() < 10);
+    assert_eq!(initial_ids.last(), Some(&"activity-9"));
+    assert_eq!(view(&first)["hasEarlierMessages"], true);
+    assert!(view(&first).to_string().len() <= 8 * 1024 * 1024 + 2048);
+    let mut previous_count = initial_ids.len();
+    while previous_count < 10 {
+        window.expand();
+        let expanded = snapshot(&mut projection, &state, &mut window);
+        let expanded_ids = ids(view(&expanded));
+        assert!(expanded_ids.len() > previous_count);
+        assert_eq!(expanded_ids.last(), Some(&"activity-9"));
+        previous_count = expanded_ids.len();
+        assert_eq!(view(&expanded)["hasEarlierMessages"], previous_count < 10);
+    }
+
+    state["turns"][0]["items"].as_array_mut().unwrap().insert(
+        0,
+        json!({"id":"earlier-body","type":"agentMessage","text":"earlier"}),
+    );
+    projection.reset();
+    let mut fresh = MessageWindow::default();
+    let limited = snapshot(&mut projection, &state, &mut fresh);
+    assert!(!ids(view(&limited)).contains(&"earlier-body"));
+    assert_eq!(view(&limited)["hasEarlierMessages"], true);
+    let mut reached_body = false;
+    for _ in 0..10 {
+        fresh.expand();
+        let more = snapshot(&mut projection, &state, &mut fresh);
+        if ids(view(&more)).contains(&"earlier-body") {
+            assert_eq!(view(&more)["hasEarlierMessages"], false);
+            reached_body = true;
+            break;
+        }
+        assert_eq!(view(&more)["hasEarlierMessages"], true);
+    }
+    assert!(reached_body);
+}
+
+#[test]
 fn history_has_a_soft_extra_byte_budget_but_never_discards_one_oversized_item() {
     let state = native_history(30, 64 * 1024);
     let mut projection = Projection::default();
@@ -240,7 +377,7 @@ fn history_has_a_soft_extra_byte_budget_but_never_discards_one_oversized_item() 
     window.expand();
     let more = snapshot(&mut projection, &state, &mut window);
     assert_eq!(ids(view(&more)).len(), 6);
-    let state = json!({"turns":[{"turnId":"big","items":[{"id":"old","type":"agentMessage","text":"earlier"},{"id":"big","type":"fileChange","changes":(0..8).map(|id|json!({"path":format!("{id}.txt"),"diff":"x".repeat(128 * 1024)})).collect::<Vec<_>>()}]}]});
+    let state = json!({"turns":[{"turnId":"big","items":[{"id":"old","type":"agentMessage","text":"earlier"},{"id":"big","type":"fileChange","changes":(0..65).map(|id|json!({"path":format!("{id}.txt"),"diff":"x".repeat(128 * 1024)})).collect::<Vec<_>>()}]}]});
     let mut window = MessageWindow::default();
     projection.reset();
     let big = snapshot(&mut projection, &state, &mut window);
@@ -250,7 +387,7 @@ fn history_has_a_soft_extra_byte_budget_but_never_discards_one_oversized_item() 
             .as_array()
             .unwrap()
             .len(),
-        8
+        65
     );
     assert!(view(&big).to_string().len() > MESSAGE_BUDGET);
     assert_eq!(view(&big)["hasEarlierMessages"], true);

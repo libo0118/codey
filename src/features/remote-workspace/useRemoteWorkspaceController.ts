@@ -204,8 +204,8 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
       const key = draftScope;
       return run(async current => {
         const sent = { ...editor, settings: composerSettings, uncertain: true };
+        const submission = rememberForSend(key, { projectId: project, text: sent.text, ...messageAttachments(sent.images), ...composerSettings });
         setEditor(sent);
-        const submission = requests.rememberSubmission(key, { projectId: project, text: sent.text, images: sent.images, ...composerSettings });
         const result = await requests.create(submission);
         if (!result.id) throw new Error("新建结果尚未确认，请先检查会话列表");
         if (!current()) return;
@@ -213,14 +213,17 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
         selectThread({ id: result.id, title: "新会话", cwd: draftProject.cwd, updatedAt: Date.now() });
         const next = firstTurnDraft(sent, result.firstTurn);
         setEditor(next);
-        if (next.uncertain) requests.rememberSubmission(result.id, { action: "send", text: sent.text, images: sent.images });
+        if (next.uncertain) {
+          try { requests.rememberSubmission(result.id, { action: "send", text: sent.text, ...messageAttachments(sent.images) }); }
+          catch { setError("会话已创建，但首条消息未确认且无法保存防重记录；请勿刷新，先核对会话。"); return; }
+        }
         if (result.firstTurn !== "accepted") setError("会话已创建，请检查第一条消息是否已发送。");
       });
     }
     if (!selectedId || !isConnected()) return false;
     return run(async current => {
+      const submission = rememberForSend(selectedId, { action: activeTurn ? "steer" : "send", text: editor.text, ...messageAttachments(editor.images) });
       setEditor(previous => ({ ...previous, uncertain: true }));
-      const submission = requests.rememberSubmission(selectedId, { action: activeTurn ? "steer" : "send", text: editor.text, images: editor.images });
       await requests.submit(selectedId, submission);
       if (!current()) return;
       requests.forgetSubmission(selectedId);
@@ -268,4 +271,14 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     stop: () => activeTurn ? perform("interrupt", { turnId: activeTurn.id }) : Promise.resolve(false),
     reloadModels: () => { if (session.current) { void loadModels(); setDefaultsRevision(value => value + 1); } },
   };
+}
+
+function rememberForSend(scope: string, args: Record<string, unknown>) {
+  try { return requests.rememberSubmission(scope, args); }
+  catch (error) { requests.forgetSubmission(scope); throw error; }
+}
+
+function messageAttachments(images: DraftImage[]) {
+  const files = images.filter(image => image.kind === "file");
+  return { images: images.filter(image => image.kind !== "file"), ...(files.length ? { files } : {}) };
 }

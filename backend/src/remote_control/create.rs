@@ -23,16 +23,93 @@ pub(super) async fn open(state: &Arc<AppState>, id: &str) -> Result<(), String> 
 
 // Called only for the first submitted message; an untouched phone draft does
 // not create a persisted thread or a second app-server.
-pub(super) async fn create(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
+pub(super) async fn create(
+    state: &Arc<AppState>,
+    args: &Value,
+    authorize: impl Fn() -> Result<(), String>,
+) -> Result<Value, String> {
     let project = saved_project(args).await?;
-    let params = creation_params(&project, args)?;
+    let mut params = creation_params(&project, args)?;
     let cwd = params["cwd"].as_str().ok_or("项目目录无效")?;
     if !Path::new(cwd).is_dir() {
         return Err("项目目录不存在，请在电脑端检查工作区".into());
     }
+    if !super::images::message_files(args)?.is_empty() {
+        let (input, attachments) = prepare_files(state, args, &authorize).await?;
+        params["attachments"] = json!(attachments);
+        params["input"] = json!(input);
+    } else {
+        authorize()?;
+    }
     let result = desktop_request(state, json!({"action":"create","params":params})).await?;
     super::desktop::validate_thread(result["id"].as_str().ok_or("创建会话结果无效")?)?;
     Ok(result)
+}
+
+pub(super) async fn prepare_files(
+    state: &Arc<AppState>,
+    args: &Value,
+    authorize: impl Fn() -> Result<(), String>,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let input = super::images::message_input(args)?;
+    let files = args["files"]
+        .as_array()
+        .filter(|files| !files.is_empty())
+        .ok_or("附件列表无效")?
+        .iter()
+        .map(|file| json!({"name":file["name"],"url":file["url"]}))
+        .collect::<Vec<_>>();
+    authorize()?;
+    let uploaded = desktop_request(state, json!({"action":"attachments","files":files})).await?;
+    finish_files(
+        args,
+        &uploaded,
+        input,
+        async {
+            let runtime = state
+                .runtime
+                .lock()
+                .await
+                .clone()
+                .ok_or("Codex 桌面尚未启动")?;
+            super::server::require_model_request_gate(&runtime.renderer_websocket_url().await)
+                .await?;
+            authorize()
+        },
+        async {
+            desktop_request(
+                state,
+                json!({"action":"discard-attachments","files":uploaded["files"]}),
+            )
+            .await?;
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn finish_files(
+    args: &Value,
+    uploaded: &Value,
+    mut input: Vec<Value>,
+    check: impl std::future::Future<Output = Result<(), String>>,
+    discard: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let prepared = async {
+        let attachments = super::images::attach_files(&mut input, args, uploaded)?;
+        check.await?;
+        Ok::<_, String>((input, attachments))
+    }
+    .await;
+    match prepared {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if discard.await.is_err() {
+                return Err(format!("{error}；附件清理未确认，请在电脑端检查"));
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(super) async fn defaults(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
@@ -100,6 +177,76 @@ fn creation_params(project: &Value, args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_creation_files_recheck_authorization_and_discard_on_failure() {
+        use std::cell::Cell;
+
+        let args = json!({"text":"","files":[{"name":"a.txt","url":"data:application/octet-stream;base64,YQ=="}],"requestId":uuid::Uuid::new_v4().to_string()});
+        let project = json!({"id":"p","cwd":"E:/code/codey"});
+        let params = creation_params(&project, &args).unwrap();
+        let input = params["input"].as_array().unwrap().clone();
+        let native =
+            json!({"files":[{"label":"a.txt","path":"/managed/a.txt","fsPath":"/managed/a.txt"}]});
+        let discarded = Cell::new(false);
+        let (prepared, attachments) =
+            finish_files(&args, &native, input.clone(), async { Ok(()) }, async {
+                discarded.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!discarded.get());
+        assert!(
+            prepared[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("## a.txt: /managed/a.txt")
+        );
+        assert_eq!(json!(attachments), native["files"]);
+        let error = finish_files(
+            &args,
+            &native,
+            input.clone(),
+            async { Err("登录会话已撤销".into()) },
+            async {
+                discarded.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "登录会话已撤销");
+        assert!(discarded.get());
+        discarded.set(false);
+        let invalid =
+            json!({"files":[{"label":"wrong","path":"/managed/a.txt","fsPath":"/managed/a.txt"}]});
+        assert!(
+            finish_files(
+                &args,
+                &invalid,
+                input.clone(),
+                async { panic!("invalid metadata must not pass the gate") },
+                async {
+                    discarded.set(true);
+                    Ok(())
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(discarded.get());
+        let error = finish_files(
+            &args,
+            &native,
+            input,
+            async { Err("登录会话已撤销".into()) },
+            async { Err("offline".into()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("附件清理未确认"));
+    }
 
     #[test]
     fn first_message_uses_native_creation_without_a_manual_title() {

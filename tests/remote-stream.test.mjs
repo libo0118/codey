@@ -25,6 +25,23 @@ test("有界真实消息组件不创建闭合正文、图片或空历史 section
   assert.ok((html.match(/<[a-z][^>]*>/g) || []).length < 250);
 });
 
+test("近期正文穿插密集活动时仍按原顺序以单栏正文呈现，活动正文保持惰性", () => {
+  const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real }).exports;
+  const messages = Array.from({ length: 20 }, (_, index) => [
+    { id: `body-${index}`, role: index % 2 ? "assistant" : "user", kind: index % 2 ? "agentMessage" : "userMessage", text: `Mock 正文 ${index}` },
+    { id: `reason-${index}`, role: "activity", kind: "reasoning", text: "Mock 折叠思考" },
+    { id: `tool-${index}`, role: "activity", kind: "mcpToolCall", text: "", tool: { name: "Mock.tool", output: "Mock 折叠工具结果" } },
+  ]).flat();
+  const html = renderToStaticMarkup(React.createElement(ConversationTurn, { turn: { id: "turn", status: "inProgress", messages } }));
+  assert.equal((html.match(/<article class="remote-message /g) || []).length, 20);
+  assert.equal((html.match(/class="remote-process"/g) || []).length, 20);
+  for (let index = 0; index < 20; index++) {
+    assert.ok(html.indexOf(`Mock 正文 ${index}<`) < html.indexOf(`data-message-id="reason-${index}"`));
+    if (index < 19) assert.ok(html.indexOf(`data-message-id="reason-${index}"`) < html.indexOf(`Mock 正文 ${index + 1}<`));
+  }
+  assert.doesNotMatch(html, /Mock 折叠思考|Mock 折叠工具结果/);
+});
+
 test("真实 Activity hook 仅在展开时创建正文，流更新不控制原生 details identity", () => {
   // Drive the actual nested Activity with the controller harness, not a second lazy-body algorithm.
   const a = createControllerHarness(new URL("../src/remote/messages.tsx", import.meta.url), (exports, props) => {

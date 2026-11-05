@@ -1,6 +1,6 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 5;
+  const version = 6;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
@@ -203,9 +203,42 @@
       }
       return { status: "ok" };
     }
-    if (args.action !== "create" && args.action !== "defaults") throw new Error("不支持的远程会话操作");
+    if (!["create", "defaults", "attachments", "discard-attachments"].includes(args.action)) throw new Error("不支持的远程会话操作");
     const { manager, reader, readServiceTier } = await remoteCreationContext();
     assertCurrent();
+    const discardAttachments = async (files) => {
+      const valid = files.filter(file => typeof file?.path === "string" && file.path);
+      const results = await Promise.allSettled(valid.map(file => Promise.resolve().then(() => manager.removePastedTextAttachment(file.path))));
+      if (valid.length !== files.length || results.some(result => result.status === "rejected")) throw new Error("附件清理未确认");
+    };
+    if (args.action === "discard-attachments") {
+      if (!Array.isArray(args.files) || !args.files.length || args.files.length > 4
+        || typeof manager.removePastedTextAttachment !== "function") throw new Error("桌面附件清理接口不可用");
+      await discardAttachments(args.files);
+      return { status: "ok" };
+    }
+    if (args.action === "attachments") {
+      if (!Array.isArray(args.files) || !args.files.length || args.files.length > 4
+        || typeof manager.createFileAttachment !== "function" || typeof manager.removePastedTextAttachment !== "function") throw new Error("桌面附件接口不可用");
+      await ensureRequestGate();
+      const created = [];
+      try {
+        for (const file of args.files) {
+          assertCurrent();
+          if (typeof file?.name !== "string" || typeof file?.url !== "string" || !file.url.startsWith("data:application/octet-stream;base64,")) throw new Error("文件数据无效");
+          const bytes = Uint8Array.from(atob(file.url.slice("data:application/octet-stream;base64,".length)), char => char.charCodeAt(0));
+          const attachment = await manager.createFileAttachment({ contents: new Blob([bytes]), label: file.name });
+          created.push(attachment);
+          if (attachment?.label !== file.name || typeof attachment?.path !== "string" || !attachment.path
+            || attachment.fsPath !== attachment.path) throw new Error("桌面附件创建结果无效");
+          assertCurrent();
+        }
+        return { files: created };
+      } catch (error) {
+        await discardAttachments(created);
+        throw error;
+      }
+    }
     if (args.action === "defaults") {
       if (typeof manager.sendRequest !== "function") throw new Error("当前 Codex 暂不支持读取默认设置");
       const { config } = await manager.sendRequest("config/read", { includeLayers: false, cwd: args.cwd });

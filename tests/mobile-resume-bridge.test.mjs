@@ -86,6 +86,8 @@ test("CDP readiness requires the current remote and session-controller generatio
   window.__codeyRemoteControl.version = 4;
   assert.equal(ready(), false, "the published adapter has no source-based creation lookup");
   window.__codeyRemoteControl.version = 5;
+  assert.equal(ready(), false, "the previous adapter cannot register native file attachments");
+  window.__codeyRemoteControl.version = 6;
   assert.equal(ready(), true);
   delete window.__codeyLoadAppServerManagerSourceResolver;
   assert.equal(ready(), false, "creation source lookup must be installed");

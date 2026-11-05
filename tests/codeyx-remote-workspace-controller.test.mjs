@@ -31,7 +31,7 @@ function fixture(t, active = true) {
   async function open() {
     render().open(thread); render(); sockets.at(-1).handlers.message({ type: "state", state: view }); await h.flush();
   }
-  return { ...h, render, browser, options, calls, sockets, journal, last, ready, open, get unauthorized() { return unauthorized; } };
+  return { ...h, render, browser, options, requests, calls, sockets, journal, last, ready, open, get unauthorized() { return unauthorized; } };
 }
 
 test("WebView 网络提示为离线时，首次和手动读取仍实际请求，不把跳过读取伪装成空会话", async t => {
@@ -357,4 +357,60 @@ test("轮询不改绑新会话项目或草稿；项目目录失败也取消同�
   h.render().refresh(); const sibling = h.last("threads"); h.last("projects").reject(new Error("project directory unavailable"));
   await h.flush(); assert.equal(sibling.args[2].aborted, true); assert.match(h.render().error, /project directory unavailable/);
   assert.ok(h.render().threads.every(item => item.running !== true)); assert.equal(h.render().loading, false); h.unmount();
+});
+
+test("新建、普通发送与运行中补充都将图片和普通文件分别传递，并在失败时防止重发", async t => {
+  const h = fixture(t); const image = { name: "old.png", size: 1, url: "data:image/png;base64,eA==" };
+  const file = { name: "report.pdf", size: 3, kind: "file", url: "data:application/octet-stream;base64,AAH/" };
+  await h.ready(); h.render().startCreating(projects[0]); h.render(); h.last("defaults").resolve({}); await h.flush();
+  h.render().changeImages([image, file]); h.render().changeDraft("创建"); let work = h.render().send();
+  assert.deepEqual(h.last("create").args[0].args.images, [image]); assert.deepEqual(h.last("create").args[0].args.files, [file]);
+  h.last("create").resolve({ id: "created", firstTurn: "accepted" }); await work; await h.flush();
+  assert.deepEqual(h.render().images, []);
+  h.render().back(); h.render(); await h.open();
+  for (const action of ["send", "steer"]) {
+    h.sockets.at(-1).handlers.message({ type: "state", state: action === "steer" ? { ...view, status: "active", turns: [{ id: "turn", status: "inProgress", messages: [] }] } : view }); await h.flush();
+    h.render().changeImages([file, image]); h.render().changeDraft(action); work = h.render().send();
+    const record = h.last("submit").args[1];
+    assert.deepEqual(record.args, { action, text: action, images: [image], files: [file] });
+    if (action === "send") { h.last("submit").resolve({}); await work; await h.flush(); }
+    else {
+      h.last("submit").reject(new Error("unknown")); await work; await h.flush();
+      const count = h.calls.filter(call => call.name === "submit").length;
+      await h.render().send(); assert.equal(h.calls.filter(call => call.name === "submit").length, count);
+      assert.equal(h.render().uncertain, true); assert.deepEqual(h.render().images, [file, image]);
+    }
+  }
+  h.unmount();
+});
+
+test("普通文件防重记录写入失败时不发送、不把未发生的请求标为结果不明", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  h.requests.rememberSubmission = (key, args) => { h.journal.set(key, { id: "pending", args }); throw new Error("无法保存附件提交记录，请清理浏览器存储后重试。"); };
+  h.render().changeImages([{ name: "a.txt", size: 1, kind: "file", url: "data:application/octet-stream;base64,eA==" }]);
+  await h.render().send(); const c = await h.flush();
+  assert.equal(h.calls.filter(call => call.name === "submit").length, 0); assert.equal(c.uncertain, false);
+  assert.equal(h.journal.size, 0); assert.match(c.error, /保存附件提交记录/); assert.equal(c.images.length, 1); h.unmount();
+});
+
+test("新建结果不明且防重记录无法落盘时保留内存锁并警告不能刷新", async t => {
+  const h = fixture(t); await h.ready(); h.render().startCreating(projects[0]); h.render(); h.last("defaults").resolve({}); await h.flush();
+  const remember = h.requests.rememberSubmission; let count = 0;
+  h.requests.rememberSubmission = (key, args) => { const record = remember(key, args); if (++count === 2) throw new Error("quota"); return record; };
+  h.render().changeImages([{ name: "a.txt", size: 1, kind: "file", url: "data:application/octet-stream;base64,eA==" }]);
+  const work = h.render().send(); h.last("create").resolve({ id: "new-unknown", firstTurn: "outcome-unknown" }); await work;
+  const c = await h.flush(); assert.equal(c.uncertain, true); assert.ok(h.journal.has("new-unknown"));
+  assert.match(c.error, /不能刷新|勿刷新/); h.unmount();
+});
+
+test("提交不明后的文件标记在重新打开时锁定，核对后仍须移除或重新选择文件", async t => {
+  const h = fixture(t); await h.ready();
+  const marker = { name: "report.pdf", kind: "file", size: 3, url: "" };
+  h.journal.set(thread.id, { id: "pending", args: { action: "send", text: "inspect", images: [], files: [marker] } });
+  await h.open(); let c = h.render(); assert.equal(c.uncertain, true); assert.deepEqual(c.images, [marker]);
+  await c.send(); c.confirmSubmission(); c = h.render(); assert.equal(c.uncertain, false);
+  await c.send(); assert.equal(h.calls.filter(call => call.name === "submit").length, 0);
+  const file = { ...marker, url: "data:application/octet-stream;base64,AAH/" };
+  c.changeImages([file]); const work = h.render().send(); assert.deepEqual(h.last("submit").args[1].args.files, [file]);
+  h.last("submit").resolve({}); await work; await h.flush(); h.unmount();
 });

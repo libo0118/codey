@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
-import { IconArrowUp, IconBoltFilled, IconBrandSpeedtest, IconCamera, IconChevronRight, IconExclamationMark, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconX } from "@tabler/icons-react";
+import { IconArrowUp, IconBoltFilled, IconBrandSpeedtest, IconCamera, IconChevronRight, IconExclamationMark, IconFile, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconX } from "@tabler/icons-react";
 import { effortLabels, permissionLabels, type ModelOption, type View, type ThreadSettings } from "./workspace-data";
-import { IMAGE_ACCEPT, readImages, imagePickerError, type DraftImage } from "./images";
+import { IMAGE_ACCEPT, readFiles, readImages, imagePickerError, type DraftImage } from "./images";
 
 export function Composer({ draft, onDraft, images, onImages, view, models, connected, busy, uncertain, onSend, onStop, onSettings, catalogError, onReloadModels }: {
   draft: string; onDraft: (draft: string) => void; view: View | null; models: ModelOption[];
@@ -16,6 +16,7 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
   const sheet = useRef<HTMLDialogElement>(null);
   const camera = useRef<HTMLInputElement>(null);
   const photos = useRef<HTMLInputElement>(null);
+  const files = useRef<HTMLInputElement>(null);
   const imageRead = useRef<AbortController | null>(null);
   const swipeStart = useRef<number | null>(null);
   const [panel, setPanel] = useState<"power" | "attachments" | null>(null);
@@ -29,10 +30,12 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
   useEffect(() => {
     const capture = camera.current;
     const library = photos.current;
+    const picker = files.current;
     const cancelCamera = () => setNotice("已取消拍照；如无法打开相机，请检查相机权限或改用照片。");
     const cancelPhotos = () => setNotice("已取消选择照片。");
-    capture?.addEventListener("cancel", cancelCamera); library?.addEventListener("cancel", cancelPhotos);
-    return () => { imageRead.current?.abort(); capture?.removeEventListener("cancel", cancelCamera); library?.removeEventListener("cancel", cancelPhotos); };
+    const cancelFiles = () => setNotice("已取消选择文件。");
+    capture?.addEventListener("cancel", cancelCamera); library?.addEventListener("cancel", cancelPhotos); picker?.addEventListener("cancel", cancelFiles);
+    return () => { imageRead.current?.abort(); capture?.removeEventListener("cancel", cancelCamera); library?.removeEventListener("cancel", cancelPhotos); picker?.removeEventListener("cancel", cancelFiles); };
   }, []);
   useLayoutEffect(() => { if (input.current) { input.current.style.height = "auto"; input.current.style.height = `${Math.min(input.current.scrollHeight, 180)}px`; } }, [draft]);
   useEffect(() => {
@@ -59,33 +62,35 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
   const disabled = busy || !connected;
   const imagesLocked = busy || uncertain || reading;
   const missingImages = images.some(image => !image.url);
+  const fileNotice = images.some(image => image.kind === "file" && image.url) ? " 刷新页面后需重新选择文件。" : "";
   const permission = view?.permissionMode || "custom";
   const tier = view?.serviceTier || "default";
   function togglePanel(next: "power" | "attachments") { setNotice(""); setPanel(current => current === next ? null : next); }
-  function pickImage(source: "camera" | "photos") {
+  function pickImage(source: "camera" | "photos" | "files") {
     if (imagesLocked) return;
     setPanel(null); setImageError(""); add.current?.focus({ preventScroll: true });
-    const picker = (source === "camera" ? camera : photos).current;
+    const picker = (source === "camera" ? camera : source === "photos" ? photos : files).current;
     try {
       if (!picker || typeof FileReader === "undefined") throw new Error("unavailable");
       picker.value = "";
       // Native capture also supports LAN HTTP. The OS owns permissions and
       // devices without capture can fall back to their image picker.
       if (picker.showPicker) picker.showPicker(); else picker.click();
-      setNotice(source === "camera" ? "请按系统提示授权拍照；相机不可用时可改用照片。" : "可选择 PNG、JPEG、GIF、WebP，最多 4 张、合计 4 MB。");
-    } catch (error) { setImageError(imagePickerError(error)); }
+      setNotice(source === "camera" ? "请按系统提示授权拍照；相机不可用时可改用照片。" : source === "photos" ? "可选择 PNG、JPEG、GIF、WebP，附件合计最多 4 个、4 MB。" : "可选择普通文件，附件合计最多 4 个、4 MB。");
+    } catch (error) { setImageError(source === "files" ? "无法打开文件选择器，请使用系统浏览器重试。" : imagePickerError(error)); }
   }
-  async function selectImages(element: HTMLInputElement) {
+  async function selectImages(element: HTMLInputElement, ordinary = false) {
     const files = Array.from(element.files || []);
     element.value = "";
-    if (!files.length || imagesLocked || imageRead.current) return;
+    if (!files.length) { if (ordinary) setNotice("已取消选择文件。"); return; }
+    if (imagesLocked || imageRead.current) return;
     const controller = new AbortController();
     imageRead.current = controller; setReading(true); setImageError(""); setNotice("");
     try {
-      const added = await readImages(files, images, controller.signal);
-      if (!controller.signal.aborted) { onImages([...images, ...added]); setNotice(`已添加 ${added.length} 张图片，发送后提交到会话。`); }
+      const added = await (ordinary ? readFiles(files, images, controller.signal) : readImages(files, images, controller.signal));
+      if (!controller.signal.aborted) { onImages([...images, ...added]); setNotice(`已添加 ${added.length} 个${ordinary ? "文件" : "图片"}，发送后提交到会话。`); }
     } catch (error) {
-      if (!controller.signal.aborted) setImageError(error instanceof Error ? error.message : "图片读取失败，请重新选择。");
+      if (!controller.signal.aborted) setImageError(error instanceof Error ? error.message : `${ordinary ? "文件" : "图片"}读取失败，请重新选择。`);
     } finally {
       if (!controller.signal.aborted) { imageRead.current = null; setReading(false); }
     }
@@ -98,15 +103,17 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
     {panel === "attachments" && <section id={`${id}-attachments`} className="remote-attachment-popover" aria-label="添加附件">
       <button type="button" disabled={imagesLocked} onClick={() => pickImage("camera")}><span><IconCamera size={28} stroke={1.8} /></span>相机</button>
       <button type="button" disabled={imagesLocked} onClick={() => pickImage("photos")}><span><IconPhoto size={28} stroke={1.8} /></span>照片</button>
+      <button type="button" disabled={imagesLocked} onClick={() => pickImage("files")}><span><IconFile size={28} stroke={1.8} /></span>文件</button>
     </section>}
     <input ref={camera} hidden type="file" aria-label="拍照添加图片" accept={IMAGE_ACCEPT} capture="environment" disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget)} />
     <input ref={photos} hidden type="file" aria-label="选择照片" accept={IMAGE_ACCEPT} multiple disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget)} />
+    <input ref={files} hidden type="file" aria-label="选择文件" multiple disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget, true)} />
     {imageError && <p className="remote-client-error" role="alert">{imageError}</p>}
-    {missingImages && <p className="remote-client-error" role="alert">浏览器未能保存图片内容，请移除标记的图片并重新选择后发送。</p>}
+    {missingImages && <p className="remote-client-error" role="alert">浏览器未能保存附件内容，请移除标记的附件并重新选择后发送。</p>}
     <form className="remote-composer" onSubmit={event => { if (reading || missingImages) { event.preventDefault(); return; } setPanel(null); setNotice(""); onSend(event); }}>
-      {images.length > 0 && <div className="remote-composer-images" aria-label="待发送图片">{images.map((image, index) => <figure className="remote-composer-image" key={index}>
-        {image.url ? <img src={image.url} alt={image.name} /> : <span>请重新选择</span>}<figcaption title={image.name}>{image.name}</figcaption>
-        <button type="button" aria-label={`移除图片 ${image.name}`} disabled={imagesLocked} onClick={() => { onImages(images.filter((_, position) => position !== index)); setImageError(""); setNotice("已移除图片。"); }}><IconX size={15} /></button>
+      {images.length > 0 && <div className="remote-composer-images" aria-label="待发送附件">{images.map((image, index) => <figure className="remote-composer-image" key={index}>
+        {!image.url ? <span>请重新选择</span> : image.kind === "file" ? <span><IconFile size={25} /></span> : <img src={image.url} alt={image.name} />}<figcaption title={image.name}>{image.name}</figcaption>
+        <button type="button" aria-label={`移除${image.kind === "file" ? "文件" : "图片"} ${image.name}`} disabled={imagesLocked} onClick={() => { onImages(images.filter((_, position) => position !== index)); setImageError(""); setNotice("已移除附件。"); }}><IconX size={15} /></button>
       </figure>)}</div>}
       <textarea ref={input} aria-label="发送给 Codex 的指令" disabled={busy} placeholder={active ? "补充当前任务的指令…" : "向 Codex 提问"} value={draft} onFocus={() => setPanel(null)} onChange={event => { onDraft(event.target.value); setNotice(""); }} rows={1} maxLength={100000} onKeyDown={event => {
         if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
@@ -126,7 +133,7 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
         </div>
       </div>
     </form>
-    <p className="remote-composer-note" role="status">{reading ? "正在读取图片…" : notice || (busy ? "正在同步…" : active ? "任务在电脑上继续执行 · 设置用于后续轮次" : permission === "full-access" ? "完全访问：可修改电脑文件并访问网络" : "任务在电脑的原工作区中执行")}</p>
+    <p className="remote-composer-note" role="status">{reading ? "正在读取附件…" : notice || (busy ? "正在同步…" : active ? "任务在电脑上继续执行 · 设置用于后续轮次" : permission === "full-access" ? "完全访问：可修改电脑文件并访问网络" : "任务在电脑的原工作区中执行")}{fileNotice}</p>
     <dialog ref={sheet} id={`${id}-advanced`} className="remote-advanced-sheet" aria-label="高级设置" tabIndex={-1} data-keyboard-navigation={keyboardNavigation || undefined} onPointerDownCapture={() => setKeyboardNavigation(false)} onKeyDownCapture={event => { if (event.key === "Tab") setKeyboardNavigation(true); }} onCancel={event => { event.preventDefault(); setAdvanced(false); }} onClick={event => {
       if (event.target !== event.currentTarget) return;
       const bounds = event.currentTarget.getBoundingClientRect();

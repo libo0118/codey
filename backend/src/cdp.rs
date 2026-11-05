@@ -1769,7 +1769,7 @@ pub(crate) async fn remote_control_request(
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
         r#"typeof window.__codeyRemoteControl === "function"
-          && window.__codeyRemoteControl.version === 5
+          && window.__codeyRemoteControl.version === 6
           && window.__codeySessionToolsInjectLoaded === true
           && typeof window.__codeyLoadAppServerManagerSourceResolver === "function"
           && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,

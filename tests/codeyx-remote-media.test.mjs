@@ -13,6 +13,13 @@ test("remote image selection rejects excessive count, byte budget, empty and uns
   await assert.rejects(media.readImages([image], [{ name: "existing", url: "", size: media.MAX_IMAGE_BYTES }], new AbortController().signal), /总大小/);
 });
 
+test("ordinary files share the existing attachment count and size budget", async () => {
+  const file = { name: "report.pdf", size: 1, type: "application/pdf" };
+  await assert.rejects(media.readFiles(Array(5).fill(file), [], new AbortController().signal), /最多/);
+  await assert.rejects(media.readFiles([file], [{ name: "photo", size: media.MAX_IMAGE_BYTES, url: "data:image/png;base64,eA==" }], new AbortController().signal), /总大小/);
+  await assert.rejects(media.readFiles([{ ...file, name: "../escape" }], [], new AbortController().signal), /文件名/);
+});
+
 test("remote attachments never turn local paths, scripts or SVG data into executable links", () => {
   for (const value of ["javascript:alert(1)", "file:///secret", "data:text/html,<script>1</script>", "data:image/svg+xml;base64,PHN2Zz4="]) assert.equal(urls.imageUrl(value), "");
   for (const value of ["javascript:alert(1)", "file:///secret", "codex://internal", "//other.invalid/x"]) assert.equal(urls.messageUrl(value), "");

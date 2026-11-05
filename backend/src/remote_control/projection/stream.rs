@@ -5,9 +5,10 @@ use std::{
 
 use serde_json::{Value, json};
 
-const INITIAL_MESSAGES: usize = 20;
+const INITIAL_BODIES: usize = 20;
 const HISTORY_MESSAGES: usize = 50;
 const MESSAGE_BUDGET: usize = 256 * 1024;
+const INITIAL_TOTAL_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_PATCHES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,25 +69,43 @@ impl MessageWindow {
             .iter()
             .position(|(_, _, _, key)| self.loaded.contains(key));
         let mut start = anchor.unwrap_or(messages.len());
-        let count = if anchor.is_none() {
-            INITIAL_MESSAGES
+        let initial = anchor.is_none();
+        let mut count = if initial {
+            INITIAL_BODIES
         } else if self.expand {
             HISTORY_MESSAGES
         } else {
             0
         };
         let mut bytes = 0;
-        for _ in 0..count {
-            if start == 0 {
-                break;
-            }
-            let size = messages[start - 1].2.to_string().len();
+        let mut total_bytes = 0;
+        while start > 0 && count > 0 {
+            let message = messages[start - 1].2;
+            // Folded activities and empty messages do not consume the body quota.
+            let counted = !initial
+                || (message["role"] != "activity"
+                    && (!message["text"]
+                        .as_str()
+                        .expect("projected text")
+                        .trim()
+                        .is_empty()
+                        || !message["attachments"]
+                            .as_array()
+                            .expect("projected attachments")
+                            .is_empty()));
+            let size = message.to_string().len();
             // A single large public message is visible intact, not silently lost.
-            if bytes > 0 && bytes + size > MESSAGE_BUDGET {
+            if (initial && total_bytes > 0 && total_bytes + size > INITIAL_TOTAL_BUDGET)
+                || (counted && bytes > 0 && bytes + size > MESSAGE_BUDGET)
+            {
                 break;
             }
             start -= 1;
-            bytes += size;
+            total_bytes += size;
+            if counted {
+                bytes += size;
+                count -= 1;
+            }
         }
         self.expand = false;
         self.loaded = messages[start..]

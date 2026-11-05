@@ -325,6 +325,7 @@ impl Desktop {
         action: &str,
         args: &Value,
         request_gate: impl std::future::Future<Output = Result<(), String>>,
+        prepare_files: impl std::future::Future<Output = Result<(Vec<Value>, Vec<Value>), String>>,
     ) -> Result<Value, String> {
         let (method, version, mut params) = action_params(&self.state, action, args)?;
         // 问题与计划的答复也可能开始新一轮；按实际 RPC 而不是 UI 操作名校验。
@@ -335,6 +336,22 @@ impl Desktop {
                 | "thread-follower-update-thread-settings"
         ) {
             request_gate.await?;
+        }
+        if matches!(action, "send" | "steer")
+            && args["files"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty())
+        {
+            let (input, attachments) = prepare_files.await?;
+            if action == "send" {
+                params["turnStart"]["request"]["input"] = json!(input);
+                params["turnStart"]["context"]["attachments"] = json!(attachments);
+            } else {
+                params["input"] = json!(input);
+                params["restoreMessage"]["request"]["input"] = json!(input);
+                params["restoreMessage"]["context"]["attachments"] = json!(attachments);
+                params["attachments"] = json!(attachments);
+            }
         }
         params["conversationId"] = json!(self.thread);
         let result = self
@@ -883,6 +900,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_file_metadata_reaches_start_and_steer_after_preparation() {
+        let args = json!({"text":"read this","files":[{"name":"report.pdf","url":"data:application/octet-stream;base64,YQ=="}],"requestId":Uuid::new_v4().to_string()});
+        let native = json!({"files":[{"label":"report.pdf","path":"/managed/report.pdf","fsPath":"/managed/report.pdf"}]});
+        let mut input = super::super::images::message_input(&args).unwrap();
+        let attachments = super::super::images::attach_files(&mut input, &args, &native).unwrap();
+        for action in ["send", "steer"] {
+            let state = if action == "send" {
+                json!({"id":"t"})
+            } else {
+                json!({"id":"t","turns":[{"status":"inProgress"}]})
+            };
+            let (mut desktop, mut server) = action_fixture(state);
+            let expected_input = json!(input);
+            let expected_attachments = json!(attachments);
+            let response = tokio::spawn(async move {
+                let frame = read_frame(&mut server).await;
+                let params = &frame["params"];
+                if action == "send" {
+                    assert_eq!(frame["method"], "thread-follower-start-turn");
+                    assert_eq!(params["turnStart"]["request"]["input"], expected_input);
+                    assert_eq!(
+                        params["turnStart"]["context"]["attachments"],
+                        expected_attachments
+                    );
+                } else {
+                    assert_eq!(frame["method"], "thread-follower-steer-turn");
+                    assert_eq!(params["input"], expected_input);
+                    assert_eq!(params["restoreMessage"]["request"]["input"], expected_input);
+                    assert_eq!(params["attachments"], expected_attachments);
+                    assert_eq!(
+                        params["restoreMessage"]["context"]["attachments"],
+                        expected_attachments
+                    );
+                }
+                write_frame(&mut server, json!({"type":"response","requestId":frame["requestId"],"resultType":"success","result":{"status":"accepted"}})).await;
+            });
+            let result = desktop
+                .action(action, &args, async { Ok(()) }, async {
+                    Ok((input.clone(), attachments.clone()))
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["status"], "accepted");
+            response.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_gate_or_revoked_preparation_never_sends_a_native_turn() {
+        let args = json!({"text":"","files":[{"name":"a.txt","url":"data:application/octet-stream;base64,YQ=="}],"requestId":Uuid::new_v4().to_string()});
+        for gate_fails in [true, false] {
+            let (mut desktop, mut server) = action_fixture(json!({"id":"t"}));
+            let error = desktop
+                .action(
+                    "send",
+                    &args,
+                    async {
+                        if gate_fails {
+                            Err("gate unavailable".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    async {
+                        if gate_fails {
+                            panic!("preparation ran before the gate")
+                        } else {
+                            Err("登录会话已撤销".into())
+                        }
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                if gate_fails {
+                    "gate unavailable"
+                } else {
+                    "登录会话已撤销"
+                }
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), server.read_u8())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn large_native_snapshot_preserves_framing_and_outgoing_limit() {
         let (mut desktop, mut server) = action_fixture(Value::Null);
         // The reported Linux snapshot is 22,197,762 bytes, above the old 16 MiB limit.
@@ -945,7 +1052,12 @@ mod tests {
         ] {
             let (mut desktop, mut server) = action_fixture(state);
             let error = desktop
-                .action(action, &args, async { Err("gate unavailable".into()) })
+                .action(
+                    action,
+                    &args,
+                    async { Err("gate unavailable".into()) },
+                    async { panic!("attachments must not be prepared") },
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error, "gate unavailable", "{action}");
@@ -986,9 +1098,12 @@ mod tests {
                 write_frame(&mut server, json!({"type":"response","requestId":request["requestId"],"resultType":"success","result":{"status":"accepted"}})).await;
             });
             let result = desktop
-                .action(action, &args, async {
-                    panic!("the model gate must not run")
-                })
+                .action(
+                    action,
+                    &args,
+                    async { panic!("the model gate must not run") },
+                    async { panic!("attachments must not be prepared") },
+                )
                 .await
                 .unwrap();
             assert_eq!(result, json!({"status":"accepted"}));
@@ -1039,6 +1154,7 @@ mod tests {
                     "send",
                     &json!({"text":"test","images":[{"url":"data:image/gif;base64,R0lGODlh"}],"requestId":Uuid::new_v4().to_string()}),
                     async { Ok(()) },
+                    async { panic!("attachments must not be prepared") },
                 )
                 .await
                 .unwrap();
@@ -1082,7 +1198,9 @@ mod tests {
         let mut desktop = Desktop::initialize(Box::new(client)).await.unwrap();
         for (_, status) in cases {
             let result = desktop
-                .action("history", &json!({}), async { Ok(()) })
+                .action("history", &json!({}), async { Ok(()) }, async {
+                    panic!("attachments must not be prepared")
+                })
                 .await;
             match status {
                 Some(status) => assert_eq!(result.unwrap(), json!({"status":status})),

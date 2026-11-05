@@ -3928,7 +3928,7 @@ test("remote adapter upgrades published v3 once, while legacy session tools rema
   const loader = Object.assign(() => { loaderCalls += 1; assert.fail("old session discovery is not passive"); }, { remoteVersion: 1 });
   const runtime = { window: { __codeyRemoteControl: old, __codeyLoadCodexSessionController: loader } };
   const activity = loadRemoteActivity(runtime);
-  assert.equal(runtime.window.__codeyRemoteControl.version, 5);
+  assert.equal(runtime.window.__codeyRemoteControl.version, 6);
   assert.equal(disposed, 1);
   assert.equal((await activity()).running["thread-1"], null);
   assert.equal(loaderCalls, 0);

@@ -9,7 +9,7 @@ const nullableString = (value: unknown) => value === null || optionalString(valu
 
 function draftImage(value: unknown): value is DraftImage {
   return record(value) && typeof value.name === "string" && typeof value.url === "string"
-    && typeof value.size === "number" && Number.isFinite(value.size) && value.size >= 0;
+    && typeof value.size === "number" && Number.isFinite(value.size) && value.size >= 0 && (value.kind === undefined || value.kind === "file");
 }
 
 export function restoreWorkspaceDraft(previous: WorkspaceDraft | undefined, pending: Submission | null): WorkspaceDraft {
@@ -21,7 +21,7 @@ export function restoreWorkspaceDraft(previous: WorkspaceDraft | undefined, pend
   if (args?.serviceTier === null || typeof args?.serviceTier === "string") settings.serviceTier = args.serviceTier;
   return {
     text: previous?.text ?? (typeof args?.text === "string" ? args.text : ""),
-    images: previous?.images ?? (Array.isArray(args?.images) ? args.images.filter(draftImage) : []),
+    images: previous?.images ?? [...(Array.isArray(args?.images) ? args.images.filter(draftImage) : []), ...(Array.isArray(args?.files) ? args.files.filter(draftImage).map(file => ({ ...file, kind: "file" as const })) : [])],
     uncertain: Boolean(previous?.uncertain || pending),
     settings: previous?.settings ?? settings,
   };

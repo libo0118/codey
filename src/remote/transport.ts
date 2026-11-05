@@ -74,14 +74,19 @@ export function rememberSubmission(scope: string, args: Record<string, unknown>)
   if (previous && JSON.stringify(previous.args) === JSON.stringify(args)) return previous;
   const record = { id: requestId(), args };
   pending.set(scope, record);
-  try { sessionStorage.setItem(storageKey(scope), JSON.stringify(record)); }
+  const files = Array.isArray(args.files) ? args.files.map(file => ({ name: file.name, size: file.size, kind: "file", url: "" })) : undefined;
+  try { sessionStorage.setItem(storageKey(scope), JSON.stringify({ ...record, args: { ...args, files } })); }
   catch {
     // Large photos can exceed the tab's storage quota. Persist a small marker
     // so a reload still prevents duplicate submission and asks for reselection.
     try {
       const images = Array.isArray(args.images) ? args.images.map(image => ({ name: image.name, size: image.size, url: "" })) : undefined;
-      sessionStorage.setItem(storageKey(scope), JSON.stringify({ id: record.id, args: { ...args, images } }));
-    } catch { /* Private browsing may disable storage entirely. Keep memory. */ }
+      sessionStorage.setItem(storageKey(scope), JSON.stringify({ id: record.id, args: { ...args, images, files } }));
+    } catch {
+      // Ordinary-file content is never journaled, so refuse a new upload if even
+      // its small anti-duplicate marker cannot survive a reload.
+      if (files?.length) throw new Error("无法保存附件提交记录，请清理浏览器存储后重试。");
+    }
   }
   return record;
 }
