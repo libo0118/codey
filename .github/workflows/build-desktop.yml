@@ -123,6 +123,9 @@ jobs:
           CODEY_UPDATE_BASE_URL: https://github.com/libo0118/codey/releases/latest/download
         run: pnpm run build
 
+      - name: Verify built default subagent Hook
+        run: node scripts/check-default-subagent-hook.mjs target/release/codey.exe
+
       - name: Build Windows installer
         shell: pwsh
         run: |

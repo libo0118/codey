@@ -598,6 +598,103 @@ fn spawn_task_receipt_binds_child_while_codex_controls_read_paths() {
 }
 
 #[test]
+fn default_child_transcript_role_can_be_absent_or_null_without_bypassing_role_checks() {
+    for (role, direct, nested_role, allowed) in [
+        ("default", json!({}), None, true),
+        (
+            "default",
+            json!({"agent_role":null}),
+            Some(Value::Null),
+            true,
+        ),
+        (
+            "default",
+            json!({"agent_role":null,"agentRole":"default"}),
+            Some(Value::Null),
+            true,
+        ),
+        ("default", json!({}), Some(json!("default")), true),
+        ("default", json!({}), Some(json!(false)), false),
+        (
+            "default",
+            json!({"agent_role":false}),
+            Some(Value::Null),
+            false,
+        ),
+        (
+            "default",
+            json!({"agent_role":"codey_worker"}),
+            Some(Value::Null),
+            false,
+        ),
+        (
+            "default",
+            json!({"agent_role":"default","agentRole":"codey_worker"}),
+            Some(Value::Null),
+            false,
+        ),
+        ("codey_quick_scan", json!({}), None, false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join(STATE_DIRECTORY);
+        write_test_runtime_policy(&state_root);
+        let session_id = "default-role-parent";
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(workspace.to_string_lossy().into_owned());
+        spawn.tool_name = Some("agents.spawn_agent".into());
+        spawn.tool_input = Some(
+            json!({"task_name":"default_reader","fork_turns":"none","message":"Read the synthetic workspace"}),
+        );
+        if role != "default" {
+            spawn.tool_input.as_mut().unwrap()["agent_type"] = json!(role);
+        }
+        assert_eq!(handle_hook(&spawn, &state_root).unwrap(), json!({}));
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input;
+        spawned.tool_response = Some(Value::String(
+            r#"{"task_name":"/root/default_reader"}"#.into(),
+        ));
+        assert_eq!(handle_hook(&spawned, &state_root).unwrap(), json!({}));
+        let agent_id = "22222222-2222-4222-8222-222222222222";
+        let transcript = temp
+            .path()
+            .join("sessions")
+            .join(format!("rollout-probe-{agent_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let mut payload = json!({"id":agent_id,"parent_thread_id":session_id,"agent_path":"/root/default_reader","source":{"subagent":{"thread_spawn":{"parent_thread_id":session_id,"agent_path":"/root/default_reader"}}}});
+        if let Some(nested_role) = nested_role {
+            payload["source"]["subagent"]["thread_spawn"]["agent_role"] = nested_role;
+        }
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(direct.as_object().unwrap().clone());
+        fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"session_meta","payload":payload})),
+        )
+        .unwrap();
+        // Delayed SubagentStart must not prevent binding the first child tool.
+        let mut child = input("PreToolUse", session_id);
+        child.agent_id = Some(agent_id.into());
+        child.agent_type = (role != "default").then(|| role.into());
+        child.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        child.tool_name = Some("mcp__codey_fastctx__glob".into());
+        child.tool_input = Some(json!({"path":workspace,"pattern":["*.rs"]}));
+        attest_test_child(&child, &state_root, &current_runtime_id());
+        let output = handle_hook(&child, &state_root).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"] != "deny",
+            allowed,
+            "role={role}, direct={direct}, output={output}"
+        );
+    }
+}
+
+#[test]
 fn transcript_identity_correlation_rejects_a_wrong_parent_session() {
     let temp = tempfile::tempdir().unwrap();
     let state_root = temp.path().join("codey-subagent-gate-v3");

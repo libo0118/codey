@@ -207,6 +207,21 @@ pub(super) fn consistent_string_field<'a>(
     Ok(resolved)
 }
 
+fn transcript_role(values: &Map<String, Value>) -> std::result::Result<Option<&str>, ()> {
+    let mut role = None;
+    for key in ["agent_role", "agentRole"] {
+        let Some(value) = values.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let value = value.as_str().ok_or(())?;
+        if role.is_some_and(|existing| existing != value) {
+            return Err(());
+        }
+        role = Some(value);
+    }
+    Ok(role)
+}
+
 pub(super) fn validate_unique_agent_bindings(ledger: &SessionLedger) -> Result<()> {
     let mut owners = BTreeMap::<&str, &str>::new();
     for (task_id, reservation) in &ledger.reservations {
@@ -330,15 +345,18 @@ pub(super) fn task_id_from_subagent_transcript(
     if !reservation.state.is_active() || reservation.fenced_at_ms.is_some() {
         return None;
     }
-    let direct_role = consistent_string_field(payload, &["agent_role", "agentRole"]).ok()?;
+    let direct_role = transcript_role(payload).ok()?;
     let nested_role = match nested {
-        Some(values) => consistent_string_field(values, &["agent_role", "agentRole"]).ok()?,
+        Some(values) => transcript_role(values).ok()?,
         None => None,
     };
     if direct_role.is_some() && nested_role.is_some() && direct_role != nested_role {
         return None;
     }
-    let metadata_role = direct_role.or(nested_role)?;
+    // Native leaves the optional role absent/null when spawn uses its default.
+    let metadata_role = direct_role
+        .or(nested_role)
+        .unwrap_or(crate::config::SUBAGENT_ROLE_DEFAULT);
     if metadata_role != reservation.role || agent_type.is_some_and(|role| role != metadata_role) {
         return None;
     }
