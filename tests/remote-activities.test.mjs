@@ -13,7 +13,7 @@ const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": ic
 const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real }).exports;
 const { ConversationTurn: ExpandedTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { ...real, react: { ...React, useState: () => [true, () => {}] } } }).exports;
 const turn = messages => ({ id: "turn", status: "completed", messages });
-const render = messages => renderToStaticMarkup(React.createElement(ConversationTurn, { turn: turn(messages) }));
+const render = messages => renderToStaticMarkup(React.createElement(ExpandedTurn, { turn: turn(messages) }));
 const renderExpanded = messages => renderToStaticMarkup(React.createElement(ExpandedTurn, { turn: turn(messages) }));
 
 test("真实活动组件呈现工具合同的 name，不以 text 或虚构 displayTitle 替换", () => {
@@ -29,7 +29,7 @@ test("native started/completed/interrupted/interacted 在顶层无状态时仍�
   for (const [action, status, label, state] of cases) {
     const html = render([{ ...startedActivity, collaboration: { action, agents: [{ id: "review", name: "审查消息展示", ...(status && { status }) }] } }]);
     assert.ok(html.includes(label), action); assert.ok(html.includes(state), action);
-    assert.match(html, /审查消息展示/); assert.doesNotMatch(html, /暂无公开结果/);
+    assert.match(html, /审查消息展示/); assert.match(html, /暂无公开结果/);
     assert.match(renderExpanded([{ ...startedActivity, collaboration: { action, agents: [{ id: "review", name: "审查消息展示", ...(status && { status }) }] } }]), /暂无公开结果/);
     assert.doesNotMatch(html, /未支持的活动|公开结果请在电脑端/);
     if (action === "started") assert.doesNotMatch(html, /已完成/);
@@ -68,15 +68,17 @@ test("长子代理名字和公开结果完整保留在有键盘滚动入口的�
 
 test("真实消息树保持工具/回答/协作原序与稳定 key，流式更新不控制 details 的展开值", () => {
   const graph = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { "@tabler/icons-react": icons, "markdown-it": MarkdownIt } });
+  graph.react.useState = () => [true, () => {}];
   const tree = graph.exports.ConversationTurn({ turn: turn(activityMessages) });
-  const children = collectElements(tree, node => elementProps(node).key !== undefined && Boolean(elementProps(node).message || elementProps(node)["data-message-id"]));
+  const flatten = tree => collectElements(tree, node => node.props.messages || node.props.message).flatMap(node => node.props.messages ? collectElements(node.type(node.props), child => child.props.message) : [node]);
+  const children = flatten(tree);
   assert.deepEqual(children.map(node => elementProps(node).key), activityMessages.map(message => message.id));
   const before = children.find(node => elementProps(node).message?.id === "collab-wait");
   const details = before.type(before.props);
   assert.equal(details.type, "details"); assert.equal(details.props.open, undefined); assert.equal(typeof details.props.onToggle, "function");
   const streamed = activityMessages.map(message => message.id === "collab-wait" ? { ...message, status: "inProgress", collaboration: { ...message.collaboration, agents: [...message.collaboration.agents, { id: "extra", name: "新增子代理", status: "running" }] } } : message);
   graph.restart();
-  const after = collectElements(graph.exports.ConversationTurn({ turn: turn([{ id: "new", role: "assistant", kind: "agentMessage", text: "新增" }, ...streamed]) }), node => elementProps(node).message?.id === "collab-wait")[0];
+  const after = flatten(graph.exports.ConversationTurn({ turn: turn([{ id: "new", role: "assistant", kind: "agentMessage", text: "新增" }, ...streamed]) })).find(node => elementProps(node).message?.id === "collab-wait");
   assert.equal(after.type, before.type); assert.equal(after.props.key, before.props.key);
   const html = render(activityMessages);
   const positions = activityMessages.map(message => html.indexOf(`data-message-id="${message.id}"`));

@@ -34,6 +34,20 @@ function fixture(t, active = true) {
   return { ...h, render, browser, options, calls, sockets, journal, last, ready, open, get unauthorized() { return unauthorized; } };
 }
 
+test("WebView 网络提示为离线时，首次和手动读取仍实际请求，不把跳过读取伪装成空会话", async t => {
+  const h = fixture(t);
+  h.browser.online(false);
+  h.render(); h.browser.tick(0);
+  assert.ok(h.last("threads"), "首次加载必须由实际接口结果决定，不能被 navigator.onLine 阻止");
+  h.last("threads").resolve([thread]); h.last("projects").resolve(projects); h.last("models").resolve(catalog); await h.flush();
+  assert.equal(h.render().threads.length, 1);
+  const first = h.last("threads"); h.render().refresh();
+  assert.notEqual(h.last("threads"), first, "用户手动刷新不依赖 WebView 的网络提示");
+  h.last("threads").reject(new Error("真实连接失败")); h.last("projects").resolve(projects); h.last("models").resolve(catalog); await h.flush();
+  assert.equal(h.render().error, "真实连接失败");
+  h.unmount();
+});
+
 test("隐藏期间不请求，重开保留草稿，过期列表、模型与错误均不回写", async t => {
   const h = fixture(t, false); let c = h.render();
   c.refresh(); c.reloadModels(); c.startCreating(); await c.send(); assert.equal(h.calls.length, 0);

@@ -2,7 +2,7 @@ import { createElement, Fragment, memo, type ReactNode } from "react";
 import MarkdownIt, { type Token } from "markdown-it";
 import { IconTerminal2 } from "@tabler/icons-react";
 import { imageUrl, messageUrl } from "./workspace-data";
-import { FileLink, fileReference } from "./files";
+import { FileImage, FileLink, fileReference } from "./files";
 import { CopyButton } from "./clipboard";
 
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true });
@@ -35,7 +35,7 @@ function tokensToReact(tokens: Token[]): ReactNode[] {
       } else if (token.type === "image") {
         const reference = String(token.attrGet("src") || ""), url = messageUrl(reference), label = token.content || "图片";
         if (inLink) { result.push(label); continue; }
-        result.push(/^data:image\//i.test(reference) && imageUrl(reference) ? <img key={key} src={reference} alt={label} loading="lazy" />
+        result.push(/^data:image\//i.test(reference) && imageUrl(reference) ? <FileImage key={key} url={reference} alt={label} />
           : url ? <a key={key} href={url} target="_blank" rel="noopener noreferrer">{label}（图片）</a>
           : fileReference(reference) ? <FileLink key={key} reference={reference} image>{label}</FileLink> : <span key={key}>{label}（图片不可用）</span>);
       } else if (tags.has(token.tag)) {

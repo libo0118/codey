@@ -62,6 +62,22 @@ export function FileLink({ reference, attachment, children, image = false }: { r
 
 export function FileImage({ url, alt }: { url: string; alt: string }) {
   const [failed, setFailed] = useState(false);
+  const preview = useRef<HTMLDialogElement | null>(null);
+  useEffect(() => () => { preview.current?.remove(); preview.current = null; }, [url]);
+  function enlarge(trigger: HTMLButtonElement) {
+    if (preview.current) return;
+    const dialog = document.createElement("dialog"), header = document.createElement("header"), title = document.createElement("span");
+    const zoom = document.createElement("button"), close = document.createElement("button"), stage = document.createElement("div"), image = document.createElement("img");
+    dialog.className = "remote-image-dialog"; dialog.setAttribute("aria-label", alt);
+    title.textContent = alt; zoom.type = close.type = "button"; zoom.textContent = "原始尺寸"; close.textContent = "关闭";
+    zoom.setAttribute("aria-pressed", "false"); stage.className = "remote-image-stage"; image.src = url; image.alt = alt;
+    zoom.onclick = () => { const original = stage.classList.toggle("is-original"); zoom.textContent = original ? "适应窗口" : "原始尺寸"; zoom.setAttribute("aria-pressed", String(original)); };
+    close.onclick = () => dialog.close();
+    image.onerror = () => { const notice = document.createElement("p"); notice.textContent = "图片暂不可读取，请关闭后重新预览。"; notice.setAttribute("role", "status"); image.remove(); stage.append(notice); };
+    dialog.onclick = event => { if (event.target === dialog) dialog.close(); };
+    dialog.onclose = () => { dialog.remove(); preview.current = null; if (trigger.isConnected) trigger.focus({ preventScroll: true }); };
+    header.append(title, zoom, close); stage.append(image); dialog.append(header, stage); document.body.append(dialog); preview.current = dialog; dialog.showModal();
+  }
   return <span className="remote-file-preview">{failed ? <><small role="status">图片暂不可预览，可能文件已变化或服务繁忙。</small><button className="remote-file-retry" type="button" onClick={() => setFailed(false)}>重新预览</button></>
-    : <img className="remote-artifact-image" src={url} alt={alt} loading="lazy" onError={() => setFailed(true)} />}</span>;
+    : <button className="remote-image-open" type="button" aria-label={`放大图片：${alt}`} aria-haspopup="dialog" onClick={event => enlarge(event.currentTarget)}><img className="remote-artifact-image" src={url} alt={alt} loading="lazy" onError={() => setFailed(true)} /></button>}</span>;
 }

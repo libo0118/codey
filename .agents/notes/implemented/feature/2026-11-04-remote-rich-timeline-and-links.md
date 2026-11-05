@@ -8,10 +8,11 @@ Status: implemented
 
 ## Decision
 
-- 使用锁定的 `markdown-it@15.0.3` 将 token 转为 React 安全节点，禁用原始 HTML、可执行 URL 与未知 schema 的 JSON 展示。按消息 identity 保留原顺序和原生 details 状态；公开摘要、计划、命令、工具和 Unified Diff 分别呈现，长代码与表格局部横滚，保留单栏消息与原 composer。已有审批只展示白名单详情，不为未知或缺少可核对摘要的请求提供盲批。
+- 使用锁定的 `markdown-it@15.0.3` 将 token 转为 React 安全节点，禁用原始 HTML、可执行 URL 与未知 schema 的 JSON 展示。按消息 identity 保留原顺序和原生 details 状态；连续活动归为一个默认折叠的过程入口，展开后再建立摘要、计划、命令、工具和 Unified Diff，正文穿插顺序不变。空公开摘要不单独生成空卡片，也不以私有 reasoning content 补齐。长代码与表格局部横滚，保留单栏消息与原 composer。
+- 用户消息只对识别出的宿主前缀拆出真实提问，附加上下文仍可按需展开，未知格式保留原文；已识别的问题回复仅呈现问题与答案，不展示协议标签和 JSON。问题表单沿用原请求能力与显式提交，默认折叠且可随时收起，选项和草稿在收起期间保留。其他审批只展示白名单详情，不为未知或缺少可核对摘要的请求提供盲批。
 - `collab*`、`subAgentActivity` 只展示原生公开活动与结果；未知结构使用安全占位，不输出 hidden prompt、私有 arguments 或原始 RPC，也不凭工具名把未公开参数拼成说明。
 - 只通过带 CSRF 的 `/remote/files/resolve` 解析文件元数据，最多一个请求活跃、十六个等待，超额、繁忙、变化或无权限均提供明确原因与显式重新检查，不无限排队或自动重试。会话切换取消旧请求，迟到结果不回写；旧登录的 401 不能清除新的 CSRF 会话。
-- 下载只使用服务端给出的、绑定同一 UUID 的 `/api/sessions/{UUID}/files/{64hex}` 同源链接，准备好 href 后由用户直接点击；不在解析时预下载文件、不异步模拟点击。Markdown 文件目的字符串仅是候选，包括 parser 正常化的 Windows 路径，不能在浏览器把路径拼成下载地址。受支持同源图片按需懒预览，暂时繁忙或源变化后提供显式重新预览，不永久隐藏或自动循环请求；外部图片是普通链接，不偷偷发背景请求。
+- 下载只使用服务端给出的、绑定同一 UUID 的 `/api/sessions/{UUID}/files/{64hex}` 同源链接，准备好 href 后由用户直接点击；不在解析时预下载文件、不异步模拟点击。Markdown 文件目的字符串仅是候选，包括 parser 正常化的 Windows 路径，不能在浏览器把路径拼成下载地址。受支持同源图片按需懒预览，点击后在原生模态框内适应窗口或显示原始尺寸；关闭恢复焦点，会话文件组件失效时销毁模态框，不保留旧引用。暂时繁忙或源变化后提供显式重新预览，不永久隐藏或自动循环请求；外部图片是普通链接，不偷偷发背景请求。
 - 会话列表提供显式复制 `codex://threads/{UUID}` 操作，不恢复或激活会话，不复制当前网页登录地址。当前库存只证明本地来源，非本地身份不臆造。
 - bootstrap 提供与 Bridge 网页兼容的 `BridgeClipboard.copy(getText, button)`；按钮渲染即带 `.message-copy` 或 `.code-copy`，允许旧 Harmony 壳捕获首击；普通浏览器依次使用安全 Clipboard、HTTP `execCommand` 和可选择的手动复制。
 

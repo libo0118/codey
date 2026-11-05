@@ -10,7 +10,8 @@ import { createModuleGraph } from "./helpers/jsx-tree.mjs";
 const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const graph = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real });
 const { RichText, ConversationTurn } = graph.exports;
-const { ConversationTurn: ExpandedTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { ...real, react: { ...React, useState: () => [true, () => {}] } } }).exports;
+const realFiles = createModuleGraph(new URL("../src/remote/files.tsx", import.meta.url), { stubs: real }).exports;
+const { ConversationTurn: ExpandedTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { ...real, "./files": realFiles, react: { ...React, useState: () => [true, () => {}] } } }).exports;
 const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, props));
 
 test("真实 Markdown 组件呈现标题、嵌套列表、表格、行内代码和围栏", () => {
@@ -41,7 +42,7 @@ test("不安全 URL、原始 HTML 和未知活动都不会成为可执行节点�
   assert.match(html, /href="https:\/\/example.invalid\/"/);
   assert.match(html, /href="mailto:team@example.invalid"/);
   for (const kind of ["futurePrivateItem", "toString", "constructor"]) {
-    const unknown = render(ConversationTurn, { turn: { id: "turn", status: "completed", messages: [{ id: "private", role: "activity", kind, text: '{"secret":"NEVER_DUMP"}', tool: { name: "NEVER_DUMP" } }] } });
+    const unknown = render(ExpandedTurn, { turn: { id: "turn", status: "completed", messages: [{ id: "private", role: "activity", kind, text: '{"secret":"NEVER_DUMP"}', tool: { name: "NEVER_DUMP" } }] } });
     assert.match(unknown, /未支持的活动/);
     assert.doesNotMatch(unknown, /NEVER_DUMP/);
   }

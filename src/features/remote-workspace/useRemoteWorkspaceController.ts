@@ -67,7 +67,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   });
   const refreshList = useStableEvent(async (background = false) => {
     const token = session.current;
-    if (!token || document.visibilityState !== "visible" || !navigator.onLine || background && listRequest.current) return;
+    if (!token || background && (document.visibilityState !== "visible" || !navigator.onLine || listRequest.current)) return;
     listRequest.current?.abort();
     const controller = listRequest.current = new AbortController();
     const liveAtStart = liveRunning.current;

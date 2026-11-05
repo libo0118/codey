@@ -19,29 +19,32 @@ test("有界真实消息组件不创建闭合正文、图片或空历史 section
   const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real }).exports;
   const html = renderToStaticMarkup(React.createElement("div", null, ...initial.turns.map(turn => React.createElement(ConversationTurn, { key: turn.id, turn }))));
   assert.equal((html.match(/class="remote-turn"/g) || []).length, 1);
-  assert.equal((html.match(/<details /g) || []).length, 19);
+  assert.equal((html.match(/<details /g) || []).length, 1);
   assert.doesNotMatch(html, /Mock lazy detail body|remote-agent-result|remote-tool|<img /);
-  assert.match(html, /核验代理（Mock）/); assert.match(html, /已完成/);
+  assert.match(html, /工作过程/); assert.match(html, /19 项活动/);
   assert.ok((html.match(/<[a-z][^>]*>/g) || []).length < 250);
 });
 
 test("真实 Activity hook 仅在展开时创建正文，流更新不控制原生 details identity", () => {
-  const graph = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: { "@tabler/icons-react": icons, "markdown-it": MarkdownIt } });
-  const tree = graph.exports.ConversationTurn({ turn: { id: "Mock-turn", status: "completed", messages: [full.turns[0].messages[199]] } });
-  const activity = collectElements(tree, node => node.props.message?.id === full.turns[0].messages[199].id)[0];
   // Drive the actual nested Activity with the controller harness, not a second lazy-body algorithm.
   const a = createControllerHarness(new URL("../src/remote/messages.tsx", import.meta.url), (exports, props) => {
     const tree = exports.ConversationTurn({ turn: { id: "Mock-turn", status: "completed", messages: [props.message] } });
-    const child = collectElements(tree, node => node.props.message?.id === props.message.id)[0];
-    return child.type(child.props);
+    const group = collectElements(tree, node => node.props.messages)[0];
+    const outer = group.type(group.props);
+    const child = collectElements(outer, node => node.props.message?.id === props.message.id)[0];
+    return child ? child.type(child.props) : outer;
   }, { "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
-  assert.ok(activity); let body = a.render({ message: activity.props.message });
+  const message = full.turns[0].messages[199];
+  let body = a.render({ message });
   assert.equal(body.props.open, undefined); assert.doesNotMatch(textContent(body), /Mock lazy detail body/);
-  body.props.onToggle({ currentTarget: { open: true } }); body = a.render();
+  const opened = { open: true };
+  body.props.onToggle({ target: opened, currentTarget: opened }); body = a.render();
+  body.props.onToggle({ target: opened, currentTarget: opened }); body = a.render();
   assert.ok(collectElements(body, node => node.props.className === "remote-agent-result").length);
-  body = a.render({ message: { ...activity.props.message, status: "completed" } });
+  body = a.render({ message: { ...message, status: "completed" } });
   assert.ok(collectElements(body, node => node.props.className === "remote-agent-result").length);
-  body.props.onToggle({ currentTarget: { open: false } }); body = a.render();
+  const closed = { open: false };
+  body.props.onToggle({ target: closed, currentTarget: closed }); body = a.render();
   assert.equal(collectElements(body, node => node.props.className === "remote-agent-result").length, 0);
   a.unmount();
 });
