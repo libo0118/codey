@@ -85,7 +85,8 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
       if (!current()) return;
       // 请求开始后的流更新优先，新的目录结果仍可清除更早的运行状态。
       const live = liveRunning.current;
-      setThreads(live && (live !== liveAtStart || live.running === null && !isConnected()) ? nextThreads.map(thread => thread.id === live.id ? { ...thread, running: live.running } : thread) : nextThreads);
+      setThreads(document.visibilityState !== "visible" || !navigator.onLine ? nextThreads.map(thread => ({ ...thread, running: null }))
+        : live && (live !== liveAtStart || live.running === null && !isConnected()) ? nextThreads.map(thread => thread.id === live.id ? { ...thread, running: live.running } : thread) : nextThreads);
       if (nextProjects) {
         setProjects(nextProjects);
         // 刷新目录不能把正在编辑的新会话草稿改绑到另一个项目。

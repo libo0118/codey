@@ -39,8 +39,9 @@ test("WebView 网络提示为离线时，首次和手动读取仍实际请求，
   h.browser.online(false);
   h.render(); h.browser.tick(0);
   assert.ok(h.last("threads"), "首次加载必须由实际接口结果决定，不能被 navigator.onLine 阻止");
-  h.last("threads").resolve([thread]); h.last("projects").resolve(projects); h.last("models").resolve(catalog); await h.flush();
+  h.last("threads").resolve([{ ...thread, running: true }]); h.last("projects").resolve(projects); h.last("models").resolve(catalog); await h.flush();
   assert.equal(h.render().threads.length, 1);
+  assert.equal(h.render().threads[0].running, null, "离线提示下没有定时刷新，不保留可能过期的绿点");
   const first = h.last("threads"); h.render().refresh();
   assert.notEqual(h.last("threads"), first, "用户手动刷新不依赖 WebView 的网络提示");
   h.last("threads").reject(new Error("真实连接失败")); h.last("projects").resolve(projects); h.last("models").resolve(catalog); await h.flush();
