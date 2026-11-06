@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "1.5.1-libo.1-preview.7"
+version = "1.5.2-libo.1-preview.1"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
