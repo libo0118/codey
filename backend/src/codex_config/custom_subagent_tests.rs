@@ -65,7 +65,7 @@ fn configured_count_reaches_native_overrides_policy_and_prompts_only_on_restart(
         for (key, expected) in [
             (
                 "root_agent_usage_hint_text",
-                format!("concurrency limit of {limit} sub-agents (excluding the root)"),
+                root_agent_collaboration_usage_hint(),
             ),
             (
                 "multi_agent_mode_hint_text",

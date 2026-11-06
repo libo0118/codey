@@ -1215,7 +1215,7 @@ fn default_child_transcript_role_can_be_absent_or_null_without_bypassing_role_ch
             Some(Value::Null),
             false,
         ),
-        ("codey_quick_scan", json!({}), None, false),
+        ("codey_worker", json!({}), None, false),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join(STATE_DIRECTORY);
