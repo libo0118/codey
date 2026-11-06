@@ -698,6 +698,28 @@ test("React manager discovery enumerates an object shared by many fibers once pe
   assert.equal(enumerations, 1);
 });
 
+test("React manager discovery prioritizes native Hook refs before wide fiber metadata exhausts the scan", () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  const manager = { sendRequest() { assert.fail("must not send"); } };
+  const scope = { query: null, get() {}, set() {}, watch() {}, when() {} };
+  let getterCalls = 0;
+  const decoy = Object.defineProperty({}, "memoizedState", { get() { getterCalls += 1; return { current: scope }; } });
+  let fiber = null;
+  for (let depth = 23; depth >= 0; depth -= 1) {
+    fiber = {
+      memoizedProps: Object.fromEntries(Array.from({ length: 120 }, (_, index) => [`noise${index}`, {}])),
+      memoizedState: depth === 0 ? { memoizedState: { current: scope } } : decoy,
+      dependencies: {}, updateQueue: {}, return: fiber,
+    };
+  }
+  runtime.document.body.__reactFiber$wideNative = fiber;
+  const found = runtime.window.__codeyAppServerManagerFromReact((candidate, hostId) => (
+    candidate === scope && hostId === "local" ? manager : null
+  ));
+  assert.equal(found, manager);
+  assert.equal(getterCalls, 0);
+});
+
 for (const topology of ["wide earlier ancestors", "shared values at different depths"]) {
   test(`native request discovery reaches a provider after ${topology} without running getters or sending`, async () => {
     const client = { hostId: "local", enqueueRequest() { assert.fail("must not send"); }, createRequest() {}, onResult() {} };

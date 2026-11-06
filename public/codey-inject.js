@@ -2244,7 +2244,15 @@
   };
 
   const collectAppServerScopeCandidates = (roots, candidates) => {
-    const queue = roots.filter(Boolean).map((value) => ({ depth: 0, value }));
+    // 原生 scope 存在 Hook ref 中，先读数据属性，避免宽泛的 fiber 元数据先耗尽预算。
+    const hookRefs = roots.flatMap((value) => {
+      try {
+        const ref = value && Object.getOwnPropertyDescriptor(value, "memoizedState")?.value;
+        const current = ref && Object.getOwnPropertyDescriptor(ref, "current")?.value;
+        return current ? [current] : [];
+      } catch { return []; }
+    });
+    const queue = [...hookRefs, ...roots].filter(Boolean).map((value) => ({ depth: 0, value }));
     const seen = new WeakSet();
     let cursor = 0;
     let inspected = 0;
