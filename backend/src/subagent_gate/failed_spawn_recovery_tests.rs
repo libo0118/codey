@@ -667,7 +667,9 @@ fn reservation_is_not_written_when_pre_save_callback_fails() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join(STATE_DIRECTORY);
     write_test_runtime_policy(&root);
+    let called = std::cell::Cell::new(false);
     let fail = |_: &str, _: &std::collections::BTreeSet<String>| -> Result<()> {
+        called.set(true);
         anyhow::bail!("synthetic cache save failure")
     };
     let result = crate::subagent_orchestrator::pre_spawn_with_workspace_and_turn(
@@ -675,8 +677,12 @@ fn reservation_is_not_written_when_pre_save_callback_fails() {
         RUNTIME,
         SESSION,
         Some(&json!({"task_name": TASK, "message": "work"})),
-        crate::subagent_orchestrator::RootHookContext::new(None, 0, 100)
+        crate::subagent_orchestrator::RootHookContext::new(Some("/repo"), 0, 100)
             .with_before_reservation_save(&fail),
+    );
+    assert!(
+        called.get(),
+        "admission must reach the injected storage failure"
     );
     assert!(result.is_err());
     assert_eq!(
