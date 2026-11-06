@@ -74,11 +74,12 @@ struct SessionLedger {
     reservations: BTreeMap<String, Reservation>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct RootHookContext<'a> {
     workspace_root: Option<&'a str>,
     active_agents: usize,
     now_ms: u64,
+    before_reservation_save: Option<&'a dyn Fn(&str, &BTreeSet<String>) -> Result<()>>,
 }
 
 impl<'a> RootHookContext<'a> {
@@ -87,7 +88,16 @@ impl<'a> RootHookContext<'a> {
             workspace_root,
             active_agents,
             now_ms,
+            before_reservation_save: None,
         }
+    }
+
+    pub(crate) fn with_before_reservation_save(
+        mut self,
+        callback: &'a dyn Fn(&str, &BTreeSet<String>) -> Result<()>,
+    ) -> Self {
+        self.before_reservation_save = Some(callback);
+        self
     }
 }
 
@@ -842,6 +852,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         workspace_root: hook_workspace_root,
         active_agents,
         now_ms,
+        before_reservation_save,
     } = context;
     let mut loaded_rules = rules::load_logged(state_root);
     let runtime_policy = crate::subagent_gate::load_runtime_subagent_policy(state_root)?;
@@ -890,6 +901,10 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     );
     if let Some(reason) = concurrency_denial(&ledger, active_agents, limit) {
         return Ok(Some(reason));
+    }
+
+    if let Some(callback) = before_reservation_save {
+        callback(&prepared.capsule.id, &ledger.issued_task_ids)?;
     }
 
     ledger.issued_task_ids.insert(prepared.capsule.id.clone());
@@ -969,6 +984,11 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         .insert("fencing.token".into(), Value::Number(fencing_token.into()));
     TraceRecorder::new(state_root).record_best_effort(&event);
     Ok(None)
+}
+
+pub(crate) fn spawn_response_is_unbound_failure(response: &Value, task_id: &str) -> bool {
+    extract_spawn_binding_identifier(response, task_id).is_none()
+        && response_is_explicit_failure(response)
 }
 
 pub(crate) fn post_spawn(
@@ -1766,6 +1786,29 @@ pub(crate) fn active_reservation_count(
         active_reservation_projection(state_root, runtime_id, session_id, now_ms)?
             .map(|(count, _)| count),
     )
+}
+
+pub(crate) fn pending_unbound_spawn_reservations(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<BTreeMap<String, u64>> {
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(ledger
+        .reservations
+        .into_iter()
+        .filter_map(|(task_id, reservation)| {
+            // A failed creation can be settled even if an unsuccessful interrupt fenced it.
+            (reservation.state == ReservationState::Pending
+                && reservation.agent_id_hash.is_none()
+                && reservation.started_at_ms.is_none())
+            .then_some((task_id, reservation.created_at_ms))
+        })
+        .collect())
 }
 
 /// A single-target status reply may only update that target, even if a provider

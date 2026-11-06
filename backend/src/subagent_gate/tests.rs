@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+#[path = "failed_spawn_recovery_tests.rs"]
+mod failed_spawn_recovery_tests;
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
 
@@ -14,6 +16,7 @@ fn input(event: &str, session: &str) -> HookInput {
         tool_name: None,
         tool_input: None,
         tool_response: None,
+        tool_use_id: None,
         turn_id: None,
         transcript_path: None,
         agent_transcript_path: None,
@@ -440,6 +443,7 @@ fn hook_input_accepts_common_camel_case_and_subagent_aliases() {
         "toolName": "Bash",
         "toolInput": { "command": "true" },
         "toolResponse": { "exitCode": 0 },
+        "toolUseId": "call-a",
         "turnId": "turn-root-a",
         "transcriptPath": "/tmp/root.jsonl",
         "agentTranscriptPath": "/tmp/child.jsonl",
@@ -452,6 +456,7 @@ fn hook_input_accepts_common_camel_case_and_subagent_aliases() {
     assert_eq!(input.agent_id.as_deref(), Some("agent-a"));
     assert_eq!(input.agent_type.as_deref(), Some("codey_quick_scan"));
     assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+    assert_eq!(input.tool_use_id.as_deref(), Some("call-a"));
     assert_eq!(input.turn_id.as_deref(), Some("turn-root-a"));
     assert_eq!(input.transcript_path.as_deref(), Some("/tmp/root.jsonl"));
     assert_eq!(

@@ -15,6 +15,7 @@ use crate::subagent::{
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
 };
 
+mod failed_spawn_recovery;
 mod runtime_policy;
 mod state;
 mod sweep;
@@ -96,6 +97,8 @@ struct HookInput {
     tool_input: Option<Value>,
     #[serde(default, alias = "toolResponse")]
     tool_response: Option<Value>,
+    #[serde(default, alias = "toolUseId")]
+    tool_use_id: Option<String>,
     #[serde(default, alias = "turnId")]
     turn_id: Option<String>,
     #[serde(default, alias = "transcriptPath")]
@@ -1047,12 +1050,18 @@ fn pre_tool_use_output(
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
         let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
+        let note_call = |task: &str, issued: &std::collections::BTreeSet<String>| {
+            failed_spawn_recovery::note_spawn_call(
+                input, state_root, runtime_id, task, issued, now_ms,
+            )
+        };
         if let Some(reason) = crate::subagent_orchestrator::pre_spawn_with_workspace_and_turn(
             state_root,
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
-            crate::subagent_orchestrator::RootHookContext::new(workspace_root, active, now_ms),
+            crate::subagent_orchestrator::RootHookContext::new(workspace_root, active, now_ms)
+                .with_before_reservation_save(&note_call),
         )? {
             return Ok(pre_tool_reason_denial(&reason));
         }
@@ -1512,6 +1521,11 @@ fn recover_root_active_state(
     else {
         return Ok(0);
     };
+    if active == 0 {
+        return Ok(0);
+    }
+    failed_spawn_recovery::recover(input, state_root, runtime_id, now_ms)?;
+    active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
         return Ok(0);
     }
