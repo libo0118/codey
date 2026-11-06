@@ -1,0 +1,139 @@
+name: Promote verified Codey preview 7
+
+on:
+  push:
+    branches: [ci/promote-codeyx-preview-7]
+    paths: [.github/workflows/promote-codeyx-preview.yml]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: codey-release-automation
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify successful source checks and preview draft
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          const repo = "libo0118/codey", sha = "f52dcdc05b60bbe23f8f3e06f64971da42f7e98e";
+          assert.equal(process.env.GITHUB_REPOSITORY, repo);
+          const get = async path => {
+            const response = await fetch("https://api.github.com/repos/" + repo + path, {
+              headers: { Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Cache-Control": "no-cache" },
+            });
+            assert(response.ok, "GitHub GET failed: " + response.status + " " + path);
+            return response.json();
+          };
+          for (const [id, expectedSha] of [[42166321162, sha]]) {
+            const run = await get("/actions/runs/" + id);
+            assert.equal(run.head_sha, expectedSha); assert.equal(run.status, "completed"); assert.equal(run.conclusion, "success");
+          }
+          const release = await get("/releases/436149018");
+          assert.equal(release.tag_name, "v1.5.1-libo.1-preview.7");
+          assert.equal(release.target_commitish, sha);
+          assert.equal(release.draft, true); assert.equal(release.prerelease, true);
+          console.log("Verified source CI and the owned preview draft");
+          NODE
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 42166321162
+          name: codey-windows-x64-installer
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 42166321162
+          name: codey-linux-x64-package
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 42166321162
+          name: codey-update-manifest
+          path: release-assets
+      - name: Verify package hashes, upload, and publish the preview
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile, readdir, lstat } from "node:fs/promises";
+          import { createHash } from "node:crypto";
+          const repo = "libo0118/codey", sha = "f52dcdc05b60bbe23f8f3e06f64971da42f7e98e";
+          const version = "1.5.1-libo.1-preview.7", tag = "v" + version, releaseId = 436149018;
+          const names = ["windows-x64-setup.exe", "linux-x64.tar.gz", "linux-x64.deb", "linux-x64.rpm"].map(suffix => "Codey-" + version + "-" + suffix);
+          names.push("latest.json");
+          const headers = { Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Cache-Control": "no-cache" };
+          const api = async (path, method = "GET", body) => {
+            const response = await fetch("https://api.github.com/repos/" + repo + path, {
+              method, headers: body ? { ...headers, "Content-Type": "application/json" } : headers,
+              body: body ? JSON.stringify(body) : undefined,
+            });
+            assert(response.ok, "GitHub API failed: " + response.status + " " + path);
+            return response.json();
+          };
+          assert.equal(process.env.GITHUB_REPOSITORY, repo);
+          assert.deepEqual((await readdir("release-assets")).sort(), [...names].sort());
+          const files = new Map();
+          for (const name of names) {
+            const path = "release-assets/" + name, metadata = await lstat(path);
+            assert(metadata.isFile() && metadata.size > 0 && metadata.size < 512 * 1024 * 1024);
+            const contents = await readFile(path);
+            files.set(name, { size: contents.length, sha256: createHash("sha256").update(contents).digest("hex") });
+          }
+          const manifest = JSON.parse(await readFile("release-assets/latest.json", "utf8"));
+          assert.equal(manifest.schema_version, 1); assert.equal(manifest.version, version); assert.equal(manifest.tag, tag);
+          assert.deepEqual(manifest.assets.map(asset => asset.file_name).sort(), names.filter(name => name !== "latest.json").sort());
+          for (const asset of manifest.assets) {
+            assert.equal(asset.size, files.get(asset.file_name).size);
+            assert.equal(asset.sha256, files.get(asset.file_name).sha256);
+            assert.equal(asset.url, "https://github.com/" + repo + "/releases/download/" + tag + "/" + encodeURIComponent(asset.file_name));
+          }
+          for (const [id, expectedSha] of [[42166321162, sha]]) {
+            const run = await api("/actions/runs/" + id);
+            assert.equal(run.head_sha, expectedSha); assert.equal(run.status, "completed"); assert.equal(run.conclusion, "success");
+          }
+          const stable = await api("/releases/latest");
+          assert.equal(stable.id, 432334605); assert.equal(stable.tag_name, "v1.5.0-libo.2");
+          assert.equal((await api("/git/ref/heads/custom")).object.sha, "22247b9937a11964a8d6167b43269d623c160127");
+          let release = await api("/releases/" + releaseId);
+          assert.equal(release.tag_name, tag); assert.equal(release.target_commitish, sha);
+          assert.equal(release.draft, true); assert.equal(release.prerelease, true);
+          assert(release.assets.every(asset => names.includes(asset.name)));
+          for (const name of names) {
+            const expected = files.get(name);
+            let asset = release.assets.find(asset => asset.name === name);
+            if (!asset) {
+              const response = await fetch("https://uploads.github.com/repos/" + repo + "/releases/" + releaseId + "/assets?name=" + encodeURIComponent(name), {
+                method: "POST", headers: { ...headers, "Content-Type": "application/octet-stream" },
+                body: await readFile("release-assets/" + name),
+              });
+              assert(response.ok, "Asset upload failed: " + response.status + " " + name);
+              asset = await response.json();
+            }
+            assert.equal(asset.name, name); assert.equal(asset.state, "uploaded"); assert.equal(asset.size, expected.size);
+            assert.equal(asset.digest, "sha256:" + expected.sha256);
+            console.log("Verified uploaded asset: " + name + " " + asset.digest);
+          }
+          release = await api("/releases/" + releaseId);
+          assert.equal(release.assets.length, names.length); assert.equal(release.draft, true); assert.equal(release.prerelease, true);
+          const promotionUrl = "https://github.com/" + repo + "/actions/runs/" + process.env.GITHUB_RUN_ID;
+          const published = await api("/releases/" + releaseId, "PATCH", {
+            draft: false, prerelease: true, make_latest: "false",
+            body: release.body + "\n\n- [CI 原包提升与上传校验](" + promotionUrl + ")",
+          });
+          assert.equal(published.draft, false); assert.equal(published.prerelease, true); assert.equal(published.tag_name, tag);
+          assert.equal((await api("/releases/latest")).id, stable.id);
+          console.log("Published preview: " + published.html_url);
+          NODE
