@@ -8,9 +8,11 @@ import { autoStubModule, collectElements, elementProps, elementType, textContent
 
 const state = await loadTypeScriptModule(new URL("../src/features/subagents/state.ts", import.meta.url));
 const { reconcileConfigDraft } = await loadTypeScriptModule(new URL("../src/configDraft.ts", import.meta.url));
+const { createBackupPreview } = await loadTypeScriptModule(new URL("../src/dev/backupPreview.ts", import.meta.url));
 const model = { value: "route/model", modelId: "model", label: "模型", providerId: "route", supportedReasoningEfforts: ["low", "ultra"], defaultReasoningEffort: "ultra" };
 const fixture = () => ({
   settingsRevision: 1, profiles: [], activeProfileId: "", subagentOptimization: true,
+  upstreamModelReasoningEffortsByProvider: { route: { model: [{ level: "Ultra", value: "ultra" }] } },
   subagentModel: "route/model", subagentReasoningEffort: "low",
   subagentRoles: Object.fromEntries([...state.BUILTIN_SUBAGENT_ROLES, { id: "default" }]
     .map(({ id }) => [id, { enabled: true, model: "route/model", reasoningEffort: "low" }])),
@@ -34,6 +36,7 @@ test("count drafts survive incoming revisions without losing explicit role delet
   assert.equal(merged.config.subagentMaxThreads, 4);
   assert.equal(merged.config.settingsRevision, 2);
   assert.equal(merged.config.scopeGuard, true);
+  assert.deepEqual(merged.config.upstreamModelReasoningEffortsByProvider, base.upstreamModelReasoningEffortsByProvider);
   assert.deepEqual(merged.config.deletedSubagentRoles, ["custom_agent_1"]);
   assert.equal(merged.dirty, true);
   const { deletedSubagentRoles: _, ...saved } = merged.config;
@@ -41,6 +44,22 @@ test("count drafts survive incoming revisions without losing explicit role delet
   assert.equal(adopted.config.subagentMaxThreads, 4);
   assert.equal(adopted.config.deletedSubagentRoles, undefined);
   assert.equal(adopted.dirty, false);
+});
+
+test("preview backup round-trips custom roles, concurrency and upstream model capabilities", () => {
+  const original = state.addCustomSubagent({ ...fixture(), subagentMaxThreads: 4,
+    webhook: { channels: [] }, codexAppPath: "old-path", userScripts: ["old-script"], codexLaunchProxy: "old-proxy" }, model);
+  let current = structuredClone(original);
+  const backup = createBackupPreview(() => ({ config: current }), config => { current = config; });
+  const exported = backup({ action: "export", confirmed: true }).content;
+  current = { ...fixture(), settingsRevision: 3, webhook: { channels: [] },
+    codexAppPath: "live-path", userScripts: ["live-script"], codexLaunchProxy: "live-proxy" };
+  backup({ action: "restore", confirmed: true, settingsRevision: 3, content: exported });
+  assert.equal(current.settingsRevision, 4);
+  assert.equal(current.subagentMaxThreads, 4);
+  assert.deepEqual(current.subagentRoles.custom_agent_1, original.subagentRoles.custom_agent_1);
+  assert.deepEqual(current.upstreamModelReasoningEffortsByProvider, original.upstreamModelReasoningEffortsByProvider);
+  assert.deepEqual([current.codexAppPath, current.userScripts, current.codexLaunchProxy], ["live-path", ["live-script"], "live-proxy"]);
 });
 
 test("custom roles default to read-only, use free IDs and stop at 32 without altering builtins", () => {
@@ -56,7 +75,7 @@ test("custom roles default to read-only, use free IDs and stop at 32 without alt
   for (let i = 1; i < 32; i++) config = state.addCustomSubagent(config, model);
   assert.equal(Object.keys(config.subagentRoles).filter(state.isCustomSubagent).length, 32);
   assert.equal(state.addCustomSubagent(config, model), config);
-  assert.equal(Object.keys(original.subagentRoles).length, 6);
+  assert.equal(Object.keys(original.subagentRoles).length, 4);
 });
 
 test("custom editing validates UTF-8 bytes without trimming or discarding invalid drafts", () => {
@@ -176,6 +195,7 @@ test("App save failures keep count and custom drafts and never emit a saved noti
   assert.equal(declarations.size, 3);
   const compiled = ts.transpileModule([...declarations.values()].join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
   const createSave = new Function("dependencies", `const { config, validateSubagents, invoke, setNotice, setBusy, persistedConfigRef, applyCommandResult } = dependencies;
+    const dirty = true, saveInFlightRef = { current: false };
     const useCallback = callback => callback, isBusy = false, errorText = error => error.message;
     ${compiled}\nreturn saveCurrent;`);
   for (const invalid of [false, "role", "count"]) {
@@ -195,6 +215,7 @@ test("App save failures keep count and custom drafts and never emit a saved noti
       assert.equal(calls[0].command, "save_codey_config");
       assert.equal(calls[0].args.config.settingsRevision, 1);
       assert.equal(calls[0].args.config.subagentMaxThreads, 4);
+      assert.deepEqual(calls[0].args.config.upstreamModelReasoningEffortsByProvider, snapshot.upstreamModelReasoningEffortsByProvider);
       assert.equal(calls[0].args.config.subagentRoles.custom_agent_1.name, snapshot.subagentRoles.custom_agent_1.name);
       assert.deepEqual(calls[0].args.config.deletedSubagentRoles, ["custom_agent_2"]);
       assert.equal(calls[0].args.deletedSubagentRoles, undefined);

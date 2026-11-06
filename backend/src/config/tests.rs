@@ -1974,6 +1974,51 @@ fn update_manifest_url_defaults_to_the_public_source_for_local_builds() {
 }
 
 #[test]
+fn release_admin_url_is_empty_without_a_release_build_identity() {
+    // 开发构建与测试一律不登记发布管理服务，正式构建也要构建标识和服务地址齐全。
+    for release_build in [false, true] {
+        assert_eq!(
+            release_admin_url_for(release_build, None, Some("https://admin.example.com")),
+            ""
+        );
+        assert_eq!(
+            release_admin_url_for(
+                release_build,
+                Some("   "),
+                Some("https://admin.example.com")
+            ),
+            ""
+        );
+        assert_eq!(
+            release_admin_url_for(release_build, Some("build_1"), None),
+            ""
+        );
+        assert_eq!(
+            release_admin_url_for(release_build, Some("build_1"), Some("  ")),
+            ""
+        );
+    }
+    assert_eq!(
+        release_admin_url_for(false, Some("build_1"), Some("https://admin.example.com")),
+        ""
+    );
+    assert_eq!(
+        release_admin_url_for(
+            true,
+            Some(" build_1 "),
+            Some(" https://admin.example.com/ ")
+        ),
+        "https://admin.example.com"
+    );
+}
+
+#[test]
+fn local_builds_have_no_release_build_id_or_admin_url() {
+    assert_eq!(release_build_id(), None);
+    assert_eq!(default_release_admin_url(), "");
+}
+
+#[test]
 fn pet_slim_mode_defaults_to_enabled_for_existing_configs() {
     let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
         .unwrap()
@@ -2087,7 +2132,7 @@ fn fresh_subagent_defaults_keep_the_original_role_preset() {
         "medium"
     );
     assert_eq!(
-        config.subagent_roles[SUBAGENT_ROLE_VISUAL_WORKER].reasoning_effort,
+        config.subagent_roles[SUBAGENT_ROLE_REVIEWER].reasoning_effort,
         "high"
     );
 }
@@ -2108,7 +2153,7 @@ fn legacy_subagent_roles_default_to_enabled_and_explicit_disables_survive_normal
     .normalize();
 
     assert!(!config.subagent_roles[SUBAGENT_ROLE_WORKER].enabled);
-    assert!(config.subagent_roles[SUBAGENT_ROLE_QUICK_SCAN].enabled);
+    assert!(config.subagent_roles[SUBAGENT_ROLE_EXPLORER].enabled);
     assert!(config.subagent_roles[SUBAGENT_ROLE_DEFAULT].enabled);
 }
 
@@ -2247,7 +2292,7 @@ fn subagent_role_map_normalizes_independently_and_syncs_the_legacy_fallback() {
             "subagentModel":"legacy-model",
             "subagentReasoningEffort":"low",
             "subagentRoles":{
-                "codey_quick_scan":{"model":" quick-model ","reasoningEffort":"MEDIUM"},
+                "codey_explorer":{"model":" quick-model ","reasoningEffort":"MEDIUM"},
                 "default":{"model":" fallback-model ","reasoningEffort":"high"},
                 "unknown":{"model":"ignored","reasoningEffort":"low"}
             }
@@ -2259,7 +2304,7 @@ fn subagent_role_map_normalizes_independently_and_syncs_the_legacy_fallback() {
     assert_eq!(config.subagent_roles.len(), SUBAGENT_ROLE_IDS.len());
     assert!(!config.subagent_roles.contains_key("unknown"));
     assert_eq!(
-        config.subagent_roles[SUBAGENT_ROLE_QUICK_SCAN],
+        config.subagent_roles[SUBAGENT_ROLE_EXPLORER],
         SubagentRoleConfig::new("quick-model", "medium")
     );
     assert_eq!(config.subagent_model, "fallback-model");
@@ -2601,4 +2646,51 @@ fn explicit_prompt_optimization_key_clear_does_not_restore_the_previous_secret()
 
     assert!(incoming.prompt_optimization.api_key.is_empty());
     assert!(!incoming.prompt_optimization.api_key_configured);
+}
+
+#[test]
+fn retired_subagent_roles_migrate_to_their_successors() {
+    let config = serde_json::from_str::<CodeyConfig>(
+        r#"{
+            "activeProfileId":"",
+            "profiles":[],
+            "subagentRoles":{
+                "codey_deep_research":{"enabled":false,"model":"deep-model","reasoningEffort":"high"},
+                "codey_quick_scan":{"enabled":true,"model":"quick-model","reasoningEffort":"low"},
+                "codey_worker":{"enabled":true,"model":"worker-model","reasoningEffort":"medium"},
+                "codey_visual_worker":{"enabled":true,"model":"ui-model","reasoningEffort":"high"},
+                "codey_visual_analysis":{"enabled":false,"model":"review-model","reasoningEffort":"xhigh"},
+                "default":{"model":"fallback-model","reasoningEffort":"medium"}
+            }
+        }"#,
+    )
+    .unwrap()
+    .normalize();
+
+    let explorer = &config.subagent_roles[SUBAGENT_ROLE_EXPLORER];
+    assert_eq!(
+        (explorer.model.as_str(), explorer.enabled),
+        ("quick-model", true)
+    );
+    assert_eq!(
+        config.subagent_roles[SUBAGENT_ROLE_WORKER].model,
+        "worker-model"
+    );
+    let reviewer = &config.subagent_roles[SUBAGENT_ROLE_REVIEWER];
+    assert_eq!(
+        (reviewer.model.as_str(), reviewer.enabled),
+        ("review-model", false)
+    );
+    assert_eq!(
+        config
+            .subagent_roles
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        {
+            let mut ids = SUBAGENT_ROLE_IDS.to_vec();
+            ids.sort_unstable();
+            ids
+        }
+    );
 }

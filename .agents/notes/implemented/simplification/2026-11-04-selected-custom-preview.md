@@ -15,7 +15,7 @@ CodeyX 集成分支从 custom 创建，隐含包含全部 fork 定制。用户�
 
 当前重叠兼容实现采用[上游优先边界](../bug-fix/2026-11-04-upstream-151-compatibility.md)，本篇的 custom 取舍不变。
 
-[失败派发回执恢复](../bug-fix/2026-11-06-failed-spawn-recovery.md)仅部分取代本篇的失败派发范围，其余生命周期裁剪决定不变。
+[失败派发回执恢复](../bug-fix/2026-11-06-failed-spawn-recovery.md)仅部分取代本篇的失败派发范围；[上游 v1.5.2 整合](../bug-fix/2026-11-06-upstream-152-integration.md)沿用该边界，其余旧 fork 生命周期裁剪决定不变。
 
 ## Alternatives considered
 

@@ -30,3 +30,14 @@ test("user-managed, failed detection, busy and inactive FastCtx controls never o
   }
   assert.equal(changes.length, 0);
 });
+
+test("FastCtx allows a new draft during save but still blocks detected user configuration", () => {
+  const changes = [];
+  for (const blocked of [false, true]) {
+    const tree = FastContextToolsCard({ ...options, isBusy: true, configEditingDisabled: false,
+      fastContextToolsStatus: { userConfigured: blocked, detectionFailed: false }, onConfigChange: next => changes.push(next) });
+    assert.equal(control(tree).disabled, blocked);
+    control(tree).onCheckedChange(false);
+  }
+  assert.deepEqual(changes, [{ fastContextTools: false, retained: "same-draft" }]);
+});

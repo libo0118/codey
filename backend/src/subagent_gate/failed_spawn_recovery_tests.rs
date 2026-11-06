@@ -60,7 +60,7 @@ fn reserve(root: &Path, at: u64, call_id: Option<&str>) {
     spawn.tool_name = Some("agents.spawn_agent".into());
     spawn.tool_use_id = call_id.map(str::to_string);
     spawn.tool_input = Some(
-        json!({"task_name": TASK, "agent_type": "codey_quick_scan", "message": "Read the bounded source"}),
+        json!({"task_name": TASK, "agent_type": "codey_explorer", "message": "Read the bounded source"}),
     );
     assert_eq!(
         handle_hook_for_runtime_at(&spawn, root, RUNTIME, at).unwrap(),
@@ -326,7 +326,8 @@ fn fenced_failed_spawn_settles_without_disturbing_a_live_sibling_or_late_events(
     );
     let mut child_write = input("PreToolUse", SESSION);
     child_write.agent_id = started.agent_id.clone();
-    child_write.agent_type = Some("codey_quick_scan".into());
+    child_write.agent_type = Some("codey_explorer".into());
+    child_write.turn_id = Some("child-turn-a".into());
     child_write.tool_name = Some("apply_patch".into());
     attest_test_child(&child_write, &root, RUNTIME);
     let denied = handle_hook_for_runtime_at(&child_write, &root, RUNTIME, 203).unwrap();
@@ -689,6 +690,32 @@ fn reservation_is_not_written_when_pre_save_callback_fails() {
         crate::subagent_orchestrator::active_reservation_count(&root, RUNTIME, SESSION, 101)
             .unwrap(),
         None
+    );
+}
+
+#[test]
+fn late_failure_cannot_settle_an_already_bound_pending_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(STATE_DIRECTORY);
+    reserve(&root, 100, Some("call"));
+    let path = session_state_dir(&root, SESSION).join("orchestrator-ledger-v1.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    ledger["reservations"][TASK]["agent_id_hash"] = json!(hash_component("bound-child"));
+    fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    crate::subagent_orchestrator::post_spawn(
+        &root,
+        RUNTIME,
+        SESSION,
+        Some(&json!({"task_name": TASK})),
+        Some(&json!("collab spawn failed: agent thread limit reached")),
+        200,
+    )
+    .unwrap();
+    let ledger: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(ledger["reservations"][TASK]["state"], "pending");
+    assert_eq!(
+        ledger["reservations"][TASK]["agent_id_hash"],
+        hash_component("bound-child")
     );
 }
 

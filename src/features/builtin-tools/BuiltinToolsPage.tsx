@@ -6,16 +6,16 @@ import { SettingsPageHeader } from "../../SettingsPageHeader";
 import { useBuiltinToolsController } from "./useBuiltinToolsController";
 import { PonytailCard } from "./PonytailCard";
 
-type Props = { active: boolean; isBusy: boolean; config: Config; fastContextToolsStatus: FastContextToolsStatus; runtimeStatus: Pick<RuntimeStatus, "running" | "fastContextToolsActive">; onConfigChange: (config: Config) => void };
+type Props = { active: boolean; isBusy: boolean; configEditingDisabled?: boolean; config: Config; fastContextToolsStatus: FastContextToolsStatus; runtimeStatus: Pick<RuntimeStatus, "running" | "fastContextToolsActive">; onConfigChange: (config: Config) => void };
 
-export function BuiltinToolsPage({ active, isBusy, config, fastContextToolsStatus, runtimeStatus, onConfigChange }: Props) {
+export function BuiltinToolsPage({ active, isBusy, configEditingDisabled = isBusy, config, fastContextToolsStatus, runtimeStatus, onConfigChange }: Props) {
   const { status, busy, error, notice, running, blocked, userManaged, setEnabled, refresh } = useBuiltinToolsController({ active, isBusy });
   return (
     <section className="secondary-section" aria-labelledby="builtin-tools-title">
       <SettingsPageHeader id="builtin-tools-title" title="内置工具" icon={<IconTools size={15} />}
         description="统一管理文件检索、代码索引与开发辅助工具。" />
       <div className="flex flex-col gap-4">
-        <FastContextToolsCard active={active} config={config} fastContextToolsStatus={fastContextToolsStatus} runtimeStatus={runtimeStatus} isBusy={isBusy} onConfigChange={onConfigChange} />
+        <FastContextToolsCard active={active} config={config} fastContextToolsStatus={fastContextToolsStatus} runtimeStatus={runtimeStatus} isBusy={isBusy} configEditingDisabled={configEditingDisabled} onConfigChange={onConfigChange} />
         <article className={`feature-card ${status?.mcp.enabled ? "active" : ""}`} aria-busy={Boolean(running)}>
           <div className="feature-card-header">
             <div className="feature-card-title"><strong>CodeGraph 代码索引</strong>

@@ -14,6 +14,7 @@ use crate::subagent::{
     api::TraceContext,
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
 };
+use crate::subagent_orchestrator::StatusResponseSource;
 
 mod failed_spawn_recovery;
 mod runtime_policy;
@@ -38,6 +39,7 @@ pub(crate) const RUNTIME_ID_ENV: &str = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+const FOLLOWUP_STATUS_NEEDS_SNAPSHOT: &str = "Codey 轮次门禁：续派后的完成通知缺少轮次标识，可能来自上一轮，不能据此结算当前轮。请调用一次 agents.list_agents 获取当前状态快照；此前已收到的匿名通知不得作为本轮验收结果。";
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_RENDERED_TOOL_RESULT_CHARS: usize = 8 * 1024;
 pub(crate) const STATE_DIRECTORY: &str = "codey-subagent-gate-v3";
@@ -118,12 +120,25 @@ struct RuntimeSubagentAttestation {
     role: String,
     model: String,
     reasoning_effort: String,
+    #[serde(default)]
+    native_sandbox: Option<NativeSandboxPermission>,
+    #[serde(default)]
+    native_sandbox_turn_hash: Option<String>,
+    #[serde(default)]
+    turn_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeSandboxPermission {
+    ReadOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObservedRuntimeSubagentSelection {
     model: String,
     reasoning_effort: String,
+    native_sandbox: Option<NativeSandboxPermission>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,9 +336,12 @@ fn handle_hook_for_runtime_at(
                     state_root,
                     runtime_id,
                     &input.session_id,
-                    agent_id,
-                    nonempty(input.agent_type.as_deref()),
-                    nonempty(input.transcript_path.as_deref()),
+                    crate::subagent_orchestrator::SubagentLifecycleContext {
+                        agent_id,
+                        agent_type: nonempty(input.agent_type.as_deref()),
+                        transcript_path: nonempty(input.transcript_path.as_deref()),
+                        turn_id: nonempty(input.turn_id.as_deref()),
+                    },
                     now_ms,
                 )?;
                 if should_track {
@@ -349,19 +367,31 @@ fn handle_hook_for_runtime_at(
         }
         "SubagentStop" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                crate::subagent_orchestrator::subagent_stopped_with_context(
+                let should_remove = crate::subagent_orchestrator::subagent_stopped_with_context(
                     state_root,
                     runtime_id,
                     &input.session_id,
-                    agent_id,
-                    nonempty(input.agent_type.as_deref()),
-                    nonempty(input.agent_transcript_path.as_deref()),
+                    crate::subagent_orchestrator::SubagentLifecycleContext {
+                        agent_id,
+                        agent_type: nonempty(input.agent_type.as_deref()),
+                        transcript_path: nonempty(input.agent_transcript_path.as_deref()),
+                        turn_id: nonempty(input.turn_id.as_deref()),
+                    },
                     now_ms,
                 )?;
-                remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
-                clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
-                if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
-                    remove_session_state(state_root, runtime_id, &input.session_id)?;
+                if should_remove {
+                    remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
+                    clear_child_tool_in_flight(
+                        state_root,
+                        runtime_id,
+                        &input.session_id,
+                        agent_id,
+                    )?;
+                    if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?
+                        == 0
+                    {
+                        remove_session_state(state_root, runtime_id, &input.session_id)?;
+                    }
                 }
             } else {
                 let settlement = crate::subagent_orchestrator::settle_unique_anonymous_stop(
@@ -627,9 +657,26 @@ fn runtime_subagent_attestation_denial(
     };
     let role =
         nonempty(input.agent_type.as_deref()).unwrap_or(crate::config::SUBAGENT_ROLE_DEFAULT);
+    if role == crate::config::SUBAGENT_ROLE_EXPLORER
+        && input
+            .tool_name
+            .as_deref()
+            .is_some_and(crate::subagent::rules::explorer_has_unbounded_side_effects)
+    {
+        return Ok(Some(
+            "CODEY_SUBAGENT_EXPLORER_WRAPPER_DENIED: Explorer 不得调用可绕过原生沙箱的通用执行包装或可操作界面工具。只读文件、搜索、图片和网络检索工具仍可用；请由主代理执行该操作。"
+                .to_string(),
+        ));
+    }
     let session_dir = session_state_dir(state_root, &input.session_id);
     let attestation_path = runtime_subagent_attestation_path(&session_dir, runtime_id, agent_id);
-    if cached_runtime_subagent_attestation_matches(&attestation_path, runtime_id, agent_id, role)? {
+    if cached_runtime_subagent_attestation_matches(
+        &attestation_path,
+        runtime_id,
+        agent_id,
+        role,
+        nonempty(input.turn_id.as_deref()),
+    )? {
         // A child that was already attested may finish while a later role-policy
         // update is pending. The new policy applies only to newly spawned work.
         return Ok(None);
@@ -694,6 +741,12 @@ fn runtime_subagent_attestation_denial(
         role: role.to_string(),
         model: observed.model,
         reasoning_effort: observed.reasoning_effort,
+        native_sandbox: observed.native_sandbox,
+        native_sandbox_turn_hash: observed
+            .native_sandbox
+            .and(input.turn_id.as_deref())
+            .map(hash_component),
+        turn_hash: input.turn_id.as_deref().map(hash_component),
     };
     let bytes = serde_json::to_vec(&attestation).context("序列化子代理运行配置证明失败")?;
     crate::fs_util::atomic_write_private_with_parent(&attestation_path, &bytes)
@@ -701,13 +754,23 @@ fn runtime_subagent_attestation_denial(
     Ok(None)
 }
 
-fn cached_runtime_subagent_attestation_matches(
-    path: &Path,
+fn child_native_read_only_attested(
+    state_root: &Path,
     runtime_id: &str,
+    input: &HookInput,
     agent_id: &str,
-    role: &str,
 ) -> Result<bool> {
-    let Some(bytes) = read_optional_runtime_policy_file(path)? else {
+    let role =
+        nonempty(input.agent_type.as_deref()).unwrap_or(crate::config::SUBAGENT_ROLE_DEFAULT);
+    if role != crate::config::SUBAGENT_ROLE_EXPLORER {
+        return Ok(false);
+    }
+    let attestation_path = runtime_subagent_attestation_path(
+        &session_state_dir(state_root, &input.session_id),
+        runtime_id,
+        agent_id,
+    );
+    let Some(bytes) = read_optional_runtime_policy_file(&attestation_path)? else {
         return Ok(false);
     };
     let Ok(attestation) = serde_json::from_slice::<RuntimeSubagentAttestation>(&bytes) else {
@@ -717,8 +780,41 @@ fn cached_runtime_subagent_attestation_matches(
         attestation.schema_version == RUNTIME_SUBAGENT_ATTESTATION_SCHEMA_VERSION
             && attestation.runtime_id_hash == hash_component(runtime_id)
             && attestation.agent_id_hash == hash_component(agent_id)
-            && attestation.role == role,
+            && attestation.role == role
+            && attestation.native_sandbox == Some(NativeSandboxPermission::ReadOnly)
+            && input.turn_id.as_deref().map(hash_component) == attestation.native_sandbox_turn_hash,
     )
+}
+
+fn cached_runtime_subagent_attestation_matches(
+    path: &Path,
+    runtime_id: &str,
+    agent_id: &str,
+    role: &str,
+    turn_id: Option<&str>,
+) -> Result<bool> {
+    let Some(bytes) = read_optional_runtime_policy_file(path)? else {
+        return Ok(false);
+    };
+    let Ok(attestation) = serde_json::from_slice::<RuntimeSubagentAttestation>(&bytes) else {
+        return Ok(false);
+    };
+    let identity_matches = attestation.schema_version
+        == RUNTIME_SUBAGENT_ATTESTATION_SCHEMA_VERSION
+        && attestation.runtime_id_hash == hash_component(runtime_id)
+        && attestation.agent_id_hash == hash_component(agent_id)
+        && attestation.role == role;
+    if !identity_matches || role != crate::config::SUBAGENT_ROLE_EXPLORER {
+        // Worker and Reviewer attestations published before turn hashes existed
+        // remain valid for their running process. Only Explorer command safety
+        // depends on the current turn's native sandbox proof.
+        return Ok(identity_matches);
+    }
+    let same_turn = match turn_id {
+        Some(turn_id) => attestation.turn_hash.as_deref() == Some(hash_component(turn_id).as_str()),
+        None => false,
+    };
+    Ok(same_turn)
 }
 
 fn runtime_subagent_attestation_path(
@@ -795,7 +891,7 @@ fn observed_runtime_subagent_selection(
         &[]
     };
 
-    let mut observed = None;
+    let mut observed: Option<ObservedRuntimeSubagentSelection> = None;
     for line in records.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -829,12 +925,30 @@ fn observed_runtime_subagent_selection(
         ) else {
             continue;
         };
-        observed = Some(ObservedRuntimeSubagentSelection {
+        let candidate = ObservedRuntimeSubagentSelection {
             model,
             reasoning_effort: reasoning_effort.to_ascii_lowercase(),
-        });
+            native_sandbox: turn_id.and_then(|_| observed_native_sandbox(payload)),
+        };
+        if observed
+            .as_ref()
+            .is_some_and(|current| current != &candidate)
+        {
+            return Ok(None);
+        }
+        observed = Some(candidate);
     }
     Ok(observed)
+}
+
+fn observed_native_sandbox(payload: &Map<String, Value>) -> Option<NativeSandboxPermission> {
+    let policy_type = payload
+        .get("sandbox_policy")
+        .and_then(Value::as_object)
+        .and_then(|policy| policy.get("type"))
+        .and_then(Value::as_str)?;
+    (policy_type.trim().eq_ignore_ascii_case("read-only"))
+        .then_some(NativeSandboxPermission::ReadOnly)
 }
 
 fn json_nonempty_string(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -970,6 +1084,10 @@ fn pre_tool_use_output(
                     agent_id,
                     agent_type: nonempty(input.agent_type.as_deref()),
                     transcript_path: nonempty(input.transcript_path.as_deref()),
+                    turn_id: nonempty(input.turn_id.as_deref()),
+                    native_read_only: child_native_read_only_attested(
+                        state_root, runtime_id, input, agent_id,
+                    )?,
                     tool_name,
                     tool_input: input.tool_input.as_ref(),
                 },
@@ -1020,14 +1138,28 @@ fn pre_tool_use_output(
                 "CODEY_SUBAGENT_PROTOCOL_CIRCUIT_OPEN: {reason}。协议状态恢复前禁止追派；只可继续对账、中断或由根代理接管。"
             )));
         }
-        if let Some(reason) = crate::subagent_orchestrator::pre_followup_task(
+        match crate::subagent_orchestrator::pre_followup_task(
             state_root,
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
+            active,
             now_ms,
+            |role| runtime_role_admission_denial(state_root, role),
         )? {
-            return Ok(pre_tool_reason_denial(&reason));
+            crate::subagent_orchestrator::FollowupAdmission::Denied(reason) => {
+                return Ok(pre_tool_reason_denial(&reason));
+            }
+            crate::subagent_orchestrator::FollowupAdmission::Delivered => {}
+            crate::subagent_orchestrator::FollowupAdmission::ResumeRequested => {
+                // A resumed child makes this the delegating root turn, exactly
+                // like a first spawn.
+                if active == 0
+                    && let Some(turn_id) = nonempty(input.turn_id.as_deref())
+                {
+                    bind_root_turn(state_root, runtime_id, &input.session_id, turn_id, now_ms)?;
+                }
+            }
         }
         return Ok(json!({}));
     }
@@ -1061,7 +1193,8 @@ fn pre_tool_use_output(
             &input.session_id,
             input.tool_input.as_ref(),
             crate::subagent_orchestrator::RootHookContext::new(workspace_root, active, now_ms)
-                .with_before_reservation_save(&note_call),
+                .with_before_reservation_save(&note_call)
+                .with_turn_id(nonempty(input.turn_id.as_deref())),
         )? {
             return Ok(pre_tool_reason_denial(&reason));
         }
@@ -1082,18 +1215,48 @@ fn pre_tool_use_output(
     if active == 0 {
         return Ok(json!({}));
     }
-    // Reading lets the root prepare review while children run; writes,
-    // commands and Stop stay blocked until every attempt settles.
+    // Reading lets the root prepare review while children run. Writes and
+    // commands wait for every attempt that may edit files; Stop always waits
+    // for every attempt.
+    if !trusted_root_turn_matches(input, state_root, runtime_id, now_ms)? {
+        let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
+        return Ok(pre_tool_denial(active, protocol_issue.as_deref()));
+    }
     if input
         .tool_name
         .as_deref()
         .is_some_and(is_root_read_only_tool)
-        && trusted_root_turn_matches(input, state_root, runtime_id, now_ms)?
+        || read_only_batch_active(state_root, runtime_id, &input.session_id, now_ms)?
     {
         return Ok(json!({}));
     }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     Ok(pre_tool_denial(active, protocol_issue.as_deref()))
+}
+
+/// Every active attempt is bound and lacks file writes, and the hook protocol
+/// is healthy, so the trusted root may keep writing and running commands.
+fn read_only_batch_active(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<bool> {
+    if protocol_issue_reason(state_root, runtime_id, session_id)?.is_some() {
+        return Ok(false);
+    }
+    let markers = active_marker_hashes_for_runtime(state_root, runtime_id, session_id)?;
+    crate::subagent_orchestrator::active_attempts_are_read_only(
+        state_root, runtime_id, session_id, &markers, now_ms,
+    )
+}
+
+fn active_root_scope(read_only_batch: bool) -> &'static str {
+    if read_only_batch {
+        "活动子代理都不会改文件，主代理可以继续独立的写入和命令；改动它们正在检索的文件后用 agents.send_message 告知对应子代理。所有子代理结算前不得形成最终结论或结束当前任务。"
+    } else {
+        "所有子代理终态或被根成功中断前只能使用 agents.* 协作工具和 read_file、inspect_local_file、grep、glob、view_image 五项只读工具，不得形成最终结论或结束当前任务。"
+    }
 }
 
 fn is_root_read_only_tool(tool_name: &str) -> bool {
@@ -1187,6 +1350,18 @@ fn post_tool_use_output(
             &input.session_id,
             input.tool_input.as_ref(),
             input.tool_response.as_ref(),
+            now_ms,
+        )?;
+        return Ok(json!({}));
+    }
+    if is_followup_task_tool(tool_name) {
+        crate::subagent_orchestrator::post_followup_task(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            input.tool_response.as_ref(),
+            nonempty(input.turn_id.as_deref()),
             now_ms,
         )?;
         return Ok(json!({}));
@@ -1315,7 +1490,7 @@ fn post_tool_use_output(
             runtime_id,
             &input.session_id,
             status_response,
-            true,
+            StatusResponseSource::Snapshot(true),
             now_ms,
         )?;
         remove_session_state(state_root, runtime_id, &input.session_id)?;
@@ -1323,25 +1498,39 @@ fn post_tool_use_output(
     }
 
     if active == 0 {
-        settle_status_response_and_markers(
+        let needs_snapshot = settle_status_response_and_markers(
             state_root,
             runtime_id,
             &input.session_id,
             status_response,
-            true,
+            if is_wait_agent_tool(tool_name) {
+                StatusResponseSource::Notification
+            } else {
+                StatusResponseSource::Snapshot(true)
+            },
             now_ms,
         )?;
+        if needs_snapshot {
+            return Ok(json!({"decision":"block", "reason":FOLLOWUP_STATUS_NEEDS_SNAPSHOT}));
+        }
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return Ok(json!({}));
     }
-    settle_status_response_and_markers(
+    let needs_snapshot = settle_status_response_and_markers(
         state_root,
         runtime_id,
         &input.session_id,
         status_response,
-        false,
+        if is_wait_agent_tool(tool_name) {
+            StatusResponseSource::Notification
+        } else {
+            StatusResponseSource::Snapshot(false)
+        },
         now_ms,
     )?;
+    if needs_snapshot {
+        return Ok(json!({"decision":"block", "reason":FOLLOWUP_STATUS_NEEDS_SNAPSHOT}));
+    }
     let remaining = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if remaining == 0 {
         remove_session_state(state_root, runtime_id, &input.session_id)?;
@@ -1352,6 +1541,8 @@ fn post_tool_use_output(
         return Ok(json!({}));
     }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
+    let read_only_batch =
+        read_only_batch_active(state_root, runtime_id, &input.session_id, now_ms)?;
     if is_single_agent_status_tool(tool_name) {
         let returned_update =
             render_untrusted_tool_result(input.tool_response.as_ref(), "agent_status");
@@ -1371,6 +1562,7 @@ fn post_tool_use_output(
                 active,
                 task_names.as_deref(),
                 protocol_issue.as_deref(),
+                read_only_batch,
             ));
         }
         Ok(post_wait_continuation(
@@ -1378,6 +1570,7 @@ fn post_tool_use_output(
             task_names.as_deref(),
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
+            read_only_batch,
         ))
     } else {
         let task_names = crate::subagent_orchestrator::active_task_names(
@@ -1391,6 +1584,7 @@ fn post_tool_use_output(
             task_names.as_deref(),
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
+            read_only_batch,
         ))
     }
 }
@@ -1400,21 +1594,21 @@ fn settle_status_response_and_markers(
     runtime_id: &str,
     session_id: &str,
     tool_response: Option<&Value>,
-    all_terminal: bool,
+    source: StatusResponseSource,
     now_ms: u64,
-) -> Result<()> {
-    let agent_id_hashes = crate::subagent_orchestrator::observe_status_response(
+) -> Result<bool> {
+    let observation = crate::subagent_orchestrator::observe_status_response(
         state_root,
         runtime_id,
         session_id,
         tool_response,
-        all_terminal,
+        source,
         now_ms,
     )?;
-    for agent_id_hash in &agent_id_hashes {
+    for agent_id_hash in &observation.settled_agent_hashes {
         remove_active_marker_by_hash(state_root, runtime_id, session_id, agent_id_hash)?;
     }
-    Ok(())
+    Ok(observation.needs_snapshot)
 }
 
 fn stop_output(
@@ -1735,7 +1929,9 @@ fn post_wait_continuation(
     task_names: Option<&[String]>,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
+    read_only_batch: bool,
 ) -> Value {
+    let scope = active_root_scope(read_only_batch);
     let returned_update = render_untrusted_tool_result(tool_response, "wait_agent");
     let names = active_task_label(active, task_names);
     let task_body_recovery = tool_response
@@ -1752,7 +1948,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动{names}。保留下方内容；可继续使用 agents.wait_agent，名单中消失的任务已结束，需要结果或补位时调用一次不带筛选的 agents.list_agents。有计划内未派发任务且有空余槽位时用新 task_name 补位；不得仅因运行时长或没有新消息中断、重派子代理。所有子代理终态或被根成功中断前只能使用 agents.* 协作工具和 read_file、inspect_local_file、grep、glob、view_image 五项只读工具，不得形成最终结论或结束当前任务。{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动{names}。保留下方内容；可继续使用 agents.wait_agent，名单中消失的任务已结束，需要结果或补位时调用一次不带筛选的 agents.list_agents。有计划内未派发任务且有空余槽位时用新 task_name 补位；不得仅因运行时长或没有新消息中断、重派子代理。{scope}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1777,7 +1973,9 @@ fn post_wait_timeout_continuation(
     active: usize,
     task_names: Option<&[String]>,
     protocol_issue: Option<&str>,
+    read_only_batch: bool,
 ) -> Value {
+    let scope = active_root_scope(read_only_batch);
     let names = active_task_label(active, task_names);
     let compatibility = protocol_issue
         .map(|issue| format!(" Hook 协议兼容性诊断：{issue}。"))
@@ -1785,7 +1983,7 @@ fn post_wait_timeout_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：wait_agent 等待超时，仍有 {active} 个子代理在运行{names}。超时只表示这段时间没有新消息，不代表异常；直接再次调用 agents.wait_agent，不需要先调用 list_agents。名单中消失的任务已经结束，需要它的结果或补位时再调用一次不带筛选的 agents.list_agents。活动期间只能使用 agents.* 协作工具和 read_file、inspect_local_file、grep、glob、view_image 五项只读工具。{compatibility}"
+            "Codey 子代理汇合门禁：wait_agent 等待超时，仍有 {active} 个子代理在运行{names}。超时只表示这段时间没有新消息，不代表异常；直接再次调用 agents.wait_agent，不需要先调用 list_agents。名单中消失的任务已经结束，需要它的结果或补位时再调用一次不带筛选的 agents.list_agents。{scope}{compatibility}"
         ),
     })
 }
@@ -1795,7 +1993,9 @@ fn post_list_continuation(
     task_names: Option<&[String]>,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
+    read_only_batch: bool,
 ) -> Value {
+    let scope = active_root_scope(read_only_batch);
     let returned_update = render_untrusted_tool_result(tool_response, "list_agents");
     let names = active_task_label(active, task_names);
     let compatibility = protocol_issue
@@ -1804,7 +2004,7 @@ fn post_list_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态{names}。本地账本活动名单是权威状态；原始快照可能迟到，已由根成功中断的 target 不得因 pending_init 再次 wait、follow-up 或追派。只对本地活动名单中的 target 调用 agents.wait_agent；有计划内未派发任务且有空余槽位时用新 task_name 补位。所有活动结算前只可使用协作工具和 read_file、inspect_local_file、grep、glob、view_image 五项只读工具。{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态{names}。本地账本活动名单是权威状态；原始快照可能迟到，已由根成功中断的 target 不得因 pending_init 再次 wait、follow-up 或追派。只对本地活动名单中的 target 调用 agents.wait_agent；有计划内未派发任务且有空余槽位时用新 task_name 补位。{scope}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }

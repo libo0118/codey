@@ -1,8 +1,6 @@
 import { memo, type CSSProperties } from "react";
 import {
   IconAdjustments,
-  IconDeviceDesktopCode,
-  IconFocus2,
   IconHelpCircle,
   IconInfoCircle,
   IconPhotoSearch,
@@ -63,7 +61,7 @@ const DEFAULT_SUBAGENT_TASK = {
   icon: IconUsersGroup,
   description: "未指定专用角色时使用的模型与思考深度。",
 } as const;
-const ROLE_ICONS = [IconFocus2, IconWorldSearch, IconPhotoSearch, IconTerminal2, IconDeviceDesktopCode];
+const ROLE_ICONS = [IconWorldSearch, IconPhotoSearch, IconTerminal2];
 const SUBAGENT_TASK_TYPES = BUILTIN_SUBAGENT_ROLES.map((task, index) => ({ ...task, icon: ROLE_ICONS[index] }));
 
 export type SubagentPolicyCardProps = {
@@ -296,7 +294,7 @@ export function SubagentPolicyCardComponent({
           id="subagent-title"
           title="子代理优化"
           icon={<IconUsersGroup size={15} />}
-          description="保留默认与五类内置角色，按任务添加自己的子代理。"
+          description="保留默认与三类内置角色，按任务添加自己的子代理。"
           actions={
             <Switch
               checked={config.subagentOptimization}
@@ -334,7 +332,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责定位、跨文件检索及界面核验，可按任务授权调用工具
+                    检索角色只读，复核角色可按任务运行测试、构建和渲染检查
                   </span>
                 </div>
                 <div className="subagent-table-head" aria-hidden="true">
@@ -361,7 +359,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责前端界面与逻辑实现，受父任务权限约束
+                    负责前后端各类实现，受父任务权限约束
                   </span>
                 </div>
                 <div className="subagent-table-head" aria-hidden="true">
@@ -408,7 +406,7 @@ export function SubagentPolicyCardComponent({
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : "角色启停、读写能力、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；停用或删除不会中止已运行任务。"}
+                    : "检索角色使用只读沙箱，开发与复核角色可写入工作区；复核仅在任务允许时运行构建、测试或渲染检查。角色启停、读写能力、模型和思考深度保存后对下次派生生效，正在运行的子代理沿用原配置；停用或删除不会中止已运行任务。实际操作仍受 Codex 原生权限约束。"}
                   {" "}自定义角色由 Codey 管理，仅供通过 Codey 启动的 Codex 加载；新增角色需保存并重启 Codex。配置随 Codey 备份保存，实际操作不越过父任务权限。
                 </div>
               </div>
@@ -420,7 +418,7 @@ export function SubagentPolicyCardComponent({
               </div>
               <div className="module-disabled-text">
                 <strong>子代理优化已关闭</strong>
-                <p>开启后选择性委派给五类内置角色或自定义角色，并配置并发数量、模型与思考深度。</p>
+                <p>开启后选择性委派给三类内置角色或自定义角色，并配置并发数量、模型与思考深度。</p>
               </div>
             </div>
           )}
@@ -440,6 +438,7 @@ type FeaturePolicyCardProps = {
   onAnalyzeDiagnosticStorage: (target: DiagnosticStorageTarget) => void;
   popupContainer: HTMLElement | null;
   isBusy: boolean;
+  configEditingDisabled: boolean;
   onConfigChange: (config: Config) => void;
   onAddChannel?: (channel: NotificationChannel) => Promise<boolean>;
   onChannelChange?: (
@@ -457,6 +456,7 @@ function FeaturePolicyCardComponent({
   onAnalyzeDiagnosticStorage,
   popupContainer,
   isBusy,
+  configEditingDisabled,
   onConfigChange,
   onAddChannel,
   onChannelChange,
@@ -497,7 +497,7 @@ function FeaturePolicyCardComponent({
                 <div className="feature-card-body gpu-mode-card-body">
                   <fieldset
                     className="gpu-mode-fieldset"
-                    disabled={isBusy}
+                    disabled={configEditingDisabled}
                     aria-describedby="gpu-launch-mode-description"
                   >
                     <legend className="sr-only">Codex GPU 启动模式</legend>
@@ -543,7 +543,7 @@ function FeaturePolicyCardComponent({
                 <strong>精简 Codex 宠物模块</strong>
                 <Switch
                   checked={config.slimCodexPet}
-                  disabled={isBusy}
+                  disabled={configEditingDisabled}
                   onCheckedChange={(checked) =>
                     onConfigChange({ ...config, slimCodexPet: checked })
                   }
@@ -566,7 +566,7 @@ function FeaturePolicyCardComponent({
                 <strong>防御性编程控制</strong>
                 <Switch
                   checked={config.scopeGuard}
-                  disabled={isBusy}
+                  disabled={configEditingDisabled}
                   onCheckedChange={(checked) =>
                     onConfigChange({ ...config, scopeGuard: checked })
                   }
@@ -600,7 +600,7 @@ function FeaturePolicyCardComponent({
                   </Button>
                   <Switch
                     checked={config.disableTraceLogWrites}
-                    disabled={isBusy}
+                    disabled={configEditingDisabled}
                     onCheckedChange={(checked) =>
                       onConfigChange({
                         ...config,
@@ -635,7 +635,7 @@ function FeaturePolicyCardComponent({
                     </Button>
                     <Switch
                       checked={config.protectCrashpadPending}
-                      disabled={isBusy}
+                      disabled={configEditingDisabled}
                       onCheckedChange={(checked) =>
                         onConfigChange({
                           ...config,
@@ -662,7 +662,7 @@ function FeaturePolicyCardComponent({
                 <strong>屏蔽完全访问安全提示</strong>
                 <Switch
                   checked={config.hideFullAccessWarning}
-                  disabled={isBusy}
+                  disabled={configEditingDisabled}
                   onCheckedChange={(checked) =>
                     onConfigChange({ ...config, hideFullAccessWarning: checked })
                   }

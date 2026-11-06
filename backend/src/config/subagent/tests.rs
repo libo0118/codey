@@ -173,3 +173,37 @@ fn invalid_custom_role_cannot_overwrite_a_valid_store() {
     assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
     assert_eq!(store.load().unwrap(), config);
 }
+
+#[test]
+fn old_builtin_roles_migrate_without_dropping_custom_roles_on_store_load() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let old = serde_json::json!({"subagentRoles": {
+        "codey_quick_scan": {"enabled": true, "model": "old-model", "reasoningEffort": "high"},
+        "custom_agent_1": custom()
+    }});
+    std::fs::write(&path, old.to_string()).unwrap();
+    let loaded = ConfigStore::new(path).load().unwrap();
+    assert_eq!(loaded.subagent_roles["codey_explorer"].model, "old-model");
+    assert!(!loaded.subagent_roles.contains_key("codey_quick_scan"));
+    assert_eq!(
+        loaded.subagent_roles["custom_agent_1"].access,
+        Some(SubagentAccess::ReadOnly)
+    );
+}
+
+#[test]
+fn legacy_partial_role_updates_reach_their_successor() {
+    let previous = crate::config::default_subagent_roles();
+    let incoming = BTreeMap::from([(
+        "codey_quick_scan".into(),
+        SubagentRoleConfig::new("updated-model", "high"),
+    )]);
+    let merged = merge_subagent_role_updates(&previous, &incoming, &[]).unwrap();
+    assert_eq!(merged["codey_explorer"].model, "updated-model");
+    assert!(!merged.contains_key("codey_quick_scan"));
+    assert!(
+        merge_subagent_role_updates(&previous, &BTreeMap::new(), &["codey_quick_scan".into()])
+            .is_err()
+    );
+}

@@ -947,20 +947,32 @@ pub const AUTH_MODE_OFFICIAL_ACCOUNT: &str = "officialAccount";
 pub const AUTH_MODE_API_KEY: &str = "apiKey";
 pub const SUBAGENT_REASONING_EFFORTS: [&str; 6] =
     ["low", "medium", "high", "xhigh", "max", "ultra"];
-pub const SUBAGENT_ROLE_QUICK_SCAN: &str = "codey_quick_scan";
-pub const SUBAGENT_ROLE_DEEP_RESEARCH: &str = "codey_deep_research";
-pub const SUBAGENT_ROLE_VISUAL_ANALYSIS: &str = "codey_visual_analysis";
+pub const SUBAGENT_ROLE_EXPLORER: &str = "codey_explorer";
 pub const SUBAGENT_ROLE_WORKER: &str = "codey_worker";
-pub const SUBAGENT_ROLE_VISUAL_WORKER: &str = "codey_visual_worker";
+pub const SUBAGENT_ROLE_REVIEWER: &str = "codey_reviewer";
 pub const SUBAGENT_ROLE_DEFAULT: &str = "default";
-pub const SUBAGENT_ROLE_IDS: [&str; 6] = [
-    SUBAGENT_ROLE_QUICK_SCAN,
-    SUBAGENT_ROLE_DEEP_RESEARCH,
-    SUBAGENT_ROLE_VISUAL_ANALYSIS,
+pub const SUBAGENT_ROLE_IDS: [&str; 4] = [
+    SUBAGENT_ROLE_EXPLORER,
     SUBAGENT_ROLE_WORKER,
-    SUBAGENT_ROLE_VISUAL_WORKER,
+    SUBAGENT_ROLE_REVIEWER,
     SUBAGENT_ROLE_DEFAULT,
 ];
+/// Roles registered by earlier releases, paired with the role that replaced
+/// them. Saved selections migrate in this order (first enabled match wins), and
+/// Codey-owned files or config tables under these names are still cleaned up.
+pub const LEGACY_SUBAGENT_ROLES: [(&str, &str); 4] = [
+    ("codey_deep_research", SUBAGENT_ROLE_EXPLORER),
+    ("codey_quick_scan", SUBAGENT_ROLE_EXPLORER),
+    ("codey_visual_worker", SUBAGENT_ROLE_WORKER),
+    ("codey_visual_analysis", SUBAGENT_ROLE_REVIEWER),
+];
+
+/// Every role ID Codey has registered, current and retired, for cleanup paths.
+pub fn owned_subagent_role_ids() -> impl Iterator<Item = &'static str> {
+    SUBAGENT_ROLE_IDS
+        .into_iter()
+        .chain(LEGACY_SUBAGENT_ROLES.into_iter().map(|(legacy, _)| legacy))
+}
 
 pub(super) fn default_upstream_protocol() -> String {
     UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string()
@@ -996,13 +1008,6 @@ pub fn default_update_manifest_url() -> String {
     update_manifest_url_from_base(option_env!("CODEY_UPDATE_BASE_URL"))
 }
 
-pub fn default_release_admin_url() -> String {
-    release_admin_url_from_build(
-        option_env!("CODEY_RELEASE_ADMIN_URL"),
-        option_env!("CODEY_UPDATE_BASE_URL"),
-    )
-}
-
 pub(super) fn release_admin_url_from_build(
     admin_url: Option<&str>,
     update_base_url: Option<&str>,
@@ -1019,4 +1024,41 @@ pub(super) fn release_admin_url_from_build(
         .unwrap_or(fallback)
         .trim_end_matches('/')
         .to_string()
+}
+
+/// 只有发布流水线注入构建标识的正式分发构建才带发布构建身份。
+pub fn release_build_id() -> Option<&'static str> {
+    if cfg!(any(test, debug_assertions)) {
+        return None;
+    }
+    option_env!("CODEY_RELEASE_BUILD_ID")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+pub fn release_admin_url_for(
+    release_build: bool,
+    build_id: Option<&str>,
+    url: Option<&str>,
+) -> String {
+    let build_id = build_id.map(str::trim).filter(|id| !id.is_empty());
+    let url = url.map(str::trim).filter(|url| !url.is_empty());
+    if release_build && build_id.is_some() {
+        url.unwrap_or_default().trim_end_matches('/').to_string()
+    } else {
+        String::new()
+    }
+}
+
+// 非正式构建不得向生产发布管理服务登记设备，回退到公开 R2 清单检查。
+pub fn default_release_admin_url() -> String {
+    let url = release_admin_url_from_build(
+        option_env!("CODEY_RELEASE_ADMIN_URL"),
+        option_env!("CODEY_UPDATE_BASE_URL"),
+    );
+    release_admin_url_for(
+        !cfg!(any(test, debug_assertions)),
+        release_build_id(),
+        Some(&url),
+    )
 }

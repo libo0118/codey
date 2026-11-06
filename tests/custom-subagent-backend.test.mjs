@@ -16,7 +16,8 @@ test("custom role save validates the raw matrix and uses an explicit non-persist
   assert.doesNotMatch(types, /deleted_subagent_roles/);
   const save = commands.slice(commands.indexOf("async fn save_codey_config_locked("));
   assert.ok(save.indexOf("merge_subagent_role_updates(") < save.indexOf("config.remember_model_aliases()"));
-  assert.match(validation, /merged\.extend\(incoming\.clone\(\)\)/);
+  assert.match(validation, /let mut incoming = incoming\.clone\(\);\s*super::normalize::migrate_legacy_subagent_roles\(&mut incoming\)/);
+  assert.match(validation, /merged\.extend\(incoming\)/);
   assert.match(validation, /for role in deleted\s*\{\s*merged\.remove\(role\)/);
   assert.match(validation, /MAX_CUSTOM_SUBAGENT_ROLES: usize = 32/);
   for (const limit of [80, 1000, 4000]) assert.match(validation, new RegExp(`, ${limit}\\)`));

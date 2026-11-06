@@ -14,7 +14,7 @@ Status: implemented
 
 ## 活动笔记审计
 
-本篇部分取代[选定 custom 范围](../simplification/2026-11-04-selected-custom-preview.md)中不恢复失败派发的决定；不恢复其他终态身份保留、turn 结算或会话选择补丁。[可配并发](../feature/2026-11-04-subagent-concurrency.md)、[自定义角色](../feature/2026-11-04-custom-subagents.md)和[上游适配](2026-11-04-upstream-151-compatibility.md)的角色、权限及上游优先边界继续生效；远程、工具、会话选择相关记录与本次互补，无过时提案需要删除或归档。
+本篇部分取代[选定 custom 范围](../simplification/2026-11-04-selected-custom-preview.md)中不恢复失败派发的决定；不恢复其他终态身份保留、turn 结算或会话选择补丁。[可配并发](../feature/2026-11-04-subagent-concurrency.md)、[自定义角色](../feature/2026-11-04-custom-subagents.md)和[上游适配](2026-11-04-upstream-151-compatibility.md)的角色、权限及上游优先边界继续生效；[上游 v1.5.2 整合](2026-11-06-upstream-152-integration.md)兼容本恢复规则，远程、工具、会话选择相关记录与本次互补，无过时提案需要删除或归档。
 
 ## Alternatives considered
 

@@ -2,7 +2,7 @@
 
 Status: implemented
 
-预览分支的 custom 保留范围以[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)为准；原速度与生命周期定制不再保留，本篇的工具安装、索引范围与配置保护仍适用。
+预览分支的 custom 保留范围以[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)为准；原速度与大部分生命周期定制不再保留；例外见[失败派发恢复](../bug-fix/2026-11-06-failed-spawn-recovery.md)，后续上游演进见[上游 v1.5.2 整合](../bug-fix/2026-11-06-upstream-152-integration.md)；本篇的工具安装、索引范围与配置保护仍适用。
 
 ## Problem
 

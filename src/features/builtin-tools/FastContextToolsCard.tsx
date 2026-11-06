@@ -7,10 +7,11 @@ type Props = {
   fastContextToolsStatus: FastContextToolsStatus;
   runtimeStatus: Pick<RuntimeStatus, "running" | "fastContextToolsActive">;
   isBusy: boolean;
+  configEditingDisabled?: boolean;
   onConfigChange: (config: Config) => void;
 };
 
-export function FastContextToolsCard({ active, config, fastContextToolsStatus, runtimeStatus, isBusy, onConfigChange }: Props) {
+export function FastContextToolsCard({ active, config, fastContextToolsStatus, runtimeStatus, isBusy, configEditingDisabled = isBusy, onConfigChange }: Props) {
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
     fastContextToolsStatus.detectionFailed;
@@ -28,9 +29,9 @@ export function FastContextToolsCard({ active, config, fastContextToolsStatus, r
   const fastContextToolsSwitch = (
     <Switch
       checked={fastContextToolsEnabled}
-      disabled={isBusy || fastctxStatusBlocksEmbedded}
+      disabled={configEditingDisabled || fastctxStatusBlocksEmbedded}
       onCheckedChange={(checked) =>
-        active && !isBusy && !fastctxStatusBlocksEmbedded && onConfigChange({ ...config, fastContextTools: checked })
+        active && !configEditingDisabled && !fastctxStatusBlocksEmbedded && onConfigChange({ ...config, fastContextTools: checked })
       }
       aria-label="启用 FastCtx 上下文工具"
     />

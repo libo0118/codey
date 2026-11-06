@@ -113,6 +113,25 @@ fn old_backups_remain_compatible_and_custom_roles_restore_as_a_complete_matrix()
 }
 
 #[test]
+fn retired_builtin_backup_roles_migrate_without_discarding_custom_roles() {
+    let mut backup: Value = serde_json::from_str(&export(configured()).unwrap()).unwrap();
+    backup["config"]["subagentRoles"] = json!({
+        "codey_quick_scan": {"enabled": true, "model": "old-model", "reasoningEffort": "high"},
+        "custom_agent_1": {"name":"检查", "description":"用途", "developerInstructions":"返回证据", "access":"readOnly", "model":"custom-model", "reasoningEffort":"low"}
+    });
+    let restored = parse(&backup.to_string())
+        .unwrap()
+        .prepare(&CodeyConfig::default())
+        .unwrap();
+    assert_eq!(restored.subagent_roles["codey_explorer"].model, "old-model");
+    assert!(!restored.subagent_roles.contains_key("codey_quick_scan"));
+    assert_eq!(
+        restored.subagent_roles["custom_agent_1"].access,
+        Some(crate::config::SubagentAccess::ReadOnly)
+    );
+}
+
+#[test]
 fn invalid_and_incompatible_backups_fail_without_echoing_input() {
     for content in ["", "test-backup-secret", "{}", "[]"] {
         assert!(parse(content).is_err());

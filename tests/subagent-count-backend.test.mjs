@@ -36,16 +36,19 @@ test("subagent count source contract reaches both launch paths, native overrides
   assert.match(policy, /pub\(crate\) max_threads: u32/);
   assert.match(policy, /validate_subagent_max_threads\(policy\.max_threads\)/);
   assert.match(orchestrator, /\|policy\| policy\.max_threads as usize/);
-  assert.match(orchestrator, /concurrency_denial\(&ledger, active_agents, limit\)/);
+  assert.match(orchestrator, /concurrency_denial\(&ledger, active_agents, now_ms, limit\)/);
   assert.doesNotMatch(orchestrator, /const CONCURRENCY_LIMIT:/);
   assert.match(wrapper, /let configs = app_server_runtime_configs\(runtime_overrides\)/);
   assert.match(wrapper, /for config in runtime_overrides/);
 });
 
-test("runtime count prompts replace both fixed-two templates without exceeding the Codex hint budget", async () => {
+test("runtime count prompt replaces the mode limit without hardcoding it in collaboration guidance", async () => {
   const [runtime, guidance] = await Promise.all([source("codex_config.rs"), source("codex_config_guidance.rs")]);
+  const collaboration = guidance.match(/pub\(crate\) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = r(#+)"([\s\S]*?)"\1;/)?.[2];
+  assert.ok(collaboration);
+  assert.doesNotMatch(collaboration, /concurrency limit of two|At most two sub-agents/);
+  assert.match(runtime, /let collaboration_hint = root_agent_collaboration_usage_hint\(\)/);
   for (const [name, phrase, replacement] of [
-    ["ROOT_AGENT_COLLABORATION_USAGE_HINT", "concurrency limit of two", (n) => `concurrency limit of ${n} sub-agents (excluding the root)`],
     ["ROOT_AGENT_MULTI_AGENT_MODE_HINT", "At most two sub-agents run at once", (n) => `At most ${n} sub-agents run at once (excluding the root)`],
   ]) {
     const literal = guidance.match(new RegExp(`pub\\(crate\\) const ${name}: &str = ("(?:[^"\\\\]|\\\\[\\s\\S])*");`))?.[1];

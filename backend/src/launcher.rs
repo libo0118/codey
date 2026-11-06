@@ -314,6 +314,9 @@ pub struct CodeyRuntime {
     crashpad_guard_enabled: Arc<AtomicBool>,
     crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 运行中 Codex 会话启动时持有的官方账号；会话内的官方额度快照一直按
+    /// 这个账号刷新，即使默认账号随后被切换。
+    session_official_account_id: Mutex<Option<String>>,
     local_router: Option<LocalRouter>,
 }
 
@@ -1949,13 +1952,13 @@ fn native_subagent_runtime_config(config: &CodeyConfig) -> CodeyConfig {
 }
 
 fn reconciled_native_subagent_runtime_config(
-    config: &CodeyConfig,
+    saved_config: &CodeyConfig,
     home: &std::path::Path,
 ) -> CodeyConfig {
-    let mut runtime_config = native_subagent_runtime_config(config);
+    let mut runtime_config = native_subagent_runtime_config(saved_config);
     // Read selection state from the original selectors. The runtime copy has
     // already expanded them once, and its raw ids can also look like aliases.
-    if let Ok(model_state) = crate::commands::native_subagent_model_state(config, home) {
+    if let Ok(model_state) = crate::commands::native_subagent_model_state(saved_config, home) {
         subagent_policy::reconcile_with_model_state(&mut runtime_config, Some(&model_state));
     }
     runtime_config
@@ -2001,7 +2004,7 @@ async fn prepare_native_runtime_state(
         anyhow::Error::new(error).context("应用原生 Provider 运行配置任务异常退出")
     })??;
     applied.enable_native_stats(home.to_path_buf()).await;
-    let mut runtime_config = config.clone();
+    let mut runtime_config = reconciled_native_subagent_runtime_config(config, home);
     runtime_config.fast_context_tools = applied.fast_context_tools_active;
     Ok(PreparedProviderState {
         runtime_config,
@@ -2225,6 +2228,12 @@ impl CodeyRuntime {
 
     pub async fn applied_model_catalog_config(&self) -> CodeyConfig {
         self.applied_model_config.read().await.catalog.clone()
+    }
+
+    /// 会话启动时持有的官方账号；会话内的官方额度快照按它刷新，与随后
+    /// 切换的默认账号无关。
+    pub(crate) async fn session_official_account_id(&self) -> Option<String> {
+        self.session_official_account_id.lock().await.clone()
     }
 
     pub async fn mark_model_config_applied(&self, config: &CodeyConfig) {
@@ -2532,6 +2541,13 @@ impl CodeyRuntime {
         stage_timings.mark("spawnAndInjectMs");
         stage_timings.report();
         let process_id = spawned.process_id;
+        // 会话内的官方额度数据按启动时的登录身份刷新；记下这个身份，之后
+        // 切换默认账号时页面可以区分哪些官方线路已经换了凭据。
+        let session_official_account_id =
+            crate::official_accounts::OfficialAccountStore::read_codex_login(home)
+                .ok()
+                .flatten()
+                .map(|record| record.id);
         let RuntimeWatchers {
             injection_statuses,
             injection_websocket_url,
@@ -2580,6 +2596,7 @@ impl CodeyRuntime {
                 crashpad_guard_enabled,
                 crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
                 crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
+                session_official_account_id: Mutex::new(session_official_account_id),
                 local_router,
             },
             codex_exit,

@@ -2,7 +2,7 @@
 
 Status: implemented
 
-本篇保留 custom 的合并决定及原始理由；预览分支对速度与会话选择补丁的保留范围由[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)部分取代，其余思考档位、遥测与 Linux 边界仍适用。
+本篇保留 custom 的合并决定及原始理由；预览分支对速度与会话选择补丁的保留范围由[选定能力方案](../simplification/2026-11-04-selected-custom-preview.md)部分取代，其余思考档位、遥测与 Linux 边界仍适用；后续统计来源的整合见[上游 v1.5.2 整合](2026-11-06-upstream-152-integration.md)。
 
 ## Problem
 

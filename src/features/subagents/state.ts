@@ -2,11 +2,9 @@ import type { BuiltinSubagentRoleId, Config, SubagentRoleConfig } from "../../Ap
 import type { SubagentModelOption } from "../../subagentModels";
 
 export const BUILTIN_SUBAGENT_ROLES = [
-  { id: "codey_quick_scan", name: "快速定位", kind: "analysis", description: "用于精确位置、重复性检查、低风险事实查找和小范围快速检索。" },
-  { id: "codey_deep_research", name: "深度检索", kind: "analysis", description: "用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。" },
-  { id: "codey_visual_analysis", name: "界面核验", kind: "analysis", description: "用于截图、页面、GUI、PDF 的视觉证据观察，以及前端改动的独立核验。" },
-  { id: "codey_worker", name: "逻辑开发", kind: "implementation", description: "用于后端、数据、算法、命令行和脚本等不改变可见界面的逻辑实现。" },
-  { id: "codey_visual_worker", name: "前端开发", kind: "implementation", description: "用于界面、布局、样式与交互实现，客户端可截图时附渲染证据。" },
+  { id: "codey_explorer", name: "检索", kind: "analysis", description: "只读检索代码、日志和文档，从快速定位到跨目录归纳，深浅由任务决定。" },
+  { id: "codey_reviewer", name: "复核", kind: "analysis", description: "独立核验已完成的改动，包括差异、针对性测试和界面渲染效果；可按任务运行构建、测试和渲染检查。" },
+  { id: "codey_worker", name: "开发", kind: "implementation", description: "负责前端、后端、数据和脚本等各类实现，改动界面时附渲染核验。" },
 ] as const satisfies ReadonlyArray<{ id: BuiltinSubagentRoleId; name: string; kind: "analysis" | "implementation"; description: string }>;
 
 export const CUSTOM_SUBAGENT_FIELDS = [

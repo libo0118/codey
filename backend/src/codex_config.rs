@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, ROOT_AGENT_COLLABORATION_USAGE_HINT,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
-    ROOT_AGENT_MULTI_AGENT_MODE_HINT_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
-    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    CODEY_FASTCTX_GUIDANCE, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+    ROOT_AGENT_MULTI_AGENT_MODE_HINT, ROOT_AGENT_MULTI_AGENT_MODE_HINT_VERSIONS,
+    SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
+    remove_codey_fastctx_guidance, remove_subagent_guidance, root_agent_collaboration_usage_hint,
+    subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -563,10 +563,7 @@ fn apply_isolated_runtime_router_config(
         // rewritten from the current definitions; nothing there needs an
         // upgrade path. Only text injected into Codex's `config.toml` keeps
         // migration lists, because that file belongs to the user.
-        let collaboration_hint = ROOT_AGENT_COLLABORATION_USAGE_HINT.replace(
-            "concurrency limit of two",
-            &format!("concurrency limit of {subagent_max_threads} sub-agents (excluding the root)"),
-        );
+        let collaboration_hint = root_agent_collaboration_usage_hint();
         rebuild_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             &collaboration_hint,
@@ -861,9 +858,17 @@ fn runtime_registration_roles(
             .all(|role| crate::config::valid_subagent_role_id(role)),
         "Codey 子代理注册集合包含未知角色"
     );
-    if enabled_roles
-        .keys()
-        .any(|role| !registered_roles.contains(role))
+    // A Codex instance launched by an earlier release still holds retired role
+    // names; it needs a restart rather than a rewrite of files it registered.
+    let registered_retired_role = registered_roles.iter().any(|role| {
+        crate::config::LEGACY_SUBAGENT_ROLES
+            .iter()
+            .any(|(legacy, _)| *legacy == role)
+    });
+    if registered_retired_role
+        || enabled_roles
+            .keys()
+            .any(|role| !registered_roles.contains(role))
     {
         return Err(SubagentRoleRegistrationChanged.into());
     }
@@ -922,7 +927,47 @@ fn prepare_runtime_agent_files(
         atomic_write(&plan.registration.config_file, &plan.contents)?;
         registrations.push(plan.registration);
     }
+    remove_unplanned_runtime_agent_files(constraints_dir, &registrations)?;
     Ok(registrations)
+}
+
+fn remove_unplanned_runtime_agent_files(
+    constraints_dir: &Path,
+    registrations: &[RuntimeAgentRegistration],
+) -> Result<()> {
+    let active_roles = registrations
+        .iter()
+        .map(|registration| registration.role.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (role, _) in crate::config::LEGACY_SUBAGENT_ROLES {
+        if active_roles.contains(role) {
+            continue;
+        }
+        let mut paths = vec![runtime_agent_path(constraints_dir, role)];
+        paths.push(
+            constraints_dir
+                .join(CODEY_SUBAGENT_SOURCES_DIR)
+                .join(format!("{role}.toml")),
+        );
+        for path in paths {
+            ensure_managed_runtime_path(constraints_dir, &path)?;
+            remove_runtime_agent_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_runtime_agent_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "清理已停用的 Codey 子代理运行时文件失败：{}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn plan_runtime_agent_files(
@@ -2058,14 +2103,13 @@ fn persistent_codey_subagent_config_is_owned(doc: &DocumentMut) -> bool {
         .get("agents")
         .and_then(Item::as_table)
         .is_some_and(|agents| {
-            SUBAGENT_ROLE_IDS.iter().any(|role| {
+            crate::config::owned_subagent_role_ids().any(|role| {
                 agents
                     .get(role)
                     .and_then(Item::as_table)
                     .is_some_and(agent_role_table_is_codey_owned)
-            }) || SUBAGENT_ROLE_IDS
-                .iter()
-                .filter(|role| **role != SUBAGENT_ROLE_DEFAULT)
+            }) || crate::config::owned_subagent_role_ids()
+                .filter(|role| *role != SUBAGENT_ROLE_DEFAULT)
                 .any(|role| agents.contains_key(role))
         });
     let owned_multi_agent_hint = doc
@@ -2094,7 +2138,7 @@ fn remove_codey_owned_agents_config(doc: &mut DocumentMut, codey_owned: bool) {
     let Some(agents) = doc.get_mut("agents").and_then(Item::as_table_mut) else {
         return;
     };
-    for role in SUBAGENT_ROLE_IDS {
+    for role in crate::config::owned_subagent_role_ids() {
         let remove_role = agents
             .get(role)
             .and_then(Item::as_table)

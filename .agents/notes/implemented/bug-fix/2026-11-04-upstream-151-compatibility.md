@@ -15,7 +15,7 @@ CodeyX 适配与官方数字 chunk 支持有重叠；叠加宽泛拦截会绕过
 
 ## 活动笔记审计
 
-[选定 custom 范围](../simplification/2026-11-04-selected-custom-preview.md)继续决定保留能力，此处仅将重叠实现交回官方；[可配并发](../feature/2026-11-04-subagent-concurrency.md)、[远程文件](../feature/2026-11-04-remote-files-and-projection.md)与[公开消息](../feature/2026-11-04-remote-rich-timeline-and-links.md)互补，保存、权限及数据边界不变。无过时提案需要删除或归档。
+[选定 custom 范围](../simplification/2026-11-04-selected-custom-preview.md)继续决定保留能力，此处仅将重叠实现交回官方；[可配并发](../feature/2026-11-04-subagent-concurrency.md)、[远程文件](../feature/2026-11-04-remote-files-and-projection.md)与[公开消息](../feature/2026-11-04-remote-rich-timeline-and-links.md)互补，保存、权限及数据边界不变。[上游 v1.5.2 整合](2026-11-06-upstream-152-integration.md)延续上游优先与 fork 独有能力的边界。无过时提案需要删除或归档。
 
 ## Alternatives considered
 

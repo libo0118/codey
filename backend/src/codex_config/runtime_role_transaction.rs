@@ -140,12 +140,30 @@ fn snapshot_runtime_agent_files(
 ) -> Result<Vec<RuntimeAgentFileSnapshot>> {
     roles
         .keys()
+        .map(String::as_str)
+        .chain(
+            crate::config::LEGACY_SUBAGENT_ROLES
+                .into_iter()
+                .map(|(role, _)| role),
+        )
         .map(|role| {
             let path = runtime_agent_path(constraints_dir, role);
             ensure_managed_runtime_path(constraints_dir, &path)?;
             let contents = read_optional(&path)?;
             Ok(RuntimeAgentFileSnapshot { path, contents })
         })
+        .chain(
+            crate::config::LEGACY_SUBAGENT_ROLES
+                .into_iter()
+                .map(|(role, _)| {
+                    let path = constraints_dir
+                        .join(CODEY_SUBAGENT_SOURCES_DIR)
+                        .join(format!("{role}.toml"));
+                    ensure_managed_runtime_path(constraints_dir, &path)?;
+                    let contents = read_optional(&path)?;
+                    Ok(RuntimeAgentFileSnapshot { path, contents })
+                }),
+        )
         .collect()
 }
 

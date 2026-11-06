@@ -4,7 +4,7 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("subagent settings expose the five supported role controls", async () => {
+test("subagent settings expose the three supported role controls", async () => {
   const [featurePolicySource, modelHookSource, modelOptionsSource, comboboxSource, stateSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
@@ -19,11 +19,9 @@ test("subagent settings expose the five supported role controls", async () => {
     /onCheckedChange=\{\(checked\) =>\s*onSubagentOptimizationChange\(checked\)\s*\}/,
   );
   for (const [id, name] of [
-    ["codey_quick_scan", "快速定位"],
-    ["codey_deep_research", "深度检索"],
-    ["codey_visual_analysis", "界面核验"],
-    ["codey_worker", "逻辑开发"],
-    ["codey_visual_worker", "前端开发"],
+    ["codey_explorer", "检索"],
+    ["codey_reviewer", "复核"],
+    ["codey_worker", "开发"],
   ]) {
     assert.match(stateSource, new RegExp(`id: "${id}"`));
     assert.match(stateSource, new RegExp(`name: "${name}"`));
@@ -33,6 +31,12 @@ test("subagent settings expose the five supported role controls", async () => {
   assert.match(featurePolicySource, /onCheckedChange=\{\(enabled\) => updateRole\(\{ enabled \}\)\}/);
   assert.match(featurePolicySource, /受父任务权限与工具门禁约束/);
   assert.match(featurePolicySource, /不提供独立安全沙箱/);
+  assert.match(featurePolicySource, /检索角色使用只读沙箱/);
+  assert.match(featurePolicySource, /检索角色只读/);
+  assert.match(featurePolicySource, /复核角色可按任务运行测试、构建和渲染检查/);
+  assert.match(featurePolicySource, /复核仅在任务允许时运行构建、测试或渲染检查/);
+  assert.match(featurePolicySource, /实际操作仍受 Codex 原生权限约束/);
+  assert.doesNotMatch(featurePolicySource, /各角色工具权限一致/);
   assert.match(featurePolicySource, /roleDisabled/);
   assert.match(stateSource, /kind: "analysis"/);
   assert.match(stateSource, /kind: "implementation"/);

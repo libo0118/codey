@@ -60,6 +60,61 @@ fn live_route_edits_preserve_subagent_hot_reload_support() {
 }
 
 #[test]
+fn applied_role_catalog_matches_the_gate_for_models_and_reasoning() {
+    let initial = official_subagent_config(1);
+    let applied = RuntimeSubagentConfig::from_config(&initial);
+    let mut changed = initial.clone();
+    changed
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .model = "provider-custom-model".into();
+    changed
+        .subagent_roles
+        .get_mut("codey_explorer")
+        .unwrap()
+        .reasoning_effort = "low".into();
+    let desired = RuntimeSubagentConfig::from_config(&changed);
+
+    assert_eq!(applied.roles, initial.subagent_roles);
+    assert_eq!(desired.roles, changed.subagent_roles);
+    assert_eq!(applied.model, desired.model);
+    assert_ne!(applied.roles, desired.roles);
+    assert_eq!(desired.roles["codey_worker"].model, "provider-custom-model");
+    assert_eq!(desired.roles["codey_explorer"].reasoning_effort, "low");
+}
+
+#[tokio::test]
+async fn switching_live_route_preserves_role_hot_reload() {
+    for local_router_enabled in [false, true] {
+        let mut initial = official_subagent_config(2);
+        initial.local_router_enabled = local_router_enabled;
+        let runtime = CodeyRuntime::for_model_delivery_test(initial.clone(), "ws://unused", None);
+        let mut latest = initial.clone();
+        latest.active_profile_id = latest.profiles.last().unwrap().id.clone();
+        assert!(runtime.supports_subagent_config_hot_reload(&latest));
+        latest.fast_context_tools = !initial.fast_context_tools;
+        assert!(!runtime.supports_subagent_config_hot_reload(&latest));
+        latest.fast_context_tools = initial.fast_context_tools;
+        latest
+            .subagent_roles
+            .get_mut("codey_worker")
+            .unwrap()
+            .reasoning_effort = "low".into();
+        latest
+            .subagent_roles
+            .get_mut("codey_explorer")
+            .unwrap()
+            .model =
+            local_router::model_alias(latest.profiles.last().unwrap().provider_id(), "gpt-6-astra");
+        assert!(!runtime.applied_subagent_config().await.matches(&latest));
+        assert!(runtime.supports_subagent_config_hot_reload(&latest));
+        latest.fast_context_tools = !initial.fast_context_tools;
+        assert!(!runtime.supports_subagent_config_hot_reload(&latest));
+    }
+}
+
+#[test]
 fn official_subagent_models_match_catalog_and_preserve_account_selection() {
     for account_count in [1, 2] {
         let mut config = official_subagent_config(account_count);
@@ -135,18 +190,18 @@ fn subagent_catalog_fallback_uses_native_ids_without_mutating_saved_routes() {
     config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/gpt-5.6-terra".into();
     config
         .subagent_roles
-        .get_mut("codey_quick_scan")
+        .get_mut("codey_explorer")
         .unwrap()
         .reasoning_effort = "low".into();
     let saved = config.clone();
     let runtime = router_subagent_runtime_config(&config, false).unwrap();
     assert_eq!(runtime.subagent_model, "gpt-6-astra");
     assert_eq!(
-        runtime.subagent_roles["codey_quick_scan"].model,
+        runtime.subagent_roles["codey_explorer"].model,
         "gpt-6-astra"
     );
     assert_eq!(
-        runtime.subagent_roles["codey_quick_scan"].reasoning_effort,
+        runtime.subagent_roles["codey_explorer"].reasoning_effort,
         "low"
     );
     assert_eq!(
@@ -472,7 +527,7 @@ fn subagent_catalog_fallback_rejects_ambiguous_routes_but_custom_catalog_preserv
         "route-b/gpt-6-astra"
     );
     assert_eq!(
-        runtime.subagent_roles["codey_quick_scan"].model,
+        runtime.subagent_roles["codey_explorer"].model,
         "route-a/gpt-6-astra"
     );
 }
@@ -604,6 +659,7 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
         crashpad_guard_enabled: Arc::new(AtomicBool::new(false)),
         crashpad_guard_shutdown: Mutex::new(None),
         crashpad_guard_task: Mutex::new(None),
+        session_official_account_id: Mutex::new(None),
         local_router: Some(router),
     };
     let original = runtime.subagent_reconcile_config(&config).unwrap();

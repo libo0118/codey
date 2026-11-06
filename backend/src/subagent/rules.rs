@@ -178,7 +178,7 @@ impl RuleSet {
     }
 
     fn validate_security_baseline(&self) -> Result<()> {
-        const EXPECTED_ROLES: [&str; 6] = crate::config::SUBAGENT_ROLE_IDS;
+        const EXPECTED_ROLES: [&str; 4] = crate::config::SUBAGENT_ROLE_IDS;
         anyhow::ensure!(
             self.roles.len() == EXPECTED_ROLES.len(),
             "子代理动态规则不能新增或删除运行时角色"
@@ -208,9 +208,14 @@ impl RuleSet {
                 tool_name: "unknown_tool",
                 tool_class: ToolClass::Unknown,
             });
+            let expected = if role == crate::config::SUBAGENT_ROLE_EXPLORER {
+                RuleEffect::Deny
+            } else {
+                RuleEffect::Allow
+            };
             anyhow::ensure!(
-                unknown.effect == RuleEffect::Allow,
-                "子代理规则必须允许角色 {role} 调用未归类工具"
+                unknown.effect == expected,
+                "子代理规则不能改变角色 {role} 的未归类工具边界"
             );
             let visual = self.evaluate(&RuleContext {
                 actor: RuleActor::Child,
@@ -544,6 +549,20 @@ pub(crate) fn classify_tool(tool_name: &str) -> ToolClass {
     }
 }
 
+/// Some execution and UI wrappers can perform side effects outside the native
+/// filesystem sandbox. An Explorer cannot use them merely because its command
+/// rollout is read-only.
+pub(crate) fn explorer_has_unbounded_side_effects(tool_name: &str) -> bool {
+    let raw = tool_name.trim().to_ascii_lowercase();
+    let normalized = normalize_tool_name(tool_name);
+    matches!(
+        normalized.as_str(),
+        "exec" | "cua_repl_js" | "cua_repl_js_reset" | "open_in_codex" | "write_stdin"
+    ) || raw == "functions.exec"
+        || raw.starts_with("mcp__cua_repl__")
+        || raw.starts_with("mcp__codex_app__")
+}
+
 const COLLABORATION_TOOLS: &[&str] = &[
     "agent",
     "spawn_agent",
@@ -639,19 +658,19 @@ mod tests {
         rules.validate().unwrap();
         let decision = rules.evaluate(&RuleContext {
             actor: RuleActor::Child,
-            role: Some("codey_quick_scan"),
+            role: Some("codey_explorer"),
             tool_name: "mcp__mystery__mutate",
             tool_class: ToolClass::Unknown,
         });
-        assert_eq!(decision.effect, RuleEffect::Allow);
-        assert_eq!(decision.rule_id, "allow-role-capabilities");
+        assert_eq!(decision.effect, RuleEffect::Deny);
+        assert_eq!(decision.rule_id, "deny-unknown-tool-class");
 
         for role in crate::config::SUBAGENT_ROLE_IDS {
             let decision = rules.evaluate(&RuleContext {
                 actor: RuleActor::Child,
                 role: Some(role),
-                tool_name: "mcp_idea_apply_patch",
-                tool_class: classify_tool("mcp_idea_apply_patch"),
+                tool_name: "apply_patch",
+                tool_class: classify_tool("apply_patch"),
             });
             assert_eq!(decision.effect, RuleEffect::Allow, "{role}");
             assert_eq!(decision.rule_id, "allow-role-capabilities", "{role}");
@@ -678,6 +697,32 @@ mod tests {
                     .effect,
                 RuleEffect::Deny,
                 "{role}"
+            );
+        }
+        for name in [
+            "functions.exec",
+            "exec",
+            "mcp__cua_repl__js",
+            "mcp__cua_repl__js_reset",
+            "mcp__codex_app__open_in_codex",
+        ] {
+            let tool_class = if matches!(name, "functions.exec" | "exec") {
+                ToolClass::Command
+            } else {
+                ToolClass::Visual
+            };
+            assert!(explorer_has_unbounded_side_effects(name), "{name}");
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some("codey_explorer"),
+                        tool_name: name,
+                        tool_class,
+                    })
+                    .effect,
+                RuleEffect::Allow,
+                "{name}"
             );
         }
         assert_eq!(
@@ -716,7 +761,7 @@ mod tests {
                 .effect,
             RuleEffect::Allow
         );
-        for role in ["codey_quick_scan", "codey_worker"] {
+        for role in ["codey_explorer", "codey_worker"] {
             assert_eq!(
                 rules
                     .evaluate(&RuleContext {
@@ -730,7 +775,7 @@ mod tests {
                 "{role}"
             );
         }
-        for role in ["codey_quick_scan", "codey_worker"] {
+        for role in ["codey_explorer", "codey_worker"] {
             assert_eq!(
                 rules
                     .evaluate(&RuleContext {
@@ -782,12 +827,12 @@ mod tests {
                 embedded()
                     .evaluate(&RuleContext {
                         actor: RuleActor::Child,
-                        role: Some("codey_quick_scan"),
+                        role: Some("codey_explorer"),
                         tool_name: tool,
                         tool_class: classify_tool(tool),
                     })
                     .effect,
-                RuleEffect::Allow,
+                RuleEffect::Deny,
                 "{tool}"
             );
             assert_eq!(
@@ -860,10 +905,10 @@ mod tests {
 
     #[test]
     fn live_rules_cannot_weaken_the_embedded_security_baseline() {
-        let mutations: [fn(&mut RuleSet); 3] = [
+        let mutations: [fn(&mut RuleSet); 4] = [
             |rules: &mut RuleSet| rules.fallback = RuleEffect::Allow,
             |rules: &mut RuleSet| {
-                rules.roles.get_mut("codey_quick_scan").unwrap().access = "read_only".into();
+                rules.roles.get_mut("codey_explorer").unwrap().access = "read_only".into();
             },
             |rules: &mut RuleSet| {
                 rules.rules.push(RuleDefinition {
@@ -871,10 +916,22 @@ mod tests {
                     priority: 9_999,
                     effect: RuleEffect::Allow,
                     actors: vec![RuleActor::Child],
-                    roles: vec!["codey_quick_scan".into()],
+                    roles: vec!["codey_explorer".into()],
                     tools: vec!["spawn_agent".into()],
                     tool_classes: vec![ToolClass::Spawn],
                     explanation: "test-only permissive mutation".into(),
+                });
+            },
+            |rules: &mut RuleSet| {
+                rules.rules.push(RuleDefinition {
+                    id: "allow-unknown-regression".into(),
+                    priority: 10_000,
+                    effect: RuleEffect::Allow,
+                    actors: vec![RuleActor::Child],
+                    roles: vec!["codey_explorer".into()],
+                    tools: Vec::new(),
+                    tool_classes: vec![ToolClass::Unknown],
+                    explanation: "test-only unknown tool mutation".into(),
                 });
             },
         ];
@@ -892,7 +949,7 @@ mod tests {
             let loaded = load(temp.path());
             assert_eq!(loaded.source, RuleSource::Embedded);
             assert_eq!(loaded.rules.fallback, RuleEffect::Deny);
-            assert_eq!(loaded.rules.roles["codey_quick_scan"].access, "write");
+            assert_eq!(loaded.rules.roles["codey_explorer"].access, "write");
             assert!(loaded.warning.is_some());
         }
     }
@@ -952,7 +1009,7 @@ mod tests {
             "mcp__codex_app__open_in_codex",
         ] {
             assert_eq!(classify_tool(tool), ToolClass::Visual, "{tool}");
-            for role in ["codey_visual_analysis", "codey_visual_worker"] {
+            for role in ["codey_reviewer", "codey_worker"] {
                 assert_eq!(
                     embedded()
                         .evaluate(&RuleContext {
@@ -970,7 +1027,7 @@ mod tests {
                 embedded()
                     .evaluate(&RuleContext {
                         actor: RuleActor::Child,
-                        role: Some("codey_quick_scan"),
+                        role: Some("codey_explorer"),
                         tool_name: tool,
                         tool_class: classify_tool(tool),
                     })

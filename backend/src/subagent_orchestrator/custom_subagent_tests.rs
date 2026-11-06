@@ -65,6 +65,8 @@ fn custom_access_is_enforced_by_real_tool_gate_and_cannot_be_overridden_by_task_
                     agent_id: agent,
                     agent_type: Some(id),
                     transcript_path: None,
+                    turn_id: Some("child-turn"),
+                    native_read_only: false,
                     tool_name: tool,
                     tool_input: None,
                 },
@@ -83,6 +85,8 @@ fn custom_access_is_enforced_by_real_tool_gate_and_cannot_be_overridden_by_task_
                         agent_id: agent,
                         agent_type: Some(id),
                         transcript_path: None,
+                        turn_id: Some("child-turn"),
+                        native_read_only: false,
                         tool_name: tool,
                         tool_input: None
                     },
@@ -118,6 +122,8 @@ fn custom_access_is_enforced_by_real_tool_gate_and_cannot_be_overridden_by_task_
                 agent_id: "writer",
                 agent_type: Some("custom_agent_2"),
                 transcript_path: None,
+                turn_id: Some("child-turn"),
+                native_read_only: false,
                 tool_name: "apply_patch",
                 tool_input: None
             },

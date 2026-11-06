@@ -1,7 +1,7 @@
 // Adapted from fraternity-z/CodeyX (AGPL-3.0-only).
 use std::collections::BTreeMap;
 
-use super::{SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_IDS, SubagentRoleConfig};
+use super::{SUBAGENT_REASONING_EFFORTS, SubagentRoleConfig, owned_subagent_role_ids};
 
 pub(crate) const MAX_CUSTOM_SUBAGENT_ROLES: usize = 32;
 
@@ -63,7 +63,7 @@ pub(crate) fn validate_subagent_roles(
 ) -> Result<(), String> {
     if roles
         .keys()
-        .filter(|role| !SUBAGENT_ROLE_IDS.contains(&role.as_str()))
+        .filter(|role| !owned_subagent_role_ids().any(|owned| owned == role.as_str()))
         .count()
         > MAX_CUSTOM_SUBAGENT_ROLES
     {
@@ -75,7 +75,7 @@ pub(crate) fn validate_subagent_roles(
                 "子代理标识无效：{role}；仅支持非保留的小写字母、数字或下划线，最多 64 字符"
             ));
         }
-        let custom = !SUBAGENT_ROLE_IDS.contains(&role.as_str());
+        let custom = !owned_subagent_role_ids().any(|owned| owned == role);
         for (label, text, max) in [
             ("名称", &selection.name, 80),
             ("用途说明", &selection.description, 1000),
@@ -113,15 +113,22 @@ pub(crate) fn merge_subagent_role_updates(
 ) -> Result<BTreeMap<String, SubagentRoleConfig>, String> {
     validate_subagent_roles(incoming)?;
     for role in deleted {
-        if !valid_subagent_role_id(role) || SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
+        if !valid_subagent_role_id(role) || owned_subagent_role_ids().any(|owned| owned == role) {
             return Err(format!("只能删除自定义子代理：{role}"));
         }
         if incoming.contains_key(role) {
             return Err(format!("子代理不能同时保存和删除：{role}"));
         }
     }
+    let mut incoming = incoming.clone();
+    super::normalize::migrate_legacy_subagent_roles(&mut incoming);
+    incoming.retain(|role, _| {
+        !super::LEGACY_SUBAGENT_ROLES
+            .iter()
+            .any(|(legacy, _)| *legacy == role)
+    });
     let mut merged = previous.clone();
-    merged.extend(incoming.clone());
+    merged.extend(incoming);
     for role in deleted {
         merged.remove(role);
     }

@@ -14,7 +14,7 @@ use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as Reservation
 use crate::subagent::protocol::{AgentState, InterruptAcknowledgement};
 use crate::subagent::rules::{self, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
-    self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
+    ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
 };
 
 mod contract;
@@ -54,6 +54,9 @@ const MAX_SPAWN_RESPONSE_JSON_BYTES: usize = 64 * 1024;
 const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_QUARANTINE_FILES_PER_SESSION: usize = 3;
 const MAX_FOLLOWUPS_PER_ATTEMPT: u32 = 3;
+// The provider starts the resumed turn while the followup call returns; an
+// undelivered followup simply lets the request lapse.
+pub(crate) const RESUME_REQUEST_GRACE_MILLIS: u64 = 120_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SessionLedger {
@@ -82,6 +85,7 @@ pub(crate) struct RootHookContext<'a> {
     active_agents: usize,
     now_ms: u64,
     before_reservation_save: Option<&'a BeforeReservationSave<'a>>,
+    root_turn_id: Option<&'a str>,
 }
 
 impl<'a> RootHookContext<'a> {
@@ -91,6 +95,7 @@ impl<'a> RootHookContext<'a> {
             active_agents,
             now_ms,
             before_reservation_save: None,
+            root_turn_id: None,
         }
     }
 
@@ -99,6 +104,11 @@ impl<'a> RootHookContext<'a> {
         callback: &'a BeforeReservationSave<'a>,
     ) -> Self {
         self.before_reservation_save = Some(callback);
+        self
+    }
+
+    pub(crate) fn with_turn_id(mut self, turn_id: Option<&'a str>) -> Self {
+        self.root_turn_id = turn_id;
         self
     }
 }
@@ -149,6 +159,175 @@ struct Reservation {
     pending_init_observed_at_ms: Option<u64>,
     #[serde(default)]
     followup_count: u32,
+    /// Identity kept after settlement so a resumed turn can rebind safely.
+    #[serde(default)]
+    last_agent_id_hash: Option<String>,
+    /// A followup to a settled attempt was admitted; the attempt reopens on
+    /// the first proof that the provider delivered it.
+    #[serde(default)]
+    resume_requested_at_ms: Option<u64>,
+    #[serde(default)]
+    interrupt_requested: bool,
+    /// Hash of the child turn whose provider rollout proved a read-only
+    /// sandbox. Legacy reservations intentionally remain unproven.
+    #[serde(default)]
+    native_read_only_turn_hash: Option<String>,
+    /// Hash of the delegating root turn that admitted this attempt.
+    #[serde(default)]
+    root_turn_id_hash: Option<String>,
+    /// Latest cumulative usage for one child turn. The per-turn map below
+    /// retains earlier turns across followups without adding them together.
+    #[serde(default)]
+    current_turn_id_hash: Option<String>,
+    /// 已结束轮的哈希只用于拒绝迟到事件，允许明确归属的新轮重新绑定。
+    #[serde(default)]
+    retired_turn_id_hashes: BTreeSet<String>,
+    #[serde(default)]
+    usage_by_turn: BTreeMap<String, TokenUsage>,
+    #[serde(default)]
+    current_turn_queued_at_ms: Option<u64>,
+    #[serde(default)]
+    current_turn_started_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalTaskObservation {
+    outcome: ExecutionOutcome,
+    turn_hash: Option<String>,
+}
+
+impl Reservation {
+    /// A successful attempt from this runtime can take another turn through
+    /// `followup_task`; interrupted, failed or exhausted attempts cannot.
+    fn resumable(&self, runtime_generation: u64) -> bool {
+        self.state == ReservationState::Terminal
+            && self.outcome == ExecutionOutcome::Succeeded
+            && !self.spawn_failed
+            && !self.interrupt_requested
+            && self.followup_count < MAX_FOLLOWUPS_PER_ATTEMPT
+            && self.runtime_generation == runtime_generation
+            && (self.agent_id_hash.is_some() || self.last_agent_id_hash.is_some())
+    }
+
+    fn resume_pending(&self, now_ms: u64) -> bool {
+        self.state == ReservationState::Terminal
+            && self
+                .resume_requested_at_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) <= RESUME_REQUEST_GRACE_MILLIS)
+    }
+
+    fn reopen_for_followup(&mut self, now_ms: u64) {
+        self.state = ReservationState::Running;
+        self.outcome = ExecutionOutcome::Unknown;
+        self.fenced_at_ms = None;
+        self.completed_at_ms = None;
+        self.error_message = None;
+        self.pending_init_observed_at_ms = None;
+        self.resume_requested_at_ms = None;
+        self.native_read_only_turn_hash = None;
+        self.token_usage = None;
+        self.current_turn_queued_at_ms = Some(now_ms);
+        self.current_turn_started_at_ms = None;
+        if let Some(previous) = self.current_turn_id_hash.clone() {
+            self.retired_turn_id_hashes.insert(previous);
+        }
+        if self.agent_id_hash.is_none() {
+            self.agent_id_hash = self.last_agent_id_hash.clone();
+        }
+        self.updated_at_ms = now_ms;
+    }
+
+    fn followup_turn_is_unresolved(&self) -> bool {
+        self.state.is_active() && self.current_turn_started_at_ms.is_none()
+    }
+
+    fn accepts_explicit_turn(&self, turn_hash: &str) -> bool {
+        if self.retired_turn_id_hashes.contains(turn_hash) {
+            return false;
+        }
+        if self.state == ReservationState::Terminal
+            && self.outcome == ExecutionOutcome::Succeeded
+            && self.resume_requested_at_ms.is_none()
+        {
+            return true;
+        }
+        if self.followup_turn_is_unresolved() {
+            return true;
+        }
+        match self.current_turn_id_hash.as_deref() {
+            Some(current) => current == turn_hash,
+            // The first child turn can be established by its authoritative
+            // start or terminal observation when no hook turn was available.
+            None => true,
+        }
+    }
+
+    fn accepts_anonymous_turn(&self) -> bool {
+        !self.followup_turn_is_unresolved()
+    }
+
+    fn accepts_terminal_turn(&self, turn_hash: Option<&str>) -> bool {
+        turn_hash.map_or_else(
+            || self.accepts_anonymous_turn(),
+            |turn_hash| self.accepts_explicit_turn(turn_hash),
+        )
+    }
+
+    fn bind_explicit_turn(&mut self, turn_hash: &str, now_ms: u64) -> bool {
+        let unresolved = self.followup_turn_is_unresolved();
+        if !self.accepts_explicit_turn(turn_hash) {
+            return false;
+        }
+        let mut changed = false;
+        if self.current_turn_id_hash.as_deref() != Some(turn_hash) {
+            if let Some(previous) = self.current_turn_id_hash.replace(turn_hash.to_string()) {
+                self.retired_turn_id_hashes.insert(previous);
+            }
+            self.current_turn_queued_at_ms = self
+                .resume_requested_at_ms
+                .take()
+                .or(self.current_turn_queued_at_ms)
+                .or(Some(now_ms));
+            self.current_turn_started_at_ms = Some(now_ms);
+            self.native_read_only_turn_hash = None;
+            changed = true;
+        }
+        if unresolved {
+            self.resume_requested_at_ms = None;
+            self.current_turn_started_at_ms.get_or_insert(now_ms);
+            changed = true;
+        }
+        if changed {
+            self.token_usage = self.usage_by_turn.get(turn_hash).cloned();
+            self.updated_at_ms = now_ms;
+        }
+        changed
+    }
+
+    fn bind_anonymous_turn(&mut self, now_ms: u64) -> bool {
+        if !self.followup_turn_is_unresolved() && self.resume_requested_at_ms.is_none() {
+            return false;
+        }
+        self.resume_requested_at_ms = None;
+        if let Some(previous) = self.current_turn_id_hash.take() {
+            self.retired_turn_id_hashes.insert(previous);
+        }
+        self.current_turn_queued_at_ms = self.current_turn_queued_at_ms.or(Some(now_ms));
+        self.current_turn_started_at_ms = Some(now_ms);
+        self.native_read_only_turn_hash = None;
+        self.token_usage = None;
+        self.updated_at_ms = now_ms;
+        true
+    }
+}
+
+fn merge_cumulative_usage(current: &TokenUsage, observed: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: current.input_tokens.max(observed.input_tokens),
+        output_tokens: current.output_tokens.max(observed.output_tokens),
+        cached_tokens: current.cached_tokens.max(observed.cached_tokens),
+        reasoning_tokens: current.reasoning_tokens.max(observed.reasoning_tokens),
+    }
 }
 
 const fn default_fencing_token() -> u64 {
@@ -678,6 +857,13 @@ fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
                 .capabilities
                 .retain(|capability| capability != "workspace.write");
         }
+        if reservation.role == crate::config::SUBAGENT_ROLE_EXPLORER {
+            let capability_count = reservation.capabilities.len();
+            reservation
+                .capabilities
+                .retain(|capability| capability != "workspace.write");
+            changed |= reservation.capabilities.len() != capability_count;
+        }
         changed |= reservation.legacy_write_capable.take().is_some();
     }
     let before = ledger.issued_task_ids.len();
@@ -775,12 +961,16 @@ fn is_canonical_hash(value: &str) -> bool {
 fn concurrency_denial(
     ledger: &SessionLedger,
     active_agents: usize,
+    now_ms: u64,
     limit: usize,
 ) -> Option<String> {
     let tracked_active = ledger
         .reservations
         .values()
-        .filter(|reservation| reservation.state.is_active() && !reservation.spawn_failed)
+        .filter(|reservation| {
+            (reservation.state.is_active() && !reservation.spawn_failed)
+                || reservation.resume_pending(now_ms)
+        })
         .collect::<Vec<_>>();
     let tracked_active_count = tracked_active.len();
     let observed_active = active_agents.max(tracked_active_count);
@@ -855,6 +1045,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         active_agents,
         now_ms,
         before_reservation_save,
+        root_turn_id,
     } = context;
     let mut loaded_rules = rules::load_logged(state_root);
     let runtime_policy = crate::subagent_gate::load_runtime_subagent_policy(state_root)?;
@@ -888,6 +1079,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             });
         }
     }
+    prepared.trace.parent_id = root_turn_id.map(hash_component);
     if ledger.issued_task_ids.contains(&prepared.capsule.id) {
         return Ok(Some(duplicate_task_id_denial(
             &ledger,
@@ -901,9 +1093,10 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         || crate::config::default_subagent_max_threads() as usize,
         |policy| policy.max_threads as usize,
     );
-    if let Some(reason) = concurrency_denial(&ledger, active_agents, limit) {
+    if let Some(reason) = concurrency_denial(&ledger, active_agents, now_ms, limit) {
         return Ok(Some(reason));
     }
+    let root_turn_id_hash = root_turn_id.map(hash_component);
 
     if let Some(callback) = before_reservation_save {
         callback(&prepared.capsule.id, &ledger.issued_task_ids)?;
@@ -953,6 +1146,16 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             spawn_failed: false,
             pending_init_observed_at_ms: None,
             followup_count: 0,
+            last_agent_id_hash: None,
+            resume_requested_at_ms: None,
+            interrupt_requested: false,
+            native_read_only_turn_hash: None,
+            root_turn_id_hash: root_turn_id_hash.clone(),
+            current_turn_id_hash: None,
+            retired_turn_id_hashes: BTreeSet::new(),
+            usage_by_turn: BTreeMap::new(),
+            current_turn_queued_at_ms: Some(now_ms),
+            current_turn_started_at_ms: None,
         },
     );
     store.save(&mut ledger, now_ms)?;
@@ -980,10 +1183,12 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         .insert("admission.mode".into(), Value::String("native".into()));
     event
         .attributes
-        .insert("attempt.id".into(), Value::String(attempt_id));
+        .insert("attempt.id".into(), Value::String(attempt_id.clone()));
     event
         .attributes
         .insert("fencing.token".into(), Value::Number(fencing_token.into()));
+    event.attempt_hash = Some(hash_component(&attempt_id));
+    event.root_turn_hash = root_turn_id_hash;
     TraceRecorder::new(state_root).record_best_effort(&event);
     Ok(None)
 }
@@ -1043,7 +1248,11 @@ pub(crate) fn post_spawn(
     let trace = reservation_trace(reservation);
     let role = reservation.role.clone();
     let mut trace_event = None;
-    if returned_agent_id.is_none() && tool_response.is_some_and(response_is_explicit_failure) {
+    if returned_agent_id.is_none()
+        && reservation.agent_id_hash.is_none()
+        && reservation.started_at_ms.is_none()
+        && tool_response.is_some_and(response_is_explicit_failure)
+    {
         reservation.state = ReservationState::Terminal;
         reservation.outcome = ExecutionOutcome::Failed;
         reservation.spawn_failed = true;
@@ -1051,7 +1260,7 @@ pub(crate) fn post_spawn(
         reservation.fenced_at_ms = Some(now_ms);
         reservation.updated_at_ms = now_ms;
         reservation.completed_at_ms = Some(now_ms);
-        reservation.token_usage = telemetry::extract_token_usage(tool_response);
+        reservation.token_usage = None;
         reservation.error_message = Some("spawn tool reported failure".to_string());
         let mut event = SubagentTraceEvent::new(
             now_ms,
@@ -1066,6 +1275,8 @@ pub(crate) fn post_spawn(
         );
         event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
         event.usage = reservation.token_usage.clone();
+        attach_duration_attributes(&mut event, reservation, now_ms);
+        associate_trace_event(&mut event, reservation);
         event.error_code = Some("spawn_failed".into());
         event.error_message = reservation.error_message.clone();
         trace_event = Some(event);
@@ -1075,6 +1286,7 @@ pub(crate) fn post_spawn(
         reservation.pending_init_observed_at_ms = None;
         reservation.updated_at_ms = now_ms;
         reservation.started_at_ms = Some(now_ms);
+        reservation.current_turn_started_at_ms = Some(now_ms);
         reservation.agent_id_hash = Some(hash_component(agent_id));
         let mut event = SubagentTraceEvent::new(
             now_ms,
@@ -1088,6 +1300,8 @@ pub(crate) fn post_spawn(
             Some(&role),
         );
         event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
+        attach_duration_attributes(&mut event, reservation, now_ms);
+        associate_trace_event(&mut event, reservation);
         trace_event = Some(event);
     } else {
         // 没有明确失败，也没有可绑定的代理 ID，只能确认工具调用已经返回，不能确认
@@ -1101,69 +1315,196 @@ pub(crate) fn post_spawn(
     Ok(())
 }
 
+/// Admission result for `agents.followup_task`.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum FollowupAdmission {
+    Denied(String),
+    /// The target is still running; the provider queues the task.
+    Delivered,
+    /// The target settled successfully; it reopens once the provider starts
+    /// the new turn, so its earlier context is reused instead of respawning.
+    ResumeRequested,
+}
+
 pub(crate) fn pre_followup_task(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
     tool_input: Option<&Value>,
+    active_agents: usize,
     now_ms: u64,
-) -> Result<Option<String>> {
+    role_admission: impl FnOnce(&str) -> Result<Option<String>>,
+) -> Result<FollowupAdmission> {
     let Some(target) = followup_task_target(tool_input) else {
-        return Ok(Some(format!(
+        return Ok(FollowupAdmission::Denied(format!(
             "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: Codey 生命周期门禁：`agents.followup_task` 缺少非空 target，已在唤醒子代理前拒绝。不要重试本次调用；请修正目标，或由主代理接管。"
         )));
     };
     let store = LedgerStore::open(state_root, session_id)?;
     let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(Some(followup_without_active_attempt_denial(
-            target,
-            "当前会话没有可验证的活动委派账本",
-        )));
+        return Ok(FollowupAdmission::Denied(
+            followup_without_active_attempt_denial(target, "当前会话没有可验证的委派账本"),
+        ));
     };
     let Some(task_id) = unique_task_for_identifier(&ledger, target)? else {
-        return Ok(Some(followup_without_active_attempt_denial(
-            target,
-            "target 无法匹配当前账本中的 reservation",
-        )));
+        return Ok(FollowupAdmission::Denied(
+            followup_without_active_attempt_denial(
+                target,
+                "target 无法匹配当前账本中的 reservation",
+            ),
+        ));
     };
-    let reservation = ledger
-        .reservations
-        .get_mut(&task_id)
-        .expect("resolved task");
+    let runtime_generation = ledger.runtime_generation;
+    let reservation = ledger.reservations.get(&task_id).expect("resolved task");
     if reservation.state == ReservationState::Running
         && reservation.agent_id_hash.is_some()
         && reservation.fenced_at_ms.is_none()
         && !reservation.spawn_failed
     {
-        if reservation.followup_count >= MAX_FOLLOWUPS_PER_ATTEMPT {
-            return Ok(Some(format!(
-                "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: attempt `{}` 已达到 follow-up 上限 {}；请由主代理接管，或使用新的 task_name 派发范围实质变化的任务。",
-                reservation.attempt_id, MAX_FOLLOWUPS_PER_ATTEMPT
-            )));
+        if let Some(denial) = followup_limit_denial(reservation) {
+            return Ok(FollowupAdmission::Denied(denial));
         }
+        let reservation = ledger
+            .reservations
+            .get_mut(&task_id)
+            .expect("resolved task");
         reservation.followup_count += 1;
+        reservation.resume_requested_at_ms = Some(now_ms);
         reservation.updated_at_ms = now_ms;
         store.save(&mut ledger, now_ms)?;
-        return Ok(None);
+        return Ok(FollowupAdmission::Delivered);
     }
     if reservation.state == ReservationState::Pending && reservation.fenced_at_ms.is_none() {
-        return Ok(Some(format!(
+        return Ok(FollowupAdmission::Denied(format!(
             "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: Codey 生命周期门禁：目标 `{target}` 的 attempt `{}` 仍为 pending，尚未绑定 agent_id；已在唤醒子代理前拒绝。不要重试 `followup_task`，请先调用一次不带筛选的 `agents.list_agents` 对账并继续等待。若快照明确没有匹配代理，由主代理接管；只有范围实质改变且仍值得委派时，才使用全新的 task_name 调用 `agents.spawn_agent`。",
             reservation.attempt_id
         )));
     }
-    Ok(Some(followup_without_active_attempt_denial(
-        target,
-        &format!(
-            "匹配 attempt `{}` 已不可恢复（state={:?}, outcome={:?}）",
-            reservation.attempt_id, reservation.state, reservation.outcome
+    if reservation.resumable(runtime_generation) {
+        if reservation.resume_pending(now_ms) {
+            return Ok(FollowupAdmission::Denied(format!(
+                "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: 目标 `{target}` 的续派已在投递中；不要重复调用 `followup_task`，直接调用 `agents.wait_agent` 等待结果。"
+            )));
+        }
+        let limit = crate::subagent_gate::load_runtime_subagent_policy(state_root)?.map_or_else(
+            || crate::config::default_subagent_max_threads() as usize,
+            |policy| policy.max_threads as usize,
+        );
+        if let Some(denial) = concurrency_denial(&ledger, active_agents, now_ms, limit) {
+            return Ok(FollowupAdmission::Denied(denial));
+        }
+        let role = ledger.reservations[&task_id].role.clone();
+        if let Some(denial) = role_admission(&role)? {
+            return Ok(FollowupAdmission::Denied(denial));
+        }
+        let reservation = ledger
+            .reservations
+            .get_mut(&task_id)
+            .expect("resolved task");
+        reservation.followup_count += 1;
+        reservation.resume_requested_at_ms = Some(now_ms);
+        reservation.updated_at_ms = now_ms;
+        store.save(&mut ledger, now_ms)?;
+        return Ok(FollowupAdmission::ResumeRequested);
+    }
+    if reservation.state == ReservationState::Terminal
+        && reservation.outcome == ExecutionOutcome::Succeeded
+        && let Some(denial) = followup_limit_denial(reservation)
+    {
+        return Ok(FollowupAdmission::Denied(denial));
+    }
+    Ok(FollowupAdmission::Denied(
+        followup_without_active_attempt_denial(
+            target,
+            &format!(
+                "匹配 attempt `{}` 不可续派（state={:?}, outcome={:?}）",
+                reservation.attempt_id, reservation.state, reservation.outcome
+            ),
         ),
-    )))
+    ))
+}
+
+fn followup_limit_denial(reservation: &Reservation) -> Option<String> {
+    (reservation.followup_count >= MAX_FOLLOWUPS_PER_ATTEMPT).then(|| {
+        format!(
+            "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: attempt `{}` 已达到 follow-up 上限 {}；请由主代理接管，或使用新的 task_name 派发范围实质变化的任务。",
+            reservation.attempt_id, MAX_FOLLOWUPS_PER_ATTEMPT
+        )
+    })
+}
+
+/// A successful followup call proves the provider accepted the task; reopen a
+/// settled attempt now unless its own lifecycle events already did.
+pub(crate) fn post_followup_task(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+    root_turn_id: Option<&str>,
+    now_ms: u64,
+) -> Result<()> {
+    if tool_response.is_some_and(response_is_explicit_failure) {
+        return Ok(());
+    }
+    let Some(target) = followup_task_target(tool_input) else {
+        return Ok(());
+    };
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(());
+    };
+    let Some(task_id) = unique_task_for_identifier(&ledger, target)? else {
+        return Ok(());
+    };
+    let (was_running, reopened) = {
+        let reservation = ledger
+            .reservations
+            .get_mut(&task_id)
+            .expect("resolved task");
+        let was_running = reservation.state == ReservationState::Running;
+        let reopened = reservation.resume_pending(now_ms);
+        if reopened {
+            reservation.reopen_for_followup(now_ms);
+        }
+        (was_running, reopened)
+    };
+    if reopened {
+        store.save(&mut ledger, now_ms)?;
+    }
+    let reservation = ledger.reservations.get(&task_id).expect("resolved task");
+    let trace = reservation_trace(reservation);
+    let role = reservation.role.clone();
+    let mut event = SubagentTraceEvent::new(
+        now_ms,
+        &trace,
+        TraceEventKind::Resumed,
+        if was_running || reservation.state.is_active() {
+            ExecutionStatus::Running
+        } else {
+            ExecutionStatus::Pending
+        },
+        runtime_id,
+        session_id,
+        &task_id,
+        Some(target),
+        Some(&role),
+    );
+    associate_trace_event(&mut event, reservation);
+    attach_duration_attributes(&mut event, reservation, now_ms);
+    if let Some(root_turn_id) = root_turn_id {
+        event.root_turn_hash = Some(hash_component(root_turn_id));
+    }
+    event
+        .attributes
+        .insert("followup.admitted".into(), Value::Bool(true));
+    TraceRecorder::new(state_root).record_best_effort(&event);
+    Ok(())
 }
 
 fn followup_without_active_attempt_denial(target: &str, detail: &str) -> String {
     format!(
-        "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: Codey 生命周期门禁：`agents.followup_task` 只能用于当前会话中仍为 running、已绑定 agent_id 且未被 fence 的 attempt；目标 `{target}` 不满足条件（{detail}），已在唤醒子代理前拒绝。不要重试 `followup_task`，也不要等待旧 canonical task 自行恢复。若仍有独立工作，使用全新的 task_name 调用 `agents.spawn_agent`；否则由主代理立即接管。"
+        "{FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE}: Codey 生命周期门禁：`agents.followup_task` 只能用于当前会话中仍在运行的 attempt，或本次运行中已成功完成、未被中断且未达续派上限的 attempt；目标 `{target}` 不满足条件（{detail}），已在唤醒子代理前拒绝。不要重试 `followup_task`，也不要等待旧 canonical task 自行恢复。若仍有独立工作，使用全新的 task_name 调用 `agents.spawn_agent`；否则由主代理立即接管。"
     )
 }
 
@@ -1177,6 +1518,9 @@ fn duplicate_task_id_denial(ledger: &SessionLedger, task_id: &str) -> String {
         ),
         Some(reservation) if reservation.state == ReservationState::Running => format!(
             "{prefix} 账本状态为 `running`，原派生已经建立。不要重发旧 ID，也不要直接 Stop；先调用一次不带筛选的 `agents.list_agents` 对账。若代理仍为 `running`、`pending_init` 或 `interrupted`，继续等待或必要协调；若已终态，消费已有结果；若快照明确没有匹配代理，由主代理接管。禁止改走 `functions.exec` 重试派生。"
+        ),
+        Some(reservation) if reservation.resumable(ledger.runtime_generation) => format!(
+            "{prefix} 该子代理已成功完成且仍可续派。要在它的上下文上继续同一工作，调用 `agents.followup_task`（target 为 `{task_id}`）；与它无关的新任务请使用全新的 `task_name`。"
         ),
         Some(reservation) if reservation.spawn_failed => format!(
             "{prefix} 账本状态为 `failed`，上次派生已明确失败，成本点虽已退还但尝试次数仍计入。不要再次使用旧 ID，也不要把本次拒绝当作完成后立即 Stop；默认由主代理接管。只有任务范围实质改变且仍值得委派时，才可用全新的 `task_name` 最多重试一次。禁止改走 `functions.exec` 重试派生。"
@@ -1195,21 +1539,15 @@ pub(crate) fn subagent_started_with_context(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
-    agent_id: &str,
-    agent_type: Option<&str>,
-    transcript_path: Option<&str>,
+    context: SubagentLifecycleContext<'_>,
     now_ms: u64,
 ) -> Result<bool> {
     update_reservation_lifecycle(
         state_root,
         runtime_id,
         session_id,
-        LifecycleContext {
-            agent_id,
-            agent_type,
-            transcript_path,
-            state: ReservationState::Running,
-        },
+        context,
+        ReservationState::Running,
         now_ms,
     )
 }
@@ -1223,32 +1561,35 @@ pub(crate) fn subagent_stopped(
     now_ms: u64,
 ) -> Result<()> {
     subagent_stopped_with_context(
-        state_root, runtime_id, session_id, agent_id, None, None, now_ms,
+        state_root,
+        runtime_id,
+        session_id,
+        SubagentLifecycleContext {
+            agent_id,
+            agent_type: None,
+            transcript_path: None,
+            turn_id: None,
+        },
+        now_ms,
     )
+    .map(|_| ())
 }
 
 pub(crate) fn subagent_stopped_with_context(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
-    agent_id: &str,
-    agent_type: Option<&str>,
-    transcript_path: Option<&str>,
+    context: SubagentLifecycleContext<'_>,
     now_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
     update_reservation_lifecycle(
         state_root,
         runtime_id,
         session_id,
-        LifecycleContext {
-            agent_id,
-            agent_type,
-            transcript_path,
-            state: ReservationState::Terminal,
-        },
+        context,
+        ReservationState::Terminal,
         now_ms,
     )
-    .map(|_| ())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1275,7 +1616,9 @@ pub(crate) fn settle_unique_anonymous_stop(
         .reservations
         .iter()
         .filter(|(_, reservation)| {
-            reservation.state.is_active() && agent_type.is_none_or(|role| reservation.role == role)
+            reservation.state.is_active()
+                && !reservation.followup_turn_is_unresolved()
+                && agent_type.is_none_or(|role| reservation.role == role)
         })
         .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
@@ -1298,25 +1641,26 @@ pub(crate) fn settle_unique_anonymous_stop(
     Ok(Some(AnonymousStopSettlement { agent_id_hash }))
 }
 
-struct LifecycleContext<'a> {
-    agent_id: &'a str,
-    agent_type: Option<&'a str>,
-    transcript_path: Option<&'a str>,
-    state: ReservationState,
+pub(crate) struct SubagentLifecycleContext<'a> {
+    pub(crate) agent_id: &'a str,
+    pub(crate) agent_type: Option<&'a str>,
+    pub(crate) transcript_path: Option<&'a str>,
+    pub(crate) turn_id: Option<&'a str>,
 }
 
 fn update_reservation_lifecycle(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
-    context: LifecycleContext<'_>,
+    context: SubagentLifecycleContext<'_>,
+    state: ReservationState,
     now_ms: u64,
 ) -> Result<bool> {
-    let LifecycleContext {
+    let SubagentLifecycleContext {
         agent_id,
         agent_type,
         transcript_path,
-        state,
+        turn_id,
     } = context;
     let store = LedgerStore::open(state_root, session_id)?;
     let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
@@ -1386,10 +1730,50 @@ fn update_reservation_lifecycle(
         anyhow::bail!("{AGENT_ID_COLLISION_ERROR_CODE}: {reason}");
     }
     let mut trace_event = None;
+    let mut lifecycle_turn_changed = false;
     if let Some(reservation) = ledger.reservations.get_mut(&task_id) {
+        let turn_hash = turn_id.map(hash_component);
+        let resumed = reservation.resume_requested_at_ms.is_some();
+        if state == ReservationState::Running && reservation.resume_pending(now_ms) {
+            reservation.reopen_for_followup(now_ms);
+            lifecycle_turn_changed = true;
+        }
+        // 新轮可能在追派回执前直接完成；明确的新轮停止事件也能确认投递。
+        if state == ReservationState::Terminal
+            && reservation.resume_pending(now_ms)
+            && turn_hash.as_deref().is_some_and(|turn| {
+                reservation.current_turn_id_hash.as_deref() != Some(turn)
+                    && !reservation.retired_turn_id_hashes.contains(turn)
+            })
+        {
+            reservation.reopen_for_followup(now_ms);
+            lifecycle_turn_changed = true;
+        }
+        if state == ReservationState::Running {
+            if let Some(turn_hash) = turn_hash.as_deref() {
+                if reservation.current_turn_id_hash.as_deref() != Some(turn_hash) {
+                    if !reservation.bind_explicit_turn(turn_hash, now_ms) {
+                        return Ok(false);
+                    }
+                    lifecycle_turn_changed = true;
+                }
+            } else if reservation.followup_turn_is_unresolved() {
+                if !reservation.bind_anonymous_turn(now_ms) {
+                    return Ok(false);
+                }
+                lifecycle_turn_changed = true;
+            }
+        } else if state == ReservationState::Terminal {
+            if !reservation.accepts_terminal_turn(turn_hash.as_deref()) {
+                return Ok(false);
+            }
+            if let Some(turn) = turn_hash.as_deref() {
+                lifecycle_turn_changed |= reservation.bind_explicit_turn(turn, now_ms);
+            }
+        }
         if reservation.state == state {
             let should_track = reservation.state.is_active();
-            let mut changed = false;
+            let mut changed = lifecycle_turn_changed;
             if reservation.agent_id_hash.as_deref() != Some(agent_hash.as_str()) {
                 reservation.agent_id_hash = Some(agent_hash);
                 if state == ReservationState::Running {
@@ -1417,7 +1801,15 @@ fn update_reservation_lifecycle(
             ReservationState::Running => {
                 reservation.outcome = ExecutionOutcome::Unknown;
                 reservation.started_at_ms.get_or_insert(now_ms);
-                Some((TraceEventKind::Started, ExecutionStatus::Running))
+                reservation.current_turn_started_at_ms.get_or_insert(now_ms);
+                Some((
+                    if resumed {
+                        TraceEventKind::Resumed
+                    } else {
+                        TraceEventKind::Started
+                    },
+                    ExecutionStatus::Running,
+                ))
             }
             ReservationState::Terminal => {
                 reservation.outcome = ExecutionOutcome::Unknown;
@@ -1460,6 +1852,13 @@ fn update_reservation_lifecycle(
             );
             event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
             event.usage = reservation.token_usage.clone();
+            attach_duration_attributes(&mut event, reservation, now_ms);
+            associate_trace_event(&mut event, reservation);
+            if resumed {
+                event
+                    .attributes
+                    .insert("resume.source".into(), Value::String("lifecycle".into()));
+            }
             event.attributes.insert(
                 "execution.outcome".into(),
                 Value::String(format!("{:?}", reservation.outcome).to_ascii_lowercase()),
@@ -1474,43 +1873,165 @@ fn update_reservation_lifecycle(
     Ok(true)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum StatusResponseSource {
+    /// 等待队列可能带来尚未消费的历史通知。
+    Notification,
+    /// 当前状态查询；参数表示调用方已确认所有代理都已结束。
+    Snapshot(bool),
+}
+
+#[derive(Default)]
+pub(crate) struct StatusResponseObservation {
+    pub settled_agent_hashes: Vec<String>,
+    pub needs_snapshot: bool,
+}
+
 pub(crate) fn observe_status_response(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
     tool_response: Option<&Value>,
-    all_terminal: bool,
+    source: StatusResponseSource,
     now_ms: u64,
-) -> Result<Vec<String>> {
+) -> Result<StatusResponseObservation> {
     let store = LedgerStore::open(state_root, session_id)?;
     let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(Vec::new());
+        return Ok(StatusResponseObservation::default());
     };
-    let mut terminal_tasks = BTreeMap::new();
-    if let Some(response) = tool_response
-        && let Err(error) =
-            collect_terminal_task_outcomes(response, &mut ledger, &mut terminal_tasks, now_ms)
-    {
-        store.save(&mut ledger, now_ms)?;
-        return Err(error);
+    let mut terminal_tasks = BTreeMap::<String, TerminalTaskObservation>::new();
+    let mut usage_by_task_turn = BTreeMap::new();
+    let mut needs_snapshot = false;
+    if let Some(response) = tool_response {
+        match collect_terminal_task_outcomes(
+            response,
+            &mut ledger,
+            &mut terminal_tasks,
+            &mut usage_by_task_turn,
+            source,
+            now_ms,
+        ) {
+            Ok(ignored_unscoped) => needs_snapshot = ignored_unscoped,
+            Err(error) => {
+                store.save(&mut ledger, now_ms)?;
+                return Err(error);
+            }
+        }
     }
-    if all_terminal {
+    let mut status_usage = Vec::new();
+    if let Some(response) = tool_response {
+        crate::subagent::protocol::collect_native_status_usage_observations(
+            response,
+            &mut status_usage,
+        );
+    }
+    for observation in status_usage {
+        let Ok(Some(task_id)) = unique_task_for_identifier(&ledger, &observation.identifier) else {
+            continue;
+        };
+        let observed_usage = observation.usage;
+        usage_by_task_turn
+            .entry(task_id)
+            .or_default()
+            .entry(hash_component(&observation.turn_id))
+            .and_modify(|current| {
+                *current = merge_cumulative_usage(current, observed_usage.clone());
+            })
+            .or_insert(observed_usage);
+    }
+    // Usage can arrive in a live status entry before the terminal snapshot.
+    // Persist it independently so a later completion does not need to copy a
+    // batch total or infer which child owns it.
+    let mut usage_only_changed = false;
+    for (task_id, observations) in &usage_by_task_turn {
+        let Some(reservation) = ledger.reservations.get_mut(task_id) else {
+            continue;
+        };
+        for (turn_hash, usage) in observations {
+            let current_turn = reservation.current_turn_id_hash.as_deref();
+            let same_current_turn = current_turn == Some(turn_hash.as_str());
+            let terminal_refinement = reservation.state == ReservationState::Terminal
+                && reservation.outcome == ExecutionOutcome::Unknown
+                && terminal_tasks.get(task_id).is_some_and(|observation| {
+                    observation
+                        .turn_hash
+                        .as_deref()
+                        .is_none_or(|turn| turn == turn_hash)
+                });
+            let unresolved_followup = reservation.followup_turn_is_unresolved();
+            let retired_turn = reservation.retired_turn_id_hashes.contains(turn_hash);
+            let frozen_history = retired_turn
+                || (!unresolved_followup
+                    && current_turn.is_some_and(|current| current != turn_hash))
+                || (same_current_turn
+                    && reservation.state == ReservationState::Terminal
+                    && !terminal_refinement);
+            let full_usage_refresh =
+                observations.len() == 1 && !frozen_history && !same_current_turn;
+            let observed_usage = usage.clone();
+            let cumulative_usage = reservation.usage_by_turn.get(turn_hash).map_or_else(
+                || observed_usage.clone(),
+                |current| merge_cumulative_usage(current, observed_usage.clone()),
+            );
+            if !frozen_history
+                && reservation.usage_by_turn.get(turn_hash) != Some(&cumulative_usage)
+            {
+                reservation
+                    .usage_by_turn
+                    .insert(turn_hash.clone(), cumulative_usage.clone());
+                usage_only_changed = true;
+            }
+            let trusted_current_turn = same_current_turn
+                && (reservation.state.is_active() || terminal_refinement)
+                && !frozen_history;
+            if trusted_current_turn {
+                if reservation.token_usage.as_ref() != Some(&cumulative_usage) {
+                    reservation.token_usage = Some(cumulative_usage);
+                    usage_only_changed = true;
+                }
+            } else if full_usage_refresh && reservation.bind_explicit_turn(turn_hash, now_ms) {
+                usage_only_changed = true;
+            }
+        }
+    }
+    if matches!(source, StatusResponseSource::Snapshot(true)) {
         for (task_id, reservation) in &ledger.reservations {
-            if reservation.state.is_active() {
+            if reservation.state.is_active() && !reservation.followup_turn_is_unresolved() {
                 terminal_tasks
                     .entry(task_id.clone())
-                    .or_insert(ExecutionOutcome::Lost);
+                    .or_insert(TerminalTaskObservation {
+                        outcome: ExecutionOutcome::Lost,
+                        turn_hash: None,
+                    });
             }
         }
     }
     let mut changed = false;
     let mut agent_id_hashes = Vec::new();
-    let usage = telemetry::extract_token_usage(tool_response);
     let mut trace_events = Vec::new();
-    for (task_id, outcome) in terminal_tasks {
+    for (task_id, observation) in terminal_tasks {
+        let outcome = observation.outcome;
         let Some(reservation) = ledger.reservations.get_mut(&task_id) else {
             continue;
         };
+        if reservation.followup_turn_is_unresolved() {
+            let bound = match observation.turn_hash.as_deref() {
+                Some(turn) => reservation.bind_explicit_turn(turn, now_ms),
+                None if matches!(source, StatusResponseSource::Snapshot(_)) => {
+                    reservation.bind_anonymous_turn(now_ms)
+                }
+                None => false,
+            };
+            if !bound {
+                continue;
+            }
+        }
+        if reservation.current_turn_id_hash.is_none()
+            && let Some(turn_hash) = observation.turn_hash.as_deref()
+            && !reservation.bind_explicit_turn(turn_hash, now_ms)
+        {
+            continue;
+        }
         let transitions_to_terminal = reservation.state != ReservationState::Terminal
             && reservation
                 .state
@@ -1520,6 +2041,7 @@ pub(crate) fn observe_status_response(
             && reservation.outcome == ExecutionOutcome::Unknown;
         if transitions_to_terminal || refines_lifecycle_stop {
             if let Some(agent_id_hash) = reservation.agent_id_hash.take() {
+                reservation.last_agent_id_hash = Some(agent_id_hash.clone());
                 agent_id_hashes.push(agent_id_hash);
             }
             reservation.state = ReservationState::Terminal;
@@ -1540,9 +2062,6 @@ pub(crate) fn observe_status_response(
                 ),
                 ExecutionOutcome::Unknown => Some("terminal outcome was not recognized".into()),
             };
-            if usage.is_some() {
-                reservation.token_usage = usage.clone();
-            }
             let trace = reservation_trace(reservation);
             let success = outcome.is_success();
             let mut event = SubagentTraceEvent::new(
@@ -1566,6 +2085,8 @@ pub(crate) fn observe_status_response(
             );
             event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
             event.usage = reservation.token_usage.clone();
+            attach_duration_attributes(&mut event, reservation, now_ms);
+            associate_trace_event(&mut event, reservation);
             event.attributes.insert(
                 "execution.outcome".into(),
                 Value::String(format!("{outcome:?}").to_ascii_lowercase()),
@@ -1578,8 +2099,10 @@ pub(crate) fn observe_status_response(
             changed = true;
         }
     }
-    if changed {
+    if changed || usage_only_changed {
         store.save(&mut ledger, now_ms)?;
+    }
+    if changed {
         let recorder = TraceRecorder::new(state_root);
         for event in &trace_events {
             recorder.record_best_effort(event);
@@ -1587,7 +2110,10 @@ pub(crate) fn observe_status_response(
     }
     agent_id_hashes.sort();
     agent_id_hashes.dedup();
-    Ok(agent_id_hashes)
+    Ok(StatusResponseObservation {
+        settled_agent_hashes: agent_id_hashes,
+        needs_snapshot,
+    })
 }
 
 /// Reconciles a full provider list snapshot into reservation-local PendingInit
@@ -1761,6 +2287,9 @@ fn reconcile_pending_init_observations(
             "pending_init.elapsed_ms".into(),
             Value::Number(now_ms.saturating_sub(observed_at_ms).into()),
         );
+        event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
+        attach_duration_attributes(&mut event, reservation, now_ms);
+        associate_trace_event(&mut event, reservation);
         trace_events.push(event);
         changed = true;
     }
@@ -1893,6 +2422,48 @@ pub(crate) fn active_reservation_projection(
         .filter_map(|reservation| reservation.agent_id_hash.clone())
         .collect();
     Ok(Some((active.len(), identities)))
+}
+
+/// Whether the root may keep writing and running commands: every active
+/// attempt is bound, declares no file writes, and no legacy marker belongs to
+/// an attempt the ledger does not know.
+pub(crate) fn active_attempts_are_read_only(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    marker_hashes: &BTreeSet<String>,
+    now_ms: u64,
+) -> Result<bool> {
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(false);
+    };
+    let active = ledger
+        .reservations
+        .values()
+        .filter(|reservation| reservation.state.is_active())
+        .collect::<Vec<_>>();
+    let bound = active
+        .iter()
+        .filter_map(|reservation| reservation.agent_id_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    Ok(!active.is_empty()
+        && active.iter().all(|reservation| {
+            reservation.agent_id_hash.is_some()
+                && reservation.fenced_at_ms.is_none()
+                && reservation.state.is_active()
+        })
+        && active.iter().all(|reservation| {
+            reservation.role == crate::config::SUBAGENT_ROLE_EXPLORER
+                && !reservation_declares_write(reservation)
+                && reservation.current_turn_id_hash.is_some()
+                && reservation.native_read_only_turn_hash == reservation.current_turn_id_hash
+        })
+        && marker_hashes
+            .iter()
+            .all(|hash| bound.contains(hash.as_str()))
+        && !bound.is_empty()
+        && bound.iter().all(|hash| marker_hashes.contains(*hash)))
 }
 
 /// Atomically fences every still-active reservation before the gate discards
@@ -2041,11 +2612,17 @@ pub(crate) fn pre_interrupt_agent(
         .reservations
         .get_mut(&task_id)
         .expect("resolved task");
+    let mut changed = !reservation.interrupt_requested;
+    reservation.interrupt_requested = true;
+    reservation.resume_requested_at_ms = None;
     if reservation.state.is_active() && reservation.fenced_at_ms.is_none() {
         reservation.fenced_at_ms = Some(now_ms);
-        reservation.updated_at_ms = now_ms;
         reservation.error_message =
             Some("root requested interrupt; tool access revoked pending settlement".into());
+        changed = true;
+    }
+    if changed {
+        reservation.updated_at_ms = now_ms;
         store.save(&mut ledger, now_ms)?;
     }
     Ok(())
@@ -2133,6 +2710,15 @@ pub(crate) fn settle_interrupt_acknowledgement(
         }
     };
     let error_message = reservation.error_message.clone();
+    let reservation_snapshot = (
+        reservation.attempt_id.clone(),
+        reservation.root_turn_id_hash.clone(),
+        reservation.current_turn_id_hash.clone(),
+        reservation.created_at_ms,
+        reservation.current_turn_queued_at_ms,
+        reservation.current_turn_started_at_ms,
+        reservation.started_at_ms,
+    );
     store.save(&mut ledger, now_ms)?;
 
     let success = outcome.is_success();
@@ -2173,6 +2759,38 @@ pub(crate) fn settle_interrupt_acknowledgement(
         "execution.outcome".into(),
         Value::String(format!("{outcome:?}").to_ascii_lowercase()),
     );
+    let (
+        attempt_id,
+        root_turn_hash,
+        turn_hash,
+        created_at_ms,
+        current_turn_queued_at_ms,
+        current_turn_started_at_ms,
+        started_at_ms,
+    ) = reservation_snapshot;
+    event.attempt_hash = Some(hash_component(&attempt_id));
+    event.root_turn_hash = root_turn_hash;
+    event.turn_hash = turn_hash;
+    event.latency_ms = Some(now_ms.saturating_sub(created_at_ms));
+    let execution_started_at_ms = current_turn_started_at_ms.or_else(|| {
+        current_turn_queued_at_ms
+            .is_none()
+            .then_some(started_at_ms)
+            .flatten()
+    });
+    if let Some(execution_started_at_ms) = execution_started_at_ms {
+        event.attributes.insert(
+            "duration.execution_ms".into(),
+            Value::Number(now_ms.saturating_sub(execution_started_at_ms).into()),
+        );
+    }
+    if let Some(queued_at_ms) = current_turn_queued_at_ms.or(Some(created_at_ms)) {
+        let execution_started_at_ms = execution_started_at_ms.unwrap_or(now_ms);
+        event.attributes.insert(
+            "duration.queue_ms".into(),
+            Value::Number(execution_started_at_ms.saturating_sub(queued_at_ms).into()),
+        );
+    }
     if prior_outcome.is_none() {
         event.error_code = Some("root_interrupt_abandoned".into());
         event.error_message = error_message;
@@ -2189,6 +2807,8 @@ pub(crate) struct ChildToolContext<'a> {
     pub(crate) agent_id: &'a str,
     pub(crate) agent_type: Option<&'a str>,
     pub(crate) transcript_path: Option<&'a str>,
+    pub(crate) turn_id: Option<&'a str>,
+    pub(crate) native_read_only: bool,
     pub(crate) tool_name: &'a str,
     pub(crate) tool_input: Option<&'a Value>,
 }
@@ -2215,6 +2835,8 @@ pub(crate) fn authorize_child_tool(
         agent_id,
         agent_type,
         transcript_path,
+        turn_id,
+        native_read_only,
         tool_name,
         tool_input,
     } = context;
@@ -2270,6 +2892,7 @@ pub(crate) fn authorize_child_tool(
         }
         return Ok(Some(reason));
     }
+    let mut started_followup = false;
     if let Some(task_id) = bound_task.as_deref()
         && let Some(current) = ledger.as_mut()
     {
@@ -2294,6 +2917,12 @@ pub(crate) fn authorize_child_tool(
             return Ok(Some(reason));
         }
         if let Some(reservation) = current.reservations.get_mut(task_id)
+            && reservation.resume_pending(now_ms)
+        {
+            reservation.reopen_for_followup(now_ms);
+            store.save(current, now_ms)?;
+        }
+        if let Some(reservation) = current.reservations.get_mut(task_id)
             && reservation.state.is_active()
             && reservation.fenced_at_ms.is_none()
             && reservation.agent_id_hash.as_deref() != Some(agent_hash.as_str())
@@ -2307,23 +2936,100 @@ pub(crate) fn authorize_child_tool(
             reservation.updated_at_ms = now_ms;
             store.save(current, now_ms)?;
         }
+        if let (Some(reservation), Some(turn_id)) = (current.reservations.get_mut(task_id), turn_id)
+        {
+            let turn_hash = hash_component(turn_id);
+            let mut changed = false;
+            if reservation.current_turn_id_hash.as_deref() != Some(turn_hash.as_str()) {
+                let unresolved = reservation.followup_turn_is_unresolved();
+                if reservation
+                    .retired_turn_id_hashes
+                    .contains(turn_hash.as_str())
+                {
+                    return Ok(Some(format!(
+                        "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 资源门禁：child turn `{turn_id}` 不属于 attempt `{}` 的当前轮，禁止使用旧轮凭证恢复工具权限。",
+                        reservation.attempt_id
+                    )));
+                }
+                if unresolved {
+                    reservation.current_turn_queued_at_ms =
+                        reservation.resume_requested_at_ms.take().or(Some(now_ms));
+                    reservation.current_turn_started_at_ms = None;
+                }
+                started_followup = reservation.followup_count > 0
+                    && reservation.current_turn_started_at_ms.is_none();
+                if let Some(previous) = reservation.current_turn_id_hash.replace(turn_hash.clone())
+                {
+                    reservation.retired_turn_id_hashes.insert(previous);
+                }
+                reservation.native_read_only_turn_hash = None;
+                reservation.token_usage = reservation.usage_by_turn.get(&turn_hash).cloned();
+                reservation.current_turn_queued_at_ms.get_or_insert(now_ms);
+                reservation.current_turn_started_at_ms.get_or_insert(now_ms);
+                changed = true;
+            }
+            if native_read_only
+                && reservation.native_read_only_turn_hash.as_deref() != Some(turn_hash.as_str())
+            {
+                reservation.native_read_only_turn_hash = Some(turn_hash);
+                changed = true;
+            }
+            if changed {
+                reservation.updated_at_ms = now_ms;
+                store.save(current, now_ms)?;
+            }
+        } else if let Some(reservation) = current.reservations.get_mut(task_id)
+            && turn_id.is_none()
+            && reservation.bind_anonymous_turn(now_ms)
+        {
+            store.save(current, now_ms)?;
+        }
     }
     let bound_reservation = bound_task.as_ref().and_then(|task_id| {
         ledger
             .as_ref()
             .and_then(|ledger| ledger.reservations.get(task_id))
     });
+    if started_followup && let Some(reservation) = bound_reservation {
+        let trace = reservation_trace(reservation);
+        let mut event = SubagentTraceEvent::new(
+            now_ms,
+            &trace,
+            TraceEventKind::Resumed,
+            ExecutionStatus::Running,
+            runtime_id,
+            session_id,
+            &reservation.task_id,
+            Some(agent_id),
+            Some(&reservation.role),
+        );
+        associate_trace_event(&mut event, reservation);
+        attach_duration_attributes(&mut event, reservation, now_ms);
+        event
+            .attributes
+            .insert("resume.source".into(), Value::String("child_tool".into()));
+        TraceRecorder::new(state_root).record_best_effort(&event);
+    }
     let role = bound_reservation.map(|reservation| reservation.role.as_str());
     if let Some(role) = role.filter(|role| crate::config::valid_subagent_role_id(role)) {
         loaded_rules.rules.register_runtime_role(role);
     }
+    let explorer_wrapper_denial = bound_reservation
+        .filter(|reservation| reservation.role == crate::config::SUBAGENT_ROLE_EXPLORER)
+        .filter(|_| rules::explorer_has_unbounded_side_effects(tool_name))
+        .map(|reservation| {
+            format!(
+                "CODEY_SUBAGENT_EXPLORER_WRAPPER_DENIED: Explorer attempt `{}` 不得调用通用执行包装或可操作界面工具 `{tool_name}`；该工具可能绕过原生只读沙箱。只读文件、搜索、图片和网络检索工具仍可用。",
+                reservation.attempt_id
+            )
+        });
     let decision = loaded_rules.rules.evaluate(&RuleContext {
         actor: RuleActor::Child,
         role,
         tool_name,
         tool_class,
     });
-    let capability_denial = match tool_class {
+    let capability_denial = explorer_wrapper_denial.or_else(|| match tool_class {
         ToolClass::Read => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 资源门禁：当前 child 无法通过派生回执或生命周期 transcript 与有效活动 attempt 安全关联，禁止执行读取工具。请停止本次调用并把错误码返回主代理；不要猜测 task 归属绕过身份绑定。"
@@ -2378,6 +3084,15 @@ pub(crate) fn authorize_child_tool(
                 "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止工具 `{tool_name}`。读取被拒绝时不得用 Bash 回退；应由根代理修正契约或直接接管。",
                 reservation.attempt_id
             )),
+            Some(reservation)
+                if reservation.role == crate::config::SUBAGENT_ROLE_EXPLORER
+                    && !reservation_turn_is_native_read_only(reservation, turn_id) =>
+            {
+                Some(format!(
+                    "Codey 沙箱门禁：explorer attempt `{}` 当前 turn 尚未从原生 rollout 证明只读权限，禁止执行通用命令 `{tool_name}`。只读文件、搜索、图片和网络检索工具仍可用；请回报主代理，由主代理执行命令或重新派发到明确只读的原生环境。",
+                    reservation.attempt_id
+                ))
+            }
             Some(_) => None,
         },
         ToolClass::Network => match bound_reservation {
@@ -2398,7 +3113,7 @@ pub(crate) fn authorize_child_tool(
             )),
             Some(_) => None,
         },
-        ToolClass::Write | ToolClass::Unknown => match bound_reservation {
+        ToolClass::Write => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 能力/资源门禁：当前 child 未绑定有效 attempt，禁止执行写入工具。不要重试写入或等待门禁自行恢复；请立即把该错误码返回主代理，由主代理使用全新的 task_name 重新派生或直接接管。"
             )),
@@ -2410,11 +3125,33 @@ pub(crate) fn authorize_child_tool(
                     reservation.attempt_id
                 ))
             }
-            Some(reservation) if !reservation_declares_write(reservation) => Some(format!(
+            Some(reservation)
+                if !reservation_declares_write(reservation) =>
+            {
+                Some(format!(
                 "Codey 能力门禁：attempt `{}` 当前不具备写入权限，工具 `{tool_name}` 未执行。请停止在本子代理内重试写入，把修改建议和证据返回主代理，由主代理完成写入。",
                 reservation.attempt_id
-            )),
+                ))
+            }
+            Some(reservation) if reservation.role == crate::config::SUBAGENT_ROLE_REVIEWER => {
+                Some(
+                    "Codey 复核门禁：Reviewer 不得直接修改源码。可继续运行测试、构建和生成测试产物；如需代码修改，请把补丁建议返回主代理或由 Worker 实施。"
+                        .to_string(),
+                )
+            }
             Some(_) => None,
+        },
+        ToolClass::Unknown if bound_reservation.is_some_and(|reservation| {
+            !reservation_declares_write(reservation)
+        }) => Some(format!(
+            "Codey 工具门禁：未归类工具 `{tool_name}` 可能产生副作用，无法证明只读；本调用未执行。请改用已登记的只读工具，或把请求返回主代理处理。"
+        )),
+        ToolClass::Unknown => match bound_reservation {
+            Some(reservation)
+                if reservation.state.is_active() && reservation.fenced_at_ms.is_none() => None,
+            _ => Some(format!(
+                "{UNBOUND_ATTEMPT_ERROR_CODE}: 当前 child 未绑定有效活动 attempt，禁止执行工具 `{tool_name}`。"
+            )),
         },
         ToolClass::Collaboration if !safe_child_reporting_tool(tool_name, tool_input) => {
             Some(
@@ -2423,7 +3160,7 @@ pub(crate) fn authorize_child_tool(
             )
         }
         _ => None,
-    };
+    });
     let trace = bound_reservation
         .map(reservation_trace)
         .unwrap_or_else(|| TraceContext::new(None));
@@ -2493,6 +3230,11 @@ pub(crate) fn authorize_child_tool(
                     .collect(),
             ),
         );
+        audit.attempt_hash = Some(hash_component(&reservation.attempt_id));
+        audit.root_turn_hash = reservation.root_turn_id_hash.clone();
+    }
+    if let Some(turn_id) = turn_id {
+        audit.turn_hash = Some(hash_component(turn_id));
     }
     if capability_denial.is_some() || decision.effect == RuleEffect::Deny {
         TraceRecorder::new(state_root).record_best_effort(&audit);
@@ -2523,7 +3265,21 @@ pub(crate) fn settle_turn(
         !ledger_has_outstanding(&ledger),
         "Codey 子代理仍有未结算的活动 attempt"
     );
-    store.remove()
+    // Successful children stay addressable for `followup_task` in later turns
+    // of this session; everything else is dropped as before.
+    let runtime_generation = ledger.runtime_generation;
+    let mut ledger = ledger;
+    ledger
+        .reservations
+        .retain(|_, reservation| reservation.resumable(runtime_generation));
+    if ledger.reservations.is_empty() {
+        return store.remove();
+    }
+    for reservation in ledger.reservations.values_mut() {
+        reservation.resume_requested_at_ms = None;
+    }
+    ledger.issued_task_ids = ledger.reservations.keys().cloned().collect();
+    store.save(&mut ledger, now_ms)
 }
 
 pub(crate) fn end_session(
@@ -2569,6 +3325,48 @@ fn reservation_declares_write(reservation: &Reservation) -> bool {
         .capabilities
         .iter()
         .any(|capability| capability == "workspace.write")
+}
+
+fn reservation_turn_is_native_read_only(reservation: &Reservation, turn_id: Option<&str>) -> bool {
+    turn_id.map(hash_component).is_some_and(|turn_hash| {
+        reservation.native_read_only_turn_hash.as_deref() == Some(&turn_hash)
+    })
+}
+
+fn associate_trace_event(event: &mut SubagentTraceEvent, reservation: &Reservation) {
+    event.attempt_hash = Some(hash_component(&reservation.attempt_id));
+    event.root_turn_hash = reservation.root_turn_id_hash.clone();
+    event.turn_hash = reservation.current_turn_id_hash.clone();
+}
+
+fn attach_duration_attributes(
+    event: &mut SubagentTraceEvent,
+    reservation: &Reservation,
+    now_ms: u64,
+) {
+    let execution_started_at_ms = reservation.current_turn_started_at_ms.or_else(|| {
+        reservation
+            .current_turn_queued_at_ms
+            .is_none()
+            .then_some(reservation.started_at_ms)
+            .flatten()
+    });
+    if let Some(started_at_ms) = execution_started_at_ms {
+        event.attributes.insert(
+            "duration.execution_ms".into(),
+            Value::Number(now_ms.saturating_sub(started_at_ms).into()),
+        );
+    }
+    if let Some(queued_at_ms) = reservation
+        .current_turn_queued_at_ms
+        .or(Some(reservation.created_at_ms))
+    {
+        let execution_started_at_ms = execution_started_at_ms.unwrap_or(now_ms);
+        event.attributes.insert(
+            "duration.queue_ms".into(),
+            Value::Number(execution_started_at_ms.saturating_sub(queued_at_ms).into()),
+        );
+    }
 }
 
 fn reservation_trace(reservation: &Reservation) -> TraceContext {
@@ -2647,23 +3445,24 @@ mod tests {
     }
 
     #[test]
-    fn native_capsule_assigns_the_same_capabilities_to_every_role() {
+    fn native_capsule_withholds_file_writes_only_from_the_explorer() {
         let temp = tempdir().unwrap();
         let rules = rules::load(temp.path()).rules;
         for role in crate::config::SUBAGENT_ROLE_IDS {
             let task =
                 prepare_task_capsule(Some(&spawn_input("task", role)), Some("/repo"), &rules)
                     .unwrap();
-            assert_eq!(
-                task.capabilities,
-                [
+            let expected: &[&str] = if role == crate::config::SUBAGENT_ROLE_EXPLORER {
+                &["command.execute", "files.read", "visual.inspect"]
+            } else {
+                &[
                     "command.execute",
                     "files.read",
                     "workspace.write",
-                    "visual.inspect"
-                ],
-                "{role}"
-            );
+                    "visual.inspect",
+                ]
+            };
+            assert_eq!(task.capabilities, expected, "{role}");
         }
     }
 
@@ -2675,7 +3474,7 @@ mod tests {
             root,
             "visual-session",
             "visual_reader",
-            "codey_visual_analysis",
+            "codey_reviewer",
             "visual-agent",
             "/repo",
             0,
@@ -2693,8 +3492,10 @@ mod tests {
                     "visual-session",
                     ChildToolContext {
                         agent_id: "visual-agent",
-                        agent_type: Some("codey_visual_analysis"),
+                        agent_type: Some("codey_reviewer"),
                         transcript_path: None,
+                        turn_id: Some("visual-turn"),
+                        native_read_only: false,
                         tool_name,
                         tool_input: None,
                     },
@@ -2710,30 +3511,50 @@ mod tests {
             root,
             "scan-session",
             "plain_reader",
-            "codey_quick_scan",
+            "codey_explorer",
             "scan-agent",
             "/scan-repo",
             0,
             30,
         );
-        for tool_name in [
-            "mcp__cua_repl__js",
-            "apply_patch",
-            "exec_command",
-            "mcp__custom__tool",
-        ] {
+        assert!(
+            authorize_child_tool_with_context(
+                root,
+                "runtime-a",
+                "scan-session",
+                ChildToolContext {
+                    agent_id: "scan-agent",
+                    agent_type: Some("codey_explorer"),
+                    transcript_path: None,
+                    turn_id: Some("scan-turn"),
+                    native_read_only: false,
+                    tool_name: "apply_patch",
+                    tool_input: None,
+                },
+                35,
+            )
+            .unwrap()
+            .is_some_and(|reason| reason.contains("不具备写入权限"))
+        );
+        for tool_name in ["mcp__cua_repl__js", "exec_command", "mcp__custom__tool"] {
             let context = || ChildToolContext {
                 agent_id: "scan-agent",
-                agent_type: Some("codey_quick_scan"),
+                agent_type: Some("codey_explorer"),
                 transcript_path: None,
+                turn_id: Some("scan-turn"),
+                native_read_only: false,
                 tool_name,
                 tool_input: None,
             };
-            assert_eq!(
+            let denial =
                 authorize_child_tool_with_context(root, "runtime-a", "scan-session", context(), 40)
-                    .unwrap(),
-                None,
-                "{tool_name}"
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                denial.contains("WRAPPER_DENIED")
+                    || denial.contains("沙箱门禁")
+                    || denial.contains("未归类工具"),
+                "{tool_name}: {denial}"
             );
         }
         subagent_stopped(root, "runtime-a", "scan-session", "scan-agent", 41).unwrap();
@@ -2743,24 +3564,28 @@ mod tests {
             "exec_command",
             "mcp__custom__tool",
         ] {
+            let denial = authorize_child_tool_with_context(
+                root,
+                "runtime-a",
+                "scan-session",
+                ChildToolContext {
+                    agent_id: "scan-agent",
+                    agent_type: Some("codey_explorer"),
+                    transcript_path: None,
+                    turn_id: Some("scan-turn"),
+                    native_read_only: false,
+                    tool_name,
+                    tool_input: None,
+                },
+                42,
+            )
+            .unwrap()
+            .unwrap();
             assert!(
-                authorize_child_tool_with_context(
-                    root,
-                    "runtime-a",
-                    "scan-session",
-                    ChildToolContext {
-                        agent_id: "scan-agent",
-                        agent_type: Some("codey_quick_scan"),
-                        transcript_path: None,
-                        tool_name,
-                        tool_input: None,
-                    },
-                    42,
-                )
-                .unwrap()
-                .unwrap()
-                .contains(UNBOUND_ATTEMPT_ERROR_CODE),
-                "{tool_name}"
+                denial.contains(UNBOUND_ATTEMPT_ERROR_CODE)
+                    || denial.contains("WRAPPER_DENIED")
+                    || denial.contains("未归类工具"),
+                "{tool_name}: {denial}"
             );
         }
     }
@@ -2794,7 +3619,7 @@ mod tests {
                 temp.path(),
                 "runtime-a",
                 "session-b",
-                Some(&spawn_input("writer_a", "codey_quick_scan")),
+                Some(&spawn_input("writer_a", "codey_explorer")),
                 Some("/repo"),
                 0,
                 10,
@@ -2806,7 +3631,7 @@ mod tests {
             temp.path(),
             "runtime-a",
             "session-a",
-            Some(&spawn_input("writer_b", "codey_deep_research")),
+            Some(&spawn_input("writer_b", "codey_reviewer")),
             Some("/repo"),
             1,
             11,
@@ -2844,7 +3669,7 @@ mod tests {
     #[test]
     fn terminal_lifecycle_settles_without_a_batch_decision() {
         let temp = tempdir().unwrap();
-        let input = spawn_input("read_task", "codey_quick_scan");
+        let input = spawn_input("read_task", "codey_explorer");
         assert_eq!(
             pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap(),
             None
@@ -2881,7 +3706,7 @@ mod tests {
                 temp.path(),
                 session,
                 task,
-                "codey_quick_scan",
+                "codey_explorer",
                 agent,
                 &format!("/repo-{index}"),
                 index,
@@ -2889,7 +3714,7 @@ mod tests {
             );
         }
 
-        let refill = spawn_input("read_d", "codey_quick_scan");
+        let refill = spawn_input("read_d", "codey_explorer");
         let denial = pre_spawn_with_workspace(
             temp.path(),
             "runtime-a",
@@ -2937,14 +3762,14 @@ mod tests {
             temp.path(),
             session,
             "read_a",
-            "codey_quick_scan",
+            "codey_explorer",
             "agent-reader",
             "/read-repo",
             1,
             20,
         );
 
-        let read_refill = spawn_input("read_b", "codey_quick_scan");
+        let read_refill = spawn_input("read_b", "codey_explorer");
         let denial = pre_spawn_with_workspace(
             temp.path(),
             "runtime-a",

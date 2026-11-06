@@ -46,6 +46,7 @@ export type Profile = {
   officialAccount: boolean;
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
+  officialSiwc?: boolean;
   supportsRemoteCompaction?: boolean;
   remoteCompactionProtocol?: "responses" | "compactEndpoint";
   supportsWebsockets?: boolean;
@@ -69,11 +70,9 @@ export type PromptOptimizationConfig = {
 };
 
 export type BuiltinSubagentRoleId =
-  | "codey_quick_scan"
-  | "codey_deep_research"
-  | "codey_visual_analysis"
+  | "codey_explorer"
   | "codey_worker"
-  | "codey_visual_worker"
+  | "codey_reviewer"
   | "default";
 
 export type SubagentRoleId = BuiltinSubagentRoleId | (string & {});
