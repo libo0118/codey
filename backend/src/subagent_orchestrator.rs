@@ -74,12 +74,14 @@ struct SessionLedger {
     reservations: BTreeMap<String, Reservation>,
 }
 
+type BeforeReservationSave<'a> = dyn Fn(&str, &BTreeSet<String>) -> Result<()> + 'a;
+
 #[derive(Clone, Copy)]
 pub(crate) struct RootHookContext<'a> {
     workspace_root: Option<&'a str>,
     active_agents: usize,
     now_ms: u64,
-    before_reservation_save: Option<&'a dyn Fn(&str, &BTreeSet<String>) -> Result<()>>,
+    before_reservation_save: Option<&'a BeforeReservationSave<'a>>,
 }
 
 impl<'a> RootHookContext<'a> {
@@ -94,7 +96,7 @@ impl<'a> RootHookContext<'a> {
 
     pub(crate) fn with_before_reservation_save(
         mut self,
-        callback: &'a dyn Fn(&str, &BTreeSet<String>) -> Result<()>,
+        callback: &'a BeforeReservationSave<'a>,
     ) -> Self {
         self.before_reservation_save = Some(callback);
         self
