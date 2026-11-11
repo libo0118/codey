@@ -52,16 +52,16 @@ fn configured_count_reaches_native_overrides_policy_and_prompts_only_on_restart(
         let mut config = config();
         config.subagent_max_threads = limit;
         let applied = start(&home, &marker, &config).unwrap();
-        for key in [
-            "agents.max_threads",
-            "agents.max_concurrent_threads_per_session",
-        ] {
-            assert!(
-                applied
-                    .runtime_config_overrides
-                    .contains(&format!("{key}={limit}"))
-            );
-        }
+        assert!(applied.runtime_config_overrides.contains(&format!(
+            "agents.max_concurrent_threads_per_session={limit}"
+        )));
+        assert!(
+            applied
+                .runtime_config_overrides
+                .iter()
+                .all(|entry| !entry.starts_with("agents.max_threads=")),
+            "Codex treats max_threads as an alias; emitting both drops all runtime roles"
+        );
         for (key, expected) in [
             (
                 "root_agent_usage_hint_text",
@@ -115,7 +115,7 @@ fn configured_count_reaches_native_overrides_policy_and_prompts_only_on_restart(
         restore_runtime_config_at(&home, &marker, false).unwrap();
         let restarted = start(&home, &marker, &config).unwrap();
         assert!(restarted.runtime_config_overrides.contains(&format!(
-            "agents.max_threads={}",
+            "agents.max_concurrent_threads_per_session={}",
             config.subagent_max_threads
         )));
         assert_eq!(

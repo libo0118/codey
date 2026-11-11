@@ -3205,6 +3205,7 @@ command = "echo preserve-user-hook"
     assert_eq!(agents["interrupt_message"].as_bool(), Some(true));
     assert_eq!(agents["custom_setting"].as_str(), Some("preserved"));
     assert_eq!(agents["enabled"].as_bool(), Some(true));
+    assert!(agents.get("max_threads").is_none());
     assert_eq!(
         agents["max_concurrent_threads_per_session"].as_integer(),
         Some(DEFAULT_SUBAGENT_MAX_CONCURRENCY)
@@ -3309,6 +3310,7 @@ default_subagent_reasoning_effort = "low"
         document["agents"]["max_concurrent_threads_per_session"].as_integer(),
         Some(4)
     );
+    assert!(document["agents"].get("max_threads").is_none());
 }
 
 #[test]
@@ -4219,7 +4221,6 @@ wire_api = "responses"
         "mcp_servers.codey_fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
         "tool_output_token_limit",
         "agents.enabled",
-        "agents.max_threads",
         "agents.max_concurrent_threads_per_session",
         "agents.default_subagent_model",
         "agents.default_subagent_reasoning_effort",

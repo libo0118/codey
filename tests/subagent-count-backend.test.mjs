@@ -28,10 +28,10 @@ test("subagent count source contract reaches both launch paths, native overrides
   ]);
   assert.match(launcher, /let subagent_max_threads = runtime_subagent_config\.subagent_max_threads/);
   assert.match(launcher, /subagent_max_threads: native_subagent_config\.subagent_max_threads/);
-  for (const key of ["max_threads", "max_concurrent_threads_per_session"]) {
-    assert.ok(runtime.includes(`agents["${key}"] = value(i64::from(limit))`));
-    assert.ok(runtime.includes(`"agents.${key}"`));
-  }
+  assert.ok(runtime.includes('agents["max_concurrent_threads_per_session"] = value(i64::from(limit))'));
+  assert.ok(runtime.includes('"agents.max_concurrent_threads_per_session"'));
+  assert.match(runtime, /agents\.remove\("max_threads"\)/);
+  assert.doesNotMatch(runtime, /agents\["max_threads"\]\s*=|"agents\.max_threads"/);
   assert.match(runtime, /subagent_max_threads: options\.subagent_max_threads/);
   assert.match(policy, /pub\(crate\) max_threads: u32/);
   assert.match(policy, /validate_subagent_max_threads\(policy\.max_threads\)/);

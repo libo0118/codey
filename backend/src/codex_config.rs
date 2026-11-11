@@ -2431,7 +2431,7 @@ fn enable_subagent_optimization(
     if !has_valid_concurrency {
         agents["max_concurrent_threads_per_session"] = value(DEFAULT_SUBAGENT_MAX_CONCURRENCY);
     }
-    agents["max_threads"] = agents["max_concurrent_threads_per_session"].clone();
+    agents.remove("max_threads");
     agents["default_subagent_model"] = value(subagent_model);
     agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
     let features = ensure_root_table(doc, "features")?;
@@ -2484,7 +2484,7 @@ fn enable_subagent_optimization(
 
 fn apply_subagent_max_threads(doc: &mut DocumentMut, limit: u32) -> Result<()> {
     let agents = ensure_root_table(doc, "agents")?;
-    agents["max_threads"] = value(i64::from(limit));
+    agents.remove("max_threads");
     agents["max_concurrent_threads_per_session"] = value(i64::from(limit));
     let multi_agent = doc["features"]["multi_agent_v2"]
         .as_table_mut()
@@ -2900,7 +2900,6 @@ fn build_isolated_runtime_overrides(
         }
         for (path, key) in [
             (&["agents", "enabled"][..], "agents.enabled"),
-            (&["agents", "max_threads"][..], "agents.max_threads"),
             (
                 &["agents", "max_concurrent_threads_per_session"][..],
                 "agents.max_concurrent_threads_per_session",
