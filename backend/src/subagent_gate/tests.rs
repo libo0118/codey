@@ -5379,7 +5379,8 @@ fn nested_thread_spawn_rollout_and_null_completed_status_settle_provisional_chil
                 "payload": {
                     "turn_id": "child-turn-1",
                     "model": "gpt-5.6-terra",
-                    "effort": "medium"
+                    "effort": "medium",
+                    "sandbox_policy": { "type": "read-only" }
                 }
             })
         ),
@@ -5387,7 +5388,7 @@ fn nested_thread_spawn_rollout_and_null_completed_status_settle_provisional_chil
     .unwrap();
 
     // Child PreToolUse with parent transcript_path resolves the child's own rollout
-    // from sessions/ for both runtime model attestation and reservation binding.
+    // from sessions/ for model/sandbox attestation and reservation binding.
     let mut child_tool = input("PreToolUse", session_id);
     child_tool.agent_id = Some(agent_id.to_string());
     child_tool.agent_type = Some("codey_explorer".to_string());

@@ -28,6 +28,8 @@ Status: implemented
 
 JavaScript 全量回归、TypeScript 检查、前端生产构建、Rust 格式及 Cargo 锁文件解析在本机执行；Windows 本机缺少 MSVC 链接器，Rust 编译、全量测试与 lint 交给现有 CI 工作流，不把源码检查当作编译完成。真实 Codex 运行、权限切换与远程客户端仍需另行现场验证。
 
+上游新增的嵌套派生 transcript 夹具声明 Explorer 的原生只读沙箱，验证新身份定位与旧权限证明同时成立；不跳过该测试，也不为无证明的命令调用放宽生产门禁。
+
 ## Consequences
 
 自定义角色权限与原生计时继续需要维护小范围 fork 差异；已有旧统计版本重新加载后会切换到新实现。CI 的手动分支构建仅上传产物，不触发 tag 发布，不自动替换任何用户正在运行的程序。
