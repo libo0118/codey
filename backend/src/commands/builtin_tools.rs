@@ -318,7 +318,13 @@ async fn status(state: &Arc<AppState>) -> Result<Value> {
 
 async fn enable(state: &Arc<AppState>) -> Result<String> {
     let root = root(state)?;
-    runtime::install(root.clone(), state.http_client.current_for_any_host().await).await?;
+    let client = state
+        .http_client()
+        .await
+        .map_err(anyhow::Error::msg)?
+        .current_for_any_host()
+        .await;
+    runtime::install(root.clone(), client).await?;
     let launcher_root = root.clone();
     tokio::task::spawn_blocking(move || runtime::prepare_launcher(&launcher_root)).await??;
     // 下载可能耗时，落盘前重新读取并校验，保留期间人工配置的改动。

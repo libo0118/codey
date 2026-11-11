@@ -197,7 +197,7 @@ test("python plugin packaging scope and scaffold unit suites pass", options, () 
   const result = spawnSync(
     python,
     ["-m", "unittest", "discover", "-s", scriptsDir, "-p", "test_*.py"],
-    { encoding: "utf8" },
+    { encoding: "utf8", env: { ...process.env, PYTHONUTF8: "1" } },
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
