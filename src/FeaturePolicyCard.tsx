@@ -332,7 +332,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    检索角色只读，复核角色可按任务运行测试、构建和渲染检查
+                    检索角色只读；复核角色可按任务运行测试、构建和渲染检查
                   </span>
                 </div>
                 <div className="subagent-table-head" aria-hidden="true">

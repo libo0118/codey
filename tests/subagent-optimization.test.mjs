@@ -36,7 +36,7 @@ test("subagent settings expose the three supported role controls", async () => {
   assert.match(featurePolicySource, /复核角色可按任务运行测试、构建和渲染检查/);
   assert.match(featurePolicySource, /复核仅在任务允许时运行构建、测试或渲染检查/);
   assert.match(featurePolicySource, /实际操作仍受 Codex 原生权限约束/);
-  assert.doesNotMatch(featurePolicySource, /各角色工具权限一致/);
+  assert.match(featurePolicySource, /检索角色使用只读沙箱/);
   assert.match(featurePolicySource, /roleDisabled/);
   assert.match(stateSource, /kind: "analysis"/);
   assert.match(stateSource, /kind: "implementation"/);

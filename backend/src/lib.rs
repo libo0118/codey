@@ -299,8 +299,7 @@ impl Drop for PluginShutdownGuard {
 }
 
 async fn run(ui: NativeUpdateUi, lifecycle: Arc<DesktopLifecycle>) -> Result<()> {
-    // Config load, ledger read and HTTP client construction (which loads the
-    // system root store) are synchronous; keep them off the async workers.
+    // Config and ledger reads are synchronous; keep them off the async workers.
     let state = tokio::task::spawn_blocking(|| {
         error_log::initialize();
         let state = Arc::new(AppState::default());
@@ -320,6 +319,18 @@ async fn run(ui: NativeUpdateUi, lifecycle: Arc<DesktopLifecycle>) -> Result<()>
     })
     .await
     .context("初始化 Codey 状态的任务异常退出")?;
+    // 系统证书加载与应用发现、会话维护并行；首次使用共用同一初始化任务。
+    let http_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(error) = http_state.http_client().await {
+            error_log::record_failure(
+                "http_client_initialization_failed",
+                "prewarm_shared_http_client",
+                error,
+                serde_json::json!({}),
+            );
+        }
+    });
     let _plugin_shutdown = PluginShutdownGuard;
     if state.remote_control.restore_startup(&state).await.is_err() {
         error_log::record_failure(

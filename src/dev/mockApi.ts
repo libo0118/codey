@@ -18,12 +18,12 @@ import {
 import { routeModelAlias } from "../modelRoutes";
 import { fallbackRouteShortName, validateThirdPartyRouteShortName } from "../routeShortNames";
 import { MAX_ROUTE_NAME_CHARACTERS, validateOfficialRouteSettings } from "../officialRouteSettings";
-import { previewOfficialModels, previewUpstreamModels } from "../previewModels";
+import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
 import { validateSubagents } from "../features/subagents/state";
 import {
   previewCrashpadPendingStats,
   previewTraceLogStats,
-} from "../previewTraceLogStats";
+} from "./previewTraceLogStats";
 
 function eligiblePreviewOutputDurationMs(item: {
   outputTokens?: number | null;

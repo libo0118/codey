@@ -135,64 +135,6 @@
     }
     return patched;
   };
-  const replaceNearestRendererGateBeforeAnchor = (
-    source,
-    pattern,
-    replacement,
-    name,
-    anchor,
-    maximumDistance,
-  ) => {
-    if (activeRendererPatchFailures?.has(name)) return source;
-    const anchorIndexes = [];
-    for (
-      let index = source.indexOf(anchor);
-      index >= 0;
-      index = source.indexOf(anchor, index + anchor.length)
-    ) anchorIndexes.push(index);
-    if (anchorIndexes.length !== 1) {
-      return recordIncompatibleRendererGate(source, name, anchorIndexes.length);
-    }
-
-    const anchorIndex = anchorIndexes[0];
-    const scopeStart = Math.max(0, anchorIndex - maximumDistance);
-    const scope = source.slice(scopeStart, anchorIndex + anchor.length);
-    const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
-    const candidates = [];
-    for (const gate of gates) {
-      scope.replace(gate.pattern, (...args) => {
-        candidates.push({ args, gate, offset: args.at(-2) });
-        return args[0];
-      });
-    }
-    if (candidates.length === 0) {
-      return recordIncompatibleRendererGate(source, name, 0);
-    }
-
-    const nearestOffset = Math.max(
-      ...candidates.map((candidate) => candidate.offset),
-    );
-    const nearestCandidates = candidates.filter(
-      (candidate) => candidate.offset === nearestOffset,
-    );
-    if (nearestCandidates.length !== 1) {
-      return recordIncompatibleRendererGate(
-        source,
-        name,
-        nearestCandidates.length,
-      );
-    }
-
-    const [{ args, gate, offset }] = nearestCandidates;
-    const effectiveReplacement = gate.replacement ?? replacement;
-    const replaced = typeof effectiveReplacement === "function"
-      ? effectiveReplacement(...args)
-      : effectiveReplacement;
-    const absoluteOffset = scopeStart + offset;
-    return source.slice(0, absoluteOffset) +
-      replaced +
-      source.slice(absoluteOffset + args[0].length);
-  };
   const replacePetRendererImportWithStubs = (match, importClause) => {
     if (typeof importClause !== "string" || importClause.trim() === "") {
       return "";
@@ -374,7 +316,7 @@
     "isNewThreadDraft:",
     "isManuallyChanged:!1,modelSettings:null,serviceTier:null",
     "inactiveThreadUnsubscriber.clearConversationStreamOwnership",
-    "codexComposerAdapter.CodexComposerAdapter.interruptThreadError",
+    "resolvedHostId:",
     "sendMessageFromView",
     "AppServerRequestClient is missing a message dispatcher",
     "codex-avatar",
@@ -391,10 +333,25 @@
     "supportsIndependentSpeedModes",
     "serviceTierAccess:",
     "electron-app-state-snapshot-request",
-    "activeInteractions=new Map"
+    "activeInteractions=new Map",
+    ":has([data-state=open])",
+    ":has(>[data-state=open])",
+    ":has(button[data-state=open])",
+    ":has(:is(button[data-state=open]))",
+    ":has([aria-expanded=true],[data-state=open])"
   ]/*end-codey-renderer-patch-anchors*/;
+  const petOnlyPatchAnchors = new Set([
+    "codex-avatar",
+    "codex-pet-assets",
+    "avatar-mascot-button",
+    "use-avatar-options",
+    "shouldPrewarmAvatarOverlay:",
+  ]);
+  const activeRendererPatchAnchors = disablePet
+    ? rendererPatchAnchors
+    : rendererPatchAnchors.filter((anchor) => !petOnlyPatchAnchors.has(anchor));
   const patchCodexRendererAsset = (source) => {
-    if (!rendererPatchAnchors.some((anchor) => source.includes(anchor))) return source;
+    if (!activeRendererPatchAnchors.some((anchor) => source.includes(anchor))) return source;
     let patched = source;
     if (source.includes("isNewThreadDraft:")
       && source.includes("modelSettingsPersistAsDefault:")
@@ -422,7 +379,11 @@
         "app server manager registry",
       );
     }
-    if (source.includes("codexComposerAdapter.CodexComposerAdapter.interruptThreadError")
+    if ((source.includes("codexComposerAdapter.CodexComposerAdapter.interruptThreadError")
+      || source.includes("CodexComposerAdapter"))
+      && source.includes("let{agentMode:")
+      && source.includes("resolvedHostId:")
+      && source.includes("submitDisabled:")
       && !source.includes("/*codey-local-quota-gate*/")) {
       // 只改变 Codex 本机发送按钮的额度条件。保留共享额度状态、官方警告
       // 和其他禁用条件；每次渲染读取当前模型，避免模型切换后复用旧判断。
@@ -761,6 +722,53 @@
     }
     return patched;
   };
+  // Codex 样式表中的 :has([data-state=open]) 等规则会让 data-state 进入 Blink
+  // RuleFeatureSet 的 :has() 失效集，悬停侧栏行切换提示气泡 data-state 时触发
+  // 整页样式重算。改写为普通属性选择器 [data-codey-open-within]，由注入脚本仅在
+  // 出现 data-state="open" 时同步到容器。
+  const openStateCssPatchedMarker = "--codey-css-open-state-has-patched";
+  const openStateCssAriaAndDataStateHasPattern =
+    /:has\(\s*\[\s*aria-expanded\s*=\s*(?:"true"|'true'|true)\s*\]\s*,\s*\[\s*data-state\s*=\s*(?:"open"|'open'|open)\s*\]\s*\)/g;
+  const openStateCssDataStateHasPattern =
+    /:has\(\s*(?::is\(\s*)?(?:>\s*)?(?:button)?\[\s*data-state\s*=\s*(?:"open"|'open'|open)\s*\]\s*\)?\s*\)/g;
+  const patchCodexRendererCssAsset = (source) => {
+    if (
+      source.includes(openStateCssPatchedMarker) ||
+      (
+        !source.includes(":has([data-state=open])") &&
+        !source.includes(":has(:is(button[data-state=open]))") &&
+        !source.includes(":has([aria-expanded=true],[data-state=open])") &&
+        !source.includes("data-state")
+      )
+    ) {
+      return source;
+    }
+    const patched = source
+      .replace(
+        openStateCssAriaAndDataStateHasPattern,
+        ":is(:has([aria-expanded=true]),[data-codey-open-within])",
+      )
+      .replace(openStateCssDataStateHasPattern, "[data-codey-open-within]");
+    if (patched === source) return source;
+    return `${patched}\n:root{${openStateCssPatchedMarker}:1}\n`;
+  };
+  const isCodexRendererCssAssetUrl = (requestUrl) => {
+    try {
+      const url = new URL(requestUrl);
+      if (url.protocol !== "app:") return false;
+      const match = /^\/assets\/(?:async\/)?([a-z0-9_~.-]+)\.css$/i.exec(
+        url.pathname,
+      );
+      if (!match) return false;
+      const stem = match[1];
+      if (!stem || stem.startsWith(".")) return false;
+      return stem
+        .split(/[-~.]/)
+        .some((segment) => /^[a-f0-9]{8,32}$/i.test(segment));
+    } catch {
+      return false;
+    }
+  };
   const isCodexRendererAssetUrl = (requestUrl) => {
     try {
       const url = new URL(requestUrl);
@@ -774,6 +782,7 @@
           /^\/assets\/(?:async\/)?\d{1,10}\.[a-f0-9]{8,32}\.js$/i.test(
             url.pathname,
           ) ||
+          isCodexRendererCssAssetUrl(requestUrl) ||
           (
             disablePet &&
             /\/(?:(?:pets-settings|app-runtime)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
@@ -798,7 +807,9 @@
       const previousRendererPatchFailures = activeRendererPatchFailures;
       activeRendererPatchFailures = rendererPatchFailuresForFingerprint(fingerprint);
       try {
-        patched = patchCodexRendererAsset(source);
+        patched = isCodexRendererCssAssetUrl(requestUrl)
+          ? patchCodexRendererCssAsset(source)
+          : patchCodexRendererAsset(source);
       } catch (error) {
         // Codex renderer bundles are minified implementation details and their
         // shapes change between releases. These UI restorations are optional:

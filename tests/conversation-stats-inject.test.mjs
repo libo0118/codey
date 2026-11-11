@@ -133,6 +133,8 @@ const createEnvironment = (options = {}) => {
     return { status: "ok" };
   };
 
+  const animationFrames = new Map();
+  let nextAnimationFrame = 1;
   const window = {
     __codexSessionDeleteBridge: options.bridgeReady === false ? undefined : bridge,
     innerHeight: 800,
@@ -141,6 +143,13 @@ const createEnvironment = (options = {}) => {
     listeners: new Map(),
     addEventListener: FakeElementCore.prototype.addEventListener,
     removeEventListener: FakeElementCore.prototype.removeEventListener,
+    dispatchEvent: FakeElementCore.prototype.dispatchEvent,
+    requestAnimationFrame: (callback) => {
+      const id = nextAnimationFrame++;
+      animationFrames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame: (id) => animationFrames.delete(id),
   };
 
   const testSetTimeout = (callback, delay, ...args) => {
@@ -189,6 +198,12 @@ const createEnvironment = (options = {}) => {
     rerun: () => vm.runInContext(source, context),
     dispose: () => context.window.__codeyConversationStats.dispose(),
     markPreviousVersion: (version = 3) => { context.window.__codeyConversationStats.version = version; },
+    animationFrames,
+    runAnimationFrames: () => {
+      const callbacks = [...animationFrames.values()];
+      animationFrames.clear();
+      callbacks.forEach((callback) => callback(0));
+    },
     window,
   };
 };
@@ -232,9 +247,15 @@ const metric = (bar, name) => name === "status" ? bar.dataset.status : bar.query
 const field = (bar, name) => bar.__codeyCs.fields[name].textContent;
 const summary = (env) => env.bar().querySelector("button.codey-cs-summary");
 const panel = (env) => env.document.getElementById("codey-conversation-stats-activity");
-const click = (element) => element.dispatchEvent({ type: "click" });
+const click = (element) => {
+  const event = { type: "click", defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  element.dispatchEvent(event);
+  return event;
+};
 const assertExpanded = (env, expanded) => {
-  assert.equal(summary(env).getAttribute("aria-expanded"), String(expanded));
+  assert.equal(summary(env).getAttribute("data-codey-expanded"), String(expanded));
+  // Codex 的 :has([aria-expanded="true"]) 规则会让该属性每次变化都整页重算样式。
+  assert.equal(summary(env).getAttribute("aria-expanded"), null);
   assert.equal(panel(env).hidden, !expanded);
 };
 
@@ -258,6 +279,27 @@ const observeRenderWork = (env) => {
   return counts;
 };
 
+test("updates an existing single text node in place instead of replacing it", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  try {
+    await flushTimers(30);
+    const element = env.bar().__codeyCs.speed;
+    const node = { nodeType: 3, nextSibling: null, nodeValue: element.textContent };
+    let replacements = 0;
+    Object.defineProperties(element, {
+      firstChild: { configurable: true, get: () => node },
+      textContent: { configurable: true, get: () => node.nodeValue, set: () => { replacements += 1; } },
+    });
+    env.setStats("conversation-1", { ...STATS, lastTurn: { ...LAST_TURN, averageOutputTokensPerSecond: 50 } });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(node.nodeValue, "50.0 Token/s");
+    assert.equal(replacements, 0);
+  } finally {
+    env.dispose();
+  }
+});
+
 test("refreshes with one composer scan per async phase and only writes changed text", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
   try {
@@ -271,9 +313,9 @@ test("refreshes with one composer scan per async phase and only writes changed t
     env.setStats("conversation-1", { ...STATS, totalTokens: 500, lastTurn: { ...LAST_TURN, averageOutputTokensPerSecond: 50 } });
     env.refresh();
     await flushTimers(30);
-    // 速度（摘要与详情）和完整累计各写一次；新增值未变，摘要不重写。
-    assert.deepEqual(counts, { composerScans: 4, textWrites: 3 });
-    assert.equal(metric(env.bar(), "total"), "新增 12k Tokens");
+    // 速度（摘要与详情）和总量（摘要与详情）各写一次。
+    assert.deepEqual(counts, { composerScans: 4, textWrites: 4 });
+    assert.equal(metric(env.bar(), "total"), "总计 500 Tokens");
     assert.equal(field(env.bar(), "totalTokens"), "500 Tokens");
     assert.equal(metric(env.bar(), "speed"), "50.0 Token/s");
     assert.equal(field(env.bar(), "speed"), "50.0 Token/s");
@@ -514,10 +556,10 @@ test("shows precise totals in the tooltip and avoids a rounded 1000k boundary", 
   const env = createEnvironment({ statsBySession: { "conversation-1": { ...STATS, totalTokens: 999_999, cachedInputTokens: null } } });
   try {
     await flushTimers(30);
-    assert.equal(metric(env.bar(), "total"), "累计 1.0M Tokens");
+    assert.equal(metric(env.bar(), "total"), "总计 1.0M Tokens");
     assert.equal(env.bar().__codeyCs.total.title, "本次运行 Token 总量 999,999 Tokens，包含缓存读取。");
     assert.equal(field(env.bar(), "totalTokens"), "999,999 Tokens");
-    assert.match(env.bar().__codeyCs.notes.activity.textContent, /不含首内容等待和工具时间/);
+    assert.equal(env.bar().__codeyCs.notes.activity.textContent, "");
   } finally {
     env.dispose();
   }
@@ -612,10 +654,10 @@ test("mounts the stats bar under the composer and renders speed/cache/total", as
   assert.equal(metric(bar, "activity"), "本轮 2 步");
   assert.match(bar.__codeyCs.activity.title, /最近一轮的模型生成步数/);
   assert.equal(metric(bar, "cache-rate"), "93%");
-  assert.equal(metric(bar, "total"), "新增 12k Tokens");
-  assert.equal(field(bar, "freshTokens"), "11,500 Tokens");
-  assert.equal(bar.__codeyCs.total.title, "新增 11,500 Tokens，为未命中缓存的输入与输出合计；本次运行 Token 总量 131,500 Tokens，包含缓存读取。");
-  assert.match(bar.querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /本次运行 新增 12k Tokens，总量 132k Tokens，缓存命中 93%/);
+  assert.equal(metric(bar, "total"), "总计 132k Tokens");
+  assert.equal(field(bar, "inputTokens"), "128,400 Tokens");
+  assert.equal(bar.__codeyCs.total.title, "本次运行 Token 总量 131,500 Tokens，包含缓存读取。");
+  assert.match(bar.querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /本次运行 总量 132k Tokens，缓存命中 93%/);
   assert.equal(field(bar, "outputTokens"), "3,100 Tokens");
   assert.equal(summary(env).querySelectorAll(".codey-cs-metric").length, 2);
   for (const selector of [".codey-cs-meta", ".codey-cs-status", '[data-field="model"]']) {
@@ -657,8 +699,8 @@ test("shows unknown values when upstream omits speed and cache", async () => {
   assert.equal(metric(bar, "speed"), "—");
   assert.equal(metric(bar, "cache-rate"), "—");
   assert.equal(field(bar, "cachedInputTokens"), "—");
-  assert.equal(metric(bar, "total"), "累计 132k Tokens", "without cache data the headline falls back to the cumulative total");
-  assert.equal(field(bar, "freshTokens"), "—");
+  assert.equal(metric(bar, "total"), "总计 132k Tokens");
+  assert.equal(field(bar, "inputTokens"), "—");
 });
 
 test("switches stats context when the conversation changes", async () => {
@@ -793,7 +835,8 @@ test("preserves reported zero tokens and zero cache hit rate", async () => {
   } } });
   await flushTimers(30);
   assert.equal(field(env.bar(), "totalTokens"), "0 Tokens");
-  assert.equal(metric(env.bar(), "total"), "新增 100 Tokens");
+  assert.equal(metric(env.bar(), "total"), "总计 0 Tokens");
+  assert.equal(field(env.bar(), "inputTokens"), "100 Tokens");
   assert.equal(field(env.bar(), "outputTokens"), "0 Tokens");
   assert.equal(metric(env.bar(), "cache-rate"), "0%");
   assert.equal(metric(env.bar(), "status"), "运行期统计");
@@ -818,9 +861,9 @@ test("pins each independent panel and switches between both groups", async () =>
   const tokens = env.bar().querySelector(".codey-cs-tokens-summary");
   click(tokens);
   assertExpanded(env, false);
-  assert.equal(tokens.getAttribute("aria-expanded"), "true");
+  assert.equal(tokens.getAttribute("data-codey-expanded"), "true");
   click(tokens);
-  assert.equal(tokens.getAttribute("aria-expanded"), "false");
+  assert.equal(tokens.getAttribute("data-codey-expanded"), "false");
 });
 
 test("centers the details immediately above the trigger and clamps the viewport", async () => {
@@ -836,6 +879,66 @@ test("centers the details immediately above the trigger and clamps the viewport"
   summary(env).getBoundingClientRect = () => ({ left: 0, top: 700, width: 200, height: 28 });
   click(summary(env));
   assert.equal(panel(env).style.left, "12px");
+});
+
+test("coalesces scroll and resize repositioning into one measurement per frame", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  try {
+    await flushTimers(30);
+    let entry = { left: 200, top: 700, width: 400, height: 28 };
+    let measurements = 0;
+    summary(env).getBoundingClientRect = () => { measurements += 1; return entry; };
+    panel(env).getBoundingClientRect = () => ({ width: 420, height: 300 });
+    click(summary(env));
+    assert.equal(panel(env).style.left, "190px");
+
+    measurements = 0;
+    entry = { ...entry, left: 300 };
+    for (let index = 0; index < 5; index += 1) {
+      env.document.dispatchEvent({ type: "scroll", target: env.document });
+      env.window.dispatchEvent({ type: "resize" });
+    }
+    assert.equal(measurements, 0, "滚动和缩放事件里不得同步测量布局");
+    assert.equal(env.animationFrames.size, 1);
+    env.runAnimationFrames();
+    assert.equal(measurements, 1);
+    assert.equal(panel(env).style.left, "290px");
+
+    env.document.dispatchEvent({ type: "scroll", target: panel(env) });
+    assert.equal(env.animationFrames.size, 0, "浮层内部滚动不移动入口");
+
+    env.document.dispatchEvent({ type: "scroll", target: env.document });
+    click(summary(env));
+    assertExpanded(env, false);
+    assert.equal(env.animationFrames.size, 0, "收起时取消排队的定位");
+    env.document.dispatchEvent({ type: "scroll", target: env.document });
+    assert.equal(env.animationFrames.size, 0, "收起后滚动不再排队");
+  } finally {
+    env.dispose();
+  }
+});
+
+test("measures the panel after lifting a stale height limit", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  try {
+    await flushTimers(30);
+    summary(env).getBoundingClientRect = () => ({ left: 200, top: 300, width: 400, height: 28 });
+    // 浮层实际高度受 max-height 限制：内容 500px，上限多少就渲染多高。
+    panel(env).getBoundingClientRect = () => {
+      const limit = Number.parseFloat(panel(env).style.maxHeight);
+      return { width: 420, height: Number.isFinite(limit) ? Math.min(500, limit) : 500 };
+    };
+    click(summary(env));
+    assert.equal(panel(env).style.top, "12px");
+
+    summary(env).getBoundingClientRect = () => ({ left: 200, top: 700, width: 400, height: 28 });
+    env.window.dispatchEvent({ type: "resize" });
+    env.runAnimationFrames();
+    assert.equal(panel(env).style.maxHeight, "680px");
+    assert.equal(panel(env).style.top, "192px", "应按新上限下的高度贴近入口");
+  } finally {
+    env.dispose();
+  }
 });
 
 test("Escape restores focus only when focus was inside the stats bar", async () => {
@@ -886,7 +989,9 @@ test("Escape from the independent panel restores its trigger focus", async () =>
 test("native popovers switch and close together with their triggers", async () => {
   const env = createEnvironment({ popover: true });
   await flushTimers(30);
-  click(summary(env));
+  // 关联只供无障碍树推导展开状态；原生点击切换必须被阻止，否则会与 setExpanded 互相抵消。
+  assert.equal(summary(env).popoverTargetElement, panel(env));
+  assert.equal(click(summary(env)).defaultPrevented, true);
   assert.equal(panel(env).popoverOpen, true);
   const tokens = env.bar().__codeyCs.panels.tokens;
   click(env.bar().__codeyCs.buttons.tokens);
@@ -935,13 +1040,13 @@ test("version replacement disposes previous ownership before installing one new 
   const env = createEnvironment();
   try {
     await flushTimers(30);
-    for (const version of [6, 7, 8, 9, 10]) {
+    for (const version of [6, 7, 8, 9, 10, 11, 16]) {
       const originalBar = env.bar();
       env.markPreviousVersion(version);
       env.rerun();
       await flushTimers(30);
       assert.notEqual(env.bar(), originalBar);
-      assert.equal(env.window.__codeyConversationStats.version, 11);
+      assert.equal(env.window.__codeyConversationStats.version, 17);
       assert.equal(env.document.querySelectorAll("#codey-conversation-stats-overlay").length, 1);
       assert.equal(env.document.listeners.get("pointerdown").length, 1);
       click(summary(env));
@@ -1017,7 +1122,7 @@ test("restores historical totals without inventing historical request informatio
   await flushTimers(30);
   assert.equal(field(env.bar(), "totalTokens"), "131,500 Tokens");
   assert.equal(metric(env.bar(), "status"), "历史统计");
-  assert.match(env.bar().querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /会话累计 新增 12k Tokens，总量 132k Tokens/);
+  assert.match(env.bar().querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /会话累计 总量 132k Tokens/);
   assert.equal(env.bar().dataset.running, "false");
 });
 
@@ -1075,7 +1180,7 @@ test("keeps invalid native last turn values unknown despite valid session aggreg
       env.refresh();
       await flushTimers(30);
       for (const key of ["speed", "modelDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), key), "—");
-      assert.equal(metric(env.bar(), "total"), "新增 12k Tokens");
+      assert.equal(metric(env.bar(), "total"), "总计 132k Tokens");
       assert.doesNotMatch(env.bar().__codeyCs.notes.activity.textContent, /TTFT 计至/);
     }
   } finally {
@@ -1099,7 +1204,7 @@ test("keeps routing TTFT at first content and respects explicit native boundarie
         lastTurn: { ...LAST_TURN, averageTtftMs: 1200, timingSource, ttftBoundary } });
       env.refresh();
       await flushTimers(30);
-      assert.ok(env.bar().__codeyCs.notes.activity.textContent.includes(`TTFT ${expected}。`));
+      assert.equal(env.bar().__codeyCs.ttftLabel.title, `TTFT ${expected}。`);
       assert.equal(field(env.bar(), "averageTtftMs"), "1.2秒");
       assert.equal(env.bar().__codeyCs.ttftLabel.textContent, expected === "计至首个输出项" ? "首输出项平均等待" : expected === "计至首个实际内容" ? "首内容平均等待" : "平均 TTFT");
     }
@@ -1148,7 +1253,7 @@ test("clears native timing values and source notes on a new turn and conversatio
     for (const key of ["speed", "modelDurationMs", "toolDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), key), "—");
     assert.equal(metric(env.bar(), "activity"), "本轮 — 步");
     assert.equal(env.bar().__codeyCs.headingTotal.textContent, "会话 5 轮");
-    assert.equal(metric(env.bar(), "total"), "新增 12k Tokens");
+    assert.equal(metric(env.bar(), "total"), "总计 132k Tokens");
     assert.doesNotMatch(env.bar().__codeyCs.notes.activity.textContent, /Codex 原生遥测|TTFT 计至/);
     assertExpanded(env, true);
     env.setConversation("conversation-2");
@@ -1178,8 +1283,8 @@ test("session totals own the turn count while the last turn owns speed, steps an
   assert.equal(metric(env.bar(), "speed"), "20.0 Token/s");
   assert.equal(field(env.bar(), "totalTokens"), "131,500 Tokens");
   assert.equal(field(env.bar(), "outputTokens"), "3,100 Tokens");
-  assert.equal(panel(env).querySelectorAll("dt").at(-1).textContent, "平均生成速度");
-  assert.match(env.bar().__codeyCs.notes.activity.textContent, /不含首内容等待和工具时间/);
+  assert.equal(panel(env).querySelectorAll("dt")[0].textContent, "平均生成速度");
+  assert.equal(env.bar().__codeyCs.notes.activity.textContent, "");
 });
 
 test("uses only the reported session turn count and preserves zero independently of last turn availability", async () => {
@@ -1200,7 +1305,7 @@ test("uses only the reported session turn count and preserves zero independently
     await flushTimers(30);
     assert.equal(metric(env.bar(), "activity"), "本轮 — 步");
     assert.equal(metric(env.bar(), "speed"), "—");
-    assert.notEqual(env.bar().dataset.state, "empty");
+    assert.notEqual(env.bar().dataset.codeyState, "empty");
   } finally {
     env.dispose();
   }
@@ -1267,7 +1372,8 @@ test("distinguishes waiting, streaming, estimated average and completed average 
     assert.equal(metric(env.bar(), "speed"), expected);
     assert.equal(field(env.bar(), "speed"), expected);
     assert.match(summary(env).getAttribute("aria-label"), /平均生成速度/);
-    assert.equal(env.bar().__codeyCs.notes.activity.textContent.includes("含生成中的 Token 估算"), changes.speedIsEstimate === true);
+    assert.equal(env.bar().__codeyCs.speed.title.includes("包含生成中的 Token 估算"), changes.speedIsEstimate === true);
+    assert.equal(env.bar().__codeyCs.notes.activity.textContent, "");
   }
 });
 
@@ -1312,7 +1418,8 @@ test("explains limited coverage of historical and partial turn records", async (
     await flushTimers(30);
     assert.equal(metric(env.bar(), "speed"), "188 Token/s");
     assert.ok(env.bar().__codeyCs.turnCoverage.title.includes(note));
-    if (coverage === "partial") assert.match(env.bar().__codeyCs.notes.activity.textContent, /记录不完整/);
+    assert.equal(env.bar().__codeyCs.turnCoverage.dataset.tone, coverage === "partial" ? "warn" : "");
+    assert.equal(env.bar().__codeyCs.notes.activity.textContent, "");
   }
 });
 
@@ -1414,9 +1521,7 @@ test("formats long durations by hours and keeps model wait, tool accumulation an
       assert.equal(field(env.bar(), "modelDurationMs"), "4小时 19分 3秒");
       assert.equal(field(env.bar(), "toolDurationMs"), "4小时 2分 47秒");
       assert.equal(env.bar().__codeyCs.turnCoverage.textContent, "会话记录 + 本次运行");
-      assert.equal(env.bar().__codeyCs.modelHint.textContent, "含首内容等待");
-      assert.equal(env.bar().__codeyCs.toolHint.textContent, "调用累计 · 并行可能重叠");
-      assert.match(env.bar().__codeyCs.notes.activity.textContent, /不含首内容等待和工具时间/);
+      assert.equal(env.bar().__codeyCs.notes.activity.textContent, "");
     }
   } finally {
     env.dispose();
@@ -1518,10 +1623,10 @@ test("explains turn boundaries and accumulated tool timing", async () => {
   assert.equal(env.bar().__codeyCs.activity.textContent, "本轮 2 步");
   assert.equal(env.bar().__codeyCs.headingTotal.textContent, "会话 4 轮");
   assert.equal(env.bar().__codeyCs.modelHint.textContent, "含首内容等待");
-  assert.equal(note, "速度仅统计有效计时步骤，不含首内容等待和工具时间。TTFT 计至首个实际内容。");
+  assert.equal(note, "");
+  assert.equal(env.bar().__codeyCs.ttftLabel.title, "TTFT 计至首个实际内容。");
   assert.match(env.bar().__codeyCs.speed.title, /按有效步骤的生成 Token 总量与生成耗时计算/);
   assert.match(env.bar().__codeyCs.turnCoverage.title, /仅包含可恢复且有有效计时的记录/);
-  assert.equal(env.bar().__codeyCs.toolHint.textContent, "调用累计 · 并行可能重叠");
 });
 
 test("renders token composition, cache ring and panel subtitles without rewriting unchanged styles", async () => {
@@ -1530,16 +1635,27 @@ test("renders token composition, cache ring and panel subtitles without rewritin
     await flushTimers(30);
     const refs = env.bar().__codeyCs;
     const grow = key => refs.segments[key].style.getPropertyValue("flex-grow");
+    const activityGrow = key => refs.activitySegments[key].style.getPropertyValue("flex-grow");
     assert.equal(refs.composition.hidden, false);
     assert.deepEqual(["cachedInputTokens", "uncachedInputTokens", "outputTokens"].map(grow), ["913", "64", "24"]);
+    assert.equal(refs.activityComposition.hidden, false);
+    assert.deepEqual(["modelDurationMs", "toolDurationMs"].map(activityGrow), ["769", "231"]);
+    assert.equal(refs.rows.speed.getAttribute("data-tier"), "primary");
+    assert.equal(refs.rows.averageTtftMs.getAttribute("data-tier"), "primary");
+    assert.equal(refs.rows.modelDurationMs.getAttribute("data-tier"), "breakdown");
+    assert.equal(refs.rows.inputTokens.getAttribute("data-tier"), "primary");
+    assert.equal(refs.rows.outputTokens.getAttribute("data-tier"), "primary");
+    assert.equal(refs.rows.cachedInputTokens.getAttribute("data-tier"), "breakdown");
+    assert.equal(refs.rows.cacheRate.getAttribute("data-tier"), "breakdown");
     assert.equal(refs.ring.style.getPropertyValue("--cs-rate"), "93");
     assert.equal(refs.rows.cacheWriteInputTokens.hidden, false);
     assert.equal(field(env.bar(), "cacheWriteInputTokens"), "2,000 Tokens");
     assert.equal(refs.subtitles.activity.textContent, "2 步 · 已完成");
-    assert.equal(refs.subtitles.tokens.textContent, "本次运行 · 含缓存读取");
+    assert.equal(refs.subtitles.tokens.textContent, "本次运行");
+    assert.equal(refs.notes.tokens.textContent, "");
 
     let styleWrites = 0;
-    for (const element of [refs.ring, ...Object.values(refs.segments)]) {
+    for (const element of [refs.ring, ...Object.values(refs.segments), ...Object.values(refs.activitySegments)]) {
       const setProperty = element.style.setProperty;
       element.style.setProperty = (...args) => { styleWrites += 1; setProperty(...args); };
     }

@@ -22,8 +22,10 @@ test("the actual Fetch service narrows official scan candidates without the fork
   assert.match(patch, /fetch_patterns\(self\.disable_pet, Some\(&outcome\.scan\)\)/);
   assert.match(patch, /context\.apply_asset_scan\(scan\.await, started\)[\s\S]*?refresh_fetch_patterns\(&connection, &context\)/);
   const patterns = patch.slice(patch.indexOf("fn fetch_patterns("), patch.indexOf("fn pet_sprite_id("));
-  assert.match(patterns, /Some\(scan\) => scan\s*\.candidates/);
-  assert.match(patterns, /None => vec!\[NUMERIC_ASSET_URL_PATTERN\.to_string\(\)\]/);
+  assert.match(patterns, /Some\(scan\) => \{\s*patterns\.extend\(scan\.candidates\.iter\(\)/);
+  const candidates = patterns.slice(patterns.indexOf("Some(scan)"), patterns.indexOf("None =>"));
+  assert.doesNotMatch(candidates, /NUMERIC_ASSET_URL_PATTERN|CSS_ASSET_URL_PATTERN/);
+  assert.match(patterns, /None => \{[\s\S]*?"urlPattern": NUMERIC_ASSET_URL_PATTERN/);
   assert.doesNotMatch(patterns, /0\.\.=9|assets\/\*\{digit\}/);
   assert.match(scan, /numeric_asset_name/);
 });

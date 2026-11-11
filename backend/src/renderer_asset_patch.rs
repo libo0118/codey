@@ -46,6 +46,8 @@ const PATCHABLE_ASSET_PREFIXES: [&str; 9] = [
 const PET_ASSET_PREFIXES: [&str; 2] = ["pets-settings", "app-runtime"];
 /// CDP Fetch 的通配符不支持字符类；数字 chunk 先宽匹配，再在请求处理时严格筛选。
 const NUMERIC_ASSET_URL_PATTERN: &str = "app://*/assets/?*.js*";
+/// 带内容哈希的样式表资源；扫描未完成时宽匹配，请求处理时按哈希名严格筛选。
+const CSS_ASSET_URL_PATTERN: &str = "app://*/assets/*.css*";
 /// 宠物精灵图。rspack 构建保留可读文件名，按宠物 id 前缀识别；只在关闭宠物时拦截。
 const PET_SPRITE_URL_PATTERN: &str = "app://*/assets/*-spritesheet-v*.webp*";
 /// 未选择过宠物时 Codex 使用的内置形象。
@@ -71,6 +73,14 @@ const UNCHANGED_STORES_PER_PRUNE: usize = 256;
 /// 页面补丁里前置字面量表的起止标记，后端据此预筛资源。
 const PATCH_ANCHORS_START: &str = "/*codey-renderer-patch-anchors*/";
 const PATCH_ANCHORS_END: &str = "/*end-codey-renderer-patch-anchors*/";
+/// 仅在开启宠物精简时才生效的前置字面量；精简关闭时不加入扫描与预筛。
+const PET_ONLY_PATCH_ANCHORS: [&str; 5] = [
+    "codex-avatar",
+    "codex-pet-assets",
+    "avatar-mascot-button",
+    "use-avatar-options",
+    "shouldPrewarmAvatarOverlay:",
+];
 const CACHE_DIR_NAME: &str = "renderer-patch-cache";
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
@@ -196,6 +206,12 @@ struct PageEntry {
 
 type PendingAssetScan = tokio::task::JoinHandle<Result<crate::renderer_asset_scan::ScanOutcome>>;
 
+struct CachedSelectedPet {
+    home: PathBuf,
+    stamp: crate::pet_slim_patch::GlobalStateStamp,
+    pet_id: String,
+}
+
 struct ServiceContext {
     fetch_interception: bool,
     install_script: Arc<str>,
@@ -204,6 +220,8 @@ struct ServiceContext {
     disable_pet: bool,
     /// Codex 数据目录；读取当前选中的宠物。
     codex_home: Option<PathBuf>,
+    /// 按全局状态文件元数据缓存的选中宠物 id，避免每次拦截精灵图重复读盘解析。
+    selected_pet: tokio::sync::Mutex<Option<CachedSelectedPet>>,
     /// 与连接调试端点并行进行的资源扫描，服务开始时取走。
     pending_scan: Mutex<Option<PendingAssetScan>>,
     /// 页面补丁的前置字面量；资源一个都不含时不必送进页面求值。
@@ -224,8 +242,9 @@ impl ServiceContext {
             patterns: Mutex::new(fetch_patterns(disable_pet, None)),
             disable_pet,
             codex_home: None,
+            selected_pet: tokio::sync::Mutex::new(None),
             pending_scan: Mutex::new(None),
-            anchors: renderer_patch_anchors(RENDERER_ASSET_PATCH_SCRIPT)
+            anchors: renderer_patch_anchors_for_mode(RENDERER_ASSET_PATCH_SCRIPT, disable_pet)
                 .expect("renderer_asset_patch.js 内置前置字面量表无效"),
             pages: Mutex::new(HashMap::new()),
             permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_PATCHES),
@@ -340,6 +359,14 @@ fn renderer_patch_anchors(script: &str) -> Result<Vec<String>> {
     Ok(anchors)
 }
 
+fn renderer_patch_anchors_for_mode(script: &str, disable_pet: bool) -> Result<Vec<String>> {
+    let mut anchors = renderer_patch_anchors(script)?;
+    if !disable_pet {
+        anchors.retain(|anchor| !PET_ONLY_PATCH_ANCHORS.contains(&anchor.as_str()));
+    }
+    Ok(anchors)
+}
+
 fn default_cache_dir() -> PathBuf {
     codey_runtime_core::paths::default_app_state_dir().join(CACHE_DIR_NAME)
 }
@@ -366,21 +393,34 @@ fn fetch_patterns(
             })
         })
         .collect();
-    let numeric_patterns = match scan {
-        Some(scan) => scan
-            .candidates
-            .iter()
-            .map(|path| format!("app://*/assets/{path}*"))
-            .collect(),
-        None => vec![NUMERIC_ASSET_URL_PATTERN.to_string()],
-    };
-    patterns.extend(numeric_patterns.into_iter().map(|url_pattern| {
-        json!({
-            "urlPattern": url_pattern,
-            "resourceType": "Script",
-            "requestStage": "Request",
-        })
-    }));
+    match scan {
+        Some(scan) => {
+            patterns.extend(scan.candidates.iter().map(|path| {
+                let resource_type = if path.ends_with(".css") {
+                    "Stylesheet"
+                } else {
+                    "Script"
+                };
+                json!({
+                    "urlPattern": format!("app://*/assets/{path}*"),
+                    "resourceType": resource_type,
+                    "requestStage": "Request",
+                })
+            }));
+        }
+        None => {
+            patterns.push(json!({
+                "urlPattern": NUMERIC_ASSET_URL_PATTERN,
+                "resourceType": "Script",
+                "requestStage": "Request",
+            }));
+            patterns.push(json!({
+                "urlPattern": CSS_ASSET_URL_PATTERN,
+                "resourceType": "Stylesheet",
+                "requestStage": "Request",
+            }));
+        }
+    }
     if disable_pet {
         // Codex 以图片元素解码精灵图。
         patterns.push(json!({
@@ -421,16 +461,43 @@ async fn selected_pet_id(context: &ServiceContext) -> String {
     let Some(home) = context.codex_home.clone() else {
         return DEFAULT_AVATAR_ID.to_string();
     };
-    match tokio::task::spawn_blocking(move || crate::pet_slim_patch::selected_avatar_id(&home))
-        .await
+    let mut cached = context.selected_pet.lock().await;
+    let previous = cached.take();
+    match tokio::task::spawn_blocking(move || -> (Option<CachedSelectedPet>, String) {
+        let stamp = crate::pet_slim_patch::global_state_stamp(&home);
+        if let Some(entry) = previous
+            && entry.home == home
+            && entry.stamp == stamp
+        {
+            let pet_id = entry.pet_id.clone();
+            return (Some(entry), pet_id);
+        }
+        match crate::pet_slim_patch::selected_avatar_id(&home) {
+            Ok(selected) => {
+                let pet_id = selected.unwrap_or_else(|| DEFAULT_AVATAR_ID.to_string());
+                (
+                    Some(CachedSelectedPet {
+                        home,
+                        stamp,
+                        pet_id: pet_id.clone(),
+                    }),
+                    pet_id,
+                )
+            }
+            Err(error) => {
+                log_service_event(
+                    "renderer_asset_patch.selected_pet_unreadable",
+                    json!({ "message": format!("{error:#}") }),
+                );
+                (None, DEFAULT_AVATAR_ID.to_string())
+            }
+        }
+    })
+    .await
     {
-        Ok(Ok(selected)) => selected.unwrap_or_else(|| DEFAULT_AVATAR_ID.to_string()),
-        Ok(Err(error)) => {
-            log_service_event(
-                "renderer_asset_patch.selected_pet_unreadable",
-                json!({ "message": format!("{error:#}") }),
-            );
-            DEFAULT_AVATAR_ID.to_string()
+        Ok((next_cache, pet_id)) => {
+            *cached = next_cache;
+            pet_id
         }
         Err(_) => DEFAULT_AVATAR_ID.to_string(),
     }
@@ -447,12 +514,13 @@ fn is_patchable_asset_url(url: &str, disable_pet: bool) -> bool {
     }
     let path = url.path();
     if let Some(name) = path.strip_prefix("/assets/async/") {
-        return numeric_asset_name(name);
+        return numeric_asset_name(name) || css_asset_name(name);
     }
     let Some(name) = path.strip_prefix("/assets/") else {
         return false;
     };
     numeric_asset_name(name)
+        || css_asset_name(name)
         || named_asset_name(name, &PATCHABLE_ASSET_PREFIXES)
         || (disable_pet && named_asset_name(name, &PET_ASSET_PREFIXES))
 }
@@ -469,6 +537,21 @@ pub(crate) fn numeric_asset_name(name: &str) -> bool {
         && id.bytes().all(|byte| byte.is_ascii_digit())
         && (8..=32).contains(&hash.len())
         && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn css_asset_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".css") else {
+        return false;
+    };
+    !stem.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~' | b'.'))
+        && stem.split(['-', '~', '.']).any(|segment| {
+            (8..=32).contains(&segment.len())
+                && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn named_asset_name(name: &str, prefixes: &[&str]) -> bool {
@@ -1251,8 +1334,11 @@ impl PatchCache {
     }
 }
 
-/// 形如 `app-initial-90eb42395b7d.js`：文件名里有一段至少 8 位的十六进制哈希。
+/// 形如 `app-initial-90eb42395b7d.js` 或 `e77f816560c6.css`：文件名里有一段至少 8 位的十六进制哈希。
 fn cacheable_asset_name(name: &str) -> bool {
+    if css_asset_name(name) {
+        return true;
+    }
     let Some(stem) = [".js", ".mjs", ".cjs"]
         .iter()
         .find_map(|extension| name.strip_suffix(extension))
@@ -1314,15 +1400,7 @@ fn store_entry(dir: &Path, name: &str, patch: Option<StoredPatch>) -> Result<()>
 }
 
 fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(format!(".tmp-{}", std::process::id()));
-    let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, contents)
-        .with_context(|| format!("写入补丁缓存 {} 失败", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("替换补丁缓存 {} 失败", path.display())
-    })
+    crate::fs_util::atomic_write(path, contents).map_err(anyhow::Error::msg)
 }
 
 fn record_patch_log(payload: &str) {
@@ -1562,6 +1640,8 @@ mod tests {
         assert!(patterns.iter().all(|pattern| {
             let expected_type = if pattern["urlPattern"] == PET_SPRITE_URL_PATTERN {
                 "Image"
+            } else if pattern["urlPattern"] == CSS_ASSET_URL_PATTERN {
+                "Stylesheet"
             } else {
                 "Script"
             };
@@ -1914,7 +1994,7 @@ mod tests {
     fn patch_anchor_table_parses_and_covers_every_gate_precondition() {
         let anchors = renderer_patch_anchors(RENDERER_ASSET_PATCH_SCRIPT).unwrap();
         for required in [
-            "codexComposerAdapter.CodexComposerAdapter.interruptThreadError",
+            "resolvedHostId:",
             "AppServerRequestClient is missing a message dispatcher",
             "serviceTierAccess:",
             ".startTurn(",
@@ -1923,6 +2003,19 @@ mod tests {
                 anchors.iter().any(|anchor| anchor == required),
                 "{required}"
             );
+        }
+        let slim_anchors =
+            renderer_patch_anchors_for_mode(RENDERER_ASSET_PATCH_SCRIPT, true).unwrap();
+        let full_pet_anchors =
+            renderer_patch_anchors_for_mode(RENDERER_ASSET_PATCH_SCRIPT, false).unwrap();
+        assert_eq!(slim_anchors.len(), anchors.len());
+        assert_eq!(
+            full_pet_anchors.len() + PET_ONLY_PATCH_ANCHORS.len(),
+            slim_anchors.len()
+        );
+        for pet_anchor in PET_ONLY_PATCH_ANCHORS {
+            assert!(slim_anchors.iter().any(|anchor| anchor == pet_anchor));
+            assert!(!full_pet_anchors.iter().any(|anchor| anchor == pet_anchor));
         }
         assert!(renderer_patch_anchors("const a=[];").is_err());
         assert!(
@@ -2007,13 +2100,27 @@ mod tests {
             candidates: vec![
                 "348410.ae8bb87271.js".to_string(),
                 "async/24191.589dcc9878.js".to_string(),
+                "async/e77f816560c6.css".to_string(),
             ],
         };
-        let exact = urls(fetch_patterns(false, Some(&scan)));
+        let exact_patterns = fetch_patterns(false, Some(&scan));
+        let exact = urls(exact_patterns.clone());
         assert!(exact.contains(&"app://*/assets/348410.ae8bb87271.js*".to_string()));
         assert!(exact.contains(&"app://*/assets/async/24191.589dcc9878.js*".to_string()));
+        assert!(exact.contains(&"app://*/assets/async/e77f816560c6.css*".to_string()));
         assert!(!exact.contains(&NUMERIC_ASSET_URL_PATTERN.to_string()));
+        assert!(!exact.contains(&CSS_ASSET_URL_PATTERN.to_string()));
         assert!(exact.contains(&"app://*/assets/app-initial*".to_string()));
+        assert!(
+            exact_patterns
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |pattern| pattern["urlPattern"] == "app://*/assets/async/e77f816560c6.css*"
+                        && pattern["resourceType"] == "Stylesheet"
+                )
+        );
 
         let named = crate::renderer_asset_scan::AssetScan {
             numeric_chunks: 0,
@@ -2156,6 +2263,8 @@ mod tests {
         for url in [
             "app://-/assets/104974.1e9a7f6707.js",
             "app://codex/assets/async/634303.855e57c3e7.js?cache=1#loader",
+            "app://-/assets/async/e77f816560c6.css",
+            "app://-/assets/app-initial-90eb4239.css",
         ] {
             assert!(is_patchable_asset_url(url, false), "{url}");
         }
@@ -2177,6 +2286,8 @@ mod tests {
             "app://-/assets/other/634303.855e57c3e7.js",
             "app://-/assets/634303.855e57c3e7.js/extra",
             "app://-/assets/12345678901.855e57c3e7.js",
+            "app://-/assets/app-initial.css",
+            "app://-/assets/async/not-a-hash.css",
         ] {
             assert!(!is_patchable_asset_url(url, true), "{url}");
         }
@@ -2203,13 +2314,16 @@ mod tests {
             "general-settings-679bf39c78a4.js",
             "104974.1e9a7f6707.js",
             "634303.855e57c3e7.js",
+            "e77f816560c6.css",
+            "app-initial-90eb4239.css",
         ] {
             assert!(cacheable_asset_name(name), "{name}");
         }
         for name in [
             "app-initial.js",
             "app-initial-dev.js",
-            "app-initial-90eb4239.css",
+            "app-initial.css",
+            "app-initial-dev.css",
             "634303.js",
             "634303.not-a-hash.js",
             "634303.855e57c3e7.js.map",

@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use hyper_util::client::proxy::matcher::Matcher as SystemProxyMatcher;
@@ -210,6 +209,7 @@ mod sse_anthropic;
 mod sse_chat;
 mod sse_responses;
 mod steering;
+mod tool_manifest;
 mod upstream;
 mod upstream_response;
 mod websocket;
@@ -248,11 +248,13 @@ pub(crate) use sse_anthropic::*;
 pub(crate) use sse_chat::*;
 pub(crate) use sse_responses::*;
 pub(crate) use steering::*;
+use tool_manifest::*;
 pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;
 pub(crate) use websocket_context::*;
 pub(crate) use websocket_ingress::*;
+pub(crate) use websocket_tls::shared_client_config;
 pub(crate) use xai::*;
 
 #[cfg(test)]
