@@ -15,7 +15,7 @@ import {
   modelKey,
   uniqueModelIds,
 } from "../modelIds";
-import { routeModelAlias } from "../modelRoutes";
+import { routeModelAlias, routeProviderId } from "../modelRoutes";
 import { fallbackRouteShortName, validateThirdPartyRouteShortName } from "../routeShortNames";
 import { MAX_ROUTE_NAME_CHARACTERS, validateOfficialRouteSettings } from "../officialRouteSettings";
 import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
@@ -348,8 +348,6 @@ if (import.meta.env.DEV) {
       upstreamModels: previewUpstreamModels,
       defaultModel: "gpt-5.6-sol",
     };
-    const routeProviderId = (profile: Profile) =>
-      profile.sourceProviderId || profile.id;
     const activePreviewProfile = () =>
       previewConfig.profiles.find(
         (profile) => profile.id === previewConfig.activeProfileId,

@@ -2,7 +2,7 @@
 // /session/stats 返回统计范围；会话 id 取自可见 composer，隐藏会话不参与。
 (() => {
   const PROBE_KEY = "__codeyConversationStats";
-  const VERSION = 17;
+  const VERSION = 19;
   const previous = window[PROBE_KEY];
   if (previous?.installed && (previous.version === VERSION || !previous.dispose)) return;
   previous?.dispose?.();
@@ -42,13 +42,18 @@
   const SUBMIT_POLL_DELAY_MS = 300;
   const SUBMIT_WATCH_MS = 15_000;
   const RESCAN_DEBOUNCE_MS = 120;
+  const LOADING_CLEAR_DELAY_MS = 20;
   const compositionKeys = ["cachedInputTokens", "uncachedInputTokens", "outputTokens"];
 
   let statsElement = null;
+  let composerHost = null;
+  let dockedBottom = 10;
+  let resizePending = false;
   let currentSessionId = "";
   let stats = null;
   let pollTimer = 0;
   let rescanTimer = 0;
+  let clearTimer = 0;
   let positionFrame = 0;
   let fetchInFlight = false;
   let lastFetchOk = false;
@@ -184,10 +189,12 @@
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
+      [${conversationAttribute}] ~ :last-child { margin-bottom: 34px !important; }
       ${styleScope} { --cs-text: var(--text-primary, CanvasText); --cs-muted: color-mix(in srgb, var(--cs-text) 58%, transparent); --cs-soft: color-mix(in srgb, var(--cs-text) 84%, transparent); --cs-line: color-mix(in srgb, var(--cs-text) 9%, transparent); --cs-line-strong: color-mix(in srgb, var(--cs-text) 14%, transparent); --cs-fill: color-mix(in srgb, var(--cs-text) 5%, transparent); --cs-platter: light-dark(color-mix(in srgb, var(--cs-text) 4.2%, #ffffff80), color-mix(in srgb, var(--cs-text) 5.5%, #ffffff05)); --cs-shine: light-dark(#ffffffb3, #ffffff1f); --cs-surface: light-dark(color-mix(in srgb, var(--bg-primary, Canvas) 82%, #ffffff), color-mix(in srgb, var(--bg-primary, Canvas) 80%, #242428)); --cs-live: light-dark(#248a3d, #30d158); --cs-accent: light-dark(#007aff, #0a84ff); --cs-cyan: light-dark(#0088a3, #32ade6); --cs-violet: light-dark(#8944ab, #bf5af2); --cs-amber: light-dark(#c46a00, #ff9f0a); --cs-seg-cached: color-mix(in srgb, var(--cs-text) 24%, transparent); --cs-seg-input: var(--cs-accent); --cs-seg-output: var(--cs-violet); --cs-seg-write: var(--cs-amber); --cs-seg-model: var(--cs-accent); --cs-seg-tool: var(--cs-cyan); -webkit-app-region: no-drag !important; pointer-events: auto !important; position: relative; box-sizing: border-box; width: 100%; min-width: 0; padding: 6px 4px 0; color: var(--cs-text); font: 12px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; font-variant-numeric: tabular-nums; }
+      #${barId} { position: fixed; left: 0; bottom: 10px; z-index: 20; pointer-events: none !important; }
       ${styleScope} *, ${styleScope} *::before, ${styleScope} *::after { box-sizing: border-box; }
       ${styleScope}[hidden], ${styleScope} [hidden] { display: none !important; }
-      ${styleScope} .codey-cs-groups { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px; width: fit-content; max-width: 100%; margin: 0 auto; padding: 2px; border-radius: 999px; background: var(--cs-fill); box-shadow: inset 0 0 0 .5px var(--cs-line), inset 0 .5px 0 var(--cs-shine); }
+      ${styleScope} .codey-cs-groups { pointer-events: auto !important; display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px; width: fit-content; max-width: 100%; margin: 0 auto; padding: 2px; border-radius: 999px; background: var(--cs-fill); box-shadow: inset 0 0 0 .5px var(--cs-line), inset 0 .5px 0 var(--cs-shine); }
       ${styleScope} .codey-cs-divider { width: .5px; height: 11px; margin: 0 1px; background: var(--cs-line-strong); }
       ${styleScope} button { font: inherit; color: inherit; cursor: pointer; }
       ${styleScope} .codey-cs-summary { display: inline-flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; min-height: 24px; padding: 2px 11px; border: 0; border-radius: 999px; background: transparent; color: var(--cs-muted); text-align: center; transition: background-color .18s cubic-bezier(.32, .72, 0, 1), color .18s cubic-bezier(.32, .72, 0, 1), box-shadow .18s cubic-bezier(.32, .72, 0, 1), opacity .2s ease; }
@@ -198,11 +205,14 @@
       ${styleScope} .codey-cs-activity-summary:is(:hover, [data-codey-expanded="true"]) .codey-cs-icon { color: var(--cs-accent); }
       ${styleScope} .codey-cs-tokens-summary:is(:hover, [data-codey-expanded="true"]) .codey-cs-icon { color: var(--cs-violet); }
       #${barId}[data-running="true"] .codey-cs-activity-summary .codey-cs-icon { color: var(--cs-live); }
-      ${styleScope} .codey-cs-metric { white-space: nowrap; }
+      ${styleScope} .codey-cs-metric { display: inline-block; white-space: nowrap; text-align: center; }
+      ${styleScope} .codey-cs-activity { min-width: 4.8em; }
       ${styleScope} .codey-cs-sep { opacity: .38; }
       ${styleScope} .codey-cs-speed, ${styleScope} .codey-cs-total { color: var(--cs-text); font-weight: 600; letter-spacing: -.01em; }
+      ${styleScope} .codey-cs-speed { min-width: 6.4em; }
+      ${styleScope} .codey-cs-total { min-width: 8.4em; }
       ${styleScope} .codey-cs-cache { display: inline-flex; align-items: center; gap: 4.5px; }
-      ${styleScope} .codey-cs-cache-rate { color: var(--cs-soft); font-weight: 560; }
+      ${styleScope} .codey-cs-cache-rate { display: inline-block; min-width: 2.4em; text-align: center; color: var(--cs-soft); font-weight: 560; }
       ${styleScope} .codey-cs-ring { --cs-rate: 0; width: 12px; height: 12px; flex: none; border-radius: 50%; background: conic-gradient(var(--cs-cyan) calc(var(--cs-rate) * 1%), var(--cs-line-strong) 0); mask: radial-gradient(circle, transparent 3.4px, #000 3.9px); }
       ${styleScope} .codey-cs-live { position: relative; display: none; width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--cs-live); }
       ${styleScope} .codey-cs-live::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; animation: codey-cs-pulse 1.8s cubic-bezier(.22, 1, .36, 1) infinite; }
@@ -259,11 +269,32 @@
     document.documentElement.appendChild(style);
   };
 
-  // 状态条挂在 composer 标记所在的同一列容器末尾，即输入卡片下方；
-  // composer 容器会随会话切换重建，所以每次都要重新核对挂载父节点。
+  // 状态条常驻挂载在根节点并固定在会话底部，避免随会话切换反复从旧
+  // composer 容器卸载并重新插入新容器；水平范围跟随当前可见 composer。
+  const positionBar = (host = composerHost?.isConnected ? composerHost : findVisibleComposerAnchor()?.parentElement, anchor = null) => {
+    if (!statsElement || !host) return;
+    composerHost = host;
+    const rect = host.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0) return;
+    setStyle(statsElement, "left", `${Math.round(rect.left)}px`);
+    setStyle(statsElement, "width", `${Math.round(rect.width)}px`);
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    const card = host.lastElementChild;
+    const slotBottom = card && card !== anchor
+      ? (card.getBoundingClientRect?.().bottom ?? rect.bottom) + 34
+      : rect.bottom;
+    const bottomGap = viewportHeight - slotBottom;
+    if (viewportHeight > 0 && bottomGap >= 4 && bottomGap <= 32) {
+      dockedBottom = Math.round(bottomGap);
+    }
+    setStyle(statsElement, "bottom", `${dockedBottom}px`);
+  };
+
   const ensureBar = (anchor = findVisibleComposerAnchor()) => {
     const host = anchor?.parentElement;
     if (!host) return null;
+    composerHost = host;
+    const root = document.body || document.documentElement;
     let bar = document.getElementById(barId) || statsElement;
     if (!bar?.__codeyCs) {
       bar = document.createElement("div");
@@ -402,16 +433,17 @@
       }
       bar.__codeyCs = refs;
     }
-    if (bar.parentElement !== host) {
+    if (bar.parentElement !== root) {
       if (statsElement) setExpanded(false);
-      host.appendChild(bar);
+      root.appendChild(bar);
     }
     const overlay = bar.__codeyCs.overlay;
     if (!overlay.isConnected) {
       setExpanded(false);
-      (document.body || document.documentElement).appendChild(overlay);
+      root.appendChild(overlay);
     }
     statsElement = bar;
+    positionBar(host, anchor);
     return bar;
   };
 
@@ -462,18 +494,26 @@
 
   // 滚动和缩放事件可能一帧多次，合并到下一帧测量一次。
   const schedulePanelPosition = (event) => {
-    if (disposed || !statsElement?.__codeyCs?.active || positionFrame) return;
+    if (disposed) return;
+    if (event?.type === "resize" && statsElement && !statsElement.hidden) resizePending = true;
+    const active = Boolean(statsElement?.__codeyCs?.active);
+    if (positionFrame || (!active && !resizePending)) return;
     // 浮层内部滚动不会移动入口。
     if (event?.type === "scroll" && containsStats(event.target)) return;
     positionFrame = window.requestAnimationFrame(() => {
       positionFrame = 0;
-      if (!disposed) positionPanel();
+      const shouldPositionBar = resizePending;
+      resizePending = false;
+      if (disposed) return;
+      if (shouldPositionBar) positionBar();
+      if (statsElement?.__codeyCs?.active) positionPanel();
     });
   };
 
   const setExpanded = (expanded, restoreFocus = false, kind = null) => {
     if (positionFrame) window.cancelAnimationFrame(positionFrame);
     positionFrame = 0;
+    resizePending = false;
     const refs = statsElement?.__codeyCs;
     if (!refs) return;
     const active = kind || refs.active || "activity";
@@ -507,7 +547,26 @@
     fetchAttempted = false;
     idleStreak = 0;
     lastStatsKey = "";
+    clearTimeout(clearTimer);
+    clearTimer = 0;
     setExpanded(false);
+  };
+
+  // 会话切换时若旧会话已有统计数据，先保留当前文本最多 20ms 等新会话首包返回，
+  // 避免本地桥接返回前先闪一帧「—」并触发宽度跳变；超时未返回再清空旧值。
+  const switchSession = (sessionId, anchor) => {
+    const hadStats = stats !== null;
+    resetSession(sessionId);
+    if (hadStats && sessionId && anchor && statsElement) {
+      setValue(statsElement, "hidden", false);
+      positionBar(anchor.parentElement, anchor);
+      clearTimer = setTimeout(() => {
+        clearTimer = 0;
+        if (!disposed && !fetchAttempted) render();
+      }, LOADING_CLEAR_DELAY_MS);
+      return;
+    }
+    render(anchor);
   };
 
   const formatSpeed = (value) => (
@@ -551,6 +610,8 @@
 
   const render = (anchor) => {
     if (disposed) return;
+    clearTimeout(clearTimer);
+    clearTimer = 0;
     const bar = ensureBar(anchor);
     if (!bar) {
       // 输入框不可见（例如离开会话页）时，若旧宿主仍在隐藏会话里，显式
@@ -713,8 +774,7 @@
     if (document.visibilityState === "hidden") return;
     const { anchor, sessionId } = resolveSessionContext();
     if (sessionId !== currentSessionId) {
-      resetSession(sessionId);
-      render(anchor);
+      switchSession(sessionId, anchor);
     }
     if (!currentSessionId) {
       schedulePoll(POLL_IDLE_MS);
@@ -769,11 +829,12 @@
       const { anchor, sessionId } = resolveSessionContext();
       const changed = sessionId !== currentSessionId;
       if (changed) {
-        resetSession(sessionId);
+        switchSession(sessionId, anchor);
+        // 会话切换立即拉取，不等下一轮轮询。
+        if (currentSessionId) schedulePoll(0);
+        return;
       }
       render(anchor);
-      // 会话切换立即拉取，不等下一轮轮询。
-      if (changed && currentSessionId) schedulePoll(0);
     }, RESCAN_DEBOUNCE_MS);
   };
 
@@ -789,11 +850,12 @@
         );
         if (visibilityChanged) {
           if (target.closest?.(conversationTurnSelector)) continue;
-          const host = statsElement?.parentElement;
-          const touchesComposer = host
-            ? target === host || host.contains(target) || target.contains(host)
-            : target.matches?.(composerInputSelector)
-              || target.querySelector?.(composerInputSelector);
+          const host = composerHost?.isConnected ? composerHost : null;
+          const touchesComposer = (
+            (host && (target === host || host.contains(target) || target.contains(host)))
+            || target.matches?.(composerInputSelector)
+            || target.querySelector?.(composerInputSelector)
+          );
           if (!touchesComposer) continue;
         }
         if (contextAttributes.includes(mutation.attributeName)) {
@@ -858,8 +920,8 @@
     listen(window, "focus", () => wake());
     listen(window, "pageshow", () => wake());
     // 发送入口只看当前输入卡片：Enter 提交或点击卡片内按钮。误判只多一次轮询。
-    const composerHost = () => statsElement?.isConnected ? statsElement.parentElement : null;
-    const inComposer = (target) => Boolean(target && !containsStats(target) && composerHost()?.contains(target));
+    const activeComposerHost = () => !statsElement?.hidden && composerHost?.isConnected ? composerHost : null;
+    const inComposer = (target) => Boolean(target && !containsStats(target) && activeComposerHost()?.contains(target));
     listen(document, "keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing && inComposer(event.target)) {
         wake(SUBMIT_POLL_DELAY_MS, true);
@@ -899,12 +961,14 @@
         sessionGeneration += 1;
         clearTimeout(pollTimer);
         clearTimeout(rescanTimer);
+        clearTimeout(clearTimer);
         setExpanded(false);
         window.__codeyConversationStatsObserver?.disconnect?.();
         delete window.__codeyConversationStatsObserver;
         listeners.splice(0).forEach(remove => remove());
         statsElement?.__codeyCs?.overlay.remove();
         statsElement?.remove();
+        composerHost = null;
         document.getElementById(styleId)?.remove();
         window[PROBE_KEY].installed = false;
       },

@@ -65,6 +65,7 @@ const ROLE_ICONS = [IconWorldSearch, IconPhotoSearch, IconTerminal2];
 const SUBAGENT_TASK_TYPES = BUILTIN_SUBAGENT_ROLES.map((task, index) => ({ ...task, icon: ROLE_ICONS[index] }));
 
 export type SubagentPolicyCardProps = {
+  active?: boolean;
   config: Config;
   isBusy: boolean;
   subagentModelOptions: SubagentModelOption[];
@@ -128,11 +129,32 @@ export function SubagentPolicyCardComponent({
           roleDisabled ? "subagent-role-disabled" : ""
         }`}
       >
+        {!isDefaultRole && (
+          <div className="subagent-role-switch-wrap">
+            <span
+              className="inline-flex"
+              title={
+                isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : undefined
+              }
+            >
+              <Switch
+                size="sm"
+                checked={selection.enabled}
+                disabled={
+                  subagentPolicyControlsDisabled || isSingleEnabledRole
+                }
+                onCheckedChange={(enabled) => updateRole({ enabled })}
+                aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
+              />
+            </span>
+          </div>
+        )}
+
         <div className="subagent-role-identity">
           <div
             className={`subagent-role-icon-box subagent-role-icon-box--${custom ? "default" : task.id}`}
           >
-            <TaskIcon size={18} stroke={1.9} aria-hidden="true" />
+            <TaskIcon size={16} stroke={1.9} aria-hidden="true" />
           </div>
           <div className="subagent-role-meta">
             <div className="subagent-role-title-row">
@@ -146,6 +168,24 @@ export function SubagentPolicyCardComponent({
                   <IconHelpCircle size={14} aria-hidden="true" />
                 </button>
               </Tooltip>
+              {custom && (
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  disabled={isBusy || isSingleEnabledRole}
+                  title={isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : `删除${task.name}`}
+                  aria-label={`删除${task.name}`}
+                  onClick={() => onRequestConfirmation({
+                    action: "delete-subagent",
+                    title: `删除子代理「${task.name}」？`,
+                    description: "将从当前配置移除这个自定义角色。点击侧栏“保存更改”后生效；保存前可放弃全部更改以恢复。",
+                    confirmLabel: "删除子代理",
+                    run: () => controller.removeRole(task.id),
+                  })}
+                >
+                  <IconTrash size={15} aria-hidden="true" />
+                </Button>
+              )}
               {roleDisabled && (
                 <span className="subagent-role-status-chip">已停用</span>
               )}
@@ -154,7 +194,7 @@ export function SubagentPolicyCardComponent({
         </div>
 
         <div className="subagent-control-group subagent-control-group--model">
-          <label className="subagent-control-label">指定模型</label>
+          <span className="subagent-control-label" aria-hidden="true">指定模型</span>
           <div className="subagent-control-field">
             <ModelCombobox
               aria-label={`${task.name}模型`}
@@ -177,7 +217,7 @@ export function SubagentPolicyCardComponent({
         </div>
 
         <div className="subagent-control-group subagent-control-group--effort">
-          <label className="subagent-control-label">思考深度</label>
+          <span className="subagent-control-label" aria-hidden="true">思考深度</span>
           <div className="subagent-control-field">
             <Select
               className="w-full min-w-0"
@@ -203,42 +243,6 @@ export function SubagentPolicyCardComponent({
               }
             />
           </div>
-        </div>
-        <div className="subagent-role-switch-wrap">
-          {custom && (
-            <Button
-              size="icon-sm"
-              variant="ghost"
-              disabled={isBusy || isSingleEnabledRole}
-              title={isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : `删除${task.name}`}
-              aria-label={`删除${task.name}`}
-              onClick={() => onRequestConfirmation({
-                action: "delete-subagent",
-                title: `删除子代理「${task.name}」？`,
-                description: "将从当前配置移除这个自定义角色。点击侧栏“保存更改”后生效；保存前可放弃全部更改以恢复。",
-                confirmLabel: "删除子代理",
-                run: () => controller.removeRole(task.id),
-              })}
-            >
-              <IconTrash size={15} aria-hidden="true" />
-            </Button>
-          )}
-          {!isDefaultRole && (
-            <span
-              title={
-                isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : undefined
-              }
-            >
-              <Switch
-                checked={selection.enabled}
-                disabled={
-                  subagentPolicyControlsDisabled || isSingleEnabledRole
-                }
-                onCheckedChange={(enabled) => updateRole({ enabled })}
-                aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
-              />
-            </span>
-          )}
         </div>
         {custom && (
           <div className="subagent-custom-fields">
@@ -336,10 +340,10 @@ export function SubagentPolicyCardComponent({
                   </span>
                 </div>
                 <div className="subagent-table-head" aria-hidden="true">
+                  <span>启用</span>
                   <span>角色</span>
                   <span>模型</span>
                   <span>思考深度</span>
-                  <span>启用</span>
                 </div>
                 <div className="subagent-group-items">
                   {analysisTasks.map(renderRoleCard)}
@@ -363,10 +367,10 @@ export function SubagentPolicyCardComponent({
                   </span>
                 </div>
                 <div className="subagent-table-head" aria-hidden="true">
+                  <span>启用</span>
                   <span>角色</span>
                   <span>模型</span>
                   <span>思考深度</span>
-                  <span>启用</span>
                 </div>
                 <div className="subagent-group-items">
                   {implementationTasks.map(renderRoleCard)}
@@ -397,7 +401,7 @@ export function SubagentPolicyCardComponent({
                 </div>
               </div>
               {controller.error && <p role="alert" className="subagent-field-error">{controller.error}</p>}
-              <div className="subagent-policy-callout">
+              <div className={`subagent-policy-callout${subagentModelOptions.length === 0 ? " is-warning" : ""}`}>
                 <IconInfoCircle
                   size={16}
                   className="subagent-callout-icon"
@@ -420,6 +424,15 @@ export function SubagentPolicyCardComponent({
                 <strong>子代理优化已关闭</strong>
                 <p>开启后选择性委派给三类内置角色或自定义角色，并配置并发数量、模型与思考深度。</p>
               </div>
+              <Button
+                variant="default"
+                size="sm"
+                className="mt-1"
+                disabled={isBusy}
+                onClick={() => onSubagentOptimizationChange(true)}
+              >
+                开启子代理优化
+              </Button>
             </div>
           )}
         </div>
@@ -428,9 +441,20 @@ export function SubagentPolicyCardComponent({
   );
 }
 
-export const SubagentPolicyCard = memo(SubagentPolicyCardComponent);
+export const SubagentPolicyCard = memo(SubagentPolicyCardComponent, (prev, next) => {
+  if (prev.active === false && next.active === false) return true;
+  if (prev.active !== next.active) return false;
+  return (
+    prev.config === next.config &&
+    prev.isBusy === next.isBusy &&
+    prev.subagentModelOptions === next.subagentModelOptions &&
+    prev.onConfigChange === next.onConfigChange &&
+    prev.onSubagentOptimizationChange === next.onSubagentOptimizationChange
+  );
+});
 
 type FeaturePolicyCardProps = {
+  active?: boolean;
   config: Config;
   isMacClient: boolean;
   isWindowsClient: boolean;
@@ -698,4 +722,21 @@ function FeaturePolicyCardComponent({
   );
 }
 
-export const FeaturePolicyCard = memo(FeaturePolicyCardComponent);
+export const FeaturePolicyCard = memo(FeaturePolicyCardComponent, (prev, next) => {
+  if (prev.active === false && next.active === false) return true;
+  if (prev.active !== next.active) return false;
+  return (
+    prev.config === next.config &&
+    prev.isMacClient === next.isMacClient &&
+    prev.isWindowsClient === next.isWindowsClient &&
+    prev.cleanupBusy === next.cleanupBusy &&
+    prev.onAnalyzeDiagnosticStorage === next.onAnalyzeDiagnosticStorage &&
+    prev.popupContainer === next.popupContainer &&
+    prev.isBusy === next.isBusy &&
+    prev.configEditingDisabled === next.configEditingDisabled &&
+    prev.onConfigChange === next.onConfigChange &&
+    prev.onAddChannel === next.onAddChannel &&
+    prev.onChannelChange === next.onChannelChange &&
+    prev.onRequestRemoveChannel === next.onRequestRemoveChannel
+  );
+});

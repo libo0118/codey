@@ -115,6 +115,18 @@
   min-width: 0;
 }
 
+@container settings-content (max-width: 560px) {
+  .launch-proxy-card .feature-card-body.launch-proxy-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .launch-proxy-label {
+    justify-content: space-between;
+  }
+}
+
 
 
 .section-heading-row {
@@ -232,13 +244,16 @@
 }
 
 /* 子代理：分组标题 + 通栏角色行，整体铺满内容列。 */
+.page > .secondary-section.subagent-section:has(.subagent-group-card) {
+  padding: 0;
+}
+
 .subagent-policy-body {
   display: flex;
   flex-direction: column;
   gap: 0;
   min-width: 0;
   align-items: stretch;
-  margin: -22px calc(var(--page-gutter-end, 28px) * -1) -26px calc(var(--page-gutter, 28px) * -1);
 }
 
 .subagent-group-card {
@@ -250,10 +265,10 @@
 .subagent-stat-badge {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 9px;
+  gap: 5px;
+  padding: 1.5px 8px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
   white-space: nowrap;
 }
@@ -282,6 +297,7 @@
 /* 分组与统一四列横向对齐矩阵 */
 .subagent-group-card,
 .subagent-group-card.codey-card {
+  --subagent-cols: 38px minmax(124px, 148px) minmax(200px, 1fr) 132px;
   display: flex;
   flex-direction: column;
   overflow: visible;
@@ -296,8 +312,8 @@
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 8px 14px;
-  padding: 22px var(--page-gutter-end, 28px) 12px var(--page-gutter, 28px);
+  gap: 4px 12px;
+  padding: 12px var(--page-gutter-end, 28px) 4px var(--page-gutter, 28px);
   border-bottom: 0;
   background: transparent;
 }
@@ -305,36 +321,32 @@
 .subagent-group-title-wrap {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
 
 .subagent-group-title {
-  font-size: 19px;
-  font-weight: 800;
+  font-size: 15.5px;
+  font-weight: 750;
   color: var(--codey-text);
-  letter-spacing: -0.015em;
+  letter-spacing: -0.01em;
 }
 
 .subagent-group-desc {
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--codey-muted);
 }
 
 .subagent-table-head {
   display: grid;
-  grid-template-columns: minmax(170px, 1.15fr) minmax(220px, 1.65fr) 144px 52px;
+  grid-template-columns: var(--subagent-cols);
   align-items: center;
-  column-gap: 16px;
-  padding: 8px var(--page-gutter-end, 28px) 8px var(--page-gutter, 28px);
+  column-gap: 10px;
+  padding: 4px var(--page-gutter-end, 28px) 5px var(--page-gutter, 28px);
   border-bottom: 1px solid var(--codey-border);
   background: transparent;
   color: var(--codey-muted);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
-}
-
-.subagent-table-head > span:last-child {
-  text-align: right;
 }
 
 .subagent-group-items {
@@ -345,16 +357,20 @@
 
 .subagent-role-item {
   display: grid;
-  grid-template-columns: minmax(170px, 1.15fr) minmax(220px, 1.65fr) 144px 52px;
+  grid-template-columns: var(--subagent-cols);
   align-items: center;
-  column-gap: 16px;
-  padding: 14px var(--page-gutter-end, 28px) 14px var(--page-gutter, 28px);
+  column-gap: 10px;
+  padding: 8px var(--page-gutter-end, 28px) 8px var(--page-gutter, 28px);
   background: transparent;
   transition: background-color 150ms ease;
 }
 
 .subagent-group-card--default > .subagent-role-item {
-  padding-block: 18px;
+  padding-block: 10px;
+}
+
+.subagent-group-card--default > .subagent-role-item > .subagent-role-identity {
+  grid-column: 1 / 3;
 }
 
 .subagent-group-items > .subagent-role-item + .subagent-role-item {
@@ -365,30 +381,15 @@
   background: var(--codey-hover);
 }
 
-.subagent-group-card--default > .subagent-role-item .subagent-role-switch-wrap::after {
-  content: "默认";
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 24px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 999px;
-  background: var(--codey-surface-sunken);
-  color: var(--codey-muted);
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.subagent-role-item.subagent-role-disabled {
-  opacity: 0.62;
+.subagent-role-item.subagent-role-disabled .subagent-role-identity,
+.subagent-role-item.subagent-role-disabled .subagent-control-group {
+  opacity: 0.58;
 }
 
 .subagent-role-identity {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -397,8 +398,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 40px;
+  width: 30px;
+  height: 30px;
   border: 0;
   border-radius: 50%;
   background: var(--codey-text);
@@ -409,7 +410,7 @@
 
 .subagent-role-disabled .subagent-role-icon-box {
   filter: grayscale(100%);
-  opacity: 0.6;
+  opacity: 0.65;
 }
 
 .subagent-role-icon-box--codey_explorer {
@@ -437,21 +438,21 @@
 .subagent-role-title-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
 }
 
 .subagent-role-name {
   margin: 0;
   color: var(--mac-text-primary);
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 650;
   letter-spacing: -0.01em;
   white-space: nowrap;
 }
 
 .subagent-role-status-chip {
-  padding: 1px 7px;
+  padding: 1px 6px;
   border: 0;
   border-radius: 999px;
   background: var(--codey-surface-sunken);
@@ -467,8 +468,8 @@
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   padding: 0;
   border: 0;
   border-radius: 4px;
@@ -490,7 +491,7 @@
 .subagent-role-switch-wrap {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 6px;
 }
 
@@ -515,25 +516,29 @@
   min-width: 0;
 }
 
-/* 四列、列间距和内边距至少需要 690px，另为滚动条留出空间。 */
-@container settings-content (max-width: 720px) {
+/* 窄容器回落为紧凑堆叠布局，开关仍置于角色前方。 */
+@container settings-content (max-width: 600px) {
   .subagent-table-head {
     display: none;
   }
 
   .subagent-role-item {
-    grid-template-columns: minmax(0, 1fr) auto;
-    row-gap: 10px;
+    grid-template-columns: auto minmax(0, 1fr);
+    row-gap: 8px;
   }
 
-  .subagent-role-identity {
+  .subagent-role-switch-wrap {
     grid-column: 1;
     grid-row: 1;
   }
 
-  .subagent-role-switch-wrap {
+  .subagent-role-identity {
     grid-column: 2;
     grid-row: 1;
+  }
+
+  .subagent-group-card--default > .subagent-role-item > .subagent-role-identity {
+    grid-column: 1 / -1;
   }
 
   .subagent-control-group {
@@ -547,7 +552,7 @@
 }
 
 .subagent-role-item--custom {
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.35fr) 130px 82px;
+  grid-template-columns: var(--subagent-cols);
   row-gap: 16px;
 }
 
@@ -597,7 +602,7 @@
 
 @container settings-content (max-width: 640px) {
   .subagent-role-item--custom {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr);
   }
 
   .subagent-custom-fields {
@@ -609,13 +614,24 @@
 .subagent-policy-callout {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 8px;
   width: auto;
-  margin: 18px var(--page-gutter-end, 28px) 24px var(--page-gutter, 28px);
-  padding: 14px 18px;
-  border-radius: 18px;
+  margin: 12px var(--page-gutter-end, 28px) 16px var(--page-gutter, 28px);
+  padding: 10px 14px;
+  border-radius: 12px;
   background: var(--codey-panel);
   border: 0;
+}
+
+.subagent-policy-callout.is-warning {
+  border: 1px solid var(--codey-amber-border);
+  background: var(--codey-amber-soft);
+}
+
+.subagent-policy-callout.is-warning .subagent-callout-icon,
+.subagent-policy-callout.is-warning .subagent-callout-text {
+  color: var(--codey-amber);
+  font-weight: 550;
 }
 
 .subagent-callout-icon {
@@ -906,9 +922,9 @@
 }
 
 .notification-fields span {
-  font-size: 11px;
+  font-size: 12.5px;
   font-weight: 600;
-  color: var(--codey-muted, #6e6e73);
+  color: var(--codey-muted);
 }
 
 .notification-dialog-fields {
@@ -1144,6 +1160,7 @@
   background: transparent;
   box-shadow: none;
   outline: none;
+  animation: codey-panel-enter 160ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .prompt-tabs-panel:focus-visible {
@@ -1181,10 +1198,10 @@
 
 .prompt-field-label {
   color: var(--codey-text);
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 13.5px;
+  font-weight: 650;
   line-height: 1.4;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.005em;
 }
 
 .prompt-field-label-row {
@@ -1246,7 +1263,7 @@
   }
 }
 
-/* MCP / Skill 列表：通栏信息流行。 */
+/* MCP / Skill 列表：通栏信息流行（插件页沿用），以及 MCP / Skill 管理工作台卡片式列表。 */
 .extension-feed {
   display: flex;
   flex-direction: column;
@@ -1272,6 +1289,529 @@
   background: var(--codey-blue-soft);
 }
 
+/* ==========================================================================
+   MCP & Skill Management Workspace (CodexExtensionsPage)
+   ========================================================================== */
+
+/* 顶部范围与工作区上下文面板 */
+.extension-workspace-bar {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--codey-border);
+  border-radius: 16px;
+  background: var(--codey-panel);
+  overflow: hidden;
+}
+
+.extension-workspace-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 10px 14px;
+}
+
+.extension-scope-left {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* 现代胶囊分段切换器（取代突兀的下划线 Tab） */
+.extension-scope-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--codey-surface-sunken);
+  border: 1px solid var(--codey-border);
+  flex-shrink: 0;
+}
+
+.extension-scope-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--codey-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.extension-scope-pill:hover:not(:disabled):not(.active) {
+  color: var(--codey-text);
+  background: var(--codey-hover);
+}
+
+.extension-scope-pill.active {
+  background: var(--codey-surface-elevated);
+  color: var(--codey-text);
+  font-weight: 700;
+  box-shadow:
+    0 1px 2px rgba(15, 20, 25, 0.06),
+    0 0 0 1px rgba(var(--codey-ink-rgb, 15, 20, 25), 0.05);
+}
+
+.extension-scope-pill:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.extension-scope-pill:focus-visible {
+  outline: 2px solid var(--codey-blue);
+  outline-offset: 1px;
+}
+
+/* 范围路径与统计概览药丸 */
+.extension-scope-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.extension-stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--codey-surface);
+  border: 1px solid var(--codey-border);
+  color: var(--codey-muted);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.extension-stat-pill strong {
+  color: var(--codey-text);
+  font-weight: 700;
+}
+
+.extension-stat-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--codey-subtle);
+  flex-shrink: 0;
+}
+
+.extension-stat-dot.is-enabled {
+  background: var(--codey-green);
+}
+
+.extension-stat-dot.is-invalid {
+  background: var(--codey-red);
+}
+
+/* 项目路径选择子栏 */
+.extension-project-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--codey-border);
+  background: var(--codey-card);
+}
+
+.extension-project-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 范围与配置路径折叠条 */
+.extension-config-disclosure {
+  border-top: 1px solid var(--codey-border);
+  background: color-mix(in srgb, var(--codey-surface) 60%, var(--codey-panel));
+  font-size: 12px;
+  color: var(--codey-muted);
+}
+
+.extension-config-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background-color 140ms ease;
+}
+
+.extension-config-summary::-webkit-details-marker {
+  display: none;
+}
+
+.extension-config-summary:hover {
+  background: var(--codey-hover);
+}
+
+.extension-config-summary:focus-visible {
+  outline: 2px solid var(--codey-blue);
+  outline-offset: -2px;
+}
+
+.extension-config-details-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px 16px;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--codey-border-subtle);
+  background: var(--codey-card);
+}
+
+.extension-config-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.extension-config-detail-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--codey-subtle);
+}
+
+.extension-config-detail-value {
+  font-size: 12px;
+  color: var(--codey-text-soft);
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+/* 筛选与搜索工具栏 */
+.extension-filter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.extension-filter-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.extension-filter-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 320px;
+}
+
+.extension-filter-bottom {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-height: 32px;
+}
+
+/* 批量操作上下文横幅 */
+.extension-batch-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 8px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--codey-blue-border);
+  background: var(--codey-blue-soft);
+  animation: codey-panel-enter 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* MCP / Skill 结构化卡片列表 */
+.extension-card-list.extension-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-inline: 0;
+  border: 0;
+  background: transparent;
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  border: 1px solid var(--codey-border);
+  border-radius: 16px;
+  background: var(--codey-card);
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card + .extension-feed-item.extension-item-card {
+  border-top: 1px solid var(--codey-border);
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card:hover {
+  border-color: var(--codey-border-strong);
+  background: var(--codey-card);
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card.is-selected {
+  border-color: var(--codey-blue-border);
+  background: color-mix(in srgb, var(--codey-blue-soft) 45%, var(--codey-card));
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card.is-invalid {
+  border-color: var(--codey-red-border);
+}
+
+.extension-card-list > .extension-feed-item.extension-item-card.is-disabled:not(.is-selected) {
+  background: color-mix(in srgb, var(--codey-panel) 55%, var(--codey-card));
+}
+
+/* 卡片语义化圓角方标图标 + 状态角标 */
+.extension-item-avatar {
+  position: relative;
+  display: flex;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: var(--codey-surface-sunken);
+  color: var(--codey-muted);
+  border: 1px solid var(--codey-border-subtle);
+  transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.extension-item-avatar.is-active {
+  background: var(--codey-text);
+  color: var(--codey-surface);
+  border-color: transparent;
+}
+
+.extension-item-avatar.is-active.tone-blue {
+  background: var(--codey-blue-soft);
+  color: var(--codey-blue);
+  border-color: var(--codey-blue-border);
+}
+
+.extension-item-avatar.is-active.tone-purple {
+  background: var(--codey-purple-soft);
+  color: var(--codey-purple);
+  border-color: var(--codey-purple-border);
+}
+
+.extension-item-avatar.is-active.tone-green {
+  background: var(--codey-green-soft);
+  color: var(--codey-green);
+  border-color: var(--codey-green-border);
+}
+
+.extension-item-avatar.is-active.tone-amber {
+  background: var(--codey-amber-soft);
+  color: var(--codey-amber);
+  border-color: var(--codey-amber-border);
+}
+
+.extension-item-avatar-dot {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--codey-card);
+  background: var(--codey-subtle);
+}
+
+.extension-item-avatar-dot.is-on {
+  background: var(--codey-green);
+}
+
+.extension-item-avatar-dot.is-invalid {
+  background: var(--codey-red);
+}
+
+.extension-item-avatar-dot.is-unknown {
+  background: var(--codey-amber);
+}
+
+/* 卡片标题与标签 */
+.extension-item-title-btn {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--codey-text);
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition: color 130ms ease;
+}
+
+.extension-item-title-btn:hover:not(:disabled) {
+  color: var(--codey-blue);
+}
+
+.extension-item-title-btn:disabled {
+  cursor: default;
+}
+
+.extension-item-title-btn:focus-visible {
+  outline: 2px solid var(--codey-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.extension-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: var(--codey-surface-sunken);
+  color: var(--codey-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.extension-tag.is-mono {
+  font-family: var(--codey-font-mono);
+  font-weight: 550;
+}
+
+.extension-tag.is-blue {
+  background: var(--codey-blue-soft);
+  color: var(--codey-blue);
+}
+
+.extension-tag.is-green {
+  background: var(--codey-green-soft);
+  color: var(--codey-green);
+}
+
+.extension-tag.is-amber {
+  background: var(--codey-amber-soft);
+  color: var(--codey-amber);
+}
+
+.extension-tag.is-purple {
+  background: var(--codey-purple-soft);
+  color: var(--codey-purple);
+}
+
+/* 卡片底部元数据与操作栏 */
+.extension-item-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--codey-border-subtle);
+}
+
+.extension-meta-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+  flex: 1 1 240px;
+  font-size: 12px;
+  color: var(--codey-muted);
+}
+
+.extension-path-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: min(100%, 340px);
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--codey-surface-sunken);
+  color: var(--codey-muted);
+  font-family: var(--codey-font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.extension-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* 分页底栏 */
+.extension-pagination-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--codey-border);
+  background: var(--codey-panel);
+  font-size: 12.5px;
+  color: var(--codey-muted);
+}
+
+@container settings-content (max-width: 600px) {
+  .extension-workspace-top,
+  .extension-card-list > .extension-feed-item.extension-item-card {
+    padding: 12px;
+  }
+
+  .extension-scope-meta {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .extension-path-pill {
+    max-width: 220px;
+  }
+}
+
 /* 扩展列表状态筛选 — 胶囊过滤标签 */
 .extension-status-chips {
   display: inline-flex;
@@ -1284,14 +1824,14 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 32px;
-  padding: 0 9px 0 14px;
+  height: 30px;
+  padding: 0 8px 0 12px;
   border: 1px solid var(--codey-border-strong);
   border-radius: 999px;
-  background: transparent;
+  background: var(--codey-card);
   color: var(--mac-text-primary);
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 12.5px;
+  font-weight: 650;
   cursor: pointer;
   transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
@@ -1311,9 +1851,9 @@
   border-radius: 999px;
   background: var(--codey-surface-sunken);
   color: var(--mac-text-secondary);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 700;
-  line-height: 19px;
+  line-height: 18px;
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
@@ -1360,8 +1900,8 @@
   flex-direction: column;
   gap: 14px;
   margin-bottom: 18px;
-  padding: 14px 16px;
-  border: 2px dashed transparent;
+  padding: 15px 16px;
+  border: 1.5px dashed var(--codey-border-strong);
   border-radius: 18px;
   background: var(--codey-panel);
   transition: border-color 150ms ease, background-color 150ms ease;
@@ -1369,12 +1909,12 @@
 
 .plugin-import-panel.is-engaged {
   padding: 16px 18px 18px;
-  border: 1px solid var(--codey-border);
+  border: 1.5px solid var(--codey-border);
   background: var(--codey-card);
 }
 
 .plugin-import-panel.is-drag-active {
-  border: 2px dashed var(--codey-blue);
+  border: 1.5px dashed var(--codey-blue);
   background: var(--codey-blue-soft);
 }
 
@@ -1392,6 +1932,13 @@
   align-items: center;
   justify-content: center;
   border-radius: 50%;
+  background: var(--codey-blue-soft);
+  color: var(--codey-blue);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.plugin-import-panel.is-drag-active .plugin-import-icon,
+.plugin-import-panel[aria-busy="true"] .plugin-import-icon {
   background: var(--codey-blue);
   color: #ffffff;
 }
@@ -1435,6 +1982,7 @@
   gap: 12px;
   padding-top: 14px;
   border-top: 1px solid var(--codey-border);
+  animation: codey-panel-enter 160ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .plugin-import-note {
@@ -1474,8 +2022,21 @@
 }
 
 @container settings-content (max-width: 560px) {
+  .plugin-import-head {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .plugin-import-title,
+  .plugin-import-hint {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
   .plugin-import-path {
     padding-left: 0;
+    flex-wrap: wrap;
   }
 }
 
@@ -1527,9 +2088,12 @@
   padding: 14px 18px;
 }
 
-.overview-config .notification-empty-card {
+.overview-config .notification-channel-list > li.notification-empty-card {
   grid-column: 1 / -1;
+  justify-content: center;
+  padding: 26px 20px;
   border-radius: 0;
+  background: var(--codey-panel);
 }
 
 .overview-config .launch-proxy-card {

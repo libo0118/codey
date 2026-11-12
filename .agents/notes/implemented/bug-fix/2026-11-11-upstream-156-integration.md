@@ -16,6 +16,8 @@ Status: implemented
 
 ## Existing-note audit
 
+[1.6.0 集成](2026-11-12-upstream-160-integration.md)承接后续正式版，同样保留这里的权限与来源隔离决定。
+
 [1.5.2 合并](2026-11-06-upstream-152-integration.md)保留旧基线和权限取舍，本记录承接后续正式版；[自定义角色](../feature/2026-11-04-custom-subagents.md)、[可配并发](../feature/2026-11-04-subagent-concurrency.md)、[失败派发恢复](2026-11-06-failed-spawn-recovery.md)仍分别约束其运行时行为。[已选 custom 范围](../simplification/2026-11-04-selected-custom-preview.md)不因同步扩大；远程投影和工具安装记录无决定冲突，不重写或归档。
 
 ## Alternatives considered

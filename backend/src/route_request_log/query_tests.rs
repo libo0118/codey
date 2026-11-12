@@ -11,10 +11,9 @@ use super::super::{
 };
 use super::{
     DAY_MS, MAX_QUERY_PAGE, MAX_QUERY_PAGE_SIZE, MAX_QUERY_SEARCH_BYTES,
-    RouteRequestLogModelAliases, clear_route_request_log_files, latest_session_recorded_speed,
-    query_route_request_log_models, query_route_request_log_stats,
-    query_route_request_log_stats_with_model_aliases, query_route_request_logs,
-    session_recorded_timing, sqlite_query_filters,
+    RouteRequestLogModelAliases, clear_route_request_log_files, query_route_request_log_models,
+    query_route_request_log_stats, query_route_request_log_stats_with_model_aliases,
+    query_route_request_logs, sqlite_query_filters,
 };
 use crate::config::RouteRequestLogBackend;
 
@@ -1327,6 +1326,7 @@ fn last_turn_stats_query_isolates_window_and_runtime_with_session_time_index() {
         ('old','own',99,'responses',0,10000,100,200,200,9999),
         ('first','own',101,'responses',0,1300,100,300,200,100),
         ('second','local:own',200,'responses',0,3300,100,500,200,600),
+        ('same-ms-historical','own',300,'responses',0,1300,100,300,200,100),
         ('parent','own',200,'responses',1,1300,100,300,200,9999),
         ('compact','own',200,'responses_compact',0,1300,100,300,200,9999),
         ('runtime','own',300,'responses',0,1300,100,300,200,500),
@@ -1346,11 +1346,27 @@ fn last_turn_stats_query_isolates_window_and_runtime_with_session_time_index() {
     };
     let totals =
         super::last_turn_recorded_stats(root.path(), "own", &window, Some(&boundary)).unwrap();
-    assert_eq!(totals.requests, 2);
+    assert_eq!(totals.requests, 3);
     assert_eq!(totals.excluded_boundary_requests, 0);
-    assert_eq!(totals.generation.speed(), Some(175.0));
-    assert_eq!(totals.model_duration_ms, 4400);
-    assert_eq!(totals.ttft_total_ms / totals.ttft_samples as f64, 400.0);
+    assert_eq!(totals.generation.speed(), Some(160.0));
+    assert_eq!(totals.model_duration_ms, 5600);
+    assert_eq!(
+        (totals.ttft_total_ms / totals.ttft_samples as f64).round(),
+        367.0
+    );
+    let excluded_ms = super::last_turn_recorded_stats(
+        root.path(),
+        "own",
+        &window,
+        Some(&RuntimeHistoryBoundary {
+            exclude_entire_millisecond: true,
+            ..boundary.clone()
+        }),
+    )
+    .unwrap();
+    assert_eq!(excluded_ms.requests, 2);
+    assert_eq!(excluded_ms.generation.speed(), Some(175.0));
+    assert_eq!(excluded_ms.model_duration_ms, 4400);
     let (sql, values) = super::last_turn_stats_query("own", &window, Some(&boundary));
     let plan = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -1371,6 +1387,16 @@ fn last_turn_stats_query_isolates_window_and_runtime_with_session_time_index() {
         .execute("DROP INDEX idx_route_request_logs_session_time", [])
         .unwrap();
     assert!(super::last_turn_recorded_stats(root.path(), "own", &window, None).is_none());
+
+    let old_schema = tempfile::tempdir().unwrap();
+    let old_conn = Connection::open(old_schema.path().join(SQLITE_FILE_NAME)).unwrap();
+    old_conn
+        .execute_batch(
+            "CREATE TABLE route_request_logs (codex_session_id TEXT, timestamp_unix_ms INTEGER);
+             CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);",
+        )
+        .unwrap();
+    assert!(super::last_turn_recorded_stats(old_schema.path(), "own", &window, None).is_none());
 }
 
 #[test]
