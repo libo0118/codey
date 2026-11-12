@@ -96,6 +96,37 @@ test("真实 Workspace prepend 保持阅读锚点、草稿和文件 scope；普�
   h.unmount();
 });
 
+test("查看过程暂停跟随，原生折叠回弹不恢复；主动滚到底部、跳转或发送才恢复", async () => {
+  const c = { view: initial, composerView: initial, selected: { id: initial.id, title: "Mock", cwd: "D:/Mock" }, selectedId: initial.id,
+    draftScope: initial.id, threads: [], projects: [], models: [], connected: true, busy: false, images: [], send: async () => true };
+  const h = createControllerHarness(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), "Workspace", {
+    "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
+  });
+  try {
+    let tree = h.render({ active: true, onUnauthorized() {}, onPanel() {}, onLogout() {} });
+    const transcript = () => collectElements(tree, node => node.props.className === "remote-messages")[0];
+    const jump = () => collectElements(tree, node => node.props["aria-label"] === "滚动到最新消息")[0];
+    const container = { scrollTop: 1600, scrollHeight: 2000, clientHeight: 400, getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+    transcript().props.ref.current = container;
+    const inspect = () => {
+      transcript().props.onClickCapture({ target: { closest: () => ({ parentElement: { matches: () => true } }) } });
+      tree = h.render();
+    };
+    inspect(); assert.ok(jump());
+    // A native details collapse may emit scroll while already at the bottom.
+    transcript().props.onScroll({ currentTarget: container }); tree = h.render(); assert.ok(jump());
+    container.scrollHeight = 2300; c.view = { ...c.view }; tree = h.render(); assert.equal(container.scrollTop, 1600);
+    transcript().props.onWheelCapture(); container.scrollTop = 1900;
+    transcript().props.onScroll({ currentTarget: container }); tree = h.render(); assert.equal(jump(), undefined);
+    container.scrollHeight = 2500; c.view = { ...c.view }; tree = h.render(); assert.equal(container.scrollTop, 2500);
+    inspect(); jump().props.onClick(); tree = h.render(); assert.equal(jump(), undefined);
+    inspect();
+    collectElements(tree, node => node.props.onSend)[0].props.onSend({ preventDefault() {} });
+    await h.flush(); tree = h.render(); assert.equal(jump(), undefined);
+    inspect(); c.draftScope = "another-thread"; tree = h.render(); tree = h.render(); assert.equal(jump(), undefined);
+  } finally { h.unmount(); }
+});
+
 test("增量回放重建完整 View，未修改 turn/message 引用保持，支持数组 prepend/remove 与根 replace", () => {
   const start = { ...initial, turns: [...initial.turns, { id: "extra", status: "completed", messages: [message] }] };
   const patches = [{ op: "replace", path: "/turns/13/messages/19/collaboration/agents/0/status", value: "running" }, { op: "add", path: "/turns/14/messages/0", value: { ...message, id: "before" } }, { op: "add", path: "/turns/14/messages/-", value: { ...message, id: "after" } }, { op: "remove", path: "/turns/14/messages/1" }, { op: "add", path: "/requests/-", value: { id: 7, method: "Mock", supported: false, params: { "a/b~c": "old" } } }, { op: "replace", path: "/requests/0/params/a~1b~0c", value: "new" }];

@@ -14,7 +14,7 @@ type Props = {
 export function Sidebar(props: Props) {
   const [collapsed, setCollapsed] = useState(new Set<string>());
   const [expanded, setExpanded] = useState(new Set<string>());
-  const [searching, setSearching] = useState(false);
+  const [searching, setSearching] = useState(true);
   const { groups, recent } = useMemo(() => groupThreads(props.threads, props.projects), [props.threads, props.projects]);
   const toggle = (setter: typeof setCollapsed, id: string) => setter(current => {
     const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next;
@@ -26,7 +26,7 @@ export function Sidebar(props: Props) {
   return <aside className="remote-thread-list" aria-label="项目和会话">
     <div className="remote-list-heading"><h1>Codex</h1><button className="remote-icon-button" aria-label="搜索会话" aria-expanded={searching} onClick={() => { setSearching(!searching); if (searching) props.onSearch(""); }}><IconSearch size={21} /></button><button className="remote-icon-button" aria-label="新建会话" onClick={() => props.onCreate()} disabled={props.busy}><IconSquarePlus size={21} /></button></div>
     <div className="remote-host"><IconDeviceLaptop size={16} /><span>本地电脑</span><span className="remote-paired">已配对</span></div>
-    {searching && <div className="remote-search"><IconSearch size={16} /><input type="search" autoFocus placeholder="搜索会话或项目" aria-label="搜索会话或项目" value={props.search} onChange={event => props.onSearch(event.target.value)} maxLength={200} /><button className="remote-icon-button" aria-label="清除搜索" onClick={() => props.onSearch("")}><IconX size={15} /></button></div>}
+    {searching && <div className="remote-search"><IconSearch size={16} /><input type="search" placeholder="搜索会话或项目" aria-label="搜索会话或项目" value={props.search} onChange={event => props.onSearch(event.target.value)} maxLength={200} /><button className="remote-icon-button" aria-label="清除搜索" onClick={() => props.onSearch("")}><IconX size={15} /></button></div>}
     <div className="remote-navigation" aria-busy={props.loading}>
       <div className="remote-section-heading"><h2>{props.archived ? "归档项目" : "项目"}</h2><button className="remote-icon-button" aria-label="刷新会话" onClick={props.onRefresh} disabled={props.busy || props.loading}><IconRefresh size={16} /></button></div>
       {groups.filter(group => !props.search || group.threads.length || group.project.name.toLowerCase().includes(props.search.toLowerCase())).map(({ project, threads }) => {

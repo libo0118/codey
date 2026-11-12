@@ -40,9 +40,10 @@ function composerHarness(t) {
   globals(t, { document: new EventTarget(), FileReader: MockReader });
   const picker = () => Object.assign(new EventTarget(), { value: "", files: [], shown: 0, showPicker() { this.shown++; } });
   const camera = picker(), photos = picker(), files = picker();
+  const dialog = { open: false, showModal() { this.open = true; }, close() { this.open = false; } };
   const refs = [
     { style: {}, scrollHeight: 32 }, { contains: () => true, querySelector: () => null },
-    { focus() {} }, { focus() {} }, { open: false }, camera, photos, files, null, null,
+    { focus() {} }, { focus() {} }, dialog, camera, photos, files, null, null,
   ];
   let cursor = 0, nextRef = 0, effects = [];
   const hooks = [];
@@ -64,7 +65,7 @@ function composerHarness(t) {
   const { Composer } = createModuleGraph(new URL("../src/remote/composer.tsx", import.meta.url), { stubs: { react, "@tabler/icons-react": icons } }).exports;
   const props = { draft: "", onDraft() {}, images: [], onImages(next) { props.images = next; }, view: null, models: [], connected: true, busy: false, uncertain: false, onSend() {}, onStop() {}, onSettings() {}, catalogError: "", onReloadModels() {} };
   return {
-    props, files,
+    props, files, dialog,
     render() { cursor = 0; nextRef = 0; const tree = Composer(props); effects.splice(0).forEach(effect => effect()); return tree; },
     unmount() { hooks.forEach(hook => hook?.cleanup?.()); },
   };
@@ -113,6 +114,36 @@ test("Composer connects file picker, cancel, read, budget, preview, remove and r
     h.props.images = [{ name: "report.pdf", kind: "file", size: 3, url: "" }]; tree = h.render();
     assert.match(textContent(tree), /重新选择/); assert.equal(byLabel(tree, "发送消息").props.disabled, true);
     byLabel(tree, "移除文件 report.pdf").props.onClick(); assert.equal(h.props.images.length, 0);
+  } finally { h.unmount(); }
+});
+
+test("mobile composer keeps input and task actions together and reuses settings actions in its advanced sheet", t => {
+  const h = composerHarness(t), settings = [];
+  h.props.view = { model: "model-a", effort: "high", permissionMode: "auto", serviceTier: "default", turns: [] };
+  h.props.models = [{ id: "model-a", label: "Model A", route: "Mock", efforts: ["high"], defaultEffort: "high" }];
+  h.props.onSettings = value => settings.push(value);
+  try {
+    let tree = h.render();
+    const row = collectElements(tree, node => node.props.className === "remote-composer-input-row")[0];
+    assert.ok(byLabel(row, "发送给 Codex 的指令"));
+    assert.ok(byLabel(row, "添加附件"));
+    assert.ok(byLabel(row, "发送消息"));
+    assert.match(textContent(byLabel(tree, "调整模型与思考强度")), /Model A/);
+    byLabel(tree, "调整模型与思考强度").props.onClick(); tree = h.render();
+    collectElements(tree, node => node.type.name === "EffortControl")[0].props.onAdvanced(); tree = h.render();
+    assert.equal(h.dialog.open, true);
+    const permission = byLabel(tree, "高级访问权限");
+    assert.equal(permission.props.value, "auto");
+    permission.props.onChange({ target: { value: "read-only" } });
+    byLabel(tree, "权限").props.onChange({ target: { value: "auto" } });
+    assert.deepEqual(settings, [{ permissionMode: "read-only" }, { permissionMode: "auto" }]);
+    assert.match(textContent(permission), /完全访问 · 无沙箱限制/);
+    h.props.connected = false; tree = h.render();
+    assert.equal(byLabel(tree, "高级访问权限").props.disabled, true);
+    assert.equal(byLabel(tree, "权限").props.disabled, true);
+    assert.equal(byLabel(tree, "模型").props.disabled, true);
+    buttonText(tree, "完成").props.onClick(); h.render();
+    assert.equal(h.dialog.open, false);
   } finally { h.unmount(); }
 });
 

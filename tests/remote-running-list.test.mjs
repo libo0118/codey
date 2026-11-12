@@ -41,6 +41,13 @@ test("绿点不增设操作列，保留完整标题、时间、复制深链菜�
   assert.equal((footer.match(/<button\b/g) || []).length, 3);
 });
 
+test("搜索默认可见但不主动聚焦，手机首屏不会因渲染搜索框自动唤起键盘", () => {
+  const tree = createModuleGraph(new URL("../src/remote/sidebar.tsx", import.meta.url), { stubs: { "@tabler/icons-react": icons } }).exports.Sidebar({ ...props, threads: [] });
+  const [input] = collectElements(tree, node => node.props["aria-label"] === "搜索会话或项目");
+  assert.ok(input);
+  assert.notEqual(input.props.autoFocus, true);
+});
+
 test("列表与项目请求透传取消 signal，保留原 POST 参数及 CSRF 传输边界", async () => {
   const calls = [];
   const { remoteWorkspaceRequests: requests } = createModuleGraph(new URL("../src/features/remote-workspace/requests.ts", import.meta.url), {

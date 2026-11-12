@@ -99,6 +99,7 @@ test("真实审批卡按公开范围呈现，不 dump 未知权限或为无详�
   for (const text of ["网络访问", "允许", "读取路径", "D:/Mock", "写入路径", "本次允许"]) assert.ok(permission.includes(text), text);
   const command = make("item/commandExecution/requestApproval", { command: "node test.js", cwd: "D:/Mock", networkApprovalContext: { host: "example.invalid", protocol: "https" } });
   assert.match(command, /example.invalid/); assert.match(command, /工作目录/);
+  assert.ok(command.indexOf(">拒绝</button>") < command.indexOf(">本次允许</button>"), "主批准操作在次要操作之后，视觉和键盘顺序一致");
   for (const [method, params] of [["unknown", { config: "NEVER_DUMP" }], ["item/permissions/requestApproval", { permissions: { config: "NEVER_DUMP" } }], ["item/commandExecution/requestApproval", {}]]) {
     const html = make(method, params); assert.match(html, /电脑端处理/); assert.doesNotMatch(html, /NEVER_DUMP|本次允许/);
   }

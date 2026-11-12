@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
-import { IconArrowUp, IconBoltFilled, IconBrandSpeedtest, IconCamera, IconChevronRight, IconExclamationMark, IconFile, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconX } from "@tabler/icons-react";
+import { IconArrowUp, IconBoltFilled, IconCamera, IconExclamationMark, IconFile, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconX } from "@tabler/icons-react";
 import { effortLabels, permissionLabels, type ModelOption, type View, type ThreadSettings } from "./workspace-data";
 import { IMAGE_ACCEPT, readFiles, readImages, imagePickerError, type DraftImage } from "./images";
 
@@ -110,24 +110,24 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
     <input ref={files} hidden type="file" aria-label="选择文件" multiple disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget, true)} />
     {imageError && <p className="remote-client-error" role="alert">{imageError}</p>}
     {missingImages && <p className="remote-client-error" role="alert">浏览器未能保存附件内容，请移除标记的附件并重新选择后发送。</p>}
+    <div className="remote-composer-toolbar">
+      <label className={`remote-permission-picker${permission === "full-access" ? " is-full-access" : ""}`} title={permissionLabels[permission] || "自定义权限"}><IconShield size={16} stroke={1.8} />{permission === "full-access" && <IconExclamationMark className="remote-shield-mark" size={10} stroke={2.3} />}<span>{permissionLabels[permission] || "自定义权限"}</span><select aria-label="权限" value={permission} disabled={disabled} onChange={event => onSettings({ permissionMode: event.target.value })}>
+        {permission === "custom" && <option value="custom" disabled>自定义权限（沿用桌面）</option>}<option value="read-only">只读 · 修改前询问</option><option value="auto">默认权限 · 工作区内读写</option><option value="full-access">完全访问 · 无沙箱限制</option>
+      </select></label>
+      <button ref={gauge} type="button" className="remote-model-picker" aria-label="调整模型与思考强度" aria-expanded={panel === "power" || advanced} aria-controls={`${id}-${advanced ? "advanced" : "power"}`} onClick={() => togglePanel("power")}><span title={modelName}>{modelName}</span><IconSelector size={14} stroke={1.8} /></button>
+      {tier === "priority" && <span className="remote-fast-indicator" role="img" aria-label="快速模式已启用" title="快速模式已启用"><IconBoltFilled size={16} /></span>}
+    </div>
     <form className="remote-composer" onSubmit={event => { if (reading || missingImages) { event.preventDefault(); return; } setPanel(null); setNotice(""); onSend(event); }}>
       {images.length > 0 && <div className="remote-composer-images" aria-label="待发送附件">{images.map((image, index) => <figure className="remote-composer-image" key={index}>
         {!image.url ? <span>请重新选择</span> : image.kind === "file" ? <span><IconFile size={25} /></span> : <img src={image.url} alt={image.name} />}<figcaption title={image.name}>{image.name}</figcaption>
         <button type="button" aria-label={`移除${image.kind === "file" ? "文件" : "图片"} ${image.name}`} disabled={imagesLocked} onClick={() => { onImages(images.filter((_, position) => position !== index)); setImageError(""); setNotice("已移除附件。"); }}><IconX size={15} /></button>
       </figure>)}</div>}
-      <textarea ref={input} aria-label="发送给 Codex 的指令" disabled={busy} placeholder={active ? "补充当前任务的指令…" : "向 Codex 提问"} value={draft} onFocus={() => setPanel(null)} onChange={event => { onDraft(event.target.value); setNotice(""); }} rows={1} maxLength={100000} onKeyDown={event => {
-        if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
-      }} />
-      <div className="remote-composer-toolbar">
-        <div className="remote-composer-tools">
-          <button ref={add} type="button" className="remote-composer-icon" aria-label="添加附件" aria-expanded={panel === "attachments"} aria-controls={`${id}-attachments`} disabled={imagesLocked} onClick={() => togglePanel("attachments")}><IconPlus size={26} stroke={1.8} /></button>
-          <label className={`remote-permission-picker${permission === "full-access" ? " is-full-access" : ""}`} title={permissionLabels[permission] || "自定义权限"}><IconShield size={23} stroke={1.8} />{permission === "full-access" && <IconExclamationMark className="remote-shield-mark" size={13} stroke={2.3} />}<select aria-label="权限" value={permission} disabled={disabled} onChange={event => onSettings({ permissionMode: event.target.value })}>
-            {permission === "custom" && <option value="custom" disabled>自定义权限（沿用桌面）</option>}<option value="read-only">只读 · 修改前询问</option><option value="auto">默认权限 · 工作区内读写</option><option value="full-access">完全访问 · 无沙箱限制</option>
-          </select></label>
-        </div>
+      <div className="remote-composer-input-row">
+        <button ref={add} type="button" className="remote-composer-icon" aria-label="添加附件" aria-expanded={panel === "attachments"} aria-controls={`${id}-attachments`} disabled={imagesLocked} onClick={() => togglePanel("attachments")}><IconPlus size={22} stroke={1.8} /></button>
+        <textarea ref={input} aria-label="发送给 Codex 的指令" disabled={busy} placeholder={active ? "补充当前任务的指令…" : "向 Codex 提问"} value={draft} onFocus={() => setPanel(null)} onChange={event => { onDraft(event.target.value); setNotice(""); }} rows={1} maxLength={100000} onKeyDown={event => {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
+        }} />
         <div className="remote-send-actions">
-          {tier === "priority" && <span className="remote-fast-indicator" role="img" aria-label="快速模式已启用" title="快速模式已启用"><IconBoltFilled size={24} /></span>}
-          <button ref={gauge} type="button" className="remote-composer-icon" aria-label="调整模型与思考强度" aria-expanded={panel === "power" || advanced} aria-controls={`${id}-${advanced ? "advanced" : "power"}`} onClick={() => togglePanel("power")}><IconBrandSpeedtest size={27} stroke={1.8} /></button>
           {active && <button type="button" className="remote-stop" aria-label="停止任务" disabled={disabled} onClick={onStop}><IconPlayerStopFilled size={17} /></button>}
           {draft.trim() || images.length > 0 ? <button className="remote-send" aria-label={active ? "补充指令" : "发送消息"} disabled={disabled || uncertain || reading || missingImages}><IconArrowUp size={22} /></button> : !active && <button type="button" className="remote-send" aria-label="发送消息" disabled><IconArrowUp size={22} /></button>}
         </div>
@@ -140,17 +140,21 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
       if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) setAdvanced(false);
     }}>
       <button type="button" className="remote-sheet-handle" aria-label="关闭高级设置" onClick={() => setAdvanced(false)} onPointerDown={event => { swipeStart.current = event.clientY; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerUp={event => { if (swipeStart.current !== null && event.clientY - swipeStart.current > 35) setAdvanced(false); swipeStart.current = null; }} onPointerCancel={() => { swipeStart.current = null; }}><span /></button>
-      <h3>高级<IconChevronRight size={19} stroke={2.3} /></h3>
+      <h3>模型与权限</h3>
       <div className="remote-settings-group">
         <label className="remote-settings-row"><span>模型</span><span className="remote-settings-value remote-model-value" title={modelName}>{modelName}</span><IconSelector size={17} /><select aria-label="模型" value={view?.model || ""} disabled={disabled || !models.length} onChange={event => {
           const next = models.find(model => model.id === event.target.value);
           if (next) onSettings({ model: next.id, effort: next.efforts.includes(view?.effort || "") ? view!.effort! : next.defaultEffort || undefined });
         }}>{!selected && <option value={view?.model || ""} disabled>{view?.model || "选择模型"}</option>}{routes.map(route => <optgroup key={route} label={route}>{models.filter(model => model.route === route).map(model => <option key={model.id} value={model.id}>{model.label}</option>)}</optgroup>)}</select></label>
-        <label className="remote-settings-row"><span>智能</span><span className="remote-settings-value">{effortLabels[view?.effort || ""] || view?.effort || "默认"}</span><IconSelector size={17} /><select aria-label="思考程度" value={view?.effort || ""} disabled={disabled || !selected?.efforts.length} onChange={event => onSettings({ effort: event.target.value })}>{!selected?.efforts.includes(view?.effort || "") && <option value={view?.effort || ""} disabled>{view?.effort || "默认"}</option>}{selected?.efforts.map(effort => <option value={effort} key={effort}>{effortLabels[effort]}</option>)}</select></label>
+        <label className="remote-settings-row"><span>思考强度</span><span className="remote-settings-value">{effortLabels[view?.effort || ""] || view?.effort || "默认"}</span><IconSelector size={17} /><select aria-label="思考程度" value={view?.effort || ""} disabled={disabled || !selected?.efforts.length} onChange={event => onSettings({ effort: event.target.value })}>{!selected?.efforts.includes(view?.effort || "") && <option value={view?.effort || ""} disabled>{view?.effort || "默认"}</option>}{selected?.efforts.map(effort => <option value={effort} key={effort}>{effortLabels[effort]}</option>)}</select></label>
       </div>
       <div className="remote-settings-group remote-speed-group">
+        <label className="remote-settings-row"><span>访问权限</span><span className="remote-settings-value">{permissionLabels[permission] || "自定义权限"}</span><IconSelector size={17} /><select aria-label="高级访问权限" value={permission} disabled={disabled} onChange={event => onSettings({ permissionMode: event.target.value })}>
+          {permission === "custom" && <option value="custom" disabled>自定义权限（沿用桌面）</option>}<option value="read-only">只读 · 修改前询问</option><option value="auto">默认权限 · 工作区内读写</option><option value="full-access">完全访问 · 无沙箱限制</option>
+        </select></label>
         <label className="remote-settings-row"><span>速度</span><span className="remote-settings-value">{tier === "priority" ? "快速" : tier === "default" ? "标准" : tier}</span><IconSelector size={17} /><select aria-label="速度模式" value={tier} disabled={disabled} onChange={event => onSettings({ serviceTier: event.target.value })}>{!["default", "priority"].includes(tier) && <option value={tier} disabled>{tier}</option>}<option value="default">标准</option><option value="priority">快速</option></select></label>
       </div>
+      <button type="button" className="remote-primary remote-settings-done" onClick={() => setAdvanced(false)}>完成</button>
     </dialog>
   </div>;
 }

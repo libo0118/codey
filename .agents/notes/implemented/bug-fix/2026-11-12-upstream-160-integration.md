@@ -25,7 +25,7 @@ Status: implemented
 
 ## Verification
 
-TypeScript 检查、前端生产构建与统计／设置页 84 项回归通过。首次全量 JavaScript 回归识别出两个集成断言需要随保留的功能同步，现已补测；另有 Python scaffold 测试因本机缺少 `cargo` 无法执行。Rust 编译、测试和 lint 尚未获得本轮通过证据，不把源码合并等同于原生验收。
+TypeScript 检查、前端生产构建与统计／设置页 84 项回归通过。全量 JavaScript 回归共 1626 项，1622 通过、3 跳过，唯一失败为 Python scaffold 测试因本机缺少 `cargo` 无法执行。首次识别出的两个集成断言已随保留的菜单和注入版本补测。Rust 编译、测试和 lint 尚未获得本轮通过证据，不把源码合并等同于原生验收。
 
 ## Consequences
 

@@ -17,6 +17,7 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
   const [atBottom, setAtBottom] = useState(true);
   const scroll = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const inspecting = useRef(false);
   const anchor = useRef<{ id: string; offset: number } | null>(null);
   const files = useMemo(() => ({ threadId: view?.id || "", enabled: active && connected && view?.id === selectedId, generation: fileGeneration }), [active, connected, selectedId, view?.id, fileGeneration]);
   function rememberAnchor() {
@@ -26,7 +27,14 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
     const first = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]")).find(element => element.getBoundingClientRect().bottom > top);
     anchor.current = first ? { id: first.dataset.messageId!, offset: first.getBoundingClientRect().top - top } : null;
   }
-  useLayoutEffect(() => { pinned.current = true; anchor.current = null; setAtBottom(true); }, [draftScope]);
+  function pauseFollowing() {
+    inspecting.current = true; pinned.current = false; setAtBottom(false); rememberAnchor();
+  }
+  function followLatest() {
+    inspecting.current = false; pinned.current = true; setAtBottom(true);
+    if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+  }
+  useLayoutEffect(() => { inspecting.current = false; pinned.current = true; anchor.current = null; setAtBottom(true); }, [draftScope]);
   useLayoutEffect(() => {
     const container = scroll.current;
     if (!container) return;
@@ -53,20 +61,24 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
       </header>
       {connectionError && <p className="remote-connection" role="status">{connectionError}</p>}
       <MessageFilesContext.Provider value={files}><div className="remote-transcript">
-        <div className="remote-messages" ref={scroll} onScroll={event => { const element = event.currentTarget; pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); rememberAnchor(); }}>
-          {view && (view.hasEarlierMessages || !view.historyComplete) && <button disabled={busy || loadingEarlier || !connected} onClick={() => { rememberAnchor(); pinned.current = false; void c.loadHistory(); }}>{loadingEarlier ? "正在加载更早内容…" : view.hasEarlierMessages ? "加载更早内容" : "加载完整历史"}</button>}
+        <div className="remote-messages" ref={scroll}
+          onClickCapture={event => { if ((event.target as HTMLElement).closest("summary")?.parentElement?.matches(".remote-process, .remote-activity")) pauseFollowing(); }}
+          onWheelCapture={() => { inspecting.current = false; }} onTouchMoveCapture={() => { inspecting.current = false; }}
+          onKeyDownCapture={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) inspecting.current = false; }}
+          onScroll={event => { const element = event.currentTarget; pinned.current = !inspecting.current && element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); rememberAnchor(); }}>
+          {view && (view.hasEarlierMessages || !view.historyComplete) && <button disabled={busy || loadingEarlier || !connected} onClick={() => { pauseFollowing(); void c.loadHistory(); }}>{loadingEarlier ? "正在加载更早内容…" : view.hasEarlierMessages ? "加载更早内容" : "加载完整历史"}</button>}
           {!creating && !view && <p className="remote-chat-loading">{connectionError ? "暂时无法读取会话，请点击重新连接。" : "正在获取桌面会话…"}</p>}
           {(creating || view?.turns.length === 0) && <div className="remote-chat-empty"><h2>从一个想法开始</h2><p>{creating && !draftProject ? "请先在电脑 Codex 中保存本地项目。" : `描述任务，让 Codex 在 ${draftProject && creating ? draftProject.name : selectedProject?.name || "当前工作区"} 中开始工作。`}</p></div>}
           {view?.turns.map((turn, index) => turn.messages.length > 0 && <ConversationTurn key={`${view.id}:${turn.id || index}`} turn={turn} />)}
           {view?.requests.map(request => <ApprovalCard key={String(request.id)} request={request} disabled={busy || !connected} onRespond={args => c.respond(request.id, args)} />)}
           {activeTurn && <p className="remote-working" role="status"><span className="remote-chat-status-dot is-connected" />Codex 正在工作…</p>}
         </div>
-        {!atBottom && <button className="remote-jump remote-icon-button" aria-label="滚动到最新消息" onClick={() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; pinned.current = true; setAtBottom(true); }}><IconArrowDown size={20} /></button>}
+        {!atBottom && <button className="remote-jump remote-icon-button" aria-label="滚动到最新消息" onClick={followLatest}><IconArrowDown size={20} /></button>}
       </div></MessageFilesContext.Provider>
       {error && <p className="remote-client-error" role="alert">{error}</p>}
       {uncertain && !busy && <div className="remote-uncertain"><p>消息未确认。请查看会话是否已收到，确认后再决定是否重新发送。</p><button onClick={c.confirmSubmission}>已核对，允许再次发送</button></div>}
       <Composer key={draftScope} draft={draft} onDraft={c.changeDraft} images={images} onImages={c.changeImages} view={composerView} models={models} connected={creating ? !!draftProject && defaultsReady : connected} busy={busy} uncertain={uncertain}
-        onSend={event => { event.preventDefault(); void c.send().then(started => { if (started) pinned.current = true; }); }}
+        onSend={event => { event.preventDefault(); void c.send().then(started => { if (started) followLatest(); }); }}
         onStop={() => void c.stop()} onSettings={c.changeSettings} catalogError={catalogError} onReloadModels={c.reloadModels} />
     </>}</main>
   </div>;
@@ -86,5 +98,5 @@ export function ApprovalCard({ request, disabled, onRespond }: { request: Approv
     || request.method === "item/fileChange/requestApproval" && knownChanges && changes.length > 0
     || request.method === "item/permissions/requestApproval" && !!permissions;
   if (!detailed) return <section className="remote-approval"><p>此请求缺少可核对的公开详情，请在电脑端处理。</p></section>;
-  return <section className="remote-approval"><h3>等待你的批准</h3><p>{request.params.reason}</p>{request.params.cwd && <p>工作目录：<code>{request.params.cwd}</code></p>}{request.params.command && <pre tabIndex={0}>{request.params.command}</pre>}{request.params.networkApprovalContext && <p>网络目标：{request.params.networkApprovalContext.protocol} · {request.params.networkApprovalContext.host}</p>}{request.params.grantRoot && <p>授权根目录：<code>{request.params.grantRoot}</code></p>}{permissions && <dl className="remote-permission-summary">{permissions.network && <><dt>网络访问</dt><dd>{permissions.network.enabled ? "允许" : "不允许"}</dd></>}{(["read", "write"] as const).map(key => permissions.fileSystem?.[key] && <div key={key}><dt>{key === "read" ? "读取路径" : "写入路径"}</dt><dd>{permissions.fileSystem[key]!.map(path => <code key={path}>{path}</code>)}</dd></div>)}</dl>}{knownChanges && <FileChanges changes={changes} />}<div>{available.includes("accept") && <button disabled={disabled} className="remote-primary" onClick={() => void onRespond({ decision: "accept" })}>本次允许</button>}{available.includes("decline") && <button disabled={disabled} onClick={() => void onRespond({ decision: "decline" })}>拒绝</button>}{available.includes("cancel") && <button disabled={disabled} onClick={() => void onRespond({ decision: "cancel" })}>取消</button>}</div></section>;
+  return <section className="remote-approval"><h3>等待你的批准</h3><p>{request.params.reason}</p>{request.params.cwd && <p>工作目录：<code>{request.params.cwd}</code></p>}{request.params.command && <pre tabIndex={0}>{request.params.command}</pre>}{request.params.networkApprovalContext && <p>网络目标：{request.params.networkApprovalContext.protocol} · {request.params.networkApprovalContext.host}</p>}{request.params.grantRoot && <p>授权根目录：<code>{request.params.grantRoot}</code></p>}{permissions && <dl className="remote-permission-summary">{permissions.network && <><dt>网络访问</dt><dd>{permissions.network.enabled ? "允许" : "不允许"}</dd></>}{(["read", "write"] as const).map(key => permissions.fileSystem?.[key] && <div key={key}><dt>{key === "read" ? "读取路径" : "写入路径"}</dt><dd>{permissions.fileSystem[key]!.map(path => <code key={path}>{path}</code>)}</dd></div>)}</dl>}{knownChanges && <FileChanges changes={changes} />}<div className="remote-approval-actions">{available.includes("decline") && <button disabled={disabled} onClick={() => void onRespond({ decision: "decline" })}>拒绝</button>}{available.includes("cancel") && <button disabled={disabled} onClick={() => void onRespond({ decision: "cancel" })}>取消</button>}{available.includes("accept") && <button disabled={disabled} className="remote-primary" onClick={() => void onRespond({ decision: "accept" })}>本次允许</button>}</div></section>;
 }

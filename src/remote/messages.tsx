@@ -13,6 +13,22 @@ const agentStatuses: Record<string, string> = { pendingInit: "初始化中", run
 const agentStatusLabel = (status: string | undefined) => status === undefined ? "未提供状态" : Object.prototype.hasOwnProperty.call(agentStatuses, status) ? agentStatuses[status] : "状态未知";
 const textKinds = new Set(["userMessage", "steeringUserMessage", "agentMessage", "assistantMessage", "planImplementation", "error"]);
 
+function activityTitle(message: Message): string {
+  if (!Object.prototype.hasOwnProperty.call(activityLabels, message.kind)) return "未支持的活动";
+  const label = activityLabels[message.kind];
+  let detail = "";
+  if (message.kind === "collabAgentToolCall" || message.kind === "subAgentActivity") {
+    const actions = message.kind === "subAgentActivity" ? lifecycleActions : collaborationActions;
+    if (!message.collaboration || !Object.prototype.hasOwnProperty.call(actions, message.collaboration.action)) return "未支持的活动";
+    detail = actions[message.collaboration.action];
+  } else if (message.kind === "commandExecution") detail = message.command?.command.split(/\r?\n/, 1)[0] || "";
+  else if (message.kind === "fileChange" && message.changes?.length) detail = `${message.changes.length} 个文件 · ${message.changes[0].path}`;
+  else if (message.kind === "plan") detail = message.plan?.find(step => ["inProgress", "in_progress"].includes(step.status || ""))?.step || "";
+  else if (message.kind !== "reasoning") detail = message.tool?.name || "";
+  detail = detail.replace(/\s+/g, " ").trim();
+  return detail ? `${label} · ${detail.slice(0, 120)}${detail.length > 120 ? "…" : ""}` : label;
+}
+
 function UserText({ text }: { text: string }) {
   let body = text, context = "";
   const trimmed = text.trim();
@@ -63,7 +79,7 @@ const Activity = memo(function Activity({ message }: { message: Message }) {
   const collaboration = collaborative && message.collaboration && Object.prototype.hasOwnProperty.call(actions, message.collaboration.action) ? message.collaboration : undefined;
   const known = Object.prototype.hasOwnProperty.call(activityLabels, message.kind) && (!collaborative || Boolean(collaboration));
   return <details className={`remote-activity remote-activity-${known ? message.kind : "unknown"}`} data-message-id={message.id || undefined} onToggle={event => { if (event.target === event.currentTarget) setExpanded(event.currentTarget.open); }}>
-    <summary><span className="remote-activity-heading"><span>{known ? activityLabels[message.kind] : "未支持的活动"}{collaboration ? ` · ${actions[collaboration.action]}` : known && message.tool && ` · ${message.tool.name}`}</span>{message.status && <small>{statusLabel(message.status)}</small>}</span>{collaboration && <span className="remote-agent-summary">{collaboration.agents.map(agent => <span className="remote-agent-state" key={agent.id}><span>{agent.name || "未命名子代理"}</span><small>{agentStatusLabel(agent.status)}</small></span>)}</span>}</summary>
+    <summary><span className="remote-activity-heading"><span>{activityTitle(message)}</span>{message.status && <small>{statusLabel(message.status)}</small>}</span>{collaboration && <span className="remote-agent-summary">{collaboration.agents.map(agent => <span className="remote-agent-state" key={agent.id}><span>{agent.name || "未命名子代理"}</span><small>{agentStatusLabel(agent.status)}</small></span>)}</span>}</summary>
     {(!known || expanded) && <>{!known ? <p className="remote-content-notice">此活动类型暂不支持，请在电脑端查看。</p>
       : collaboration ? <div className="remote-collaboration">{collaboration.agents.length ? collaboration.agents.map(agent => <section key={agent.id}><h4>{agent.name || "未命名子代理"}</h4>{agent.message?.trim() ? <div className="remote-agent-result" tabIndex={0} role="region" aria-label={`${agent.name || "未命名子代理"}的公开结果，可滚动`}><RichText text={agent.message} /></div> : <p className="remote-content-notice">暂无公开结果。</p>}</section>) : <p className="remote-content-notice">暂无公开子代理状态或结果。</p>}</div>
       : message.kind === "commandExecution" ? message.command ? <><p className="remote-command-cwd">{message.command.cwd}</p><CodeBlock text={message.command.command} language="命令" />{message.command.output && <pre className="remote-command-output" tabIndex={0} aria-label="命令输出，可横向滚动">{message.command.output}</pre>}{message.command.exitCode !== undefined && <p className={message.command.exitCode ? "remote-client-error" : "remote-content-notice"}>退出码 {message.command.exitCode}</p>}</> : <CodeBlock text={message.text} language="命令与输出" />
@@ -79,8 +95,9 @@ const Activity = memo(function Activity({ message }: { message: Message }) {
 const ActivityGroup = memo(function ActivityGroup({ messages, working }: { messages: Message[]; working: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const visible = messages.filter(message => message.kind !== "reasoning" || message.text.trim() || message.attachments?.length);
+  const latest = [...visible].reverse().find(message => message.kind !== "reasoning");
   return <details className="remote-process" data-message-id={messages[0].id || undefined} onToggle={event => { if (event.target === event.currentTarget) setExpanded(event.currentTarget.open); }}>
-    <summary>{working ? "正在思考" : "工作过程"}{visible.length > 0 && <small> · {visible.length} 项活动</small>}</summary>
+    <summary><span className="remote-process-heading">{working ? "正在工作" : "工作过程"}{visible.length > 0 && <small> · {visible.length} 项活动</small>}</span>{latest && <span className="remote-process-preview">{activityTitle(latest)}</span>}</summary>
     {expanded && <div className="remote-process-body">{visible.length ? visible.map((message, index) => <Activity key={message.id || `${message.kind}:${index}`} message={message} />) : <p className="remote-content-notice">暂无公开思考摘要，原始思考内容不在远程端显示。</p>}</div>}
   </details>;
 });

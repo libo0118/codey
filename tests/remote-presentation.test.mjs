@@ -57,13 +57,34 @@ test("过程展开才创建详情，嵌套详情关闭不折叠整个过程", ()
     return group.type(group.props);
   }, { "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
   try {
-    let tree = h.render(); assert.match(textContent(tree), /正在思考/);
+    let tree = h.render(); assert.match(textContent(tree), /正在工作/);
     assert.equal(collectElements(tree, node => node.props.message).length, 0);
     const outer = { open: true }; tree.props.onToggle({ target: outer, currentTarget: outer }); tree = h.render();
     assert.equal(collectElements(tree, node => node.props.message).length, 1);
     tree.props.onToggle({ target: { open: false }, currentTarget: outer }); tree = h.render();
     assert.equal(collectElements(tree, node => node.props.message).length, 1);
   } finally { h.unmount(); }
+});
+
+test("过程摘要只用最新公开动作，不提前创建工具输出或思考正文", () => {
+  const messages = [
+    { id: "old", role: "activity", kind: "commandExecution", text: "", command: { command: "old-command", output: "OLD_OUTPUT" } },
+    { id: "tool", role: "activity", kind: "mcpToolCall", status: "failed", text: "PRIVATE_TEXT", tool: { name: "inspect_local_file", input: "PRIVATE_INPUT", output: "HIDDEN_OUTPUT" } },
+    { id: "reason", role: "activity", kind: "reasoning", text: "HIDDEN_REASONING" },
+  ];
+  const html = render(messages);
+  assert.match(html, /remote-process-preview">MCP 工具 · inspect_local_file/);
+  assert.doesNotMatch(html, /old-command|OLD_OUTPUT|PRIVATE_TEXT|PRIVATE_INPUT|HIDDEN_OUTPUT|HIDDEN_REASONING|任务失败|已完成/);
+  assert.equal((html.match(/<details /g) || []).length, 1);
+  for (const [message, expected] of [
+    [{ kind: "commandExecution", command: { command: "npm run check\nDO_NOT_PREVIEW", output: "HIDDEN_OUTPUT" } }, /执行命令 · npm run check/],
+    [{ kind: "fileChange", changes: [{ path: "src/App.tsx", diff: "HIDDEN_DIFF" }] }, /文件变更 · 1 个文件 · src\/App.tsx/],
+    [{ kind: "plan", plan: [{ step: "已做的步骤", status: "completed" }, { step: "验证页面", status: "in_progress" }] }, /工作计划 · 验证页面/],
+  ]) {
+    const preview = render([{ id: "action", role: "activity", text: "", ...message }]);
+    assert.match(preview, expected);
+    assert.doesNotMatch(preview, /DO_NOT_PREVIEW|HIDDEN_OUTPUT|HIDDEN_DIFF|已做的步骤/);
+  }
 });
 
 test("问题卡默认可折叠，选项和手写答案仍只在明确提交后发送", async () => {
