@@ -11,11 +11,21 @@ use super::super::{
 };
 use super::{
     DAY_MS, MAX_QUERY_PAGE, MAX_QUERY_PAGE_SIZE, MAX_QUERY_SEARCH_BYTES,
-    RouteRequestLogModelAliases, clear_route_request_log_files, query_route_request_log_models,
-    query_route_request_log_stats, query_route_request_log_stats_with_model_aliases,
-    query_route_request_logs, sqlite_query_filters,
+    RouteRequestLogModelAliases, clear_route_request_log_files, last_turn_recorded_stats,
+    query_route_request_log_models, query_route_request_log_stats,
+    query_route_request_log_stats_with_model_aliases, query_route_request_logs,
+    sqlite_query_filters,
 };
 use crate::config::RouteRequestLogBackend;
+use crate::conversation_stats::TurnWindow;
+
+fn recorded_window() -> TurnWindow {
+    TurnWindow {
+        id: "recorded-fixture".into(),
+        started_at_unix_ms: 0,
+        completed_at_unix_ms: None,
+    }
+}
 
 #[test]
 fn model_candidates_paginate_all_models_and_apply_account_filters() {
@@ -1105,12 +1115,13 @@ fn sqlite_analytics_rejects_invalid_ranges_and_grouping() {
 }
 
 #[test]
-fn session_recorded_speed_uses_latest_eligible_own_request_without_creating_logs() {
+fn last_turn_recorded_speed_uses_eligible_own_requests_without_creating_logs() {
     let directory = tempfile::tempdir().unwrap();
-    assert_eq!(
-        latest_session_recorded_speed(directory.path(), "thread-sample"),
-        None
-    );
+    let speed = |id| {
+        last_turn_recorded_stats(directory.path(), id, &recorded_window(), None)
+            .and_then(|totals| totals.generation.speed())
+    };
+    assert_eq!(speed("thread-sample"), None);
     let path = directory.path().join(SQLITE_FILE_NAME);
     assert!(!path.exists());
     let mut sink = SqliteSink::open(&path, 30).unwrap();
@@ -1144,31 +1155,20 @@ fn session_recorded_speed_uses_latest_eligible_own_request_without_creating_logs
     .unwrap();
     sink.finish().unwrap();
     drop(sink);
-    assert_eq!(
-        latest_session_recorded_speed(directory.path(), "thread-sample"),
-        Some((200.0, 100))
-    );
-    assert_eq!(
-        latest_session_recorded_speed(directory.path(), "foreign"),
-        None
-    );
+    assert_eq!(speed("thread-sample"), Some(200.0));
+    assert_eq!(speed("foreign"), None);
     // 关闭写入后依然只读历史；兼容日志内带 local: 前缀的会话归属。
     let conn = Connection::open(&path).unwrap();
     conn.execute("UPDATE route_request_logs SET codex_session_id='local:thread-sample' WHERE request_id='own'", []).unwrap();
-    assert_eq!(
-        latest_session_recorded_speed(directory.path(), "thread-sample"),
-        Some((200.0, 100))
-    );
-    for invalid_output in [0, 99] {
+    assert_eq!(speed("thread-sample"), Some(200.0));
+    // 最近一轮聚合保留短输出和明确的零值，不使用旧单请求速度的 100 Token 门槛。
+    for output in [0, 99] {
         conn.execute(
             "UPDATE route_request_logs SET output_tokens=?1 WHERE request_id='own'",
-            [invalid_output],
+            [output],
         )
         .unwrap();
-        assert_eq!(
-            latest_session_recorded_speed(directory.path(), "thread-sample"),
-            None
-        );
+        assert_eq!(speed("thread-sample"), Some(output as f64));
     }
     conn.execute(
         "UPDATE route_request_logs SET output_tokens=200 WHERE request_id='own'",
@@ -1181,16 +1181,13 @@ fn session_recorded_speed_uses_latest_eligible_own_request_without_creating_logs
         [],
     )
     .unwrap();
-    assert_eq!(
-        latest_session_recorded_speed(directory.path(), "thread-sample"),
-        None
-    );
+    assert_eq!(speed("thread-sample"), None);
 }
 
 #[test]
 fn session_recorded_timing_excludes_parent_compaction_and_missing_measurements() {
     let directory = tempfile::tempdir().unwrap();
-    assert!(session_recorded_timing(directory.path(), "own", None).is_none());
+    assert!(last_turn_recorded_stats(directory.path(), "own", &recorded_window(), None).is_none());
     assert!(!directory.path().join(SQLITE_FILE_NAME).exists());
     let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
     let mut entry = sample_entry("first");
@@ -1230,19 +1227,22 @@ fn session_recorded_timing_excludes_parent_compaction_and_missing_measurements()
     .unwrap();
     sink.finish().unwrap();
     drop(sink);
-    let timing = session_recorded_timing(directory.path(), "own", None).unwrap();
+    let timing =
+        last_turn_recorded_stats(directory.path(), "own", &recorded_window(), None).unwrap();
     assert_eq!(timing.requests, 3);
-    assert_eq!(timing.model_duration_ms, Some(2000));
-    assert_eq!(timing.average_ttft_ms, Some(700.0));
-    assert_eq!(timing.timing_request_count, 2);
-    assert_eq!(timing.ttft_sample_count, 2);
-    assert!(session_recorded_timing(directory.path(), "foreign", None).is_none());
+    assert_eq!(timing.model_duration_ms, 2000);
+    assert_eq!(timing.ttft_total_ms / timing.ttft_samples as f64, 700.0);
+    assert_eq!(timing.model_samples, 2);
+    assert_eq!(timing.ttft_samples, 2);
+    assert!(
+        last_turn_recorded_stats(directory.path(), "foreign", &recorded_window(), None).is_none()
+    );
     // 旧库缺计时字段时只返回未知，不迁移、不创建字段，也不依赖当前日志开关。
     let old = tempfile::tempdir().unwrap();
     let connection = Connection::open(old.path().join(SQLITE_FILE_NAME)).unwrap();
     connection.execute_batch("CREATE TABLE route_request_logs (codex_session_id TEXT, timestamp_unix_ms INTEGER);
         CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
-    assert!(session_recorded_timing(old.path(), "own", None).is_none());
+    assert!(last_turn_recorded_stats(old.path(), "own", &recorded_window(), None).is_none());
     let columns: u64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('route_request_logs')",
@@ -1261,9 +1261,11 @@ fn session_recorded_timing_filters_invalid_times_and_applies_runtime_boundary() 
     connection.execute_batch("CREATE TABLE route_request_logs (
         request_id TEXT PRIMARY KEY, codex_session_id TEXT, timestamp_unix_ms INTEGER,
         request_kind TEXT, codex_session_is_parent INTEGER, total_duration_ms INTEGER,
-        router_pre_upstream_ms INTEGER, downstream_first_content_ms INTEGER);
+        router_pre_upstream_ms INTEGER, downstream_first_content_ms INTEGER,
+        upstream_first_byte_ms INTEGER, output_tokens INTEGER);
         CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);
-        INSERT INTO route_request_logs VALUES
+        INSERT INTO route_request_logs (request_id,codex_session_id,timestamp_unix_ms,request_kind,
+            codex_session_is_parent,total_duration_ms,router_pre_upstream_ms,downstream_first_content_ms) VALUES
         ('old','own',100,'responses',0,1100,100,100),
         ('same-ms-old','local:own',200,'responses',0,2100,100,NULL),
         ('runtime','own',200,'responses',0,600,100,300),
@@ -1277,15 +1279,17 @@ fn session_recorded_timing_filters_invalid_times_and_applies_runtime_boundary() 
         request_ids: std::collections::HashSet::from(["runtime".into()]),
         exclude_entire_millisecond: false,
     };
-    let timing = session_recorded_timing(root.path(), "own", Some(&boundary)).unwrap();
+    let window = recorded_window();
+    let timing = last_turn_recorded_stats(root.path(), "own", &window, Some(&boundary)).unwrap();
     assert_eq!(timing.requests, 5);
-    assert_eq!(timing.model_duration_ms, Some(3900));
-    assert_eq!(timing.timing_request_count, 3);
-    assert_eq!(timing.average_ttft_ms, Some(150.0));
-    assert_eq!(timing.ttft_sample_count, 2);
-    let overflow = session_recorded_timing(
+    assert_eq!(timing.model_duration_ms, 3900);
+    assert_eq!(timing.model_samples, 3);
+    assert_eq!(timing.ttft_total_ms / timing.ttft_samples as f64, 150.0);
+    assert_eq!(timing.ttft_samples, 2);
+    let overflow = last_turn_recorded_stats(
         root.path(),
         "own",
+        &window,
         Some(&RuntimeHistoryBoundary {
             exclude_entire_millisecond: true,
             ..boundary.clone()
@@ -1293,8 +1297,8 @@ fn session_recorded_timing_filters_invalid_times_and_applies_runtime_boundary() 
     )
     .unwrap();
     assert_eq!(overflow.requests, 4);
-    assert_eq!(overflow.model_duration_ms, Some(1900));
-    let (sql, values) = super::session_timing_query("own", Some(&boundary));
+    assert_eq!(overflow.model_duration_ms, 1900);
+    let (sql, values) = super::last_turn_stats_query("own", &window, Some(&boundary));
     let plan = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
@@ -1459,10 +1463,14 @@ fn last_turn_stats_excludes_boundary_milliseconds_without_hiding_partial_coverag
 
 #[test]
 fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_boundary() {
-    use super::{session_average_query, session_recorded_average};
     use crate::conversation_stats::RuntimeHistoryBoundary;
     let directory = tempfile::tempdir().unwrap();
-    assert!(session_recorded_average(directory.path(), "own", None).is_none());
+    let window = recorded_window();
+    let recorded = |boundary: Option<&RuntimeHistoryBoundary>| {
+        last_turn_recorded_stats(directory.path(), "own", &window, boundary)
+            .map(|totals| totals.generation)
+    };
+    assert!(recorded(None).is_none());
     assert!(!directory.path().join(SQLITE_FILE_NAME).exists());
     let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
     let mut own = sample_entry("old");
@@ -1524,23 +1532,19 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
         request_ids: std::collections::HashSet::from(["runtime".to_owned()]),
         exclude_entire_millisecond: false,
     };
-    let totals = session_recorded_average(directory.path(), "own", Some(&boundary)).unwrap();
+    let totals = recorded(Some(&boundary)).unwrap();
     assert_eq!(totals.output_tokens, 40.0);
     assert_eq!(totals.generation_ms, 3_000.0);
     assert_eq!(totals.requests, 3);
     assert_eq!(totals.speed(), Some(40.0 / 3.0));
-    let old_only = session_recorded_average(
-        directory.path(),
-        "own",
-        Some(&RuntimeHistoryBoundary {
-            exclude_entire_millisecond: true,
-            ..boundary.clone()
-        }),
-    )
+    let old_only = recorded(Some(&RuntimeHistoryBoundary {
+        exclude_entire_millisecond: true,
+        ..boundary.clone()
+    }))
     .unwrap();
     assert_eq!(old_only.requests, 2);
     assert_eq!(old_only.speed(), Some(5.0));
-    let all = session_recorded_average(directory.path(), "own", None).unwrap();
+    let all = recorded(None).unwrap();
     assert_eq!(all.requests, 5);
     assert_eq!(all.output_tokens, 950.0);
     let connection = Connection::open(directory.path().join(SQLITE_FILE_NAME)).unwrap();
@@ -1550,13 +1554,8 @@ fn session_recorded_average_filters_invalid_rows_and_deduplicates_runtime_bounda
             [],
         )
         .unwrap();
-    assert_eq!(
-        session_recorded_average(directory.path(), "own", Some(&boundary))
-            .unwrap()
-            .requests,
-        2
-    );
-    let (sql, values) = session_average_query("own", Some(&boundary));
+    assert_eq!(recorded(Some(&boundary)).unwrap().requests, 2);
+    let (sql, values) = super::last_turn_stats_query("own", &window, Some(&boundary));
     let plan = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
@@ -1579,7 +1578,7 @@ fn session_recorded_average_is_read_only_for_old_schema() {
     let connection = Connection::open(directory.path().join(SQLITE_FILE_NAME)).unwrap();
     connection.execute_batch("CREATE TABLE route_request_logs (codex_session_id TEXT, timestamp_unix_ms INTEGER);
         CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
-    assert!(super::session_recorded_average(directory.path(), "own", None).is_none());
+    assert!(last_turn_recorded_stats(directory.path(), "own", &recorded_window(), None).is_none());
     assert_eq!(
         connection
             .query_row(
@@ -1594,32 +1593,35 @@ fn session_recorded_average_is_read_only_for_old_schema() {
 
 #[test]
 fn session_average_query_uses_index_with_large_unrelated_history() {
-    use super::{session_average_query, session_recorded_average};
     let directory = tempfile::tempdir().unwrap();
     let connection = Connection::open(directory.path().join(SQLITE_FILE_NAME)).unwrap();
     connection.execute_batch("CREATE TABLE route_request_logs (
         request_id TEXT PRIMARY KEY, codex_session_id TEXT, timestamp_unix_ms INTEGER,
         request_kind TEXT, codex_session_is_parent INTEGER, output_tokens INTEGER,
-        total_duration_ms INTEGER, router_pre_upstream_ms INTEGER, upstream_first_byte_ms INTEGER);
+        total_duration_ms INTEGER, router_pre_upstream_ms INTEGER, upstream_first_byte_ms INTEGER,
+        downstream_first_content_ms INTEGER);
         CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);
         WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<99999)
-        INSERT INTO route_request_logs SELECT 'other-'||x, 'other-'||(x%1000), x, 'responses', 0, 100, 1300, 100, 200 FROM n;
+        INSERT INTO route_request_logs SELECT 'other-'||x, 'other-'||(x%1000), x, 'responses', 0, 100, 1300, 100, 200, 300 FROM n;
         WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<9999)
-        INSERT INTO route_request_logs SELECT 'own-'||x, 'own', x, 'responses', 0, 100, 1300, 100, 200 FROM n;").unwrap();
+        INSERT INTO route_request_logs SELECT 'own-'||x, 'own', x+1, 'responses', 0, 100, 1300, 100, 200, 300 FROM n;").unwrap();
     let boundary = crate::conversation_stats::RuntimeHistoryBoundary {
-        timestamp_unix_ms: 5000,
+        timestamp_unix_ms: 5001,
         request_ids: std::collections::HashSet::from(["own-5000".to_owned()]),
         exclude_entire_millisecond: false,
     };
     let started = std::time::Instant::now();
-    let totals = session_recorded_average(directory.path(), "own", Some(&boundary)).unwrap();
+    let window = recorded_window();
+    let totals = last_turn_recorded_stats(directory.path(), "own", &window, Some(&boundary))
+        .unwrap()
+        .generation;
     eprintln!(
         "session average: 100000 unrelated + 10000 own rows, indexed aggregate of 5000 rows: {:?}",
         started.elapsed()
     );
     assert_eq!(totals.requests, 5000);
     assert_eq!(totals.speed(), Some(100.0));
-    let (sql, params) = session_average_query("own", Some(&boundary));
+    let (sql, params) = super::last_turn_stats_query("own", &window, Some(&boundary));
     let plan = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()

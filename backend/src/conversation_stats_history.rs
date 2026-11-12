@@ -604,7 +604,6 @@ pub(super) fn usage_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route_request_log::{SessionGenerationTotals, SessionRecordedTiming};
     use serde_json::json;
     const ID: &str = "01a1471c-962b-7d00-a9c4-0658dd26dd46";
 
