@@ -141,14 +141,13 @@ pub(super) fn validate(args: &Value) -> Result<(), String> {
             .as_str()
             .filter(|s| !s.trim().is_empty() && s.len() <= 20_000)
             .ok_or("目标内容为空或过长")?;
-        if let Some(budget) = args.get("tokenBudget") {
-            if !budget.is_null()
-                && !budget
-                    .as_u64()
-                    .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
-            {
-                return Err("目标预算须为正整数或 null".into());
-            }
+        if let Some(budget) = args.get("tokenBudget")
+            && !budget.is_null()
+            && !budget
+                .as_u64()
+                .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
+        {
+            return Err("目标预算须为正整数或 null".into());
         }
     }
     Ok(())
