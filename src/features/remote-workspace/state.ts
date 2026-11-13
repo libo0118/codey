@@ -1,6 +1,7 @@
 import type { DraftImage } from "../../remote/images";
 import type { Approval, Message, ThreadSettings, Turn, View } from "../../remote/workspace-data";
 import { isAttachment } from "../../remote/workspace-data";
+import { isGoal } from "../../remote/goals";
 import type { ConversationEvent, Submission, ViewPatch, WorkspaceDraft } from "./types";
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -80,6 +81,8 @@ function conversation(value: unknown): value is View {
     && (value.hasEarlierMessages === undefined || typeof value.hasEarlierMessages === "boolean")
     && [value.title, value.cwd, value.status, value.model, value.effort].every(nullableString) && optionalString(value.permissionMode)
     && (value.serviceTier === null || optionalString(value.serviceTier))
+    && (value.threadGoal == null || isGoal(value.threadGoal))
+    && (value.goalAvailability === undefined || typeof value.goalAvailability === "string" && ["ready", "unavailable", "unsupported"].includes(value.goalAvailability))
     && Array.isArray(value.turns) && value.turns.every(turn) && Array.isArray(value.requests) && value.requests.every(approval);
 }
 

@@ -1,6 +1,6 @@
 // Remote-only native-manager adapter. Existing session/model hooks retain ownership.
 (() => {
-  const version = 6;
+  const version = 7;
   if (window.__codeyRemoteControl?.version === version) return;
   window.__codeyRemoteControl?.dispose?.();
   let disposed = false;
@@ -133,6 +133,106 @@
     throw new Error("当前 Codex 暂不支持远程新建会话，请更新 Codey 后重试");
   };
 
+  const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+  const goalView = value => {
+    if (value === null) return null;
+    const status = { usage_limited: "usageLimited", budget_limited: "budgetLimited" }[value?.status] || value?.status;
+    if (typeof value?.objective !== "string" || !value.objective.trim() || value.objective.length > 20_000
+      || !goalStatuses.has(status)) throw new Error("invalid goal");
+    const goal = { objective: value.objective, status };
+    if (value.goalId != null) {
+      if (typeof value.goalId !== "string" || !value.goalId || value.goalId.length > 512) throw new Error("invalid goal identity");
+      goal.goalId = value.goalId;
+    }
+    for (const key of ["createdAt", "updatedAt", "tokenBudget", "tokensUsed", "timeUsedSeconds"]) {
+      const millis = key.endsWith("At") ? value[`${key}Ms`] : undefined;
+      if (millis != null && (!Number.isSafeInteger(millis) || millis < 0)) throw new Error("invalid goal time");
+      const number = value[key] ?? (millis != null ? Math.floor(millis / 1000) : undefined);
+      if (number == null) continue;
+      if (!Number.isSafeInteger(number) || number < 0) throw new Error("invalid goal number");
+      goal[key] = number;
+    }
+    return goal;
+  };
+  const sameGoal = (current, expected) => current === null ? expected === null
+    : expected !== null && current.objective === expected.objective && current.status === expected.status
+      && (current.goalId ? current.goalId === expected.goalId : current.createdAt != null && current.createdAt === expected.createdAt);
+  const goalFailure = (code, message, availability = "unavailable", activation = "not-requested") =>
+    ({ status: "failed", code, message, availability, activation });
+  const goalCall = async call => {
+    const pending = call();
+    try { return await pending; }
+    finally { try { pending?.[Symbol.dispose]?.(); } catch {} }
+  };
+  const remoteGoal = async (args, assertCurrent, ensureRequestGate) => {
+    let manager, current;
+    const readGoal = async () => {
+      const result = await goalCall(() => manager.sendRequest("thread/goal/get", { threadId: args.threadId }));
+      assertCurrent();
+      if (!result || !Object.hasOwn(result, "goal")) throw new Error("missing goal result");
+      if (result.goal !== null) return goalView(result.goal);
+      const conversation = await goalCall(() => manager.getConversation(args.threadId));
+      assertCurrent();
+      if (conversation?.id !== args.threadId) throw new Error("conversation unavailable");
+      return conversation.completedThreadGoal?.status === "complete" ? goalView(conversation.completedThreadGoal) : null;
+    };
+    try {
+      ({ manager } = await remoteCreationContext());
+      assertCurrent();
+      current = await readGoal();
+    } catch (error) {
+      const unsupported = error?.code === -32601 || error?.code === "method_not_found";
+      return goalFailure(unsupported ? "goal_unsupported" : "goal_unavailable", "原生目标暂不可读取，请在电脑端检查", unsupported ? "unsupported" : "unavailable");
+    }
+    if (args.action === "goalRead") return { status: "ok", availability: "ready", goal: current, activation: "not-requested" };
+    let expected;
+    try { expected = goalView(args.expected); } catch { return goalFailure("goal_invalid", "目标身份无效"); }
+    if (!sameGoal(current, expected)) return goalFailure("goal_conflict", "目标已变化，请刷新后重试", "ready");
+    const allowed = args.action === "goalCreate" ? current === null || current.status === "complete"
+      : args.action === "goalPause" ? current && ["active", "blocked", "usageLimited", "budgetLimited"].includes(current.status)
+        : ["goalResume", "goalEdit"].includes(args.action) && current?.status === "paused";
+    if (!allowed) return goalFailure("goal_conflict", "目标当前状态不支持此操作", "ready");
+    const activating = ["goalCreate", "goalResume"].includes(args.action);
+    try {
+      // Hosted managers expose async RPC stubs for every property; await real owner evidence.
+      const role = await goalCall(() => manager.getStreamRole(args.threadId));
+      assertCurrent();
+      if (role?.role !== "owner") return goalFailure("goal_unavailable", "请在会话所属的 Codex 窗口重新连接");
+      if (activating) await ensureRequestGate();
+      assertCurrent();
+      if (activating) {
+        const conversation = await goalCall(() => manager.getConversation(args.threadId));
+        assertCurrent();
+        const history = conversation?.turnHistory?.kind === "canonical" ? conversation.turnHistory.history : conversation?.turns;
+        const turns = Array.isArray(history) ? history : Array.isArray(history?.islands) && history?.entitiesByKey
+          ? history.islands.flatMap(island => island.entries || []).map(entry => history.entitiesByKey[entry.value]) : history?.items;
+        if (conversation?.id !== args.threadId || !Array.isArray(turns)) return goalFailure("goal_unavailable", "尚未确认当前回复状态，请重新连接");
+        if (turns.some(turn => turn?.status === "inProgress")) return goalFailure("goal_busy", "当前回复仍在执行，请等待完成后新建或继续目标", "ready");
+      }
+      current = await readGoal();
+      if (!sameGoal(current, expected)) return goalFailure("goal_conflict", "目标已变化，请刷新后重试", "ready");
+    } catch { return goalFailure("goal_unavailable", "目标操作校验未就绪，未发送操作"); }
+    try {
+      let result;
+      if (args.action === "goalCreate" && args.tokenBudget === undefined) {
+        result = await goalCall(() => manager.setThreadGoal(args.threadId, { objective: args.objective, appendTranscriptItem: false }));
+      } else if (["goalPause", "goalResume"].includes(args.action)) {
+        result = await goalCall(() => manager.setThreadGoalStatus(args.threadId, { status: activating ? "active" : "paused" }));
+      } else {
+        const params = { threadId: args.threadId, objective: args.objective, status: activating ? "active" : "paused" };
+        if (Object.hasOwn(args, "tokenBudget")) params.tokenBudget = args.tokenBudget;
+        else if (current?.tokenBudget != null) params.tokenBudget = current.tokenBudget;
+        const response = await goalCall(() => manager.sendRequest("thread/goal/set", params));
+        result = response?.goal;
+      }
+      assertCurrent();
+      const goal = goalView(result);
+      if (!goal || goal.status !== (activating ? "active" : "paused")
+        || goal.objective !== (args.objective ?? current.objective)) throw new Error("unconfirmed goal");
+      return { status: "ok", availability: "ready", goal, activation: "not-requested" };
+    } catch { return goalFailure("goal_outcome_unknown", "目标操作结果未确认，请刷新查看，勿重复提交", "unavailable", "unknown"); }
+  };
+
   // Keep creation and resumption inside the desktop's native manager. In
   // particular, its creation-input reader installs the same tools, project
   // instructions and permission defaults as the desktop composer.
@@ -167,6 +267,9 @@
       requestPatch = patch;
     };
     assertCurrent();
+    if (["goalRead", "goalCreate", "goalPause", "goalResume", "goalEdit"].includes(args.action)) {
+      return remoteGoal(args, assertCurrent, ensureRequestGate);
+    }
     if (args.action === "activity") {
       if (!Array.isArray(args.threadIds) || args.threadIds.length > 200
         || args.threadIds.some(id => typeof id !== "string" || !id)) throw new Error("会话活动请求无效");

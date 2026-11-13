@@ -7,6 +7,9 @@ const thread = { id: "thread", title: "Thread", cwd: "/project", updatedAt: 1 };
 const view = { id: thread.id, status: "idle", turns: [], requests: [], historyComplete: false };
 const catalog = { models: ["model"], default_model: "model", model_metadata: [{ model: "model", supported_reasoning_efforts: ["low", "high"], default_reasoning_effort: "high" }] };
 
+const goal = { objective: "隔离目标", status: "paused", createdAt: 12, tokensUsed: 24, tokenBudget: 1000 };
+const goalReply = (value, activation = "not-requested") => ({ status: "ok", availability: "ready", goal: value, activation });
+
 
 function fixture(t, active = true) {
   const browser = installControllerWindow(t);
@@ -34,6 +37,56 @@ function fixture(t, active = true) {
   }
   return { ...h, render, browser, options, requests, calls, sockets, journal, last, ready, open, get unauthorized() { return unauthorized; } };
 }
+
+test("目标通过显式只读确认，缺失或读取失败不当作无目标", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  assert.equal(h.render().goal, undefined);
+  const read = h.render().readGoal(); assert.equal(h.last("action").args[1], "goalRead");
+  h.last("action").reject(new Error("native unavailable")); await read; await h.flush();
+  assert.equal(h.render().goal, undefined); assert.match(h.render().goalError, /native unavailable/);
+  const retry = h.render().readGoal(); h.last("action").resolve(goalReply(null)); assert.equal(await retry, true); await h.flush();
+  assert.equal(h.render().goal, null); assert.equal(h.calls.filter(call => call.name === "submit").length, 0);
+  h.unmount();
+});
+
+test("目标写入携带白名单 expected，创建和恢复只有启动回执确认才解锁", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  h.sockets.at(-1).handlers.message({ type: "state", state: { ...view, threadGoal: goal, goalAvailability: "ready" } }); await h.flush();
+  const operation = h.render().commandGoal("resume", {}); await h.render().commandGoal("resume", {});
+  assert.equal(h.calls.filter(call => call.name === "submit").length, 1);
+  const submission = h.last("submit").args[1];
+  assert.deepEqual(submission.args, { action: "goalResume", expected: { objective: goal.objective, status: "paused", createdAt: 12 } });
+  assert.equal(h.journal.has("goal:thread"), true);
+  h.last("submit").resolve(goalReply({ ...goal, status: "active" }, "accepted"));
+  assert.equal(await operation, true); await h.flush();
+  assert.equal(h.render().goal.status, "active"); assert.equal(h.journal.size, 0);
+  h.unmount();
+});
+
+test("目标写入未知后不重发，重读不擅自确认启动，手动核对才解锁", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  h.sockets.at(-1).handlers.message({ type: "state", state: { ...view, threadGoal: null, goalAvailability: "ready" } }); await h.flush();
+  const operation = h.render().commandGoal("create", { objective: "new", tokenBudget: null });
+  h.last("submit").resolve(goalReply({ ...goal, status: "active" }, "not-requested"));
+  assert.equal(await operation, false); await h.flush();
+  assert.equal(h.render().goalUncertain, true);
+  assert.equal(await h.render().commandGoal("create", { objective: "new" }), false);
+  const read = h.render().readGoal(); h.last("action").resolve(goalReply({ ...goal, status: "active" })); await read; await h.flush();
+  assert.equal(h.render().goalUncertain, true); assert.equal(h.calls.filter(call => call.name === "submit").length, 1);
+  h.render().confirmGoalSubmission(); assert.equal(h.render().goalUncertain, false);
+  h.unmount();
+});
+
+test("旧登录的目标结果不写新会话，保留未确认标记且预算编辑不伪造用量", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  h.sockets.at(-1).handlers.message({ type: "state", state: { ...view, threadGoal: goal, goalAvailability: "ready" } }); await h.flush();
+  const operation = h.render().commandGoal("edit", { objective: "updated", tokenBudget: 2000 });
+  h.options.active = false; h.render(); h.options.active = true; h.render();
+  h.last("submit").resolve(goalReply({ ...goal, objective: "updated", tokensUsed: 0 }));
+  assert.equal(await operation, false); await h.flush();
+  assert.equal(h.render().goalUncertain, true); assert.equal(h.journal.has("goal:thread"), true);
+  assert.notEqual(h.render().goal?.objective, "updated"); h.unmount();
+});
 
 test("WebView 网络提示为离线时，首次和手动读取仍实际请求，不把跳过读取伪装成空会话", async t => {
   const h = fixture(t);

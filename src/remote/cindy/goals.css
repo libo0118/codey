@@ -1,0 +1,48 @@
+/* Cindy's compact context sheet; native Goal state remains authoritative. */
+.cindy-goal-surface { flex: none; min-width: 0; width: 100%; max-width: 820px; padding: 0 28px; margin: 0 auto 4px; }
+.cindy-goal-surface, .cindy-goal-sheet { color: var(--remote-fg, #191b1e); font: inherit; font-size: 14px; line-height: 1.55; }
+.cindy-goal-surface *, .cindy-goal-sheet, .cindy-goal-sheet * { box-sizing: border-box; }
+.cindy-goal-surface button:where([data-cindy-control]), .cindy-goal-sheet button:where([data-cindy-control]) { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; touch-action: manipulation; }
+.cindy-goal-surface button[data-cindy-control]:disabled, .cindy-goal-sheet button[data-cindy-control]:disabled { opacity: .42; cursor: not-allowed; }
+.cindy-goal-surface :focus-visible, .cindy-goal-sheet :focus-visible { outline: 2px solid var(--remote-focus, #287a68); outline-offset: -2px; }
+.cindy-goal-bar { display: flex; align-items: center; gap: 2px; min-height: 54px; padding: 4px 4px 4px 8px; border: 1px solid var(--remote-line, #e0e4dd); border-radius: 14px; background: var(--remote-panel, #fffffc); }
+.cindy-goal-open { display: flex; align-items: center; gap: 9px; min-width: 0; min-height: 44px; flex: 1; padding: 0 4px; text-align: left; border-radius: 8px; }
+.cindy-goal-copy { flex: 1; min-width: 0; }
+.cindy-goal-copy strong, .cindy-goal-copy > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.cindy-goal-copy strong { font-weight: 500; }
+.cindy-goal-copy > span { color: var(--remote-muted, #6d736e); }
+.cindy-goal-surface svg, .cindy-goal-sheet svg { flex: none; stroke-width: 1.7; }
+.cindy-goal-icon { display: grid; place-items: center; flex: none; width: 44px; height: 44px; min-height: 44px; padding: 0; border-radius: 50%; }
+.cindy-goal-icon:hover:not(:disabled), .cindy-goal-open:hover, .cindy-goal-row:hover:not(:disabled) { background: var(--remote-hover, #edf0e9); }
+.cindy-goal-bar[data-goal-status="active"] strong, .cindy-goal-label[data-goal-status="active"] { color: var(--remote-running, #167365); }
+.cindy-goal-bar:is([data-goal-status="blocked"], [data-goal-status="usageLimited"], [data-goal-status="budgetLimited"], [data-goal-status="unknown"]) strong, .cindy-goal-label:is([data-goal-status="blocked"], [data-goal-status="usageLimited"], [data-goal-status="budgetLimited"]) { color: var(--remote-warning, #98611f); }
+.cindy-goal-sheet { position: fixed; inset: auto 0 0; width: min(560px, 100%); max-width: 100%; max-height: calc(100dvh - 16px); margin: 0 auto; padding: 8px 20px max(22px, env(safe-area-inset-bottom)); overflow: auto; overscroll-behavior: contain; border: 1px solid var(--remote-line, #e0e4dd); border-bottom: 0; border-radius: 22px 22px 0 0; background: var(--remote-bg, #f8f8f5); }
+.cindy-goal-sheet::backdrop { background: #141a2566; }
+.cindy-goal-handle { width: 34px; height: 4px; border-radius: 4px; margin: 0 auto 7px; background: var(--remote-line, #e0e4dd); }
+.cindy-goal-heading { display: flex; align-items: center; gap: 8px; min-height: 48px; margin: 0 -8px 12px; }
+.cindy-goal-heading h2 { margin: 0; font-size: 16px; font-weight: 500; }
+.cindy-goal-label { display: flex; align-items: center; gap: 7px; margin: 12px 0 0; color: var(--remote-muted, #6d736e); font-size: 12px; }
+.cindy-goal-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+.cindy-goal-objective { margin: 10px 0 0; font-size: 16px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cindy-goal-meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 12px; color: var(--remote-muted, #6d736e); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.cindy-goal-actions { margin-top: 22px; }
+.cindy-goal-sheet .cindy-goal-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 10px 2px; border-top: 1px solid var(--remote-line, #e0e4dd); text-align: left; font-weight: 500; overflow-wrap: anywhere; }
+.cindy-goal-row span { min-width: 0; }
+.cindy-goal-hint, .cindy-goal-notice, .cindy-goal-error { margin: 12px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.cindy-goal-hint { color: var(--remote-muted, #6d736e); }
+.cindy-goal-notice { color: var(--remote-warning, #98611f); }
+.cindy-goal-notice p { margin: 0 0 8px; }
+.cindy-goal-error { color: var(--remote-danger, #b33435); white-space: pre-wrap; }
+.cindy-goal-sheet .cindy-goal-editor, .cindy-goal-sheet .cindy-goal-budget input { min-width: 0; max-width: 100%; border: 1px solid var(--remote-line, #e0e4dd); border-radius: 14px; padding: 14px; color: inherit; background: var(--remote-panel, #fffffc); font: inherit; font-size: 16px; }
+.cindy-goal-sheet .cindy-goal-editor { display: block; width: 100%; min-height: 146px; resize: vertical; margin-top: 10px; line-height: 1.65; }
+.cindy-goal-budget { margin-top: 13px; }
+.cindy-goal-budget summary { display: flex; align-items: center; justify-content: space-between; min-height: 44px; list-style: none; cursor: pointer; }
+.cindy-goal-budget summary::-webkit-details-marker { display: none; }
+.cindy-goal-sheet .cindy-goal-budget label { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; font-size: 13px; }
+.cindy-goal-sheet .cindy-goal-budget input { width: 145px; min-height: 44px; border-radius: 10px; padding: 8px 10px; }
+.cindy-goal-budget input:invalid { border-color: var(--remote-warning, #98611f); }
+.cindy-goal-sheet .cindy-goal-primary { width: 100%; min-height: 50px; margin-top: 22px; border-radius: 26px; background: var(--remote-fg, #191b1e); color: var(--remote-bg, #f8f8f5); font-weight: 500; }
+.cindy-goal-sheet .cindy-goal-refresh { margin-top: 18px; color: var(--remote-muted, #6d736e); font-size: 12px; }
+@media (max-width: 360px) { .cindy-goal-sheet { padding-left: 16px; padding-right: 16px; } }
+@media (max-width: 760px) { .cindy-goal-surface { padding: 0 12px; } }
+@media (prefers-color-scheme: dark) { .cindy-goal-surface, .cindy-goal-sheet { color-scheme: dark; color: var(--remote-fg, #efefed); --remote-warning: #e6b770; --remote-danger: #f28d8d; } .cindy-goal-bar { background: var(--remote-panel, #1d1f21); } .cindy-goal-sheet { background: var(--remote-bg, #121314); } }

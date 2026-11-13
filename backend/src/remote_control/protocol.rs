@@ -523,10 +523,12 @@ pub(super) fn view_metadata(state: &Value) -> Value {
             "params": params.unwrap_or_else(||json!({"message":"请在电脑端处理此类请求"}))})
     }).collect();
     requests.extend(async_requests(state));
+    let (goal, goal_availability) = super::goals::metadata(state);
     json!({"id":scalar_id(&state["id"]), "title":state["title"].as_str(), "cwd":state["cwd"].as_str(),
         "model":state["latestThreadSettings"]["model"].as_str().or(state["latestModel"].as_str()),
         "effort":state["latestThreadSettings"]["effort"].as_str().or(state["latestReasoningEffort"].as_str()),
         "serviceTier":state["latestThreadSettings"]["serviceTier"].as_str(),
+        "threadGoal":goal,"goalAvailability":goal_availability,
         "permissionMode":permission_mode(&state["latestThreadSettings"]),
         "status":state["threadRuntimeStatus"]["type"].as_str(), "requests":requests,
         "historyComplete":state["turnHistory"]["history"]["isComplete"].as_bool().or(state["turnsPagination"]["hasLoadedOldest"].as_bool()).unwrap_or(true)})

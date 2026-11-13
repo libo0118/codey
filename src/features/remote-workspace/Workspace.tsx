@@ -3,6 +3,7 @@ import { IconArrowDown, IconArrowLeft, IconDeviceLaptop, IconRefresh, IconSquare
 import type { Approval } from "../../remote/workspace-data";
 import { HomeSurface } from "../../remote/cindy/HomeSurface";
 import { NewSessionSurface } from "../../remote/cindy/NewSessionSurface";
+import { GoalSurface } from "../../remote/cindy/GoalSurface";
 import { Composer } from "../../remote/composer";
 import { ConversationTurn, FileChanges, RichText } from "../../remote/messages";
 import { MessageFilesContext } from "../../remote/files";
@@ -82,7 +83,7 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
         </div>
         {!atBottom && <button className="remote-jump remote-icon-button" aria-label="滚动到最新消息" onClick={followLatest}><IconArrowDown size={20} /></button>}
       </div></MessageFilesContext.Provider>
-      {notices}{composer}
+      {notices}<GoalSurface key={`goal:${selectedId}`} goal={c.goal} connected={connected} busy={busy} running={!!activeTurn} error={c.goalError} uncertain={c.goalUncertain} onRead={c.readGoal} onCommand={c.commandGoal} onConfirmUnknown={c.confirmGoalSubmission} />{composer}
     </>}</main>}
   </div>;
 }

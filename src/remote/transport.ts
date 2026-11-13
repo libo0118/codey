@@ -1,5 +1,5 @@
 export class RemoteError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number, readonly activation?: string) { super(message); }
 }
 
 export type RemoteSession = { authenticated: boolean; username?: string; csrfToken?: string; expiresAt?: string };
@@ -30,11 +30,11 @@ export async function remoteRequest<T>(path: string, args?: unknown, signal?: Ab
       clearRemoteSession();
       window.dispatchEvent(new Event("codey-remote-unauthorized"));
     }
-    let result: { status?: string; message?: string } & Partial<RemoteSession>;
+    let result: { status?: string; message?: string; activation?: unknown } & Partial<RemoteSession>;
     try { result = await response.json(); }
     catch { throw new RemoteError(`远程服务返回了无效响应 (${response.status})`, response.status); }
     signal?.throwIfAborted();
-    if (!response.ok || result?.status === "failed") throw new RemoteError(result?.message || `请求失败 (${response.status})`, response.status);
+    if (!response.ok || result?.status === "failed") throw new RemoteError(result?.message || `请求失败 (${response.status})`, response.status, typeof result?.activation === "string" ? result.activation : undefined);
     if (path === "/remote/session" || login) {
       if (typeof result?.authenticated !== "boolean" || result.authenticated && (typeof result.csrfToken !== "string" || !result.csrfToken)) { clearRemoteSession(); throw new RemoteError("登录响应缺少安全校验信息，请重新登录", 502); }
       csrfToken = result.authenticated ? result.csrfToken! : "";
@@ -85,7 +85,7 @@ export function rememberSubmission(scope: string, args: Record<string, unknown>)
     } catch {
       // Ordinary-file content is never journaled, so refuse a new upload if even
       // its small anti-duplicate marker cannot survive a reload.
-      if (files?.length) throw new Error("无法保存附件提交记录，请清理浏览器存储后重试。");
+      if (files?.length || typeof args.action === "string" && args.action.startsWith("goal")) throw new Error(files?.length ? "无法保存附件提交记录，请清理浏览器存储后重试。" : "无法保存目标提交记录，请清理浏览器存储后重试。");
     }
   }
   return record;

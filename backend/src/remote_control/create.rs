@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::commands::AppState;
 
-async fn desktop_request(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
+pub(super) async fn desktop_request(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
     let runtime = state
         .runtime
         .lock()

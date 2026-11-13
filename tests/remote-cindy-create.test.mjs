@@ -101,3 +101,12 @@ test("新建页沿用 Composer 的草稿/附件/模型权限动作，只有显�
   composer.props.onSend({ preventDefault() { calls.push("preventDefault"); } }); await Promise.resolve();
   assert.deepEqual(calls.slice(-2), ["preventDefault", "send"]);
 });
+
+test("目标条与输入区使用不同会话 key，不因实时列表重渲染积累重复目标条", () => {
+  const c = controller("conversation"); c.draftScope = c.selectedId;
+  const graph = createModuleGraph(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), { stubs: { ...stubs, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c } } });
+  const tree = graph.exports.Workspace({ active: true });
+  const [goal] = collectElements(tree, node => node.type.name === "GoalSurface");
+  const [composer] = collectElements(tree, node => node.type.name === "Composer");
+  assert.notEqual(goal.props.key, composer.props.key);
+});

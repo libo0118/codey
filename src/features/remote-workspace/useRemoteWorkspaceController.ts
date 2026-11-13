@@ -8,6 +8,8 @@ import type { DraftImage } from "../../remote/images";
 import { remoteWorkspaceRequests as requests } from "./requests";
 import { canSendDraft, firstTurnDraft, restoreWorkspaceDraft } from "./state";
 import type { WorkspaceDraft } from "./types";
+import { goalExpected, goalResult, type Goal, type GoalCommand } from "../../remote/goals";
+import { RemoteError } from "../../remote/transport";
 import { useRemoteConversationController } from "./useRemoteConversationController";
 
 export function useRemoteWorkspaceController({ active, onUnauthorized }: { active: boolean; onUnauthorized: () => void }) {
@@ -28,6 +30,9 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const [catalogError, setCatalogError] = useState("");
   const [loading, setLoading] = useState(true);
   const [listRevision, setListRevision] = useState(0);
+  const [goalReadState, setGoalReadState] = useState<{ view: View; goal: Goal | null } | null>(null);
+  const [goalError, setGoalError] = useState("");
+  const [, setGoalJournalRevision] = useState(0);
   const scope = useOperationScope(active);
   const session = useRef<object | null>(null);
   const listVersion = useRef(0);
@@ -47,6 +52,11 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const { view, connected, isConnected, connectionError, reconnect, fileGeneration, loadingEarlier, loadEarlier } = useRemoteConversationController(active, selectedId, unauthorized);
   const composerView: View | null = creating ? { id: "", turns: [], requests: [], historyComplete: true, ...composerSettings } : view;
   const activeTurn = view ? [...view.turns].reverse().find(turn => turn.status === "inProgress") : undefined;
+  const liveView = useRef(view); liveView.current = view;
+  const goalScope = selectedId ? `goal:${selectedId}` : "";
+  const goal = goalReadState?.view === view ? goalReadState?.goal : view?.goalAvailability === "ready" ? view.threadGoal : undefined;
+  const goalUncertain = !!goalScope && !!requests.readSubmission(goalScope);
+  useEffect(() => { setGoalError(""); }, [selectedId, active]);
 
   const clearRunning = useStableEvent((since?: typeof liveRunning.current) => {
     const live = liveRunning.current;
@@ -248,6 +258,50 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     requests.forgetSubmission(draftScope); setEditor(previous => ({ ...previous, uncertain: false })); setError("");
   }
 
+  async function readGoal() {
+    if (!session.current || !selectedId || !isConnected()) return false;
+    let success = false;
+    await run(async current => {
+      setGoalError("");
+      try {
+        const result = goalResult(await requests.action(selectedId, "goalRead"));
+        if (!current()) return;
+        if (result.availability !== "ready" || result.goal === undefined) throw new Error("原生目标暂不可读取，请在电脑端检查");
+        if (liveView.current) setGoalReadState({ view: liveView.current, goal: result.goal });
+        success = true;
+      } catch (cause) { if (current()) setGoalError(errorText(cause)); throw cause; }
+    });
+    return success;
+  }
+
+  async function commandGoal(command: GoalCommand, args: { objective?: string; tokenBudget?: number | null }) {
+    if (!session.current || !selectedId || !isConnected() || goal === undefined || !goalScope || requests.readSubmission(goalScope)) return false;
+    if (args.objective !== undefined && (!args.objective.trim() || new TextEncoder().encode(args.objective).length > 20_000)) { setGoalError("目标内容不能为空或超过 20,000 字节"); return false; }
+    let success = false;
+    const key = goalScope;
+    await run(async current => {
+      setGoalError("");
+      const action = { create: "goalCreate", edit: "goalEdit", pause: "goalPause", resume: "goalResume" }[command];
+      const submission = rememberForSend(key, { action, expected: goalExpected(goal), ...args });
+      try {
+        const result = goalResult(await requests.submit(selectedId, submission));
+        if (!current()) return;
+        if (result.activation === "unknown") throw new Error("目标启动结果未确认，请在桌面核对，勿重复提交");
+        if ((command === "create" || command === "resume") && result.activation !== "accepted") throw new Error("目标已保存，但启动消息未确认，请在桌面核对");
+        requests.forgetSubmission(key);
+        if (result.goal !== undefined && liveView.current) setGoalReadState({ view: liveView.current, goal: result.goal });
+        else reconnect();
+        success = true;
+      } catch (cause) {
+        // A pre-write rejection is retryable; a lost receipt must remain blocked.
+        if (cause instanceof RemoteError && cause.activation === "not-requested") requests.forgetSubmission(key);
+        if (current()) setGoalError(errorText(cause));
+        throw cause;
+      }
+    });
+    return success;
+  }
+
   return {
     threads, projects, selected, selectedId, selectedProject: selected ? projectForThread(selected, projects) : undefined,
     search, archived, project, creating, draftScope, draftProject, defaultsReady, composerView,
@@ -255,6 +309,8 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     draft: editor.text, images: editor.images, uncertain: editor.uncertain,
     catalogError: [catalogError, creating ? defaultsError : ""].filter(Boolean).join(" "),
     open, startCreating, send, changeSettings, confirmSubmission,
+    goal, goalError, goalUncertain, readGoal, commandGoal,
+    confirmGoalSubmission: () => { if (session.current && !scope.pending && goalScope) { requests.forgetSubmission(goalScope); setGoalJournalRevision(value => value + 1); setGoalError(""); } },
     changeDraft: (text: string) => { if (session.current && !scope.pending) setEditor(previous => ({ ...previous, text })); },
     changeImages: (images: DraftImage[]) => { if (session.current && !scope.pending && !editor.uncertain) setEditor(previous => ({ ...previous, images })); },
     changeSearch: (value: string) => { if (session.current) { listVersion.current++; setSearch(value); } },

@@ -3,6 +3,7 @@ mod auth;
 mod create;
 mod desktop;
 mod files;
+mod goals;
 mod images;
 mod projection;
 mod protocol;

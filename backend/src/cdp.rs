@@ -1769,7 +1769,7 @@ pub(crate) async fn remote_control_request(
     let ready = codey_runtime_core::bridge::evaluate_script(
         websocket_url,
         r#"typeof window.__codeyRemoteControl === "function"
-          && window.__codeyRemoteControl.version === 6
+          && window.__codeyRemoteControl.version === 7
           && window.__codeySessionToolsInjectLoaded === true
           && typeof window.__codeyLoadAppServerManagerSourceResolver === "function"
           && window.__codeyLoadCodexSessionController?.remoteVersion === 1"#,
@@ -1876,7 +1876,12 @@ pub(crate) async fn remote_control_request(
         .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
         .filter(|value| value.is_object())
         .ok_or("桌面会话接口返回了无效结果")?;
-    if value["status"] == "failed" {
+    if value["status"] == "failed"
+        && !matches!(
+            args["action"].as_str(),
+            Some("goalRead" | "goalCreate" | "goalPause" | "goalResume" | "goalEdit")
+        )
+    {
         return Err(value["message"]
             .as_str()
             .unwrap_or("桌面未确认远程操作")

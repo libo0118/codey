@@ -690,6 +690,11 @@ async fn action_once(
 ) -> Result<Value, String> {
     let id = args["requestId"].as_str().ok_or("操作缺少请求标识")?;
     super::desktop::validate_thread(id)?;
+    let goal =
+        path == "/remote/action" && args["action"].as_str().is_some_and(super::goals::is_action);
+    if goal {
+        super::goals::validate(args)?;
+    }
     let digest: [u8; 32] = Sha256::digest(format!("{path}\n{args}").as_bytes()).into();
     authorize_action(core, token)?;
     let thread = if path == "/remote/create" {
@@ -706,6 +711,19 @@ async fn action_once(
             // A queued action may outlive device authorization or service shutdown.
             authorize_action(&core, &token)?;
             if !create {
+                if goal && args["action"] != "goalRead" {
+                    let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+                    return super::goals::once(
+                        state
+                            .store
+                            .path()
+                            .with_file_name("remote-goal-receipts.json"),
+                        args["requestId"].as_str().ok_or("缺少请求标识")?.to_owned(),
+                        digest,
+                        perform_action(&core, &token, &args),
+                    )
+                    .await;
+                }
                 return perform_action(&core, &token, &args).await;
             }
             let state = core.state.upgrade().ok_or("Codey 正在退出")?;
@@ -724,7 +742,14 @@ async fn action_once(
         .lock()
         .await
         .start(id, digest, thread, operation)?;
-    let value = result.finish().await;
+    let mut value = result.finish().await;
+    if goal && value.get("activation").is_none() {
+        value = if args["action"] == "goalRead" {
+            json!({"status":"failed","code":"goal_unavailable","message":"原生目标暂不可读取，请在电脑端检查","availability":"unavailable","activation":"not-requested"})
+        } else {
+            super::goals::unknown()
+        };
+    }
     authorize_action(core, token)?;
     Ok(value)
 }
@@ -763,6 +788,10 @@ async fn perform_action(core: &Core, token: &str, args: &Value) -> Result<Value,
     let thread = args["threadId"].as_str().ok_or("缺少会话标识")?;
     super::desktop::validate_thread(thread)?;
     let action = args["action"].as_str().ok_or("缺少会话操作")?;
+    if super::goals::is_action(action) {
+        let state = core.state.upgrade().ok_or("Codey 正在退出")?;
+        return super::goals::perform(&state, args, || authorize_action(core, token)).await;
+    }
     if action == "open" {
         follow_desktop(core, token, thread).await?;
         return Ok(json!({"status":"ok"}));
