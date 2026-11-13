@@ -7,6 +7,7 @@ import * as nativeWeb from "react-native-web";
 import MarkdownIt from "markdown-it";
 import { renderToStaticMarkup } from "react-dom/server";
 import { collectElements, createModuleGraph, textContent } from "./helpers/jsx-tree.mjs";
+import { createControllerHarness } from "./helpers/controller-harness.mjs";
 
 const stubs = { "@tabler/icons-react": icons, "react-native-web": nativeWeb, "markdown-it": MarkdownIt };
 const projects = [{ id: "p", name: "Project", cwd: "/synthetic/project" }, { id: "q", name: "Other", cwd: "/synthetic/other" }];
@@ -94,6 +95,7 @@ test("新建页沿用 Composer 的草稿/附件/模型权限动作，只有显�
   const tree = graph.exports.Workspace({ active: true });
   const surface = collectElements(tree, node => node.type.name === "NewSessionSurface")[0];
   const composer = collectElements(tree, node => node.type.name === "Composer")[0];
+  assert.equal(composer.props.onGoal, undefined);
   assert.deepEqual(calls, []); assert.equal(surface.props.onBack, c.back);
   surface.props.onProject(projects[1]); composer.props.onDraft("保留草稿"); composer.props.onImages([]); composer.props.onSettings({ permissionMode: "read-only" });
   assert.deepEqual(calls, [["project", projects[1]], ["draft", "保留草稿"], ["images", []], ["settings", { permissionMode: "read-only" }]]);
@@ -109,4 +111,31 @@ test("目标条与输入区使用不同会话 key，不因实时列表重渲染�
   const [goal] = collectElements(tree, node => node.type.name === "GoalSurface");
   const [composer] = collectElements(tree, node => node.type.name === "Composer");
   assert.notEqual(goal.props.key, composer.props.key);
+});
+
+test("会话加号只打开受控目标面板，切换会话或进入新建页关闭，不发送或创建目标", () => {
+  const calls = [], c = controller("conversation"); c.goal = null;
+  c.readGoal = () => calls.push("read"); c.commandGoal = () => calls.push("command"); c.send = () => calls.push("send");
+  const h = createControllerHarness(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), "Workspace", {
+    ...stubs, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
+  });
+  const child = (tree, name) => collectElements(tree, node => node.type?.name === name)[0];
+  try {
+    let tree = h.render({ active: true });
+    assert.equal(child(tree, "GoalSurface").props.open, false);
+    child(tree, "Composer").props.onGoal(); tree = h.render();
+    assert.equal(child(tree, "GoalSurface").props.open, true); assert.deepEqual(calls, []);
+    child(tree, "GoalSurface").props.onOpenChange(false); tree = h.render();
+    assert.equal(child(tree, "GoalSurface").props.open, false);
+    child(tree, "Composer").props.onGoal(); tree = h.render();
+    c.selectedId = "other"; c.draftScope = "other"; tree = h.render();
+    assert.equal(child(tree, "GoalSurface").props.open, false);
+    c.selectedId = "synthetic"; c.draftScope = "synthetic-draft"; tree = h.render();
+    assert.equal(child(tree, "GoalSurface").props.open, false);
+    child(tree, "Composer").props.onGoal(); tree = h.render();
+    c.creating = true; tree = h.render();
+    assert.equal(child(tree, "Composer").props.onGoal, undefined); assert.equal(child(tree, "GoalSurface"), undefined);
+    c.creating = false; tree = h.render();
+    assert.equal(child(tree, "GoalSurface").props.open, false); assert.deepEqual(calls, []);
+  } finally { h.unmount(); }
 });

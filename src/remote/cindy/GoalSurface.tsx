@@ -7,6 +7,8 @@ export type { Goal } from "../goals";
 
 export type GoalSurfaceProps = {
   goal: Goal | null | undefined;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   connected: boolean;
   busy: boolean;
   running: boolean;
@@ -32,8 +34,7 @@ function trapFocus(event: KeyboardEvent<HTMLDialogElement>) {
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
 }
 
-export function GoalSurface({ goal, connected, busy, running, error, uncertain, onRead, onCommand, onConfirmUnknown }: GoalSurfaceProps) {
-  const [open, setOpen] = useState(false);
+export function GoalSurface({ goal, open, onOpenChange, connected, busy, running, error, uncertain, onRead, onCommand, onConfirmUnknown }: GoalSurfaceProps) {
   const [mode, setMode] = useState<"detail" | "create" | "edit">(goal === null ? "create" : "detail");
   const [objective, setObjective] = useState("");
   const [budget, setBudget] = useState("");
@@ -59,6 +60,8 @@ export function GoalSurface({ goal, connected, busy, running, error, uncertain, 
 
   useEffect(() => {
     if (!open) return;
+    setMode(current => current === "edit" ? current : goal === null ? "create" : "detail");
+    void read();
     const dialog = dialogRef.current!;
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     // showModal 让背景 inert，并将面板放入 top layer，避免 composer 的 overflow 裁切。
@@ -85,12 +88,6 @@ export function GoalSurface({ goal, connected, busy, running, error, uncertain, 
     } finally { pendingRead.current = false; setReading(false); }
   }
 
-  function show() {
-    setOpen(true);
-    setMode(current => current === "edit" ? current : goal === null ? "create" : "detail");
-    void read();
-  }
-
   async function command(action: "create" | "edit" | "pause" | "resume") {
     if (locked || pendingCommand.current || pendingRead.current) return;
     if ((action === "create" && (!creating || running)) || (action === "resume" && (!canResume || running)) ||
@@ -114,18 +111,22 @@ export function GoalSurface({ goal, connected, busy, running, error, uncertain, 
   const toggleLabel = canPause ? "暂停目标" : "继续目标";
   const toggleDisabled = locked || (!canPause && running);
   const ToggleIcon = canPause ? IconPlayerPause : IconPlayerPlay;
-  return <div className="cindy-goal-surface">
-    <div className="cindy-goal-bar" data-goal-status={uncertain || unconfirmed ? "unknown" : goal?.status || "none"} aria-busy={working}>
-      <button type="button" data-cindy-control="goal-open" className="cindy-goal-open" aria-haspopup="dialog" aria-expanded={open} onClick={show}>
-        <IconTarget size={19} aria-hidden="true" /><span className="cindy-goal-copy"><strong>{status}</strong>{goal && <span title={goal.objective}>{goal.objective}</span>}</span>
-      </button>
-      {(canPause || canResume) && <button type="button" data-cindy-control="goal-toggle" className="cindy-goal-icon" aria-label={toggleLabel} disabled={toggleDisabled} onClick={() => void command(toggle)}><ToggleIcon size={18} aria-hidden="true" /></button>}
-      <button type="button" data-cindy-control="goal-details" className="cindy-goal-icon" aria-label="查看目标详情" aria-haspopup="dialog" onClick={show}><IconChevronRight size={18} aria-hidden="true" /></button>
-    </div>
+  const showBar = uncertain || (!!goal && goal.status !== "complete");
+  if (!showBar && !open) return null;
+  return <>
+    {showBar && <div className="cindy-goal-surface">
+      <div className="cindy-goal-bar" data-goal-status={uncertain || unconfirmed ? "unknown" : goal?.status || "none"} aria-busy={working}>
+        <button type="button" data-cindy-control="goal-open" className="cindy-goal-open" aria-haspopup="dialog" aria-expanded={open} onClick={() => onOpenChange(true)}>
+          <IconTarget size={19} aria-hidden="true" /><span className="cindy-goal-copy"><strong>{status}</strong>{goal && <span title={goal.objective}>{goal.objective}</span>}</span>
+        </button>
+        {(canPause || canResume) && <button type="button" data-cindy-control="goal-toggle" className="cindy-goal-icon" aria-label={toggleLabel} disabled={toggleDisabled} onClick={() => void command(toggle)}><ToggleIcon size={18} aria-hidden="true" /></button>}
+        <button type="button" data-cindy-control="goal-details" className="cindy-goal-icon" aria-label="查看目标详情" aria-haspopup="dialog" onClick={() => onOpenChange(true)}><IconChevronRight size={18} aria-hidden="true" /></button>
+      </div>
+    </div>}
     {open && <dialog ref={dialogRef} className="cindy-goal-sheet" aria-modal="true" aria-labelledby={`${id}-title`} aria-busy={working}
-      onKeyDown={trapFocus} onCancel={event => { event.preventDefault(); setOpen(false); }} onClose={() => setOpen(false)}>
+      onKeyDown={trapFocus} onCancel={event => { event.preventDefault(); onOpenChange(false); }} onClose={() => onOpenChange(false)}>
       <div className="cindy-goal-handle" aria-hidden="true" />
-      <div className="cindy-goal-heading"><button type="button" data-cindy-control="goal-back" className="cindy-goal-icon" aria-label={editing ? "返回目标详情" : "返回对话"} onClick={() => editing ? setMode("detail") : setOpen(false)}><IconArrowLeft size={20} aria-hidden="true" /></button><h2 id={`${id}-title`}>{editing ? "修改目标" : creating ? "新建目标" : "会话目标"}</h2></div>
+      <div className="cindy-goal-heading"><button type="button" data-cindy-control="goal-back" className="cindy-goal-icon" aria-label={editing ? "返回目标详情" : "返回对话"} onClick={() => editing ? setMode("detail") : onOpenChange(false)}><IconArrowLeft size={20} aria-hidden="true" /></button><h2 id={`${id}-title`}>{editing ? "修改目标" : creating ? "新建目标" : "会话目标"}</h2></div>
       {uncertain && <div className="cindy-goal-notice" role="status"><p>上次操作结果未知。请先在桌面核对目标状态和启动消息；不会自动重发。</p><button type="button" data-cindy-control="goal-confirm" className="cindy-goal-row" disabled={working} onClick={onConfirmUnknown}>已在桌面核对</button></div>}
       {creating || editing ? <form onSubmit={event => { event.preventDefault(); void command(editing ? "edit" : "create"); }}>
         <label className="cindy-goal-label" htmlFor={`${id}-objective`}>{editing ? "目标内容" : "希望 Codex 持续完成什么？"}</label>
@@ -147,5 +148,5 @@ export function GoalSurface({ goal, connected, busy, running, error, uncertain, 
       {!connected && <p className="cindy-goal-hint" role="status">连接断开；恢复连接后才能读取或操作目标。</p>}
       {(localError || error) && <p className="cindy-goal-error" role="alert">{localError || error}</p>}
     </dialog>}
-  </div>;
+  </>;
 }

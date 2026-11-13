@@ -342,7 +342,10 @@ impl Desktop {
                 .as_array()
                 .is_some_and(|files| !files.is_empty())
         {
-            let (input, attachments) = prepare_files.await?;
+            let (input, attachments) = match prepare_files.await {
+                Ok(prepared) => prepared,
+                Err(message) => return Ok(super::create::preparation_failure(message)),
+            };
             if action == "send" {
                 params["turnStart"]["request"]["input"] = json!(input);
                 params["turnStart"]["context"]["attachments"] = json!(attachments);
@@ -942,7 +945,7 @@ mod tests {
         let args = json!({"text":"","files":[{"name":"a.txt","url":"data:application/octet-stream;base64,YQ=="}],"requestId":Uuid::new_v4().to_string()});
         for gate_fails in [true, false] {
             let (mut desktop, mut server) = action_fixture(json!({"id":"t"}));
-            let error = desktop
+            let result = desktop
                 .action(
                     "send",
                     &args,
@@ -961,16 +964,15 @@ mod tests {
                         }
                     },
                 )
-                .await
-                .unwrap_err();
-            assert_eq!(
-                error,
-                if gate_fails {
-                    "gate unavailable"
-                } else {
-                    "登录会话已撤销"
-                }
-            );
+                .await;
+            if gate_fails {
+                assert_eq!(result.unwrap_err(), "gate unavailable");
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    json!({"status":"failed","submission":"not-started","message":"文件准备失败，消息未发送：登录会话已撤销"})
+                );
+            }
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), server.read_u8())
                     .await

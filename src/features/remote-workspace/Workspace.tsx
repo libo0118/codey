@@ -17,6 +17,8 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
     draftScope, draftProject, defaultsReady, composerView, view, connected, connectionError, activeTurn,
     models, busy, loading, error, draft, images, uncertain, catalogError, fileGeneration, loadingEarlier } = c;
   const [atBottom, setAtBottom] = useState(true);
+  const [goalOpenFor, setGoalOpenFor] = useState<string | null>(null);
+  useLayoutEffect(() => { setGoalOpenFor(null); }, [selectedId, creating]);
   const scroll = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const inspecting = useRef(false);
@@ -51,7 +53,7 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
 
   const composer = <Composer key={draftScope} draft={draft} onDraft={c.changeDraft} images={images} onImages={c.changeImages} view={composerView} models={models} connected={creating ? (project === null || !!draftProject) && defaultsReady : connected} busy={busy} uncertain={uncertain}
     onSend={event => { event.preventDefault(); void c.send().then(started => { if (started) followLatest(); }); }}
-    onStop={() => void c.stop()} onSettings={c.changeSettings} catalogError={catalogError} onReloadModels={c.reloadModels} />;
+    onStop={() => void c.stop()} onSettings={c.changeSettings} catalogError={catalogError} onReloadModels={c.reloadModels} onGoal={!creating && selectedId ? () => setGoalOpenFor(selectedId) : undefined} />;
   const notices = <>{error && <p className="remote-client-error" role="alert">{error}</p>}
     {uncertain && !busy && <div className="remote-uncertain"><p>消息未确认。请查看会话是否已收到，确认后再决定是否重新发送。</p><button onClick={c.confirmSubmission}>已核对，允许再次发送</button></div>}</>;
   const scene = creating ? "create" : selected ? "conversation" : "list";
@@ -83,7 +85,7 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
         </div>
         {!atBottom && <button className="remote-jump remote-icon-button" aria-label="滚动到最新消息" onClick={followLatest}><IconArrowDown size={20} /></button>}
       </div></MessageFilesContext.Provider>
-      {notices}<GoalSurface key={`goal:${selectedId}`} goal={c.goal} connected={connected} busy={busy} running={!!activeTurn} error={c.goalError} uncertain={c.goalUncertain} onRead={c.readGoal} onCommand={c.commandGoal} onConfirmUnknown={c.confirmGoalSubmission} />{composer}
+      {notices}<GoalSurface key={`goal:${selectedId}`} goal={c.goal} open={!!selectedId && goalOpenFor === selectedId} onOpenChange={open => setGoalOpenFor(open && selectedId ? selectedId : null)} connected={connected} busy={busy} running={!!activeTurn} error={c.goalError} uncertain={c.goalUncertain} onRead={c.readGoal} onCommand={c.commandGoal} onConfirmUnknown={c.confirmGoalSubmission} />{composer}
     </>}</main>}
   </div>;
 }

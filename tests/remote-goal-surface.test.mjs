@@ -6,6 +6,7 @@ import * as icons from "@tabler/icons-react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "node:fs";
 import { collectElements, createModuleGraph, textContent } from "./helpers/jsx-tree.mjs";
+import { createControllerHarness } from "./helpers/controller-harness.mjs";
 
 const entry = new URL("../src/remote/cindy/GoalSurface.tsx", import.meta.url);
 const baseGoal = { objective: "验证目标\n完整正文", status: "active", tokensUsed: 24001, tokenBudget: 100000, timeUsedSeconds: 841 };
@@ -14,15 +15,43 @@ const control = (tree, name) => collectElements(tree, node => node.props["data-c
 const element = (tree, type) => collectElements(tree, node => node.type === type)[0];
 
 function mount(overrides = {}) {
-  const calls = [];
-  const props = { goal: baseGoal, connected: true, busy: false, running: false, error: "", uncertain: false,
+  const calls = [], focused = [];
+  class FakeElement { isConnected = true; focus() { focused.push(this); } getClientRects() { return [1]; } }
+  const first = new FakeElement(), opener = new FakeElement(), document = { activeElement: opener };
+  const dialog = { shown: 0, closed: 0, showModal() { this.shown++; }, close() { this.closed++; }, querySelector() { return first; } };
+  const props = { goal: baseGoal, open: false, onOpenChange: open => { props.open = open; }, connected: true, busy: false, running: false, error: "", uncertain: false,
     onRead: async () => { calls.push("read"); return true; },
     onCommand: async (action, args) => { calls.push([action, args]); return true; },
     onConfirmUnknown: () => calls.push("confirmed"), ...overrides };
-  const graph = createModuleGraph(entry, { stubs: { "@tabler/icons-react": icons } });
-  const render = () => { graph.restart(); return graph.exports.GoalSurface(props); };
-  return { calls, props, graph, render, async open() { control(render(), "open").props.onClick(); await settle(); return render(); } };
+  const h = createControllerHarness(entry, exports => {
+    const tree = exports.GoalSurface(props), sheet = element(tree, "dialog");
+    if (sheet) sheet.props.ref.current = dialog;
+    return tree;
+  }, { "@tabler/icons-react": icons });
+  function withDom(action) {
+    const previous = { document: globalThis.document, HTMLElement: globalThis.HTMLElement };
+    Object.assign(globalThis, { document, HTMLElement: FakeElement });
+    try { return action(); } finally { Object.assign(globalThis, previous); }
+  }
+  const render = () => withDom(() => h.render());
+  return { calls, props, render, withDom, document, FakeElement, first, opener, focused, dialog,
+    async open() { render(); props.onOpenChange(true); render(); await settle(); return render(); } };
 }
+
+test("无目标、未读与已完成目标关闭时不渲染占位，未完成与未知写入仍保留摘要", () => {
+  for (const goal of [null, undefined, { ...baseGoal, status: "complete" }]) {
+    const h = mount({ goal }); assert.equal(h.render(), null); assert.deepEqual(h.calls, []);
+  }
+  for (const status of ["active", "paused", "blocked", "usageLimited", "budgetLimited"]) {
+    const h = mount({ goal: { ...baseGoal, status } });
+    assert.ok(control(h.render(), "open")); assert.deepEqual(h.calls, []);
+  }
+  for (const goal of [null, undefined, { ...baseGoal, status: "complete" }]) {
+    const h = mount({ goal, uncertain: true });
+    assert.match(textContent(h.render()), /目标状态待核对/);
+    assert.equal(collectElements(h.render(), node => node.props["data-goal-status"] === "unknown").length, 1);
+  }
+});
 
 test("摘要只读打开详情，六态中文、完整正文与真实数字不混入 HAP chrome 合同", async () => {
   const labels = { active: "目标进行中", paused: "目标已暂停", blocked: "目标等待处理", usageLimited: "目标用量受限", budgetLimited: "目标预算受限", complete: "目标已完成" };
@@ -50,9 +79,9 @@ test("unknown、读取失败和结果待核对均不当成 none，也不会自�
     const tree = await h.open();
     assert.equal(control(tree, "save"), undefined);
     assert.equal(control(tree, "create"), undefined);
-    assert.equal(element(tree, "div").props.className, "cindy-goal-surface");
+    assert.equal(control(tree, "open"), undefined);
     assert.match(textContent(tree), /读取成功前不能创建目标/);
-    assert.equal(collectElements(tree, n => n.props["data-goal-status"] === "unknown").length, 1);
+    assert.equal(collectElements(tree, n => n.props["data-goal-status"] === "none").length, 0);
   }
   const h = mount({ goal: null, uncertain: true });
   let tree = await h.open();
@@ -73,6 +102,15 @@ test("读取异常显示错误且阻止创建，成功重读后才可进入表�
   control(h.render(), "refresh").props.onClick(); await settle();
   tree = h.render();
   assert.ok(control(tree, "save"));
+});
+
+test("读取返回成功不代替权威 goal，未确认状态不能进入新建", async () => {
+  const h = mount({ goal: undefined }); let tree = await h.open();
+  assert.equal(control(tree, "save"), undefined); assert.equal(control(tree, "create"), undefined);
+  assert.match(textContent(tree), /读取成功前不能创建目标/);
+  h.props.goal = { ...baseGoal, status: "complete" }; tree = h.render();
+  assert.equal(element(tree, "form"), undefined); assert.ok(control(tree, "create"));
+  assert.deepEqual(h.calls, ["read"]);
 });
 
 test("新建默认折叠高级预算，仅显式提交原生字段；失败保留草稿，成功转详情", async () => {
@@ -167,6 +205,10 @@ test("完成目标保留详情并允许明确新建，不允许直接编辑旧�
   assert.equal(control(tree, "edit"), undefined);
   assert.equal(control(tree, "toggle-detail"), undefined);
   control(tree, "create").props.onClick(); tree = h.render();
+  control(tree, "back").props.onClick(); assert.equal(h.render(), null);
+  tree = await h.open(); assert.equal(element(tree, "form"), undefined);
+  assert.match(textContent(tree), /目标已完成/); assert.deepEqual(h.calls, ["read", "read"]);
+  control(tree, "create").props.onClick(); tree = h.render();
   element(tree, "textarea").props.onChange({ target: { value: "下一项目标" } }); tree = h.render();
   element(tree, "form").props.onSubmit({ preventDefault() {} }); await settle();
   assert.deepEqual(h.calls.at(-1), ["create", { objective: "下一项目标", tokenBudget: null }]);
@@ -186,28 +228,20 @@ test("双击不重复发指令，异常保留编辑草稿并明确报错", async
 });
 
 test("原生模态、Tab 首尾环绕、Escape/返回及关闭后焦点恢复", async () => {
-  const h = mount(); const effects = [];
-  h.graph.react.useEffect = effect => effects.push(effect);
-  let tree = h.render(); control(tree, "open").props.onClick(); await settle(); effects.length = 0; tree = h.render();
-  const dialog = element(tree, "dialog"), focused = [], originalDocument = globalThis.document, originalHTMLElement = globalThis.HTMLElement;
-  class FakeElement { isConnected = true; focus() { focused.push(this); } getClientRects() { return [1]; } }
-  const first = new FakeElement(), last = new FakeElement(), opener = new FakeElement(), hidden = new FakeElement();
+  const h = mount(); let tree = h.render();
+  control(tree, "open").props.onClick(); tree = h.render(); await settle(); tree = h.render();
+  const dialog = element(tree, "dialog"), last = new h.FakeElement(), hidden = new h.FakeElement();
   hidden.getClientRects = () => [];
-  let shown = 0, closed = 0;
-  globalThis.HTMLElement = FakeElement; globalThis.document = { activeElement: opener };
-  try {
-    dialog.props.ref.current = { showModal() { shown++; }, close() { closed++; }, querySelector() { return first; } };
-    const cleanups = effects.map(effect => effect()); assert.equal(shown, 1);
-    for (const [current, shiftKey, expected] of [[last, false, first], [first, true, last]]) {
-      globalThis.document.activeElement = current; let prevented = false;
-      dialog.props.onKeyDown({ key: "Tab", shiftKey, currentTarget: { querySelectorAll: () => [first, hidden, last] }, preventDefault() { prevented = true; } });
-      assert.equal(prevented, true); assert.equal(focused.at(-1), expected);
-    }
-    cleanups.forEach(cleanup => cleanup?.()); assert.equal(closed, 1); assert.equal(focused.at(-1), opener);
-    let canceled = false; dialog.props.onCancel({ preventDefault() { canceled = true; } });
-    assert.equal(canceled, true); assert.equal(element(h.render(), "dialog"), undefined);
-    tree = await h.open(); control(tree, "back").props.onClick(); assert.equal(element(h.render(), "dialog"), undefined);
-  } finally { globalThis.document = originalDocument; globalThis.HTMLElement = originalHTMLElement; }
+  assert.equal(h.dialog.shown, 1);
+  for (const [current, shiftKey, expected] of [[last, false, h.first], [h.first, true, last]]) {
+    h.document.activeElement = current; let prevented = false;
+    h.withDom(() => dialog.props.onKeyDown({ key: "Tab", shiftKey, currentTarget: { querySelectorAll: () => [h.first, hidden, last] }, preventDefault() { prevented = true; } }));
+    assert.equal(prevented, true); assert.equal(h.focused.at(-1), expected);
+  }
+  let canceled = false; dialog.props.onCancel({ preventDefault() { canceled = true; } });
+  assert.equal(canceled, true); assert.equal(element(h.render(), "dialog"), undefined);
+  assert.equal(h.dialog.closed, 1); assert.equal(h.focused.at(-1), h.opener);
+  tree = await h.open(); control(tree, "back").props.onClick(); assert.equal(element(h.render(), "dialog"), undefined);
 });
 
 test("缺失用量不伪造零，实际 React 渲染转义正文，布局包含窄屏与深色约束", async () => {

@@ -1,13 +1,14 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
-import { IconArrowUp, IconBoltFilled, IconCamera, IconExclamationMark, IconFile, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconX } from "@tabler/icons-react";
+import { IconArrowUp, IconBoltFilled, IconCamera, IconExclamationMark, IconFile, IconPhoto, IconPlayerStopFilled, IconPlus, IconSelector, IconShield, IconTarget, IconX } from "@tabler/icons-react";
 import { effortLabels, permissionLabels, type ModelOption, type View, type ThreadSettings } from "./workspace-data";
 import { IMAGE_ACCEPT, readFiles, readImages, imagePickerError, type DraftImage } from "./images";
 
-export function Composer({ draft, onDraft, images, onImages, view, models, connected, busy, uncertain, onSend, onStop, onSettings, catalogError, onReloadModels }: {
+export function Composer({ draft, onDraft, images, onImages, view, models, connected, busy, uncertain, onSend, onStop, onSettings, catalogError, onReloadModels, onGoal }: {
   draft: string; onDraft: (draft: string) => void; view: View | null; models: ModelOption[];
   images: DraftImage[]; onImages: (images: DraftImage[]) => void;
   connected: boolean; busy: boolean; uncertain: boolean; onSend: (event: FormEvent) => void;
   onStop: () => void; onSettings: (settings: ThreadSettings) => void; catalogError: string; onReloadModels: () => void;
+  onGoal?: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
   const dock = useRef<HTMLDivElement>(null);
@@ -40,7 +41,7 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
   useLayoutEffect(() => { if (input.current) { input.current.style.height = "auto"; input.current.style.height = `${Math.min(input.current.scrollHeight, 180)}px`; } }, [draft]);
   useEffect(() => {
     if (!panel) return;
-    dock.current?.querySelector<HTMLButtonElement>(panel === "power" ? ".remote-power-model" : ".remote-attachment-popover button")?.focus({ preventScroll: true });
+    dock.current?.querySelector<HTMLButtonElement>(panel === "power" ? ".remote-power-model" : ".remote-attachment-popover button:not(:disabled)")?.focus({ preventScroll: true });
     const dismiss = (event: PointerEvent) => { if (!dock.current?.contains(event.target as Node)) setPanel(null); };
     const blur = (event: FocusEvent) => { if (!dock.current?.contains(event.target as Node)) setPanel(null); };
     const escape = (event: KeyboardEvent) => {
@@ -100,10 +101,11 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
     {panel === "power" && <section id={`${id}-power`} className="remote-power-popover" aria-label="模型与思考强度">
       <EffortControl modelName={modelName} efforts={efforts} effort={view?.effort || ""} disabled={disabled} onChange={effort => onSettings({ effort })} onAdvanced={() => { setPanel(null); setKeyboardNavigation(false); setAdvanced(true); }} />
     </section>}
-    {panel === "attachments" && <section id={`${id}-attachments`} className="remote-attachment-popover" aria-label="添加附件">
+    {panel === "attachments" && <section id={`${id}-attachments`} className="remote-attachment-popover" aria-label={onGoal ? "附件与会话目标" : "添加附件"}>
       <button type="button" disabled={imagesLocked} onClick={() => pickImage("camera")}><span><IconCamera size={28} stroke={1.8} /></span>相机</button>
       <button type="button" disabled={imagesLocked} onClick={() => pickImage("photos")}><span><IconPhoto size={28} stroke={1.8} /></span>照片</button>
       <button type="button" disabled={imagesLocked} onClick={() => pickImage("files")}><span><IconFile size={28} stroke={1.8} /></span>文件</button>
+      {onGoal && <button type="button" aria-haspopup="dialog" onClick={() => { setPanel(null); add.current?.focus({ preventScroll: true }); onGoal(); }}><span><IconTarget size={28} stroke={1.8} /></span>会话目标</button>}
     </section>}
     <input ref={camera} hidden type="file" aria-label="拍照添加图片" accept={IMAGE_ACCEPT} capture="environment" disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget)} />
     <input ref={photos} hidden type="file" aria-label="选择照片" accept={IMAGE_ACCEPT} multiple disabled={imagesLocked} onChange={event => void selectImages(event.currentTarget)} />
@@ -123,7 +125,7 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
         <button type="button" aria-label={`移除${image.kind === "file" ? "文件" : "图片"} ${image.name}`} disabled={imagesLocked} onClick={() => { onImages(images.filter((_, position) => position !== index)); setImageError(""); setNotice("已移除附件。"); }}><IconX size={15} /></button>
       </figure>)}</div>}
       <div className="remote-composer-input-row">
-        <button ref={add} type="button" className="remote-composer-icon" aria-label="添加附件" aria-expanded={panel === "attachments"} aria-controls={`${id}-attachments`} disabled={imagesLocked} onClick={() => togglePanel("attachments")}><IconPlus size={22} stroke={1.8} /></button>
+        <button ref={add} type="button" className="remote-composer-icon" aria-label={onGoal ? "添加附件或目标" : "添加附件"} aria-expanded={panel === "attachments"} aria-controls={`${id}-attachments`} disabled={imagesLocked && !onGoal} onClick={() => togglePanel("attachments")}><IconPlus size={22} stroke={1.8} /></button>
         <textarea ref={input} aria-label="发送给 Codex 的指令" disabled={busy} placeholder={active ? "补充当前任务的指令…" : "向 Codex 提问"} value={draft} onFocus={() => setPanel(null)} onChange={event => { onDraft(event.target.value); setNotice(""); }} rows={1} maxLength={100000} onKeyDown={event => {
           if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
         }} />

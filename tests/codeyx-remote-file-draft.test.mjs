@@ -41,9 +41,10 @@ function composerHarness(t) {
   const picker = () => Object.assign(new EventTarget(), { value: "", files: [], shown: 0, showPicker() { this.shown++; } });
   const camera = picker(), photos = picker(), files = picker();
   const dialog = { open: false, showModal() { this.open = true; }, close() { this.open = false; } };
+  const add = { focused: 0, focus() { this.focused++; } };
   const refs = [
     { style: {}, scrollHeight: 32 }, { contains: () => true, querySelector: () => null },
-    { focus() {} }, { focus() {} }, dialog, camera, photos, files, null, null,
+    { focus() {} }, add, dialog, camera, photos, files, null, null,
   ];
   let cursor = 0, nextRef = 0, effects = [];
   const hooks = [];
@@ -65,7 +66,7 @@ function composerHarness(t) {
   const { Composer } = createModuleGraph(new URL("../src/remote/composer.tsx", import.meta.url), { stubs: { react, "@tabler/icons-react": icons } }).exports;
   const props = { draft: "", onDraft() {}, images: [], onImages(next) { props.images = next; }, view: null, models: [], connected: true, busy: false, uncertain: false, onSend() {}, onStop() {}, onSettings() {}, catalogError: "", onReloadModels() {} };
   return {
-    props, files, dialog,
+    props, files, dialog, add,
     render() { cursor = 0; nextRef = 0; const tree = Composer(props); effects.splice(0).forEach(effect => effect()); return tree; },
     unmount() { hooks.forEach(hook => hook?.cleanup?.()); },
   };
@@ -114,6 +115,30 @@ test("Composer connects file picker, cancel, read, budget, preview, remove and r
     h.props.images = [{ name: "report.pdf", kind: "file", size: 3, url: "" }]; tree = h.render();
     assert.match(textContent(tree), /重新选择/); assert.equal(byLabel(tree, "发送消息").props.disabled, true);
     byLabel(tree, "移除文件 report.pdf").props.onClick(); assert.equal(h.props.images.length, 0);
+  } finally { h.unmount(); }
+});
+
+test("Composer 加号保留三个附件项，目标入口先关菜单并恢复加号焦点，不解锁未知附件提交", t => {
+  const h = composerHarness(t), calls = [];
+  h.props.onGoal = () => { calls.push("goal"); assert.ok(h.add.focused > 0); };
+  h.props.onSend = () => calls.push("send");
+  h.props.uncertain = true; h.props.images = [{ name: "pending.txt", kind: "file", size: 1, url: "" }];
+  try {
+    let tree = h.render(), add = byLabel(tree, "添加附件或目标");
+    assert.equal(add.props.disabled, false); add.props.onClick(); tree = h.render();
+    for (const name of ["相机", "照片", "文件"]) {
+      assert.equal(buttonText(tree, name).props.disabled, true);
+      buttonText(tree, name).props.onClick();
+    }
+    assert.equal(h.files.shown, 0);
+    assert.equal(collectElements(byLabel(tree, "附件与会话目标"), node => node.type === "button").length, 4);
+    assert.equal(buttonText(tree, "会话目标").props["aria-haspopup"], "dialog");
+    buttonText(tree, "会话目标").props.onClick(); tree = h.render();
+    assert.equal(byLabel(tree, "附件与会话目标"), undefined); assert.deepEqual(calls, ["goal"]);
+    assert.equal(byLabel(tree, "发送消息").props.disabled, true);
+    assert.equal(byLabel(tree, "选择文件").props.disabled, true);
+    assert.equal(byLabel(tree, "移除文件 pending.txt").props.disabled, true);
+    assert.equal(h.props.uncertain, true); assert.equal(h.props.images[0].url, "");
   } finally { h.unmount(); }
 });
 

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createControllerHarness, deferred, installControllerWindow } from "./helpers/controller-harness.mjs";
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
+const { RemoteError } = await loadTypeScriptModule(new URL("../src/remote/transport.ts", import.meta.url));
 
 const projects = [{ id: "p", name: "Project", cwd: "/project" }, { id: "q", name: "Other", cwd: "/other" }];
 const thread = { id: "thread", title: "Thread", cwd: "/project", updatedAt: 1 };
@@ -26,7 +29,7 @@ function fixture(t, active = true) {
     forgetSubmission: key => journal.delete(key),
     connect(id, handlers) { const socket = { id, handlers, closed: 0, close() { this.closed++; } }; sockets.push(socket); return socket; },
   });
-  const h = createControllerHarness(new URL("../src/features/remote-workspace/useRemoteWorkspaceController.ts", import.meta.url), "useRemoteWorkspaceController", { "./requests": { remoteWorkspaceRequests: requests } });
+  const h = createControllerHarness(new URL("../src/features/remote-workspace/useRemoteWorkspaceController.ts", import.meta.url), "useRemoteWorkspaceController", { "./requests": { remoteWorkspaceRequests: requests }, "../../remote/transport": { RemoteError } });
   const render = () => h.render(options);
   const last = name => calls.findLast(call => call.name === name);
   async function ready(threads = [thread]) {
@@ -37,6 +40,31 @@ function fixture(t, active = true) {
   }
   return { ...h, render, browser, options, requests, calls, sockets, journal, last, ready, open, get unauthorized() { return unauthorized; } };
 }
+
+test("文件准备明确失败时保留文件和文字，消息尚未提交不应锁成未知结果", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  const images = [{ name: "fixture.png", url: "data:application/octet-stream;base64,YQ==", size: 1, kind: "file" }];
+  h.render().changeDraft("请读取附件"); h.render().changeImages(images); h.render();
+  const work = h.render().send();
+  const failure = new RemoteError("文件准备失败，消息未发送", 200); failure.submission = "not-started";
+  h.last("submit").reject(failure); await work; await h.flush();
+  assert.equal(h.render().uncertain, false);
+  assert.equal(h.journal.size, 0);
+  assert.equal(h.render().draft, "请读取附件"); assert.deepEqual(h.render().images, images);
+  assert.equal(h.calls.filter(c => c.name === "submit").length, 1, "不自动重试");
+  h.unmount();
+});
+
+test("新建会话文件准备明确失败时不重复创建，草稿可由用户手动再次提交", async t => {
+  const h = fixture(t); await h.ready(); h.render().startCreating(null); h.render();
+  h.last("defaults").resolve({ model: "model" }); await h.flush();
+  h.render().changeDraft("新建文件任务"); h.render().changeImages([{ name: "a.txt", url: "data:application/octet-stream;base64,YQ==", size: 1, kind: "file" }]); h.render();
+  const work = h.render().send(); const failure = new RemoteError("文件准备失败，消息未发送", 200); failure.submission = "not-started";
+  h.last("create").reject(failure); await work; await h.flush();
+  assert.equal(h.render().uncertain, false); assert.equal(h.journal.size, 0);
+  assert.equal(h.render().creating, true); assert.equal(h.render().draft, "新建文件任务"); assert.equal(h.render().images.length, 1);
+  assert.equal(h.calls.filter(c => c.name === "create").length, 1); h.unmount();
+});
 
 test("目标通过显式只读确认，缺失或读取失败不当作无目标", async t => {
   const h = fixture(t); await h.ready(); await h.open();

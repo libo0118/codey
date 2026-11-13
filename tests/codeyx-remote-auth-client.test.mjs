@@ -54,6 +54,18 @@ test("unauthorized non-JSON responses revoke local authentication state before d
   await assert.rejects(remote.remoteRequest("/remote/action", {}), /先登录/);
 });
 
+test("only the explicit pre-submission receipt identifies a retryable preparation failure", async t => {
+  const oldFetch = globalThis.fetch, oldWindow = globalThis.window;
+  globalThis.window = new EventTarget();
+  t.after(() => { globalThis.fetch = oldFetch; globalThis.window = oldWindow; remote.clearRemoteSession(); });
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ authenticated: true, csrfToken: "fixture" }) });
+  await remote.remoteRequest("/remote/session");
+  for (const submission of ["not-started", undefined, "unknown", ["not-started"]]) {
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ status: "failed", message: "synthetic failure", submission }) });
+    await assert.rejects(remote.remoteRequest("/remote/action", {}), error => error instanceof remote.RemoteError && error.submission === (submission === "not-started" ? submission : undefined));
+  }
+});
+
 function authFixture(t) {
   installControllerWindow(t);
   const calls = []; let cleared = 0;

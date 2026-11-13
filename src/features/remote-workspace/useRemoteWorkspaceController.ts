@@ -216,7 +216,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
         const sent = { ...editor, settings: composerSettings, uncertain: true };
         const submission = rememberForSend(key, { projectId: project, text: sent.text, ...messageAttachments(sent.images), ...composerSettings });
         setEditor(sent);
-        const result = await requests.create(submission);
+        const result = await requests.create(submission).catch(cause => { releaseUnsubmitted(cause, key, current); throw cause; });
         if (!result.id) throw new Error("新建结果尚未确认，请先检查会话列表");
         if (!current()) return;
         requests.forgetSubmission(key); drafts.current.delete(key);
@@ -234,11 +234,18 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     return run(async current => {
       const submission = rememberForSend(selectedId, { action: activeTurn ? "steer" : "send", text: editor.text, ...messageAttachments(editor.images) });
       setEditor(previous => ({ ...previous, uncertain: true }));
-      await requests.submit(selectedId, submission);
+      await requests.submit(selectedId, submission).catch(cause => { releaseUnsubmitted(cause, selectedId, current); throw cause; });
       if (!current()) return;
       requests.forgetSubmission(selectedId);
       setEditor(previous => ({ ...previous, text: "", images: [], uncertain: false }));
     });
+  }
+
+  function releaseUnsubmitted(cause: unknown, key: string, current: () => boolean) {
+    if (current() && cause instanceof RemoteError && cause.submission === "not-started") {
+      requests.forgetSubmission(key);
+      setEditor(previous => ({ ...previous, uncertain: false }));
+    }
   }
 
   function perform(action: string, args: Record<string, unknown> = {}, reload = false) {

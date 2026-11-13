@@ -21,6 +21,10 @@ pub(super) async fn open(state: &Arc<AppState>, id: &str) -> Result<(), String> 
     Ok(())
 }
 
+pub(super) fn preparation_failure(message: String) -> Value {
+    json!({"status":"failed","submission":"not-started","message":format!("文件准备失败，消息未发送：{message}")})
+}
+
 // Called only for the first submitted message; an untouched phone draft does
 // not create a persisted thread or a second app-server.
 pub(super) async fn create(
@@ -36,7 +40,10 @@ pub(super) async fn create(
         return Err("项目目录不存在，请在电脑端检查工作区".into());
     }
     if !super::images::message_files(args)?.is_empty() {
-        let (input, attachments) = prepare_files(state, args, &authorize).await?;
+        let (input, attachments) = match prepare_files(state, args, &authorize).await {
+            Ok(prepared) => prepared,
+            Err(message) => return Ok(preparation_failure(message)),
+        };
         params["attachments"] = json!(attachments);
         params["input"] = json!(input);
     } else {
