@@ -45,7 +45,8 @@ function fixture(value = initial) {
       return { scope: scope, hostId: hostId, requestClient: scope.get("client"), dynamicTools: new Map(), readCreationInputs: async () => ({}) };
     } }),
   };
-  vm.runInNewContext(source, { window, document: { scripts: [{ src: "app://codex/assets/app-initial-goal-fixture.js" }], querySelectorAll: () => [] }, performance: { getEntriesByType: () => [] } });
+  // Node 22's isolated VM lacks Symbol.dispose; share the native RPC handle's symbol.
+  vm.runInNewContext(source, { Symbol, window, document: { scripts: [{ src: "app://codex/assets/app-initial-goal-fixture.js" }], querySelectorAll: () => [] }, performance: { getEntriesByType: () => [] } });
   const run = (action, patch = {}) => window.__codeyRemoteControl({ action, threadId, expected: expected(goal), ...patch }, Date.now() + 10_000);
   return { manager, window, run, writes, reads, setGoal: value => { goal = value; }, setCompleted: value => { completed = value; } };
 }
