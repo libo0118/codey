@@ -423,20 +423,18 @@ fn identity_matches(file: &PendingFile) -> bool {
     let Ok(metadata) = fs::symlink_metadata(&file.path) else {
         return false;
     };
-    if !metadata.file_type().is_file()
-        || metadata.len() != file.identity.length
-        || metadata.modified().ok() != file.identity.modified
-    {
-        return false;
-    }
+    let matches = metadata.file_type().is_file()
+        && metadata.len() == file.identity.length
+        && metadata.modified().ok() == file.identity.modified;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.dev() != file.identity.device || metadata.ino() != file.identity.inode {
-            return false;
-        }
+        matches && metadata.dev() == file.identity.device && metadata.ino() == file.identity.inode
     }
-    true
+    #[cfg(not(unix))]
+    {
+        matches
+    }
 }
 
 fn inventory(pending_directories: &[PathBuf]) -> PendingInventory {
