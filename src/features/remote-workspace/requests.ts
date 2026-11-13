@@ -8,7 +8,7 @@ export const remoteWorkspaceRequests = {
   threads: (search: string, archived: boolean, signal?: AbortSignal) => remoteRequest<Thread[]>("/remote/threads", { search, archived }, signal),
   projects: (signal?: AbortSignal) => remoteRequest<Project[]>("/remote/projects", {}, signal),
   models: () => remoteRequest<ModelCatalog>("/remote/models", {}),
-  defaults: (projectId: string) => remoteRequest<ThreadSettings>("/remote/defaults", { projectId }),
+  defaults: (projectId: string | null) => remoteRequest<ThreadSettings>("/remote/defaults", { projectId }),
   session: async () => { const result = await remoteRequest<{ authenticated: boolean }>("/remote/session"); if (!result.authenticated) throw new RemoteError("登录已过期或被撤销", 401); return result; },
   action: (threadId: string, action: string, args: Record<string, unknown> = {}) =>
     remoteRequest("/remote/action", { ...args, threadId, action, requestId: requestId() }),

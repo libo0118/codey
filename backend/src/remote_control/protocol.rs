@@ -394,6 +394,10 @@ pub(super) fn item_view(item: &Value, turn_id: &Value, index: usize) -> Value {
     result
 }
 
+pub(super) fn projectless_approval_policy() -> Value {
+    json!({"granular":{"sandbox_approval":false,"rules":false,"skill_approval":false,"request_permissions":true,"mcp_elicitations":true}})
+}
+
 fn permission_mode(settings: &Value) -> &'static str {
     let profile = settings["activePermissionProfile"]["id"]
         .as_str()
@@ -403,6 +407,10 @@ fn permission_mode(settings: &Value) -> &'static str {
         .is_some_and(|value| value != "user")
     {
         return "custom";
+    }
+    if profile == Some(":workspace") && settings["approvalPolicy"] == projectless_approval_policy()
+    {
+        return "auto";
     }
     match (
         profile,
@@ -694,6 +702,18 @@ mod tests {
         assert_eq!(
             permission_mode(&json!({"permissions":":danger-full-access","approvalPolicy":"never"})),
             "full-access"
+        );
+        assert_eq!(
+            permission_mode(
+                &json!({"permissions":":workspace","approvalPolicy":projectless_approval_policy()})
+            ),
+            "auto"
+        );
+        let mut custom = projectless_approval_policy();
+        custom["granular"]["rules"] = json!(true);
+        assert_eq!(
+            permission_mode(&json!({"permissions":":workspace","approvalPolicy":custom})),
+            "custom"
         );
         assert_eq!(
             permission_mode(

@@ -30,8 +30,9 @@ pub(super) async fn create(
 ) -> Result<Value, String> {
     let project = saved_project(args).await?;
     let mut params = creation_params(&project, args)?;
-    let cwd = params["cwd"].as_str().ok_or("项目目录无效")?;
-    if !Path::new(cwd).is_dir() {
+    if let Some(cwd) = params["cwd"].as_str()
+        && !Path::new(cwd).is_dir()
+    {
         return Err("项目目录不存在，请在电脑端检查工作区".into());
     }
     if !super::images::message_files(args)?.is_empty() {
@@ -114,10 +115,20 @@ async fn finish_files(
 
 pub(super) async fn defaults(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
     let project = saved_project(args).await?;
-    desktop_request(state, json!({"action":"defaults","cwd":project["cwd"]})).await
+    let request = if project.is_null() {
+        json!({"action":"defaults"})
+    } else {
+        json!({"action":"defaults","cwd":project["cwd"]})
+    };
+    desktop_request(state, request).await
 }
 
 async fn saved_project(args: &Value) -> Result<Value, String> {
+    match args.get("projectId") {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::String(_)) => {}
+        _ => return Err("请选择工作区或明确选择不指定工作目录".into()),
+    }
     let projects =
         tokio::task::spawn_blocking(|| super::store::projects(crate::codex_config::codex_home()))
             .await
@@ -132,26 +143,43 @@ async fn saved_project(args: &Value) -> Result<Value, String> {
 }
 
 fn creation_params(project: &Value, args: &Value) -> Result<Value, String> {
-    let cwd = project["cwd"]
-        .as_str()
-        .filter(|cwd| !cwd.is_empty())
-        .ok_or("项目目录无效")?;
+    let projectless = project.is_null();
     let (_, _, turn) = super::desktop::action_params(&json!({}), "send", args)?;
     let mut params = json!({
         "input":turn["turnStart"]["request"]["input"],
         "clientUserMessageId":args["requestId"],
-        "cwd":cwd, "workspaceRoots":project["rootPaths"].as_array().filter(|roots| !roots.is_empty()).cloned().unwrap_or_else(|| vec![json!(cwd)]),
-        "workspaceKind":"project", "projectAssignment":{"projectId":project["id"],"projectKind":"local"},
         "useAppServerPermissionDefault":true,
         "attachments":[], "commentAttachments":[], "collaborationMode":null,
     });
+    if projectless {
+        params["workspaceKind"] = json!("projectless");
+        params["workspaceRoots"] = json!([]);
+    } else {
+        let cwd = project["cwd"]
+            .as_str()
+            .filter(|cwd| !cwd.is_empty())
+            .ok_or("项目目录无效")?;
+        params["cwd"] = json!(cwd);
+        params["workspaceRoots"] = json!(
+            project["rootPaths"]
+                .as_array()
+                .filter(|roots| !roots.is_empty())
+                .cloned()
+                .unwrap_or_else(|| vec![json!(cwd)])
+        );
+        params["workspaceKind"] = json!("project");
+        params["projectAssignment"] = json!({"projectId":project["id"],"projectKind":"local"});
+    }
     if args.get("model").is_some()
         || args.get("effort").is_some()
         || args.get("serviceTier").is_some()
         || args.get("permissionMode").is_some()
     {
-        let (_, _, settings) =
-            super::desktop::action_params(&json!({"cwd":cwd}), "settings", args)?;
+        let (_, _, settings) = super::desktop::action_params(
+            &json!({"workspaceKind":params["workspaceKind"]}),
+            "settings",
+            args,
+        )?;
         let settings = &settings["threadSettings"];
         if settings.get("effort").is_some() && settings.get("model").is_none() {
             return Err("请先选择模型再设置思考程度".into());
@@ -163,12 +191,9 @@ fn creation_params(project: &Value, args: &Value) -> Result<Value, String> {
             params["serviceTier"] = tier.clone();
         }
         if settings.get("permissions").is_some() {
-            params["useAppServerPermissionDefault"] = json!(false);
-            params["permissionsConfig"] = json!({
-                "activePermissionProfile":settings["activePermissionProfile"],
-                "approvalPolicy":settings["approvalPolicy"], "approvalsReviewer":settings["approvalsReviewer"],
-                "sandboxPolicy":settings["sandboxPolicy"], "runtimeWorkspaceRoots":params["workspaceRoots"],
-            });
+            let mode = args["permissionMode"].as_str().ok_or("权限模式无效")?;
+            params["permissionSelection"] = json!({"kind":"agent-mode","agentMode":if projectless && mode == "auto" { "granular" } else { mode }});
+            params["usePermissionSelection"] = json!(true);
         }
     }
     Ok(params)
@@ -276,10 +301,11 @@ mod tests {
             "route/model"
         );
         assert_eq!(
-            params["permissionsConfig"]["activePermissionProfile"]["id"],
-            ":read-only"
+            params["permissionSelection"],
+            json!({"kind":"agent-mode","agentMode":"read-only"})
         );
-        assert_eq!(params["useAppServerPermissionDefault"], false);
+        assert_eq!(params["usePermissionSelection"], true);
+        assert!(params.get("permissionsConfig").is_none());
         for patch in [
             json!({"text":" "}),
             json!({"text":"a".repeat(100_001)}),
@@ -301,6 +327,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn projectless_is_explicit_and_uses_native_workspace_and_permission_selection() {
+        assert_eq!(
+            saved_project(&json!({"projectId":null})).await.unwrap(),
+            Value::Null
+        );
+        assert!(saved_project(&json!({})).await.is_err());
+        assert!(saved_project(&json!({"projectId":true})).await.is_err());
+        for (mode, native_mode) in [
+            ("read-only", "read-only"),
+            ("auto", "granular"),
+            ("full-access", "full-access"),
+        ] {
+            let args = json!({"projectId":null,"text":"开始","requestId":uuid::Uuid::new_v4().to_string(),"permissionMode":mode,"cwd":"/untrusted","workspaceRoots":["/"]});
+            let params = creation_params(&Value::Null, &args).unwrap();
+            assert_eq!(params["workspaceKind"], "projectless");
+            assert_eq!(params["workspaceRoots"], json!([]));
+            assert!(params.get("cwd").is_none());
+            assert!(params.get("projectAssignment").is_none());
+            assert!(params.get("permissionsConfig").is_none());
+            assert_eq!(
+                params["permissionSelection"],
+                json!({"kind":"agent-mode","agentMode":native_mode})
+            );
+        }
     }
 
     #[test]

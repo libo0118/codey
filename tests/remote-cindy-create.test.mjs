@@ -29,15 +29,28 @@ test("Cindy 新建页只选择现有工作区，展示项目路径并透传原�
   assert.equal(collectElements(tree, node => node.props["aria-label"] === "工作区").length, 0);
 });
 
-test("没有项目与忙碌时不能选择，不伪装可发送；默认值失败保持未就绪提示", () => {
+test("没有项目仍可明确选择不指定工作目录，忙碌和默认值未就绪保持禁发", () => {
   const graph = createModuleGraph(entry, { stubs });
   let tree = graph.exports.NewSessionSurface({ projects: [], busy: false, defaultsReady: false });
-  assert.equal(collectElements(tree, node => node.props["aria-label"] === "选择工作区")[0].props.disabled, true);
+  assert.equal(collectElements(tree, node => node.props["aria-label"] === "选择工作区")[0].props.disabled, false);
   assert.match(textContent(tree), /没有可用项目|保存本地项目/);
   graph.restart(); tree = graph.exports.NewSessionSurface({ projects, project: projects[0], busy: true, defaultsReady: false });
   assert.equal(collectElements(tree, node => node.props["aria-label"] === "选择工作区")[0].props.disabled, true);
   assert.equal(collectElements(tree, node => node.props["data-codey-action"] === "back")[0].props.disabled, true);
   assert.match(textContent(tree), /默认设置尚未就绪/);
+});
+
+test("不指定工作目录是独立的 null 选择，不伪造主目录或已保存项目", () => {
+  const calls = [], graph = createModuleGraph(entry, { stubs });
+  const props = { projects, project: projects[0], projectless: false, busy: false, defaultsReady: true, onProject: p => calls.push(p) };
+  let tree = graph.exports.NewSessionSurface(props);
+  collectElements(tree, node => node.props["aria-label"] === "选择工作区")[0].props.onPress();
+  graph.restart(); tree = graph.exports.NewSessionSurface(props);
+  collectElements(tree, node => node.props["aria-label"] === "不指定工作目录")[0].props.onPress();
+  assert.deepEqual(calls, [null]);
+  graph.restart(); tree = graph.exports.NewSessionSurface({ ...props, project: undefined, projectless: true });
+  assert.match(textContent(tree), /不指定工作目录/); assert.match(textContent(tree), /Codex 管理实际目录/);
+  assert.doesNotMatch(textContent(tree), /\/home|没有可用项目/);
 });
 
 function controller(scene) {
@@ -54,6 +67,7 @@ function controller(scene) {
 test("实际 Workspace 三场景满足 v2 唯一header/footer/action合同，默认值未就绪时发送禁用", () => {
   for (const scene of ["list", "create", "conversation"]) {
     const c = controller(scene);
+    if (scene === "conversation") { c.selected.cwd = ""; c.selectedProject = undefined; c.view.cwd = "/synthetic/codex-managed"; }
     const { Workspace } = createModuleGraph(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), {
       stubs: { ...stubs, react: React, "react/jsx-runtime": jsx, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c } },
     }).exports;
@@ -65,6 +79,7 @@ test("实际 Workspace 三场景满足 v2 唯一header/footer/action合同，默
     assert.equal((html.match(/data-codey-action="back"/g) || []).length, scene === "list" ? 0 : 1);
     assert.match(html, /data-codey-action="archive" aria-pressed="false"/);
     if (scene !== "list") assert.match(html, /aria-label="发送消息" disabled=""/);
+    if (scene === "conversation") assert.match(html, /codex-managed/);
   }
 });
 

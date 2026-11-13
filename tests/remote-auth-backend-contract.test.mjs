@@ -80,6 +80,25 @@ test("native creation retains creation-input tools while defaults expose no cred
   assert.equal(submitted.inputs, creationInputs);
 });
 
+test("projectless creation forwards native permission selection without inventing a cwd or replacing native tools", async () => {
+  let submitted, configCwd = "unread";
+  const manager = {
+    sendRequest: async (_method, params) => { configCwd = params.cwd; return { config: { model: "synthetic-model" } }; },
+    startConversation: async (params, options) => { submitted = params; await options.readThreadCreationInputs(); return { status: "created", conversationId: "created", firstTurn: { status: "accepted" } }; },
+  };
+  const app = runtime(manager);
+  app.context.document.scripts.push({ src: "app://codex/assets/app-initial-test.js" });
+  app.window.__codeyImportCodexAsset = async () => ({ factory: function (scope, hostId) {
+    return { scope: scope, hostId: hostId, requestClient: scope.get("client"), dynamicTools: new Map(), readCreationInputs: async () => ({ tools: ["native-tool"] }) };
+  } });
+  await app.window.__codeyRemoteControl({ action: "defaults" }, Date.now() + 10000); assert.equal(configCwd, undefined);
+  const params = { workspaceKind: "projectless", workspaceRoots: [], permissionSelection: { kind: "agent-mode", agentMode: "granular" }, usePermissionSelection: true };
+  const result = await app.window.__codeyRemoteControl({ action: "create", params }, Date.now() + 10000);
+  assert.equal(submitted, params);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { id: "created", firstTurn: "accepted" });
+  assert.equal(Object.hasOwn(submitted, "cwd"), false);
+});
+
 test("remote creation reuses the shared source resolver when manager exports are absent", async () => {
   const inputs = { tools: ["native-tool"], instructions: "native project instructions" };
   let submitted, sourceReads = 0;

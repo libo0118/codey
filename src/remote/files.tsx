@@ -63,20 +63,56 @@ export function FileLink({ reference, attachment, children, image = false }: { r
 export function FileImage({ url, alt }: { url: string; alt: string }) {
   const [failed, setFailed] = useState(false);
   const preview = useRef<HTMLDialogElement | null>(null);
-  useEffect(() => () => { preview.current?.remove(); preview.current = null; }, [url]);
+  useEffect(() => () => { preview.current?.close(); preview.current = null; }, [url]);
   function enlarge(trigger: HTMLButtonElement) {
     if (preview.current) return;
     const dialog = document.createElement("dialog"), header = document.createElement("header"), title = document.createElement("span");
     const zoom = document.createElement("button"), close = document.createElement("button"), stage = document.createElement("div"), image = document.createElement("img");
     dialog.className = "remote-image-dialog"; dialog.setAttribute("aria-label", alt);
-    title.textContent = alt; zoom.type = close.type = "button"; zoom.textContent = "原始尺寸"; close.textContent = "关闭";
-    zoom.setAttribute("aria-pressed", "false"); stage.className = "remote-image-stage"; image.src = url; image.alt = alt;
-    zoom.onclick = () => { const original = stage.classList.toggle("is-original"); zoom.textContent = original ? "适应窗口" : "原始尺寸"; zoom.setAttribute("aria-pressed", String(original)); };
+    title.textContent = alt; zoom.type = close.type = "button"; zoom.textContent = "原始尺寸"; close.textContent = "← 返回对话"; zoom.disabled = true;
+    zoom.setAttribute("aria-pressed", "false"); stage.className = "remote-image-stage"; stage.tabIndex = 0; stage.setAttribute("role", "region"); stage.setAttribute("aria-label", "图片预览，可滚动查看"); image.src = url; image.alt = alt; image.draggable = false;
+    let scale = 1, width = 0, height = 0, distance = 0;
+    function resizeImage(next: number, clientX?: number, clientY?: number) {
+      const rect = stage.getBoundingClientRect(), x = clientX === undefined ? stage.clientWidth / 2 : clientX - rect.left, y = clientY === undefined ? stage.clientHeight / 2 : clientY - rect.top;
+      const oldWidth = Number.parseFloat(image.style.width) || width * scale, oldHeight = Number.parseFloat(image.style.height) || height * scale;
+      const pointX = (stage.scrollLeft + x - Math.max(0, (stage.clientWidth - oldWidth) / 2)) / oldWidth;
+      const pointY = (stage.scrollTop + y - Math.max(0, (stage.clientHeight - oldHeight) / 2)) / oldHeight;
+      scale = Math.max(1, Math.min(Math.max(8, image.naturalWidth / width), next));
+      image.style.width = `${width * scale}px`; image.style.height = `${height * scale}px`;
+      image.style.marginTop = `${Math.max(0, (stage.clientHeight - height * scale) / 2)}px`;
+      const enlarged = stage.classList.toggle("is-original", scale > 1);
+      zoom.textContent = enlarged ? "适应窗口" : "原始尺寸"; zoom.setAttribute("aria-pressed", String(enlarged));
+      stage.scrollLeft = pointX * width * scale + Math.max(0, (stage.clientWidth - width * scale) / 2) - x;
+      stage.scrollTop = pointY * height * scale + Math.max(0, (stage.clientHeight - height * scale) / 2) - y;
+    }
+    function fitImage() {
+      width = Math.min(image.naturalWidth, stage.clientWidth, image.naturalWidth * stage.clientHeight / image.naturalHeight);
+      height = width * image.naturalHeight / image.naturalWidth; resizeImage(scale);
+    }
+    const observer = new ResizeObserver(() => { if (dialog.open && !zoom.disabled) fitImage(); }); observer.observe(stage);
+    image.onload = () => { zoom.disabled = false; fitImage(); };
+    zoom.onclick = () => resizeImage(scale > 1 ? 1 : image.naturalWidth / width);
+    dialog.addEventListener("wheel", event => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault(); if (!zoom.disabled) resizeImage(scale * Math.exp(-event.deltaY / 300), event.clientX, event.clientY);
+    }, { passive: false });
+    const separation = (event: TouchEvent) => Math.hypot(event.touches[0].clientX - event.touches[1].clientX, event.touches[0].clientY - event.touches[1].clientY);
+    stage.addEventListener("touchstart", event => { if (event.touches.length >= 2) { event.preventDefault(); distance = separation(event); } }, { passive: false });
+    stage.addEventListener("touchmove", event => {
+      if (event.touches.length < 2) return;
+      event.preventDefault(); const next = separation(event);
+      if (!zoom.disabled && distance > 0) resizeImage(scale * next / distance, (event.touches[0].clientX + event.touches[1].clientX) / 2, (event.touches[0].clientY + event.touches[1].clientY) / 2);
+      distance = next;
+    }, { passive: false });
+    stage.addEventListener("touchend", () => { distance = 0; });
+    stage.addEventListener("touchcancel", () => { distance = 0; });
+    dialog.addEventListener("gesturestart", event => event.preventDefault(), { passive: false });
+    dialog.addEventListener("gesturechange", event => event.preventDefault(), { passive: false });
     close.onclick = () => dialog.close();
-    image.onerror = () => { const notice = document.createElement("p"); notice.textContent = "图片暂不可读取，请关闭后重新预览。"; notice.setAttribute("role", "status"); image.remove(); stage.append(notice); };
+    image.onerror = () => { zoom.disabled = true; const notice = document.createElement("p"); notice.textContent = "图片暂不可读取，请返回后重新预览。"; notice.setAttribute("role", "status"); image.remove(); stage.append(notice); };
     dialog.onclick = event => { if (event.target === dialog) dialog.close(); };
-    dialog.onclose = () => { dialog.remove(); preview.current = null; if (trigger.isConnected) trigger.focus({ preventScroll: true }); };
-    header.append(title, zoom, close); stage.append(image); dialog.append(header, stage); document.body.append(dialog); preview.current = dialog; dialog.showModal();
+    dialog.onclose = () => { observer.disconnect(); image.onload = image.onerror = null; dialog.remove(); if (preview.current === dialog) preview.current = null; if (trigger.isConnected) trigger.focus({ preventScroll: true }); };
+    header.append(close, title, zoom); stage.append(image); dialog.append(header, stage); document.body.append(dialog); preview.current = dialog; dialog.showModal();
   }
   return <span className="remote-file-preview">{failed ? <><small role="status">图片暂不可预览，可能文件已变化或服务繁忙。</small><button className="remote-file-retry" type="button" onClick={() => setFailed(false)}>重新预览</button></>
     : <button className="remote-image-open" type="button" aria-label={`放大图片：${alt}`} aria-haspopup="dialog" onClick={event => enlarge(event.currentTarget)}><img className="remote-artifact-image" src={url} alt={alt} loading="lazy" onError={() => setFailed(true)} /></button>}</span>;

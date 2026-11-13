@@ -12,7 +12,7 @@ import { useRemoteWorkspaceController } from "./useRemoteWorkspaceController";
 
 export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { active: boolean; onUnauthorized: () => void; onPanel: () => void; onLogout: () => void }) {
   const c = useRemoteWorkspaceController({ active, onUnauthorized });
-  const { threads, projects, selected, selectedId, selectedProject, archived, creating,
+  const { threads, projects, selected, selectedId, selectedProject, archived, creating, project,
     draftScope, draftProject, defaultsReady, composerView, view, connected, connectionError, activeTurn,
     models, busy, loading, error, draft, images, uncertain, catalogError, fileGeneration, loadingEarlier } = c;
   const [atBottom, setAtBottom] = useState(true);
@@ -48,7 +48,7 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
     rememberAnchor();
   }, [view, draftScope]);
 
-  const composer = <Composer key={draftScope} draft={draft} onDraft={c.changeDraft} images={images} onImages={c.changeImages} view={composerView} models={models} connected={creating ? !!draftProject && defaultsReady : connected} busy={busy} uncertain={uncertain}
+  const composer = <Composer key={draftScope} draft={draft} onDraft={c.changeDraft} images={images} onImages={c.changeImages} view={composerView} models={models} connected={creating ? (project === null || !!draftProject) && defaultsReady : connected} busy={busy} uncertain={uncertain}
     onSend={event => { event.preventDefault(); void c.send().then(started => { if (started) followLatest(); }); }}
     onStop={() => void c.stop()} onSettings={c.changeSettings} catalogError={catalogError} onReloadModels={c.reloadModels} />;
   const notices = <>{error && <p className="remote-client-error" role="alert">{error}</p>}
@@ -56,12 +56,12 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
   const scene = creating ? "create" : selected ? "conversation" : "list";
   return <div className={`remote-codex-workspace${selected || creating ? " has-selection" : ""}`} data-codey-ui="2" data-codey-scene={scene}>
     <HomeSurface threads={threads} projects={projects} selectedId={selectedId} busy={busy} loading={loading} archived={archived} error={!selected && !creating ? error : ""} showHeaderChrome={scene === "list"} onArchived={c.changeArchived} onOpen={c.open} onCreate={c.startCreating} onRefresh={c.refresh} onPanel={onPanel} onLogout={onLogout} />
-    {creating ? <NewSessionSurface projects={projects} project={draftProject} busy={busy} defaultsReady={defaultsReady} onProject={c.startCreating} onBack={c.back} notices={notices}>{composer}</NewSessionSurface>
+    {creating ? <NewSessionSurface projects={projects} project={draftProject} projectless={project === null} busy={busy} defaultsReady={defaultsReady} onProject={c.startCreating} onBack={c.back} notices={notices}>{composer}</NewSessionSurface>
       : <main className="remote-chat">{!selected ? <div className="remote-welcome"><IconDeviceLaptop size={36} stroke={1.25} /><h2>今天想做些什么？</h2><p>选择项目或会话，继续电脑上的工作。</p><button className="remote-primary" onClick={() => c.startCreating()}><IconSquarePlus size={18} />新建会话</button></div> : <>
       <header className="remote-chat-header" data-codey-chrome="header">
         <button className="remote-back remote-icon-button" data-codey-action="back" aria-label="返回会话列表" disabled={busy} onClick={c.back}><IconArrowLeft size={22} /></button>
         <div><h2>{view?.title || selected.title}</h2>
-          <p><span className={connected ? "remote-chat-status-dot is-connected" : "remote-chat-status-dot"} />{selectedProject?.name || selected.cwd.split(/[\\/]/).filter(Boolean).pop() || "当前工作区"}<span>·</span>{connected ? activeTurn ? "正在工作" : "已连接" : connectionError ? "未连接" : "连接中"}</p>
+          <p><span className={connected ? "remote-chat-status-dot is-connected" : "remote-chat-status-dot"} />{selectedProject?.name || (view?.cwd || selected.cwd).split(/[\\/]/).filter(Boolean).pop() || "未指定工作目录"}<span>·</span>{connected ? activeTurn ? "正在工作" : "已连接" : connectionError ? "未连接" : "连接中"}</p>
         </div>
         <button className="remote-icon-button" disabled={busy} aria-label="新建会话" onClick={() => c.startCreating(selectedProject)}><IconSquarePlus size={20} /></button>
         <button className="remote-icon-button" disabled={busy} aria-label="重新连接" onClick={c.reconnect}><IconRefresh size={18} /></button>

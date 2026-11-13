@@ -497,35 +497,22 @@ pub(super) fn action_params(
             if let Some(mode) = args.get("permissionMode") {
                 // Same built-in permission profiles as the desktop composer.
                 // Apply only an explicit selection, leaving custom policies alone.
-                let (profile, approval, sandbox) = match mode.as_str() {
-                    Some("read-only") => (
-                        ":read-only",
-                        "on-request",
-                        json!({"type":"readOnly","networkAccess":false}),
+                let (profile, approval) = match mode.as_str() {
+                    Some("read-only") => (":read-only", json!("on-request")),
+                    Some("auto") => (
+                        ":workspace",
+                        if state["workspaceKind"] == "projectless" {
+                            protocol::projectless_approval_policy()
+                        } else {
+                            json!("on-request")
+                        },
                     ),
-                    Some("auto") => {
-                        let cwd = state["cwd"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                            .ok_or("尚未取得会话工作目录")?;
-                        (
-                            ":workspace",
-                            "on-request",
-                            json!({"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}),
-                        )
-                    }
-                    Some("full-access") => (
-                        ":danger-full-access",
-                        "never",
-                        json!({"type":"dangerFullAccess"}),
-                    ),
+                    Some("full-access") => (":danger-full-access", json!("never")),
                     _ => return Err("权限模式无效".into()),
                 };
-                settings["approvalPolicy"] = json!(approval);
+                settings["approvalPolicy"] = approval;
                 settings["approvalsReviewer"] = json!("user");
-                settings["sandboxPolicy"] = sandbox;
                 settings["permissions"] = json!(profile);
-                settings["activePermissionProfile"] = json!({"id":profile,"extends":null});
             }
             if settings.as_object().is_none_or(|value| value.is_empty()) {
                 return Err("请选择要修改的会话设置".into());
@@ -747,32 +734,25 @@ mod tests {
                 action_params(&state, "settings", &json!({"serviceTier":tier})).unwrap();
             assert_eq!(payload, json!({"threadSettings":{"serviceTier":tier}}));
         }
-        for (mode, profile, sandbox, approval) in [
-            ("read-only", ":read-only", "readOnly", "on-request"),
-            ("auto", ":workspace", "workspaceWrite", "on-request"),
-            (
-                "full-access",
-                ":danger-full-access",
-                "dangerFullAccess",
-                "never",
-            ),
+        for (mode, profile, approval) in [
+            ("read-only", ":read-only", "on-request"),
+            ("auto", ":workspace", "on-request"),
+            ("full-access", ":danger-full-access", "never"),
         ] {
             let (method, _, payload) =
                 action_params(&state, "settings", &json!({"permissionMode":mode})).unwrap();
             let settings = &payload["threadSettings"];
             assert_eq!(method, "thread-follower-update-thread-settings");
             assert_eq!(settings["permissions"], profile);
-            assert_eq!(settings["activePermissionProfile"]["id"], profile);
             assert_eq!(settings["approvalPolicy"], approval);
-            assert_eq!(settings["sandboxPolicy"]["type"], sandbox);
+            assert_eq!(settings["approvalsReviewer"], "user");
+            assert!(
+                settings.get("sandboxPolicy").is_none(),
+                "Native rejects permissions combined with sandboxPolicy"
+            );
+            assert!(settings.get("activePermissionProfile").is_none());
             assert!(settings.get("model").is_none());
             assert!(payload.get("activeTurnId").is_none());
-            if mode == "auto" {
-                assert_eq!(
-                    settings["sandboxPolicy"]["writableRoots"],
-                    json!(["E:/code/codey"])
-                );
-            }
         }
         for args in [
             json!({}),
@@ -788,7 +768,17 @@ mod tests {
         ] {
             assert!(action_params(&state, "settings", &args).is_err());
         }
-        assert!(action_params(&json!({}), "settings", &json!({"permissionMode":"auto"})).is_err());
+        let (_, _, settings) = action_params(
+            &json!({"workspaceKind":"projectless"}),
+            "settings",
+            &json!({"permissionMode":"auto"}),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["threadSettings"]["approvalPolicy"],
+            protocol::projectless_approval_policy()
+        );
+        assert!(settings["threadSettings"].get("sandboxPolicy").is_none());
     }
 
     #[test]

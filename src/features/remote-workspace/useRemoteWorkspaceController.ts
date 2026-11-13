@@ -16,10 +16,10 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const [selected, setSelected] = useState<Thread | null>(null);
   const [search, setSearch] = useState("");
   const [archived, setArchived] = useState(false);
-  const [project, setProject] = useState("");
+  const [project, setProject] = useState<string | null>("");
   const [creating, setCreating] = useState(false);
   const [editor, setEditor] = useState<WorkspaceDraft>(() => restoreWorkspaceDraft(undefined, null));
-  const [creationDefaults, setCreationDefaults] = useState<{ project: string; settings: ThreadSettings } | null>(null);
+  const [creationDefaults, setCreationDefaults] = useState<{ project: string | null; settings: ThreadSettings } | null>(null);
   const [defaultsError, setDefaultsError] = useState("");
   const [defaultsRevision, setDefaultsRevision] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -36,7 +36,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   const modelVersion = useRef(0);
   const drafts = useRef(new Map<string, WorkspaceDraft>());
   const selectedId = selected?.id;
-  const draftScope = creating ? `create:${project}` : selectedId;
+  const draftScope = creating ? project === null ? "create-no-project" : `create:${project}` : selectedId;
   const draftProject = projects.find(item => item.id === project);
   const defaultsReady = creationDefaults?.project === project;
   const composerSettings = { ...defaultThreadSettings(catalog, defaultsReady ? creationDefaults.settings : {}), ...editor.settings };
@@ -90,7 +90,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
       if (nextProjects) {
         setProjects(nextProjects);
         // 刷新目录不能把正在编辑的新会话草稿改绑到另一个项目。
-        if (!creating) setProject(previous => nextProjects.some(item => item.id === previous) ? previous : nextProjects[0]?.id || "");
+        if (!creating) setProject(previous => previous === null ? null : nextProjects.some(item => item.id === previous) ? previous : nextProjects[0]?.id ?? null);
       }
     } catch (cause) { if (current()) { clearRunning(liveAtStart); fail(cause); } }
     finally { if (current() && !background) setLoading(false); controller.abort(); if (listRequest.current === controller) listRequest.current = null; }
@@ -156,7 +156,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   useEffect(() => { if (active) void loadModels(); }, [active, loadModels]);
 
   useEffect(() => {
-    if (!active || !creating || !project) return;
+    if (!active || !creating || project === "") return;
     let disposed = false;
     setCreationDefaults(null); setDefaultsError("");
     void requests.defaults(project).then(settings => {
@@ -177,11 +177,11 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
     if (!session.current || scope.pending || selectedId === thread.id) return;
     selectThread(thread);
   };
-  function startCreating(target?: Project) {
+  function startCreating(target?: Project | null) {
     if (!session.current || scope.pending) return;
-    const next = target?.id || project;
+    const next = target === null ? null : target?.id ?? project;
     setProject(next); setCreating(true); setCreationDefaults(null); setDefaultsRevision(value => value + 1);
-    setSelected(null); setError(""); restoreDraft(`create:${next}`);
+    setSelected(null); setError(""); restoreDraft(next === null ? "create-no-project" : `create:${next}`);
   }
 
   async function run(operation: (current: () => boolean) => Promise<void>) {
@@ -200,7 +200,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
   async function send() {
     if (!session.current || scope.pending || !canSendDraft(editor) || !draftScope || requests.readSubmission(draftScope)) return false;
     if (creating) {
-      if (!draftProject || !defaultsReady) return false;
+      if (project !== null && !draftProject || !defaultsReady) return false;
       const key = draftScope;
       return run(async current => {
         const sent = { ...editor, settings: composerSettings, uncertain: true };
@@ -210,7 +210,7 @@ export function useRemoteWorkspaceController({ active, onUnauthorized }: { activ
         if (!result.id) throw new Error("新建结果尚未确认，请先检查会话列表");
         if (!current()) return;
         requests.forgetSubmission(key); drafts.current.delete(key);
-        selectThread({ id: result.id, title: "新会话", cwd: draftProject.cwd, updatedAt: Date.now() });
+        selectThread({ id: result.id, title: "新会话", cwd: draftProject?.cwd ?? "", updatedAt: Date.now() });
         const next = firstTurnDraft(sent, result.firstTurn);
         setEditor(next);
         if (next.uncertain) {

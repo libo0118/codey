@@ -7,6 +7,7 @@ const thread = { id: "thread", title: "Thread", cwd: "/project", updatedAt: 1 };
 const view = { id: thread.id, status: "idle", turns: [], requests: [], historyComplete: false };
 const catalog = { models: ["model"], default_model: "model", model_metadata: [{ model: "model", supported_reasoning_efforts: ["low", "high"], default_reasoning_effort: "high" }] };
 
+
 function fixture(t, active = true) {
   const browser = installControllerWindow(t);
   const calls = [], sockets = [], journal = new Map();
@@ -84,6 +85,53 @@ test("切换会话和项目隔离草稿，默认值失败可重试，晚到的�
   old.resolve({ model: "old", serviceTier: "priority" }); await h.flush(); assert.equal(h.render().composerView.serviceTier, null);
   h.render().startCreating(projects[0]); h.render(); assert.equal(h.render().draft, "项目草稿");
   h.render().back(); h.render(); h.render().open(thread); h.render(); assert.equal(h.render().draft, "会话草稿"); h.unmount();
+});
+
+test("无项目草稿与项目草稿隔离，读取全局默认值后显式首发且采用原生实际 cwd", async t => {
+  const h = fixture(t); await h.ready();
+  h.render().startCreating(projects[0]); h.render(); h.render().changeDraft("项目草稿"); h.render();
+  h.render().startCreating(null); h.render();
+  assert.equal(h.render().project, null); assert.equal(h.render().draftScope, "create-no-project");
+  assert.deepEqual(h.last("defaults").args, [null]);
+  h.render().changeDraft("无项目草稿"); h.render(); assert.equal(await h.render().send(), false);
+  h.last("defaults").resolve({ model: "model", serviceTier: "default" }); await h.flush();
+  h.render().startCreating(projects[0]); h.render(); assert.equal(h.render().draft, "项目草稿");
+  h.render().startCreating(null); h.render(); assert.equal(h.render().draft, "无项目草稿");
+  h.last("defaults").resolve({ model: "model", serviceTier: "default" }); await h.flush();
+  assert.equal(h.calls.filter(c => c.name === "create").length, 0);
+  const work = h.render().send(); await h.render().send();
+  const create = h.last("create"); assert.equal(create.args[0].args.projectId, null);
+  assert.equal(h.calls.filter(c => c.name === "create").length, 1);
+  create.resolve({ id: "projectless-thread", firstTurn: "accepted" });
+  await work; await h.flush(); assert.equal(h.render().selected.cwd, "");
+  h.sockets.at(-1).handlers.message({ type: "state", state: { ...view, id: "projectless-thread", cwd: "/synthetic/codex-managed" } }); await h.flush();
+  assert.equal(h.render().view.cwd, "/synthetic/codex-managed");
+  assert.equal(h.journal.size, 0); h.unmount();
+});
+
+test("没有已保存项目也能新建，创建未确认保留独立防重记录，不自动重试", async t => {
+  const h = fixture(t); h.render(); h.browser.tick(0);
+  h.last("threads").resolve([]); h.last("projects").resolve([]); h.last("models").resolve(catalog); await h.flush();
+  h.render().startCreating(null); h.render(); h.last("defaults").resolve({ model: "model" }); await h.flush();
+  h.render().changeDraft("无项目首次发送"); h.render(); const work = h.render().send();
+  h.last("create").reject(new Error("创建结果未确认")); await work; await h.flush();
+  assert.equal(h.render().uncertain, true); assert.equal(h.journal.has("create-no-project"), true);
+  assert.equal(await h.render().send(), false); assert.equal(h.calls.filter(c => c.name === "create").length, 1);
+  h.unmount();
+});
+
+test("已有会话完全访问只由显式设置动作提交，等待确认后重连读取真实权限", async t => {
+  const h = fixture(t); await h.ready(); await h.open();
+  assert.equal(h.calls.filter(c => c.name === "action").length, 0);
+  h.render().changeSettings({ permissionMode: "full-access" }); h.render();
+  assert.deepEqual(h.last("action").args, [thread.id, "settings", { permissionMode: "full-access" }]);
+  h.render().changeSettings({ permissionMode: "auto" });
+  assert.equal(h.calls.filter(c => c.name === "action").length, 1);
+  const before = h.sockets.length; h.last("action").resolve({ status: "ok" }); await h.flush();
+  assert.equal(h.sockets.length, before + 1); assert.equal(h.render().connected, false);
+  h.sockets.at(-1).handlers.message({ type: "state", state: { ...view, permissionMode: "full-access" } }); await h.flush();
+  assert.equal(h.render().view.permissionMode, "full-access");
+  assert.equal(h.calls.filter(c => c.name === "submit").length, 0); h.unmount();
 });
 
 test("连接按会话隔离、隐藏清理、断线退避重连且不重放写入，桌面不可用停止自动重试", async t => {

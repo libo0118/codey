@@ -10,7 +10,7 @@ Status: implemented
 
 - `src/remote/cindy/` 从 Cindy `deef17354321527fd857acf62662955139ef2491` 的 HomeSurface、HomeNewTaskButton 与 sessions/new 页面提取 RN render/StyleSheet 切片，经 `react-native-web@0.21.4` 渲染。原始行段、实际改动及未复制部分写在 `SOURCE.md`，Apache-2.0 原许可与新 Web 运行依赖许可均保留。不搬 Expo、云服务、语音、原生 morph、虚拟历史或业务状态模型。
 - 列表由 Cindy 的 chevron/folder/标题/计数项目头、缩进子项、行首状态图标、单行标题和右侧优先状态槽构成。项目子项桌面缩进 25px、手机 27px；标题省略但 DOM `title` 保留全名。只有 `running === true` 呈现橙色运行图标与右侧中性 spinner，未知状态只显示已有时间，不伪造错误、等待或未读。折叠汇总仅观察当前已加载条目，计数明确标注该范围。保留空项目、新建、归档、刷新与深链复制；按用户要求移除列表搜索入口和输入栏，后端既有查询协议不变。
-- 新建页保留底部设备/工作区选择器堆栈和首条消息区域；设备只读显示 `location.host`，工作区仅选择真实已保存项目。草稿、附件、模型、速度、权限和发送仍由原 Composer 与 `c.startCreating/changeSettings/changeDraft/send` 处理。选择项目不创建假会话；默认值成功加载前禁发、附件读取/丢失禁发、项目/会话草稿隔离以及未知写入防重均不变。消息和审批页只接入显式导航标记，不重写认证、CSRF、transport、DTO 或历史增量。
+- 新建页保留底部设备/工作区选择器堆栈和首条消息区域；设备只读显示 `location.host`，工作区选择真实已保存项目或[原生无项目模式](2026-11-13-remote-native-permissions-projectless.md)，实际目录仍由原生管理器决定。草稿、附件、模型、速度、权限和发送仍由原 Composer 与 `c.startCreating/changeSettings/changeDraft/send` 处理。选择项目不创建假会话；默认值成功加载前禁发、附件读取/丢失禁发、项目/会话草稿隔离以及未知写入防重均不变。消息和审批页只接入显式导航标记，不重写认证、CSRF、transport、DTO 或历史增量。
 - 原 `sidebar.tsx` 删除，全部调用方迁到 `HomeSurface`，不保留内部旧别名。当前活动页只有一个标记顶栏；驻留列表仍保留真实 footer 动作，因此未接入 HAP 的网页也能自行导航。
 - RNWeb Pressable 用 `data-cindy-control` 声明样式所有权，原 Web 通用按钮规则通过零特异性的 `:where(:not(...))` 排除这些控件，不覆盖 Cindy 的圆形新建入口和透明列表行。图标、菜单及选择器仍保留至少 44px 点击区，不用缩小热区换取紧凑外观。
 

@@ -133,7 +133,7 @@ export function Composer({ draft, onDraft, images, onImages, view, models, conne
         </div>
       </div>
     </form>
-    <p className="remote-composer-note" role="status">{reading ? "正在读取附件…" : notice || (busy ? "正在同步…" : active ? "任务在电脑上继续执行 · 设置用于后续轮次" : permission === "full-access" ? "完全访问：可修改电脑文件并访问网络" : "任务在电脑的原工作区中执行")}{fileNotice}</p>
+    <p className="remote-composer-note" role="status">{reading ? "正在读取附件…" : notice || (busy ? "正在同步…" : active ? "任务在电脑上继续执行 · 设置用于后续轮次" : permission === "full-access" ? "完全访问：可修改电脑文件并访问网络" : "任务在电脑上按所选权限执行")}{fileNotice}</p>
     <dialog ref={sheet} id={`${id}-advanced`} className="remote-advanced-sheet" aria-label="高级设置" tabIndex={-1} data-keyboard-navigation={keyboardNavigation || undefined} onPointerDownCapture={() => setKeyboardNavigation(false)} onKeyDownCapture={event => { if (event.key === "Tab") setKeyboardNavigation(true); }} onCancel={event => { event.preventDefault(); setAdvanced(false); }} onClick={event => {
       if (event.target !== event.currentTarget) return;
       const bounds = event.currentTarget.getBoundingClientRect();
