@@ -41,6 +41,23 @@ The following attribution is reproduced verbatim from FastCtx's NOTICE:
 
 ## Selectively adapted integrations
 
+The project/session list and new-conversation surfaces in `src/remote/cindy/`
+adapt React Native render and StyleSheet slices from
+[makecindy/cindy](https://github.com/makecindy/cindy/tree/deef17354321527fd857acf62662955139ef2491),
+commit `deef17354321527fd857acf62662955139ef2491`, under Apache-2.0.
+The original license is preserved in `licenses/Cindy/LICENSE`; modified files
+identify their source and changes in `src/remote/cindy/SOURCE.md`.
+This is a selective, modified integration and does not imply endorsement.
+
+The remote bundle renders these slices using `react-native-web@0.21.4` (MIT).
+Its bundled dependencies are `@babel/runtime@7.29.7` (MIT),
+`@react-native/normalize-colors@0.74.89` (MIT), `fbjs@3.0.5` (MIT),
+`inline-style-prefixer@7.0.1` (MIT), `css-in-js-utils@3.1.0` (MIT),
+`hyphenate-style-name@1.1.0` (BSD-3-Clause), and `styleq@0.1.3` (MIT).
+Their copyright and license texts are preserved in
+`licenses/react-native-web.LICENSES.txt`. The `react-native` dependency of
+`@types/react-native-web` is development-only and is not bundled.
+
 The optional CodeGraph/Ponytail management, remote sessions, session retention,
 and configuration backup adapt source from
 [fraternity-z/CodeyX](https://github.com/fraternity-z/CodeyX/tree/30e1daa4861762626628e6c2805366cd6519e6f2),

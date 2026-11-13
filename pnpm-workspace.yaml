@@ -1,5 +1,7 @@
 allowBuilds:
   esbuild: true
+overrides:
+  '@types/react-native-web>react-native': 0.80.3
 minimumReleaseAgeExclude:
   - '@internationalized/number@3.6.9'
   - '@react-types/shared@3.37.0'

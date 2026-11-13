@@ -3,11 +3,12 @@ import test from "node:test";
 import * as React from "react";
 import * as jsx from "react/jsx-runtime";
 import * as icons from "@tabler/icons-react";
+import * as nativeWeb from "react-native-web";
 import MarkdownIt from "markdown-it";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createModuleGraph } from "./helpers/jsx-tree.mjs";
 
-const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
+const real = { react: React, "react/jsx-runtime": jsx, "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const graph = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real });
 const { RichText, ConversationTurn } = graph.exports;
 const realFiles = createModuleGraph(new URL("../src/remote/files.tsx", import.meta.url), { stubs: real }).exports;

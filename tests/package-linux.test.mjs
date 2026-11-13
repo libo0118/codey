@@ -16,7 +16,22 @@ const licenseFiles = [
   ["licenses/FastCtx/LICENSE-APACHE", "licenses/FastCtx/LICENSE-APACHE"],
   ["licenses/FastCtx/NOTICE", "licenses/FastCtx/NOTICE"],
   ["vendor/ComputerUse/LICENSE", "licenses/ComputerUse/LICENSE"],
+  ["licenses/Cindy/LICENSE", "licenses/Cindy/LICENSE"],
+  ["src/remote/cindy/SOURCE.md", "licenses/Cindy/SOURCE.md"],
+  ["licenses/react-native-web.LICENSES.txt", "licenses/react-native-web.LICENSES.txt"],
 ];
+
+test("desktop packaging recipes retain Cindy and RNWeb license texts and slice provenance", async () => {
+  for (const script of ["scripts/build.mjs", "scripts/package-linux.mjs"]) {
+    const text = await readFile(join(root, script), "utf8");
+    for (const [source] of licenseFiles.slice(-3)) assert.ok(text.includes(source), `${script}: ${source}`);
+  }
+  const nsis = await readFile(join(root, "scripts/installer/windows/Codey.nsi"), "utf8");
+  assert.ok(nsis.includes('File "${PROJECT_ROOT}\\licenses\\Cindy\\LICENSE"'));
+  assert.ok(nsis.includes('File "/oname=SOURCE.md" "${PROJECT_ROOT}\\src\\remote\\cindy\\SOURCE.md"'));
+  assert.ok(nsis.includes('File "${PROJECT_ROOT}\\licenses\\react-native-web.LICENSES.txt"'));
+  assert.ok(nsis.includes('Delete "$INSTDIR\\licenses\\Cindy\\SOURCE.md"'));
+});
 
 async function fixture(directory) {
   await writeFile(join(directory, "package.json"), '{"version":"1.2.3-libo.1"}');

@@ -68,6 +68,9 @@ for (const [source, destination] of [
   ["licenses/FastCtx/LICENSE-APACHE", "licenses/FastCtx/LICENSE-APACHE"],
   ["licenses/FastCtx/NOTICE", "licenses/FastCtx/NOTICE"],
   ["vendor/ComputerUse/LICENSE", "licenses/ComputerUse/LICENSE"],
+  ["licenses/Cindy/LICENSE", "licenses/Cindy/LICENSE"],
+  ["src/remote/cindy/SOURCE.md", "licenses/Cindy/SOURCE.md"],
+  ["licenses/react-native-web.LICENSES.txt", "licenses/react-native-web.LICENSES.txt"],
 ]) {
   const bundledDestination = join(resources, ...destination.split("/"));
   mkdirSync(dirname(bundledDestination), { recursive: true });

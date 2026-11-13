@@ -169,7 +169,8 @@ test("invalid connection renders an unavailable header and read-only conversatio
   const Composer = createStub("Composer");
   const graph = createModuleGraph(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), { autoStub: true, stubs: {
     "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
-    "../../remote/sidebar": { Sidebar: createStub("Sidebar") },
+    "../../remote/cindy/HomeSurface": { HomeSurface: createStub("HomeSurface") },
+    "../../remote/cindy/NewSessionSurface": { NewSessionSurface: createStub("NewSessionSurface") },
     "../../remote/composer": { Composer },
     "../../remote/messages": { ConversationTurn: createStub("ConversationTurn"), RichText: createStub("RichText") },
   } });

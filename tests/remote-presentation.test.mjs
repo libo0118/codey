@@ -3,12 +3,13 @@ import test from "node:test";
 import * as React from "react";
 import * as jsx from "react/jsx-runtime";
 import * as icons from "@tabler/icons-react";
+import * as nativeWeb from "react-native-web";
 import MarkdownIt from "markdown-it";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createControllerHarness } from "./helpers/controller-harness.mjs";
 import { collectElements, createModuleGraph, textContent } from "./helpers/jsx-tree.mjs";
 
-const stubs = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
+const stubs = { react: React, "react/jsx-runtime": jsx, "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs }).exports;
 const render = messages => renderToStaticMarkup(React.createElement(ConversationTurn, { turn: { id: "turn", status: "completed", messages } }));
 const user = text => ({ id: "user", kind: "userMessage", role: "user", text });
@@ -55,7 +56,7 @@ test("过程展开才创建详情，嵌套详情关闭不折叠整个过程", ()
     ] } });
     const group = collectElements(tree, node => Array.isArray(node.props.messages))[0];
     return group.type(group.props);
-  }, { "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
+  }, { "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
   try {
     let tree = h.render(); assert.match(textContent(tree), /正在工作/);
     assert.equal(collectElements(tree, node => node.props.message).length, 0);
@@ -88,7 +89,7 @@ test("过程摘要只用最新公开动作，不提前创建工具输出或思�
 });
 
 test("问题卡默认可折叠，选项和手写答案仍只在明确提交后发送", async () => {
-  const graph = createModuleGraph(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), { stubs: { "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": {} } });
+  const graph = createModuleGraph(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), { stubs: { "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": {} } });
   const calls = [], request = { id: "async:q", method: "codey/requestUserInputAsync", supported: true, params: { questions: [{ id: "q", question: "选哪个？", options: [{ label: "第一项" }, { label: "第二项" }] }] } };
   const props = { request, disabled: false, onRespond: async args => calls.push(args) };
   let tree = graph.exports.ApprovalCard(props);

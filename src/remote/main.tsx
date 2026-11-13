@@ -11,6 +11,7 @@ import "../tailwind.css";
 import "../styles.css";
 import "../styles.integrations.css";
 import "./styles.css";
+import "./cindy/styles.css";
 
 window.__codeyRemoteMode = true;
 installRemoteClipboard();
@@ -42,7 +43,7 @@ function RemoteApp() {
   </form></main>;
 
   return <div className="remote-shell" aria-busy={c.busy}>
-    {tab === "panel" && <header className="remote-topbar"><button aria-label="返回 Codex" onClick={() => setTab("workspace")}><IconArrowLeft size={18} /></button><strong>Codey 控制台</strong><button disabled={c.busy} aria-label="注销登录" onClick={() => void c.logout()}><IconLogout size={18} /></button></header>}
+    {tab === "panel" && <header className="remote-topbar"><button data-codey-console-back="" aria-label="返回 Codex" onClick={() => setTab("workspace")}><IconArrowLeft size={18} /></button><strong>Codey 控制台</strong><button disabled={c.busy} aria-label="注销登录" onClick={() => void c.logout()}><IconLogout size={18} /></button></header>}
     <div className="remote-codex-workspace-container" hidden={tab !== "workspace"}><Workspace active={tab === "workspace" && !c.busy} onUnauthorized={c.unauthorized} onPanel={() => setTab("panel")} onLogout={() => void c.logout()} /></div>
     {tab === "panel" && <div className="remote-panel"><ReadOnlyConsole active={tab === "panel"} /></div>}
     {c.error && <p className="remote-client-error" role="alert">{c.error}</p>}

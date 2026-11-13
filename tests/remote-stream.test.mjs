@@ -3,6 +3,7 @@ import test from "node:test";
 import * as React from "react";
 import * as jsx from "react/jsx-runtime";
 import * as icons from "@tabler/icons-react";
+import * as nativeWeb from "react-native-web";
 import MarkdownIt from "markdown-it";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createControllerHarness, installControllerWindow } from "./helpers/controller-harness.mjs";
@@ -11,7 +12,7 @@ import { largeRemoteView, remoteWindow } from "./fixtures/bounded-remote-stream.
 
 const state = createModuleGraph(new URL("../src/features/remote-workspace/state.ts", import.meta.url)).exports;
 const full = largeRemoteView(), initial = remoteWindow(full);
-const real = { react: React, "react/jsx-runtime": jsx, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
+const real = { react: React, "react/jsx-runtime": jsx, "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt };
 const message = { id: "new", role: "assistant", kind: "agentMessage", text: "Mock new answer" };
 const delta = (patches, baseRevision = 1) => ({ type: "delta", baseRevision, revision: baseRevision + 1, patches });
 
@@ -50,7 +51,7 @@ test("真实 Activity hook 仅在展开时创建正文，流更新不控制原�
     const outer = group.type(group.props);
     const child = collectElements(outer, node => node.props.message?.id === props.message.id)[0];
     return child ? child.type(child.props) : outer;
-  }, { "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
+  }, { "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
   const message = full.turns[0].messages[199];
   let body = a.render({ message });
   assert.equal(body.props.open, undefined); assert.doesNotMatch(textContent(body), /Mock lazy detail body/);
@@ -71,7 +72,7 @@ test("真实 Workspace prepend 保持阅读锚点、草稿和文件 scope；普�
   const c = { view: initial, composerView: initial, selected: { id: initial.id, title: "Mock", cwd: "D:/Mock" }, selectedId: initial.id,
     draftScope: initial.id, threads: [], projects: [], models: [], connected: true, busy: false, fileGeneration: 1, draft: "保留 Mock 草稿", images: [], loadHistory: () => history++ };
   const h = createControllerHarness(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), "Workspace", {
-    "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
+    "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
   });
   const props = { active: true, onUnauthorized() {}, onPanel() {}, onLogout() {} };
   let tree = h.render(props);
@@ -100,7 +101,7 @@ test("查看过程暂停跟随，原生折叠回弹不恢复；主动滚到底�
   const c = { view: initial, composerView: initial, selected: { id: initial.id, title: "Mock", cwd: "D:/Mock" }, selectedId: initial.id,
     draftScope: initial.id, threads: [], projects: [], models: [], connected: true, busy: false, images: [], send: async () => true };
   const h = createControllerHarness(new URL("../src/features/remote-workspace/Workspace.tsx", import.meta.url), "Workspace", {
-    "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
+    "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt, "./useRemoteWorkspaceController": { useRemoteWorkspaceController: () => c },
   });
   try {
     let tree = h.render({ active: true, onUnauthorized() {}, onPanel() {}, onLogout() {} });
