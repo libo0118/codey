@@ -79,6 +79,7 @@ function approval(value: unknown): value is Approval {
 function conversation(value: unknown): value is View {
   return record(value) && typeof value.id === "string" && typeof value.historyComplete === "boolean"
     && (value.hasEarlierMessages === undefined || typeof value.hasEarlierMessages === "boolean")
+    && (value.historyRevision === undefined || typeof value.historyRevision === "number" && Number.isSafeInteger(value.historyRevision) && value.historyRevision >= 0)
     && [value.title, value.cwd, value.status, value.model, value.effort].every(nullableString) && optionalString(value.permissionMode)
     && (value.serviceTier === null || optionalString(value.serviceTier))
     && (value.threadGoal == null || isGoal(value.threadGoal))

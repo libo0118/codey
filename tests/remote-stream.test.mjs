@@ -6,7 +6,7 @@ import * as icons from "@tabler/icons-react";
 import * as nativeWeb from "react-native-web";
 import MarkdownIt from "markdown-it";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createControllerHarness, installControllerWindow } from "./helpers/controller-harness.mjs";
+import { createControllerHarness, deferred, installControllerWindow } from "./helpers/controller-harness.mjs";
 import { collectElements, createModuleGraph, textContent } from "./helpers/jsx-tree.mjs";
 import { largeRemoteView, remoteWindow } from "./fixtures/bounded-remote-stream.mjs";
 
@@ -85,7 +85,7 @@ test("真实 Workspace prepend 保持阅读锚点、草稿和文件 scope；普�
   transcript().props.ref.current = container;
   container.scrollTop = 600; transcript().props.onScroll({ currentTarget: container }); tree = h.render();
   const scope = fileScope(), top = nodes[6].getBoundingClientRect().top;
-  const button = collectElements(tree, node => node.type === "button" && textContent(node) === "加载更早内容")[0];
+  const button = collectElements(tree, node => node.type === "button" && textContent(node) === "加载更早对话记录")[0];
   button.props.onClick(); assert.equal(history, 1);
   prepend = 500; container.scrollHeight += 500; c.view = remoteWindow(full, 70); tree = h.render();
   assert.equal(container.scrollTop, 1100); assert.equal(nodes[6].getBoundingClientRect().top, top);
@@ -158,16 +158,94 @@ test("增量输入拒绝未知操作、坏 pointer、原型路径、越界、缺
 function fixture(t) {
   let h;
   t.after(() => h?.unmount());
-  const browser = installControllerWindow(t), sockets = [];
+  const browser = installControllerWindow(t), sockets = [], reads = [];
   let unauthorized = 0;
   const requests = { session: async () => ({}), unauthorized: error => error?.status === 401,
+    action(...args) { const call = { args, ...deferred() }; reads.push(call); return call.promise; },
     connect(id, handlers) { const socket = { id, handlers, closed: 0, historyCalls: 0, close() { this.closed++; }, history() { this.historyCalls++; } }; sockets.push(socket); return socket; } };
   h = createControllerHarness(new URL("../src/features/remote-workspace/useRemoteConversationController.ts", import.meta.url), "useRemoteConversationController", { "./requests": { remoteWorkspaceRequests: requests } });
   const options = { active: true, id: initial.id }, render = () => h.render(options.active, options.id, () => unauthorized++);
   const frame = (event, socket = sockets.at(-1)) => { const parsed = state.conversationEvent(event); if (parsed) socket.handlers.message(parsed); };
   render();
-  return { ...h, render, sockets, frame, browser, options, get unauthorized() { return unauthorized; } };
+  return { ...h, render, sockets, frame, browser, options, reads, get unauthorized() { return unauthorized; } };
 }
+
+test("Native 历史未完整时一次点击补读并等待对话记录，不提前结束加载或重连", async t => {
+  const h = fixture(t);
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, hasEarlierMessages: false, historyComplete: false } });
+  assert.equal(h.render().loadEarlier(), true); assert.equal(h.render().loadEarlier(), false);
+  assert.deepEqual(h.reads[0].args, [initial.id, "history"]); assert.equal(h.sockets[0].historyCalls, 1);
+  h.reads[0].resolve({ status: "ok" }); await h.flush();
+  assert.equal(h.render().loadingEarlier, true, "RPC ACK 不是对话记录已送达");
+  h.frame(delta([{ op: "replace", path: "", value: { ...remoteWindow(full, 70), historyComplete: true } }]));
+  assert.equal(h.render().loadingEarlier, false); assert.equal(h.sockets.length, 1);
+});
+
+test("Native 历史读取失败仅结束加载并允许显式重试，普通聊天连接保持有效", async t => {
+  const h = fixture(t);
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, hasEarlierMessages: false, historyComplete: false } });
+  h.render().loadEarlier(); h.reads[0].reject(new Error("Native history unavailable")); await h.flush();
+  assert.equal(h.render().loadingEarlier, false); assert.equal(h.render().connected, true);
+  assert.equal(h.render().historyError, "Native history unavailable"); assert.equal(h.reads.length, 1);
+  assert.equal(h.render().loadEarlier(), true); assert.equal(h.reads.length, 2);
+});
+
+test("过程变化与首条实时回复不能提前结束尚无对话的 Native 历史加载", async t => {
+  const h = fixture(t);
+  const activity = { id: "live-step", role: "activity", kind: "reasoning", text: "public summary" };
+  const current = { ...initial, hasEarlierMessages: false, historyComplete: false, turns: [{ id: "live", status: "inProgress", messages: [activity] }] };
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: current }); h.render().loadEarlier();
+  h.frame(delta([{ op: "add", path: "/turns/0/messages/0", value: { ...activity, id: "inserted-step" } }]));
+  assert.equal(h.render().loadingEarlier, true);
+  h.frame(delta([{ op: "add", path: "/turns/0/messages/-", value: { id: "live-answer", role: "assistant", kind: "agentMessage", text: "live answer" } }], 2));
+  assert.equal(h.render().loadingEarlier, true); assert.equal(h.reads.length, 1);
+  h.reads[0].resolve({ status: "ok" }); await h.flush();
+  h.frame(delta([{ op: "replace", path: "", value: { ...current, historyComplete: true, hasEarlierMessages: true, turns: [{ ...current.turns[0], messages: [{ id: "old-answer", role: "assistant", kind: "agentMessage", text: "older answer" }, activity] }] } }], 3));
+  assert.equal(h.render().loadingEarlier, false);
+});
+
+test("本地更早记录在加载期间消失时补读 Native，旧会话读取错误不污染新会话", async t => {
+  const h = fixture(t);
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, historyComplete: false } });
+  h.render().loadEarlier(); assert.equal(h.reads.length, 0);
+  h.frame(delta([{ op: "replace", path: "/hasEarlierMessages", value: false }]));
+  assert.equal(h.reads.length, 1); assert.equal(h.render().loadingEarlier, true);
+  h.options.id = "other"; h.render();
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, id: "other", hasEarlierMessages: false, historyComplete: false } });
+  h.render().loadEarlier(); h.reads[0].reject({ status: 401 }); await h.flush();
+  assert.equal(h.unauthorized, 0); assert.equal(h.render().loadingEarlier, true); assert.equal(h.render().historyError, "");
+  h.reads[1].resolve({ status: "ok" }); await h.flush();
+  h.frame(delta([{ op: "replace", path: "/historyComplete", value: true }]));
+  assert.equal(h.render().loadingEarlier, false);
+});
+
+test("新流只由历史读取回执结束加载，删除首条对话或过程更新不充当回执", t => {
+  const h = fixture(t);
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, historyRevision: 0 } });
+  h.render().loadEarlier();
+  h.frame(delta([{ op: "remove", path: "/turns/0" }]));
+  assert.equal(h.render().loadingEarlier, true);
+  h.frame(delta([{ op: "replace", path: "/historyRevision", value: 1 }], 2));
+  assert.equal(h.render().loadingEarlier, false);
+});
+
+test("历史回执数值在网络边界校验，已声明的回执不能撤回或倒退", t => {
+  for (const historyRevision of [-1, 0.5, "1", Number.MAX_SAFE_INTEGER + 1]) assert.throws(() => state.conversationEvent({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, historyRevision } }), /数据无效/);
+  for (const patch of [{ op: "remove", path: "/historyRevision" }, { op: "replace", path: "/historyRevision", value: 1 }]) {
+    const h = fixture(t);
+    h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, historyRevision: 2 } });
+    h.frame(delta([patch])); assert.equal(h.render().connected, false); assert.match(h.render().connectionError, /数据无效/); h.unmount();
+  }
+});
+
+test("Native 补读的 401 立即撤销当前连接，迟到状态不再恢复在线", async t => {
+  const h = fixture(t);
+  h.frame({ type: "state", streamVersion: 2, revision: 1, state: { ...initial, hasEarlierMessages: false, historyComplete: false } });
+  const socket = h.sockets[0]; h.render().loadEarlier(); h.reads[0].reject({ status: 401 }); await h.flush();
+  assert.equal(h.unauthorized, 1); assert.equal(h.render().connected, false); assert.equal(socket.closed, 1);
+  h.frame(delta([{ op: "replace", path: "/historyComplete", value: true }]), socket);
+  assert.equal(h.render().connected, false); assert.equal(h.render().loadEarlier(), false);
+});
 
 test("真实订阅接受 v2 首帧与目标增量，历史只读单 flight，不重连或重放写操作", t => {
   const h = fixture(t);

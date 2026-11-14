@@ -58,7 +58,7 @@ function fixture(t) {
   return { ...h, render, ready, browser, options, sockets, calls, journal, last, get unauthorized() { return unauthorized; } };
 }
 
-test("新 URL 协商 v2，旧服务完整帧兼容；ack/error 不伪造连接，历史优先只读 WS 且不自动扩展 Native", async t => {
+test("新 URL 协商 v2，旧服务完整帧兼容；历史优先只读 WS，显式补读 Native 后仍扩展窗口", async t => {
   const h = fixture(t); await h.ready(false); const socket = h.sockets[0];
   assert.equal(socket.url, "wss://mobile.invalid/remote/events/thread?stream=2");
   socket.frame({ type: "ack", requestId: "Mock-ack" }); socket.frame({ type: "error", message: "Mock ignored" });
@@ -76,7 +76,7 @@ test("新 URL 协商 v2，旧服务完整帧兼容；ack/error 不伪造连接�
   h.last("/remote/action").resolve({}); await work; h.render(); assert.equal(h.sockets.length, 1, "v2 Native 历史读取也不为分页重连");
   h.render().reconnect(); h.render(); assert.equal(h.sockets.length, 2);
   assert.equal(h.render().connected, false); h.sockets[1].frame({ type: "state", state: view }); assert.equal(h.render().connected, true);
-  assert.equal(h.render().draft, "保留草稿"); assert.equal(socket.sent.length, 1);
+  assert.equal(h.render().draft, "保留草稿"); assert.deepEqual(socket.sent, ['{"type":"history"}', '{"type":"history"}']);
 });
 
 for (const [label, bad] of [
@@ -180,7 +180,7 @@ test("invalid connection renders an unavailable header and read-only conversatio
   assert.match(textContent(find(node => elementProps(node).className === "remote-connection")), /数据无效/);
   assert.equal(elementProps(find(node => elementType(node) === Composer)).connected, false);
   assert.equal(elementProps(find(node => elementType(node)?.name === "ApprovalCard")).disabled, true);
-  assert.equal(elementProps(find(node => elementType(node) === "button" && textContent(node) === "加载完整历史")).disabled, true);
+  assert.equal(elementProps(find(node => elementType(node) === "button" && textContent(node) === "加载完整对话记录")).disabled, true);
 });
 
 for (const action of ["history", "settings"]) {

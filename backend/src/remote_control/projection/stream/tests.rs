@@ -297,23 +297,23 @@ fn initial_window_counts_visible_bodies_not_interleaved_activity_or_empty_messag
         &ids(&client)[ids(&client).len() - 2..],
         &["live-activity", "live-body"]
     );
-    for (first, more) in [("body-15", true), ("body-5", true), ("body-0", false)] {
-        window.expand();
-        receive(
-            &mut encoder,
-            snapshot(&mut projection, &state, &mut window),
-            &mut client,
-            &mut revision,
-        );
-        assert_eq!(ids(&client).first(), Some(&first));
-        assert_eq!(ids(&client).last(), Some(&"live-body"));
-        assert_eq!(client["hasEarlierMessages"], more);
-    }
-    assert_eq!(ids(&client).len(), 227);
+    window.expand();
+    receive(
+        &mut encoder,
+        snapshot(&mut projection, &state, &mut window),
+        &mut client,
+        &mut revision,
+    );
+    assert_eq!(ids(&client).first(), Some(&"body-0"));
+    assert_eq!(ids(&client).last(), Some(&"live-body"));
+    assert_eq!(client["hasEarlierMessages"], false);
+    assert_eq!(ids(&client).len(), 127);
+    assert!(!ids(&client).contains(&"tool-24"));
+    assert!(ids(&client).contains(&"tool-25"));
 }
 
 #[test]
-fn activity_only_initial_window_is_still_bounded_and_history_remains_available() {
+fn activity_only_initial_window_is_bounded_and_does_not_offer_dialogue_history() {
     let small = json!({"turns":[{"turnId":"turn","status":"inProgress","items":(0..35).map(|id| json!({"id":format!("small-{id}"),"type":"reasoning","summary":["public"]})).collect::<Vec<_>>()}]});
     let mut projection = Projection::default();
     let small_view = snapshot(&mut projection, &small, &mut MessageWindow::default());
@@ -331,18 +331,12 @@ fn activity_only_initial_window_is_still_bounded_and_history_remains_available()
     let initial_ids = ids(view(&first));
     assert!(initial_ids.len() > 1 && initial_ids.len() < 10);
     assert_eq!(initial_ids.last(), Some(&"activity-9"));
-    assert_eq!(view(&first)["hasEarlierMessages"], true);
+    assert_eq!(view(&first)["hasEarlierMessages"], false);
     assert!(view(&first).to_string().len() <= 8 * 1024 * 1024 + 2048);
-    let mut previous_count = initial_ids.len();
-    while previous_count < 10 {
-        window.expand();
-        let expanded = snapshot(&mut projection, &state, &mut window);
-        let expanded_ids = ids(view(&expanded));
-        assert!(expanded_ids.len() > previous_count);
-        assert_eq!(expanded_ids.last(), Some(&"activity-9"));
-        previous_count = expanded_ids.len();
-        assert_eq!(view(&expanded)["hasEarlierMessages"], previous_count < 10);
-    }
+    window.expand();
+    let expanded = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&expanded)), initial_ids);
+    assert_eq!(view(&expanded)["hasEarlierMessages"], false);
 
     state["turns"][0]["items"].as_array_mut().unwrap().insert(
         0,
@@ -353,18 +347,92 @@ fn activity_only_initial_window_is_still_bounded_and_history_remains_available()
     let limited = snapshot(&mut projection, &state, &mut fresh);
     assert!(!ids(view(&limited)).contains(&"earlier-body"));
     assert_eq!(view(&limited)["hasEarlierMessages"], true);
-    let mut reached_body = false;
-    for _ in 0..10 {
-        fresh.expand();
-        let more = snapshot(&mut projection, &state, &mut fresh);
-        if ids(view(&more)).contains(&"earlier-body") {
-            assert_eq!(view(&more)["hasEarlierMessages"], false);
-            reached_body = true;
-            break;
-        }
-        assert_eq!(view(&more)["hasEarlierMessages"], true);
-    }
-    assert!(reached_body);
+    fresh.expand();
+    let more = snapshot(&mut projection, &state, &mut fresh);
+    assert_eq!(ids(view(&more)).first(), Some(&"earlier-body"));
+    assert_eq!(view(&more)["hasEarlierMessages"], false);
+}
+
+#[test]
+fn earlier_pages_count_dialogue_only_and_keep_recent_and_live_processes() {
+    let mut state = json!({"turns":(0..95).map(|index|json!({"turnId":format!("turn-{index}"),"status":"completed","items":[
+        if index == 37 { json!({"id":"body-37","type":"userMessage","content":[{"type":"file","path":"/synthetic/report.txt"}]}) } else { json!({"id":format!("body-{index}"),"type":"agentMessage","text":"answer"}) },
+        {"id":format!("empty-{index}"),"type":"agentMessage","text":" "},
+        {"id":format!("step-{index}"),"type":"reasoning","summary":["x".repeat(12000)]}
+    ]})).collect::<Vec<_>>()});
+    let mut projection = Projection::default();
+    let mut window = MessageWindow::default();
+    let first = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&first)).first(), Some(&"body-75"));
+    window.expand();
+    let more = snapshot(&mut projection, &state, &mut window);
+    let loaded = ids(view(&more));
+    assert_eq!(loaded.first(), Some(&"body-25"));
+    assert_eq!(
+        loaded.iter().filter(|id| id.starts_with("body-")).count(),
+        70
+    );
+    assert!(!loaded.contains(&"step-74"));
+    assert!(!loaded.contains(&"empty-74"));
+    assert!(loaded.contains(&"step-75"));
+    assert!(loaded.contains(&"body-37"));
+    assert_eq!(view(&more)["hasEarlierMessages"], true);
+    apply(
+        &mut projection,
+        &mut state,
+        json!([{"op":"add","path":"/turns/94/items/-","value":{"id":"live-step","type":"commandExecution","command":"live"}}]),
+    );
+    let live = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&live)).first(), Some(&"body-25"));
+    assert_eq!(ids(view(&live)).last(), Some(&"live-step"));
+    assert!(!ids(view(&live)).contains(&"step-74"));
+    window.expand();
+    let oldest = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&oldest)).first(), Some(&"body-0"));
+    assert_eq!(view(&oldest)["hasEarlierMessages"], false);
+}
+
+#[test]
+fn an_expansion_waits_for_native_backfill_without_revealing_historical_processes() {
+    let mut state = json!({"turnsPagination":{"hasLoadedOldest":false},"turns":[{"turnId":"active","status":"inProgress","items":[{"id":"latest","type":"agentMessage","text":"latest answer"},{"id":"live-step","type":"reasoning","summary":["live"]}]}]});
+    let mut projection = Projection::default();
+    let mut window = MessageWindow::default();
+    let first = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(view(&first)["historyComplete"], false);
+    assert_eq!(view(&first)["hasEarlierMessages"], false);
+    window.expand();
+    assert!(snapshot(&mut projection, &state, &mut window).as_ref() == first.as_ref());
+    state["turns"][0]["items"].as_array_mut().unwrap().splice(0..0, [json!({"id":"old-body","type":"userMessage","content":[{"type":"text","text":"old question"}]}), json!({"id":"old-step","type":"reasoning","summary":["old process"]})]);
+    state["turnsPagination"]["hasLoadedOldest"] = json!(true);
+    projection.reset();
+    let more = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&more)), ["old-body", "latest", "live-step"]);
+    assert_eq!(view(&more)["historyComplete"], true);
+    assert_eq!(view(&more)["historyRevision"], 1);
+}
+
+#[test]
+fn the_first_live_message_is_not_an_ack_for_pending_native_history() {
+    let mut state = json!({"turnsPagination":{"hasLoadedOldest":false},"turns":[{"turnId":"active","status":"inProgress","items":[]}]});
+    let mut projection = Projection::default();
+    let mut window = MessageWindow::default();
+    snapshot(&mut projection, &state, &mut window);
+    window.expand();
+    snapshot(&mut projection, &state, &mut window);
+    apply(
+        &mut projection,
+        &mut state,
+        json!([{"op":"add","path":"/turns/0/items/-","value":{"id":"first-live","type":"agentMessage","text":"live answer"}}]),
+    );
+    let live = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&live)), ["first-live"]);
+    assert_eq!(view(&live)["historyRevision"], 0);
+    state["turns"].as_array_mut().unwrap().insert(0, json!({"turnId":"old","status":"completed","items":[{"id":"old-body","type":"agentMessage","text":"old answer"},{"id":"old-process","type":"reasoning","summary":["old"]}]}));
+    state["turnsPagination"]["hasLoadedOldest"] = json!(true);
+    projection.reset();
+    let more = snapshot(&mut projection, &state, &mut window);
+    assert_eq!(ids(view(&more)), ["old-body", "first-live"]);
+    assert_eq!(view(&more)["historyRevision"], 1);
 }
 
 #[test]

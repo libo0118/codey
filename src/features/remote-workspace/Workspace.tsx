@@ -76,7 +76,8 @@ export function Workspace({ active, onUnauthorized, onPanel, onLogout }: { activ
           onWheelCapture={() => { inspecting.current = false; }} onTouchMoveCapture={() => { inspecting.current = false; }}
           onKeyDownCapture={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) inspecting.current = false; }}
           onScroll={event => { const element = event.currentTarget; pinned.current = !inspecting.current && element.scrollHeight - element.scrollTop - element.clientHeight < 100; setAtBottom(pinned.current); rememberAnchor(); }}>
-          {view && (view.hasEarlierMessages || !view.historyComplete) && <button disabled={busy || loadingEarlier || !connected} onClick={() => { pauseFollowing(); void c.loadHistory(); }}>{loadingEarlier ? "正在加载更早内容…" : view.hasEarlierMessages ? "加载更早内容" : "加载完整历史"}</button>}
+          {view && (view.hasEarlierMessages || !view.historyComplete) && <button disabled={busy || loadingEarlier || !connected} onClick={() => { pauseFollowing(); void c.loadHistory(); }}>{loadingEarlier ? "正在加载更早对话记录…" : view.hasEarlierMessages !== undefined ? "加载更早对话记录" : "加载完整对话记录"}</button>}
+          {c.historyError && <p className="remote-client-error" role="alert">{c.historyError}</p>}
           {!view && <p className="remote-chat-loading">{connectionError ? "暂时无法读取会话，请点击重新连接。" : "正在获取桌面会话…"}</p>}
           {view?.turns.length === 0 && <div className="remote-chat-empty"><h2>从一个想法开始</h2><p>{`描述任务，让 Codex 在 ${selectedProject?.name || "当前工作区"} 中开始工作。`}</p></div>}
           {view?.turns.map((turn, index) => turn.messages.length > 0 && <ConversationTurn key={`${view.id}:${turn.id || index}`} turn={turn} />)}

@@ -1,12 +1,9 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{Value, json};
 
 const INITIAL_BODIES: usize = 20;
-const HISTORY_MESSAGES: usize = 50;
+const HISTORY_BODIES: usize = 50;
 const MESSAGE_BUDGET: usize = 256 * 1024;
 const INITIAL_TOTAL_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_PATCHES: usize = 4096;
@@ -29,8 +26,23 @@ impl StreamVersion {
 
 #[derive(Default)]
 pub(crate) struct MessageWindow {
-    loaded: HashSet<(String, String)>,
+    // Retain recent/live context separately from conversation-only backfill.
+    loaded: HashMap<(String, String), bool>,
     expand: bool,
+    history_revision: u64,
+}
+
+fn is_dialogue(message: &Value) -> bool {
+    message["role"] != "activity"
+        && (!message["text"]
+            .as_str()
+            .expect("projected text")
+            .trim()
+            .is_empty()
+            || !message["attachments"]
+                .as_array()
+                .expect("projected attachments")
+                .is_empty())
 }
 
 impl MessageWindow {
@@ -67,13 +79,32 @@ impl MessageWindow {
         // deleted or reordered. Appending messages never slides the window away.
         let anchor = messages
             .iter()
-            .position(|(_, _, _, key)| self.loaded.contains(key));
-        let mut start = anchor.unwrap_or(messages.len());
-        let initial = anchor.is_none();
+            .position(|(_, _, _, key)| self.loaded.contains_key(key));
+        let initial = anchor.is_none() && !self.expand;
+        let previous_recent = messages
+            .iter()
+            .position(|(_, _, _, key)| self.loaded.get(key) == Some(&true))
+            .or_else(|| {
+                messages
+                    .iter()
+                    .rposition(|(_, _, _, key)| self.loaded.contains_key(key))
+                    .map(|index| index + 1)
+            })
+            .or_else(|| {
+                messages
+                    .iter()
+                    .position(|(index, _, _, _)| turns[*index]["status"] == "inProgress")
+            })
+            .unwrap_or(messages.len());
+        let mut start = anchor.unwrap_or(if initial {
+            messages.len()
+        } else {
+            previous_recent
+        });
         let mut count = if initial {
             INITIAL_BODIES
         } else if self.expand {
-            HISTORY_MESSAGES
+            HISTORY_BODIES
         } else {
             0
         };
@@ -82,18 +113,12 @@ impl MessageWindow {
         while start > 0 && count > 0 {
             let message = messages[start - 1].2;
             // Folded activities and empty messages do not consume the body quota.
-            let counted = !initial
-                || (message["role"] != "activity"
-                    && (!message["text"]
-                        .as_str()
-                        .expect("projected text")
-                        .trim()
-                        .is_empty()
-                        || !message["attachments"]
-                            .as_array()
-                            .expect("projected attachments")
-                            .is_empty()));
-            let size = message.to_string().len();
+            let counted = is_dialogue(message);
+            let size = if initial || counted {
+                message.to_string().len()
+            } else {
+                0
+            };
             // A single large public message is visible intact, not silently lost.
             if (initial && total_bytes > 0 && total_bytes + size > INITIAL_TOTAL_BUDGET)
                 || (counted && bytes > 0 && bytes + size > MESSAGE_BUDGET)
@@ -107,24 +132,31 @@ impl MessageWindow {
                 count -= 1;
             }
         }
-        self.expand = false;
-        self.loaded = messages[start..]
+        let recent_start = if initial { start } else { previous_recent };
+        // A requested Native backfill may arrive after the history command.
+        let waiting_for_native =
+            self.expand && count == HISTORY_BODIES && metadata["historyComplete"] != true;
+        if self.expand && !waiting_for_native {
+            self.history_revision += 1;
+        }
+        self.expand = waiting_for_native;
+        self.loaded = messages
             .iter()
-            .map(|(_, _, _, key)| key.clone())
+            .enumerate()
+            .skip(start)
+            .map(|(index, (_, _, _, key))| (key.clone(), index >= recent_start))
             .collect();
-        let boundary = messages
-            .get(start)
-            .map(|(turn, message, _, _)| (*turn, *message));
+        let mut visible = vec![Vec::new(); turns.len()];
+        for (position, (turn, _, message, _)) in messages.iter().enumerate().skip(start) {
+            if position >= recent_start || is_dialogue(message) {
+                visible[*turn].push(*message);
+            }
+        }
         metadata["turns"] = turns
             .iter()
             .enumerate()
             .filter_map(|(index, turn)| {
-                let messages = turn["messages"].as_array().expect("projected messages");
-                let messages = match boundary {
-                    Some((first, offset)) if index == first => &messages[offset..],
-                    Some((first, _)) if index > first => messages.as_slice(),
-                    _ => &[],
-                };
+                let messages = &visible[index];
                 // The composer still sees every active turn and the current
                 // empty turn; old invisible completed-turn metadata is not history.
                 if messages.is_empty() && turn["status"] != "inProgress" && index + 1 != turns.len()
@@ -149,7 +181,12 @@ impl MessageWindow {
                 ))
             })
             .collect();
-        metadata["hasEarlierMessages"] = json!(start > 0);
+        metadata["hasEarlierMessages"] = json!(
+            messages[..start]
+                .iter()
+                .any(|(_, _, message, _)| is_dialogue(message))
+        );
+        metadata["historyRevision"] = json!(self.history_revision);
         metadata
     }
 }

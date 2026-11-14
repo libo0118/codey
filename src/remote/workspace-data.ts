@@ -15,7 +15,7 @@ export type Message = {
 };
 export type Turn = { id: string | null; status: string | null; error?: unknown; startedAt?: number | null; completedAt?: number | null; messages: Message[] };
 export type ThreadSettings = { model?: string | null; effort?: string | null; serviceTier?: string | null; permissionMode?: string };
-export type View = ThreadSettings & { id: string; title?: string | null; cwd?: string | null; status?: string | null; turns: Turn[]; requests: Approval[]; historyComplete: boolean; hasEarlierMessages?: boolean; threadGoal?: Goal | null; goalAvailability?: GoalAvailability };
+export type View = ThreadSettings & { id: string; title?: string | null; cwd?: string | null; status?: string | null; turns: Turn[]; requests: Approval[]; historyComplete: boolean; hasEarlierMessages?: boolean; historyRevision?: number; threadGoal?: Goal | null; goalAvailability?: GoalAvailability };
 export type ModelOption = { id: string; label: string; route: string; efforts: string[]; defaultEffort: string };
 export type ModelCatalog = { models?: string[]; default_model?: string; clear_models?: boolean; model_metadata?: { model: string; display_name?: string; model_display_name?: string; route_name?: string; supported_reasoning_efforts?: string[]; default_reasoning_effort?: string }[] };
 

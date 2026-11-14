@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useStableEvent } from "../../useStableEvent";
+import { errorText } from "../../appUtils";
 import type { View } from "../../remote/workspace-data";
 import { remoteWorkspaceRequests as requests } from "./requests";
 import { applyConversationPatches } from "./state";
 
 function historyBoundary(view: View): string {
-  const turn = view.turns.find(turn => turn.messages.length);
-  const first = turn?.messages[0];
-  return first ? JSON.stringify([turn!.id, first.id ?? [first.role, first.kind, first.text]]) : "";
+  for (const turn of view.turns) {
+    const first = turn.messages.find(message => message.role !== "activity" && (message.text.trim() || message.attachments?.length));
+    if (first) return JSON.stringify([turn.id, first.id ?? [first.role, first.kind, first.text]]);
+  }
+  return "";
 }
 
 export function useRemoteConversationController(active: boolean, threadId: string | undefined, onUnauthorized: () => void) {
@@ -17,6 +20,7 @@ export function useRemoteConversationController(active: boolean, threadId: strin
   const [revision, setRevision] = useState(0);
   const [fileGeneration, setFileGeneration] = useState(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [historyError, setHistoryError] = useState("");
   const historyRequest = useRef<(() => boolean) | undefined>(undefined);
   // 断线时同步拦住旧 render 的操作回调，不等待 React 提交。
   const connectedThread = useRef<string | undefined>(undefined);
@@ -24,7 +28,7 @@ export function useRemoteConversationController(active: boolean, threadId: strin
 
   useEffect(() => {
     connectedThread.current = undefined; historyRequest.current = undefined;
-    setConnected(false); setConnectionError(""); setLoadingEarlier(false);
+    setConnected(false); setConnectionError(""); setLoadingEarlier(false); setHistoryError("");
     if (!active || !threadId) return;
     let disposed = false;
     let unavailable = false;
@@ -45,7 +49,25 @@ export function useRemoteConversationController(active: boolean, threadId: strin
       let snapshot: View | null = null;
       let streamRevision: number | undefined;
       let earlierBoundary: string | undefined;
+      let earlierRevision: number | undefined;
+      let historyOperation: object | undefined;
+      let nativeHistoryRequested = false;
       const current = () => !disposed && connection === token;
+      const readNativeHistory = () => {
+        if (!historyOperation || snapshot?.hasEarlierMessages || snapshot?.historyComplete || nativeHistoryRequested) return;
+        const operation = historyOperation;
+        nativeHistoryRequested = true;
+        void requests.action(threadId, "history").catch(cause => {
+          if (!current()) return;
+          if (requests.unauthorized(cause)) {
+            disposed = true; window.clearTimeout(timer); socket?.close(); connectedThread.current = undefined; historyRequest.current = undefined;
+            setConnected(false); setLoadingEarlier(false); unauthorized(); return;
+          }
+          if (historyOperation !== operation) return;
+          historyOperation = undefined; earlierBoundary = undefined; setLoadingEarlier(false);
+          setHistoryError(errorText(cause));
+        });
+      };
       const closed = (message = "", stop = false) => {
         if (!current()) return;
         const closedToken = connection = {};
@@ -74,11 +96,15 @@ export function useRemoteConversationController(active: boolean, threadId: strin
                 streamRevision = event.revision;
               }
               if (next.id !== threadId) throw new Error();
+              if (snapshot?.historyRevision !== undefined && (next.historyRevision === undefined || next.historyRevision < snapshot.historyRevision)) throw new Error();
               if (!snapshot) setFileGeneration(value => value + 1);
               snapshot = next;
-              if (earlierBoundary !== undefined && (!next.hasEarlierMessages || historyBoundary(next) !== earlierBoundary)) {
-                earlierBoundary = undefined; setLoadingEarlier(false);
+              if (earlierBoundary !== undefined) {
+                const finished = earlierRevision !== undefined ? next.historyRevision! > earlierRevision
+                  : next.historyComplete && !next.hasEarlierMessages || historyBoundary(next) !== earlierBoundary && (earlierBoundary !== "" || next.historyComplete);
+                if (finished) { earlierBoundary = undefined; historyOperation = undefined; setLoadingEarlier(false); }
               }
+              readNativeHistory();
               connectedThread.current = threadId;
               setView(next); setConnected(true); setConnectionError(""); delay = 2000;
             } catch { closed("会话数据无效，请重新连接", true); }
@@ -87,9 +113,9 @@ export function useRemoteConversationController(active: boolean, threadId: strin
           close: () => closed(),
         });
         historyRequest.current = () => {
-          if (!current() || unavailable || connectedThread.current !== threadId || streamRevision === undefined || !snapshot?.hasEarlierMessages || earlierBoundary !== undefined) return false;
-          earlierBoundary = historyBoundary(snapshot); setLoadingEarlier(true);
-          try { socket!.history(); return true; }
+          if (!current() || unavailable || connectedThread.current !== threadId || streamRevision === undefined || !snapshot || !snapshot.hasEarlierMessages && snapshot.historyComplete || earlierBoundary !== undefined) return false;
+          earlierBoundary = historyBoundary(snapshot); earlierRevision = snapshot.historyRevision; historyOperation = {}; nativeHistoryRequested = false; setLoadingEarlier(true); setHistoryError("");
+          try { socket!.history(); readNativeHistory(); return true; }
           catch { closed(); return false; }
         };
       } catch { closed(); }
@@ -100,6 +126,6 @@ export function useRemoteConversationController(active: boolean, threadId: strin
 
   return { view: view?.id === threadId ? view : null, connected: active && connected && view?.id === threadId,
     isConnected: () => active && threadId !== undefined && connectedThread.current === threadId,
-    connectionError, fileGeneration, loadingEarlier, loadEarlier: () => active && Boolean(historyRequest.current?.()),
+    connectionError, fileGeneration, loadingEarlier, historyError, loadEarlier: () => active && Boolean(historyRequest.current?.()),
     reconnect: () => { if (active) setRevision(value => value + 1); } };
 }
