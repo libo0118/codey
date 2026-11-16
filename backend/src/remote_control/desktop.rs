@@ -275,7 +275,7 @@ impl Desktop {
         {
             return Ok(false);
         }
-        if event["version"] != 11 {
+        if !matches!(event["version"].as_u64(), Some(11 | 13)) {
             return Err("当前 Codex 桌面会话协议不兼容，请更新 Codey".into());
         }
         let change = &event["params"]["change"];
@@ -693,6 +693,32 @@ mod tests {
         assert!(desktop.apply_event(event).unwrap());
         let patch = json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"patches","revision":3,"baseRevision":2,"patches":[]}}});
         assert!(desktop.apply_event(patch).unwrap_err().contains("失步"));
+    }
+
+    #[tokio::test]
+    async fn verified_stream_versions_accept_snapshots_and_patches() {
+        for version in [11, 13] {
+            let (mut desktop, _server) = action_fixture(json!({"id":"t"}));
+            let snapshot = json!({"type":"broadcast","method":"thread-stream-state-changed","version":version,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":1,"conversationState":{"id":"t","title":"before","turns":[]}}}});
+            assert!(desktop.apply_event(snapshot).unwrap());
+            let patch = json!({"type":"broadcast","method":"thread-stream-state-changed","version":version,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["title"],"value":"after"}],"acceptedTextChanges":[]}}});
+            assert!(desktop.apply_event(patch).unwrap());
+            assert_eq!(desktop.state["title"], "after");
+            assert_eq!(desktop.provenance().unwrap().revision, Some(2));
+            let stale = json!({"type":"broadcast","method":"thread-stream-state-changed","version":version,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"patches","baseRevision":1,"revision":3,"patches":[]}}});
+            assert!(desktop.apply_event(stale).unwrap_err().contains("失步"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_stream_versions_are_rejected_without_changing_state() {
+        for version in [json!(10), json!(12), json!(14), json!("13"), Value::Null] {
+            let (mut desktop, _server) = action_fixture(json!({"id":"t"}));
+            let before = desktop.state.clone();
+            let event = json!({"type":"broadcast","method":"thread-stream-state-changed","version":version,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":1,"conversationState":{"id":"t","title":"unverified"}}}});
+            assert!(desktop.apply_event(event).unwrap_err().contains("协议不兼容"));
+            assert_eq!(desktop.state, before);
+        }
     }
 
     #[tokio::test]
