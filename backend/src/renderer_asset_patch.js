@@ -79,6 +79,8 @@
     "isCustomModelProvider",
     "getHasInProgressLocalConversation",
     "electron-app-state-snapshot-request",
+    "submitDisabledReasons:",
+    "checkout-webview-presentation-changed",
   ];
   const rendererGateFailureExcerpts = (source) => {
     const excerpts = [];
@@ -334,6 +336,7 @@
     "shouldPrewarmAvatarOverlay:",
     "forcePricingRefreshInBackground",
     "use_embedded_credit_checkout",
+    "checkout-webview-presentation-changed",
     "Desktop host did not provide its AppServerManager service",
     ".sendFollowUpMessage(",
     ".startTurn(",
@@ -403,7 +406,7 @@
       || source.includes("CodexComposerAdapter"))
       && source.includes("let{agentMode:")
       && source.includes("resolvedHostId:")
-      && source.includes("submitDisabled:")
+      && (source.includes("submitDisabled:") || source.includes("submitDisabledReasons:"))
       && !source.includes("/*codey-local-quota-gate*/")) {
       // 只改变 Codex 本机发送按钮的额度条件。保留共享额度状态、官方警告
       // 和其他禁用条件；每次渲染读取当前模型，避免模型切换后复用旧判断。
@@ -428,22 +431,24 @@
             pattern: /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=\(0,[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*\)\("local"===(?<host>[$A-Z_a-z][$\w]*)&&[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:[$A-Z_a-z][$\w]*,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let (?<disabled>[$A-Z_a-z][$\w]*)=[^;]{0,512}?\|\|\k<quota>;[\s\S]{0,6000}?submitDisabled:\k<disabled>,)/g,
             replacement: replaceQuota,
           },
+          // Codex 26.1111 起把禁用条件拆成带原因标识的数组拼入 submitDisabledReasons。
+          {
+            pattern: /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=\(0,[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*\)\("local"===(?<host>[$A-Z_a-z][$\w]*)&&[$A-Z_a-z][$\w]*\.[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:[$A-Z_a-z][$\w]*,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let [^;]{0,1024}?,[$A-Z_a-z][$\w]*=\k<quota>&&[`"]usage-limit[`"];[\s\S]{0,6000}?submitDisabledReasons:[$A-Z_a-z][$\w]*,)/g,
+            replacement: replaceQuota,
+          },
         ],
         null,
         "local third-party composer quota",
       );
       // Codex 26.1021 起 Team 等工作空间额度耗尽时另有按主机的硬阻断，
-      // 在禁用表达式中紧挨额度条件；旧版没有该条件时保持不变。
+      // 在禁用表达式或原因列表中紧挨额度条件；旧版没有该条件时保持不变。
       if (quotaGate != null && patched.includes("/*codey-local-quota-gate*/")) {
         const { disabled, host, mode, quota } = quotaGate;
         const name = value => value.replace(/\$/g, "\\$");
         const ident = "[$A-Z_a-z][$\\w]*";
-        const disabledMatches = [...patched.matchAll(new RegExp(`let ${name(disabled)}=[^;]{0,512}?\\|\\|(${ident})\\|\\|${name(quota)}([,;])`, "g"))];
-        const hard = disabledMatches.length === 1 ? disabledMatches[0][1] : null;
-        const terminator = disabledMatches.length === 1 ? disabledMatches[0][2] : null;
-        const hardDefinitions = hard == null
-          ? []
-          : [
+        const hasUniqueHostHardDefinition = (hard) => {
+          if (hard == null || hard === host) return false;
+          const hardDefinitions = [
             ...patched.matchAll(
               new RegExp(
                 `(?:^|[,;{]|(?:const|let|var) )${name(hard)}=(?:${ident}\\(${ident},${name(host)}\\)|\\(0,${ident}\\.${ident}\\)\\(${ident}\\.${ident},${name(host)}\\))`,
@@ -451,13 +456,29 @@
               ),
             ),
           ];
-        if (hard != null
-          && hard !== host
-          && hardDefinitions.length === 1) {
-          const [{ 0: matched, index }] = disabledMatches;
-          const term = `||${hard}||${quota}${terminator}`;
-          const offset = index + matched.length - term.length;
-          patched = `${patched.slice(0, offset)}||${hard}&&${localSendGate("codey-local-hard-block-gate", host, mode)}||${quota}${terminator}${patched.slice(offset + term.length)}`;
+          return hardDefinitions.length === 1;
+        };
+        if (disabled != null) {
+          const disabledMatches = [...patched.matchAll(new RegExp(`let ${name(disabled)}=[^;]{0,512}?\\|\\|(${ident})\\|\\|${name(quota)}([,;])`, "g"))];
+          const hard = disabledMatches.length === 1 ? disabledMatches[0][1] : null;
+          const terminator = disabledMatches.length === 1 ? disabledMatches[0][2] : null;
+          if (hasUniqueHostHardDefinition(hard)) {
+            const [{ 0: matched, index }] = disabledMatches;
+            const term = `||${hard}||${quota}${terminator}`;
+            const offset = index + matched.length - term.length;
+            patched = `${patched.slice(0, offset)}||${hard}&&${localSendGate("codey-local-hard-block-gate", host, mode)}||${quota}${terminator}${patched.slice(offset + term.length)}`;
+          }
+        } else {
+          const reasonMatches = [
+            ...patched.matchAll(
+              new RegExp(`(,${ident}=)(${ident})(&&[\\x60"]reserve-limit[\\x60"],${ident}=${name(quota)}&&[\\x60"]usage-limit[\\x60"];)`, "g"),
+            ),
+          ];
+          const hard = reasonMatches.length === 1 ? reasonMatches[0][2] : null;
+          if (hasUniqueHostHardDefinition(hard)) {
+            const [{ 0: matched, 1: prefix, 3: suffix, index }] = reasonMatches;
+            patched = `${patched.slice(0, index)}${prefix}${hard}&&${localSendGate("codey-local-hard-block-gate", host, mode)}${suffix}${patched.slice(index + matched.length)}`;
+          }
         }
       }
     }
@@ -494,6 +515,7 @@
     if (
       source.includes("AppServerRequestClient is missing a message dispatcher")
       && source.includes("mcp_request_enqueued")
+      && !source.includes("globalThis.__codeyModelRequestSourceGateInstalled=true")
       && /this\.dispatchMessage\?\.\((["'`])mcp-request\1/.test(source)
     ) {
       // Current Codex can create threads through AppServerRequestClient without
@@ -596,6 +618,7 @@
     if (
       source.includes("isPrewarm:")
       && /[`"]use_embedded_credit_checkout[`"]/.test(source)
+      && !source.includes("checkout-webview-presentation-changed")
       && !/&&\(!0\|\|[^;]{0,600}?[`"]use_embedded_credit_checkout[`"]/.test(source)
     ) {
       // 额度购买页同理：未展示时不再挂载隐藏的预热 webview，展示时照常加载。
@@ -604,6 +627,26 @@
         /,!([$A-Z_a-z][$\w]*)&&\((?=[^;]{0,600}?\.get\([`"]use_embedded_credit_checkout[`"],!1\)\)\)return null;)/g,
         (_match, presented) => `,!${presented}&&(!0||`,
         "credit checkout webview prewarm",
+      );
+    }
+    if (
+      source.includes("checkout-webview-presentation-changed")
+      && source.includes("isPrewarm:")
+      && !source.includes("/*codey-personal-checkout-prewarm*/")
+    ) {
+      // Codex 26.1111 起个人版定价与额度充值共用 CheckoutPersonalWebviewHost：
+      // 仅在存在实际路由参数时启用宿主，并跳过伴随挂载的隐藏预热 webview。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /,([$A-Z_a-z][$\w]*)=null!=([$A-Z_a-z][$\w]*)\|\|[$A-Z_a-z][$\w]*\|\|[$A-Z_a-z][$\w]*;(?=return\s*[^;]{0,300}?\{chatGptOrigin:[$A-Z_a-z][$\w]*,enabled:\1,search:\2\})/g,
+        (_match, enabled, search) => `,${enabled}=/*codey-personal-checkout-prewarm*/null!=${search};`,
+        "personal checkout webview prewarm",
+      );
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\b[$A-Z_a-z][$\w]*=)\(0,[$A-Z_a-z][$\w]*\.jsx\)\([`"]div[`"],\{[`"]aria-hidden[`"]:!0,inert:!0,className:[`"]pointer-events-none invisible fixed inset-0[`"],children:\(0,[$A-Z_a-z][$\w]*\.jsx\)\([$A-Z_a-z][$\w]*,\{isPrewarm:!0,partition:[$A-Z_a-z][$\w]*,search:[$A-Z_a-z][$\w]*\}\)\}\)/g,
+        (_match, assign) => `${assign}null`,
+        "personal checkout prewarm element",
       );
     }
     if (
@@ -681,7 +724,8 @@
     }
     if (
       source.includes("supportsIndependentSpeedModes") &&
-      source.includes("ultrafast_mode")
+      source.includes("ultrafast_mode") &&
+      !source.includes("/*codey-service-tier-access*/")
     ) {
       // Fast/Ultrafast permission comes only from ChatGPT account requirements.
       // Codey routes declare speed tiers in the model catalog, so the shared
@@ -690,11 +734,12 @@
       patched = replaceUniqueRendererGate(
         patched,
         /if\s*\(\s*(?:([$A-Z_a-z][$\w]*)\s*==\s*null|null\s*==\s*([$A-Z_a-z][$\w]*))\s*\)\s*return\s*!1\s*;\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*[$A-Z_a-z][$\w]*\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*return\s*(?:\4\s*===\s*[`"]flex[`"]|[`"]flex[`"]\s*===\s*\4)\s*\|\|\s*(?:\1|\2)\[\s*\3\s*\?\?\s*[`"]fast[`"]\s*\]/g,
-        "return!0",
+        "/*codey-service-tier-access*/return!0",
         "service tier access",
       );
     }
     if (source.includes("={serviceTierAccess:")
+      && !source.includes("{fast:!0,ultrafast:!0}")
       && /=\{serviceTierAccess:[$A-Z_a-z][$\w]*,isLoading:/.test(source)) {
       // API key logins and pending requirements yield a null access object,
       // which hides the speed control and settings entirely. Keep a fixed
@@ -707,6 +752,7 @@
       );
     }
     if (source.includes("electron-app-state-snapshot-request")
+      && !source.includes("/*codey-heartbeat-snapshot-skip*/")
       && /case[`"]electron-app-state-snapshot-request[`"]:/.test(source)) {
       // Main asks the focused window for a full app-state snapshot every 30 s,
       // then adds process sampling, a debug log and a Sentry breadcrumb. Skip
@@ -717,7 +763,7 @@
         patched,
         /(case[`"]electron-app-state-snapshot-request[`"]:\{)(?=[\s\S]{0,2000}?collectAppStateSnapshot\(([$A-Z_a-z][$\w]*)\.hostId,\2\.reason\)[\s\S]{0,2000}?dispatchMessage\([`"]electron-app-state-snapshot-response[`"][^;]{0,400};break((?: [$A-Z_a-z][$\w]*)?)\})/g,
         (_match, prefix, messageName, label) =>
-          `${prefix}if(${messageName}.reason===\`heartbeat\`)break${label};`,
+          `${prefix}/*codey-heartbeat-snapshot-skip*/if(${messageName}.reason===\`heartbeat\`)break${label};`,
         "app state heartbeat snapshot",
       );
     }
@@ -743,7 +789,8 @@
         "interaction heartbeat",
       );
     }
-    if (patched.includes("globalThis.__codeyModelWhitelistPatch?.trackOutgoingMessage")
+    if (!patched.includes("globalThis.__codeyModelRequestSourceGateInstalled=true")
+      && patched.includes("globalThis.__codeyModelWhitelistPatch?.trackOutgoingMessage")
       && patched.includes("let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage")
       && patched.includes("globalThis.__codeyModelWhitelistPatch?.rewriteIncomingResult")) {
       patched += "\n;globalThis.__codeyModelRequestSourceGateInstalled=true;\n";

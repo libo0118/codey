@@ -716,7 +716,12 @@ mod tests {
             let (mut desktop, _server) = action_fixture(json!({"id":"t"}));
             let before = desktop.state.clone();
             let event = json!({"type":"broadcast","method":"thread-stream-state-changed","version":version,"sourceClientId":"owner","params":{"hostId":"local","conversationId":"t","change":{"type":"snapshot","revision":1,"conversationState":{"id":"t","title":"unverified"}}}});
-            assert!(desktop.apply_event(event).unwrap_err().contains("协议不兼容"));
+            assert!(
+                desktop
+                    .apply_event(event)
+                    .unwrap_err()
+                    .contains("协议不兼容")
+            );
             assert_eq!(desktop.state, before);
         }
     }

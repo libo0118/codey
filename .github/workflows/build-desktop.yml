@@ -19,7 +19,49 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  frontend:
+    name: Shared frontend checks and overlay
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.2"
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript check
+        run: pnpm run check
+
+      - name: JavaScript tests
+        run: pnpm run test:js
+
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
+      - name: Upload prebuilt frontend overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-overlay-assets
+          path: dist-overlay
+          if-no-files-found: error
+
   windows:
+    needs: [frontend]
     name: Windows x64
     runs-on: windows-latest
     env:
@@ -90,17 +132,11 @@ jobs:
           "NSISDIR=$nsisHome" | Out-File -FilePath $env:GITHUB_ENV -Append
           "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: TypeScript check
-        run: pnpm run check
-
-      - name: JavaScript tests
-        run: pnpm run test:js
-
-      - name: Build embedded frontend assets
-        run: pnpm run vite:build
+      - name: Download prebuilt frontend overlay
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-overlay-assets
+          path: dist-overlay
 
       - name: Rust format
         run: cargo fmt --all -- --check
@@ -157,6 +193,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    needs: [frontend]
     name: Linux x64
     runs-on: ubuntu-24.04
     env:
@@ -200,17 +237,11 @@ jobs:
           key: linux-el8-x64
           workspaces: ". -> target/linux-el8"
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: TypeScript check
-        run: pnpm run check
-
-      - name: JavaScript tests
-        run: pnpm run test:js
-
-      - name: Build embedded frontend assets
-        run: pnpm run vite:build
+      - name: Download prebuilt frontend overlay
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-overlay-assets
+          path: dist-overlay
 
       - name: Build EL8 x64 toolchain image
         run: docker build --platform linux/amd64 --tag codey-linux-x64-builder scripts/installer/linux

@@ -50,9 +50,10 @@ test("pull requests enforce the unified Rust quality gate", () => {
 test("tag-triggered Windows releases independently enforce Rust quality gates", () => {
   assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
   const windowsJob = workflow.slice(workflow.indexOf("\n  windows:"), workflow.indexOf("\n  linux:"));
+  const frontendJob = workflow.slice(workflow.indexOf("\n  frontend:"), workflow.indexOf("\n  windows:"));
   assertRustQualityGates(windowsJob);
-  assert.match(windowsJob, /pnpm run check/);
-  assert.match(windowsJob, /pnpm run test:js/);
+  assert.match(frontendJob, /pnpm run check/);
+  assert.match(frontendJob, /pnpm run test:js/);
   assert.doesNotMatch(windowsJob, /overlay-recovery-native\.ps1/);
   assert.match(windowsJob, /working-directory: vendor\/ComputerUse\/windows\s+run: go test \.\/\.\.\./);
   assert.match(workflow, /runs-on: windows-latest/);
@@ -91,7 +92,7 @@ test("Linux x64 independently passes the same gates before both platform package
   assert.match(linuxJob, /dpkg-dev rpm rpm2cpio cpio/);
   assert.match(linuxJob, /CODEY_REQUIRE_LINUX_PACKAGING_TOOLS: "1"/);
   assertRustQualityGates(linuxJob);
-  for (const command of ["pnpm run check", "pnpm run test:js", "pnpm run vite:build", "node scripts/build.mjs", "node scripts/package-linux.mjs"]) assert.ok(linuxJob.includes(command), command);
+  for (const command of ["node scripts/build.mjs", "node scripts/package-linux.mjs"]) assert.ok(linuxJob.includes(command), command);
   const linuxBuilder = fs.readFileSync(new URL("../scripts/installer/linux/Dockerfile", import.meta.url), "utf8");
   assert.match(linuxBuilder, /^FROM registry\.access\.redhat\.com\/ubi8\/ubi:8\.10$/m);
   assert.match(linuxJob, /docker build --platform linux\/amd64/);
@@ -140,8 +141,18 @@ test("Windows Rust tests share a bounded test-process budget without changing Li
   assert.doesNotMatch(linuxJob, /RUST_TEST_THREADS/);
 });
 
-test("Windows release reuses the prebuilt frontend overlay", () => {
-  assert.match(workflow, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
+test("both desktop platforms require the checked shared frontend overlay", () => {
+  const frontendJob = workflow.slice(workflow.indexOf("\n  frontend:"), workflow.indexOf("\n  windows:"));
+  assert.match(frontendJob, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
+  assert.match(frontendJob, /name: frontend-overlay-assets\s+path: dist-overlay/);
+  assert.equal((workflow.match(/run: pnpm run vite:build/g) || []).length, 1);
+  for (const [job, next] of [["windows", "linux"], ["linux", "release"]]) {
+    const platformJob = workflow.slice(workflow.indexOf(`\n  ${job}:`), workflow.indexOf(`\n  ${next}:`));
+    assert.match(platformJob, /needs: \[frontend\]/);
+    assert.match(platformJob, /- name: Download prebuilt frontend overlay[\s\S]*?name: frontend-overlay-assets\s+path: dist-overlay/);
+    assert.doesNotMatch(platformJob, /pnpm run vite:build/);
+    assert.match(platformJob, /CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  }
   assert.match(workflow, /cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
   assert.match(workflow, /cargo clippy --workspace --all-targets --locked -- -D warnings\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
   assert.match(workflow, /- name: Build Windows executable\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
@@ -200,7 +211,7 @@ test("desktop packages include FastCtx license and notice files", () => {
 test("Windows release publishes the installer without a portable zip", () => {
   const nsisInstallStep = workflowStep(
     "- name: Install NSIS",
-    "- name: Install frontend dependencies",
+    "- name: Download prebuilt frontend overlay",
   );
   const windowsPackageStep = workflowStep(
     "- name: Build Windows installer",
