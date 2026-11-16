@@ -20,9 +20,10 @@ test("有界真实消息组件不创建闭合正文、图片或空历史 section
   const { ConversationTurn } = createModuleGraph(new URL("../src/remote/messages.tsx", import.meta.url), { stubs: real }).exports;
   const html = renderToStaticMarkup(React.createElement("div", null, ...initial.turns.map(turn => React.createElement(ConversationTurn, { key: turn.id, turn }))));
   assert.equal((html.match(/class="remote-turn"/g) || []).length, 1);
-  assert.equal((html.match(/<details /g) || []).length, 1);
+  assert.equal((html.match(/<details /g) || []).length, 2, "连续工具过程折叠，子代理完成事件独立可见");
   assert.doesNotMatch(html, /Mock lazy detail body|remote-agent-result|remote-tool|<img /);
-  assert.match(html, /工作过程/); assert.match(html, /19 项活动/);
+  assert.match(html, /工作过程/); assert.match(html, /18 项活动/);
+  assert.match(html, /核验代理（Mock）/); assert.match(html, /已完成/);
   assert.ok((html.match(/<[a-z][^>]*>/g) || []).length < 250);
 });
 
@@ -47,10 +48,8 @@ test("真实 Activity hook 仅在展开时创建正文，流更新不控制原�
   // Drive the actual nested Activity with the controller harness, not a second lazy-body algorithm.
   const a = createControllerHarness(new URL("../src/remote/messages.tsx", import.meta.url), (exports, props) => {
     const tree = exports.ConversationTurn({ turn: { id: "Mock-turn", status: "completed", messages: [props.message] } });
-    const group = collectElements(tree, node => node.props.messages)[0];
-    const outer = group.type(group.props);
-    const child = collectElements(outer, node => node.props.message?.id === props.message.id)[0];
-    return child ? child.type(child.props) : outer;
+    const child = collectElements(tree, node => node.props.message?.id === props.message.id)[0];
+    return child.type(child.props);
   }, { "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
   const message = full.turns[0].messages[199];
   let body = a.render({ message });

@@ -34,6 +34,22 @@ test("提问回复呈现问题和答案，不显示协议标签或 JSON；未知
   assert.match(render([user('<send_user_message_question_reply>{"unknown":true}</send_user_message_question_reply>')]), /unknown/);
 });
 
+test("单次工具和子代理事件按截图独立成行，不隐藏到连续过程入口", () => {
+  const messages = [
+    { id: "inspect", role: "activity", kind: "mcpToolCall", text: "", tool: { name: "inspect_local_file", output: "LAZY_OUTPUT" } },
+    { id: "agent", role: "activity", kind: "subAgentActivity", text: "", collaboration: { action: "completed", agents: [{ id: "child", name: "核对布局", status: "completed", message: "LAZY_AGENT_RESULT" }] } },
+    { id: "command", role: "activity", kind: "commandExecution", text: "", command: { command: "pnpm run check", output: "LAZY_COMMAND_RESULT" } },
+    { id: "answer", role: "assistant", kind: "agentMessage", text: "检查完成" },
+  ];
+  const html = render(messages);
+  assert.equal((html.match(/class="remote-activity /g) || []).length, 3);
+  assert.doesNotMatch(html, /class="remote-process"|LAZY_OUTPUT|LAZY_AGENT_RESULT|LAZY_COMMAND_RESULT/);
+  assert.match(html, /remote-activity-icon/); assert.match(html, /remote-activity-chevron/);
+  assert.match(html, /核对布局/); assert.match(html, /已完成/);
+  const order = messages.map(message => html.indexOf(`data-message-id="${message.id}"`));
+  assert.ok(order.every((position, index) => position >= 0 && (!index || position > order[index - 1])));
+});
+
 test("连续过程合为一个懒加载入口，回答穿插顺序不变，空摘要不生成空详情卡", () => {
   const messages = [
     { id: "a", role: "activity", kind: "reasoning", text: "" },
@@ -48,6 +64,28 @@ test("连续过程合为一个懒加载入口，回答穿插顺序不变，空�
   assert.ok(html.indexOf('data-message-id="answer"') < html.indexOf('data-message-id="c"'));
 });
 
+test("单次记录流入第二步时保留原组件和已展开列表，收起后仍卸载过程行", () => {
+  const h = createControllerHarness(new URL("../src/remote/messages.tsx", import.meta.url), (exports, props) => {
+    const tree = exports.ConversationTurn({ turn: { id: "turn", status: "inProgress", messages: props.messages } });
+    const group = collectElements(tree, node => Array.isArray(node.props.messages))[0];
+    return group.type(group.props);
+  }, { "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
+  const first = { id: "first", role: "activity", kind: "mcpToolCall", text: "", tool: { name: "lookup", output: "LAZY_RESULT" } };
+  try {
+    let tree = h.render({ messages: [first] });
+    assert.equal(tree.props.className, "remote-record-sequence"); assert.equal(tree.props.open, true);
+    const child = collectElements(tree, node => node.props.message?.id === "first")[0];
+    tree = h.render({ messages: [first, { ...first, id: "second" }] });
+    assert.equal(tree.props.className, "remote-process"); assert.equal(tree.props.open, true);
+    const after = collectElements(tree, node => node.props.message?.id === "first")[0];
+    assert.equal(after.type, child.type); assert.equal(after.props.key, child.props.key);
+    const closed = { open: false }; tree.props.onToggle({ target: closed, currentTarget: closed }); tree = h.render();
+    assert.equal(collectElements(tree, node => node.props.message).length, 0);
+    tree = h.render({ messages: [first] });
+    assert.equal(tree.props.open, true); assert.equal(collectElements(tree, node => node.props.message).length, 1);
+  } finally { h.unmount(); }
+});
+
 test("过程展开才创建详情，嵌套详情关闭不折叠整个过程", () => {
   const h = createControllerHarness(new URL("../src/remote/messages.tsx", import.meta.url), (exports) => {
     const tree = exports.ConversationTurn({ turn: { id: "turn", status: "inProgress", messages: [
@@ -58,7 +96,7 @@ test("过程展开才创建详情，嵌套详情关闭不折叠整个过程", ()
     return group.type(group.props);
   }, { "react-native-web": nativeWeb, "@tabler/icons-react": icons, "markdown-it": MarkdownIt });
   try {
-    let tree = h.render(); assert.match(textContent(tree), /正在工作/);
+    let tree = h.render(); assert.match(textContent(tree), /正在思考/);
     assert.equal(collectElements(tree, node => node.props.message).length, 0);
     const outer = { open: true }; tree.props.onToggle({ target: outer, currentTarget: outer }); tree = h.render();
     assert.equal(collectElements(tree, node => node.props.message).length, 1);
@@ -67,14 +105,15 @@ test("过程展开才创建详情，嵌套详情关闭不折叠整个过程", ()
   } finally { h.unmount(); }
 });
 
-test("过程摘要只用最新公开动作，不提前创建工具输出或思考正文", () => {
+test("连续过程标题保持轻量，单次记录只预览公开动作，不提前创建结果或思考正文", () => {
   const messages = [
     { id: "old", role: "activity", kind: "commandExecution", text: "", command: { command: "old-command", output: "OLD_OUTPUT" } },
     { id: "tool", role: "activity", kind: "mcpToolCall", status: "failed", text: "PRIVATE_TEXT", tool: { name: "inspect_local_file", input: "PRIVATE_INPUT", output: "HIDDEN_OUTPUT" } },
     { id: "reason", role: "activity", kind: "reasoning", text: "HIDDEN_REASONING" },
   ];
   const html = render(messages);
-  assert.match(html, /remote-process-preview">MCP 工具 · inspect_local_file/);
+  assert.match(html, /工作过程/); assert.match(html, /3 项活动/);
+  assert.doesNotMatch(html, /remote-process-preview|inspect_local_file/);
   assert.doesNotMatch(html, /old-command|OLD_OUTPUT|PRIVATE_TEXT|PRIVATE_INPUT|HIDDEN_OUTPUT|HIDDEN_REASONING|任务失败|已完成/);
   assert.equal((html.match(/<details /g) || []).length, 1);
   for (const [message, expected] of [
